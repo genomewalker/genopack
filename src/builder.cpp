@@ -110,6 +110,32 @@ struct ArchiveBuilder::Impl {
         });
         spdlog::info("MinHash sorted {} genomes", work.size());
 
+        // ── Intra-batch sequence dedup ─────────────────────────────────────────
+        // After MinHash sort, identical sequences are adjacent.
+        // Key: (oph_fingerprint, genome_length). Keep most-complete; tiebreak: first.
+        {
+            size_t n_before = work.size();
+            size_t out = 0;
+            for (size_t i = 0; i < work.size(); ) {
+                size_t j = i + 1;
+                while (j < work.size()
+                       && work[j].stats.oph_fingerprint == work[i].stats.oph_fingerprint
+                       && work[j].stats.genome_length   == work[i].stats.genome_length)
+                    ++j;
+                size_t keep = i;
+                for (size_t k = i + 1; k < j; ++k)
+                    if (work[k].record.completeness > work[keep].record.completeness)
+                        keep = k;
+                if (out != keep) work[out] = std::move(work[keep]);
+                ++out;
+                i = j;
+            }
+            work.resize(out);
+            if (work.size() < n_before)
+                spdlog::info("Dedup: removed {} identical-sequence duplicates within batch",
+                             n_before - work.size());
+        }
+
         // ── Pass 2: write v2 single-file archive ──────────────────────────────
 
         // Open AppendWriter on the output .gpk file
@@ -147,7 +173,7 @@ struct ArchiveBuilder::Impl {
         uint64_t next_section_id = 1;
 
         ShardId current_shard_id = 0;
-        std::unique_ptr<ShardWriterV2> shard_writer;
+        std::unique_ptr<ShardWriter> shard_writer;
         std::vector<GenomeMeta> catalog_rows;
         catalog_rows.reserve(work.size());
         std::vector<std::pair<std::string, GenomeId>> accession_pairs;
@@ -182,7 +208,7 @@ struct ArchiveBuilder::Impl {
         };
 
         auto open_shard = [&]() {
-            shard_writer = std::make_unique<ShardWriterV2>(
+            shard_writer = std::make_unique<ShardWriter>(
                 current_shard_id, current_shard_id, cfg.shard_cfg);
             ++current_shard_id;
         };

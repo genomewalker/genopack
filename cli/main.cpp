@@ -100,6 +100,65 @@ static int cmd_stat(const std::string& archive_dir, bool json) {
     return 0;
 }
 
+// ── genopack dedup ─────────────────────────────────────────────────────────────
+static int cmd_dedup(const std::string& archive_path, bool dry_run) {
+    ArchiveReader reader;
+    reader.open(archive_path);
+
+    ExtractQuery q;
+    auto all = reader.filter_meta(q);
+
+    all.erase(std::remove_if(all.begin(), all.end(),
+        [](const GenomeMeta& m){ return m.is_deleted(); }), all.end());
+
+    std::sort(all.begin(), all.end(), [](const GenomeMeta& a, const GenomeMeta& b) {
+        return a.oph_fingerprint < b.oph_fingerprint;
+    });
+
+    std::vector<GenomeId> to_tombstone;
+    size_t n_groups = 0;
+
+    size_t i = 0;
+    while (i < all.size()) {
+        size_t j = i + 1;
+        while (j < all.size()
+               && all[j].oph_fingerprint == all[i].oph_fingerprint
+               && all[j].genome_length   == all[i].genome_length) {
+            ++j;
+        }
+        if (j > i + 1) {
+            ++n_groups;
+            size_t keep = i;
+            for (size_t k = i + 1; k < j; ++k) {
+                if (all[k].completeness_x10 > all[keep].completeness_x10 ||
+                    (all[k].completeness_x10 == all[keep].completeness_x10 &&
+                     all[k].genome_id < all[keep].genome_id))
+                    keep = k;
+            }
+            for (size_t k = i; k < j; ++k)
+                if (k != keep)
+                    to_tombstone.push_back(all[k].genome_id);
+        }
+        i = j;
+    }
+
+    spdlog::info("dedup: scanned {} genomes, found {} duplicate groups, {} to remove",
+                 all.size(), n_groups, to_tombstone.size());
+
+    if (dry_run || to_tombstone.empty()) {
+        if (dry_run) spdlog::info("dedup: dry-run, no changes made");
+        return 0;
+    }
+
+    ArchiveAppender appender(archive_path);
+    for (GenomeId id : to_tombstone)
+        appender.remove(id);
+    appender.commit();
+
+    spdlog::info("dedup: tombstoned {} duplicates", to_tombstone.size());
+    return 0;
+}
+
 // ── genopack rm ────────────────────────────────────────────────────────────────
 static int cmd_rm(const std::string& archive_dir,
                   const std::vector<std::string>& genome_ids) {
@@ -172,6 +231,16 @@ int main(int argc, char** argv) {
         app2.add_from_tsv(add_input);
         app2.commit();
         std::exit(0);
+    });
+
+    // genopack dedup
+    auto* dedup_cmd = app.add_subcommand("dedup", "Remove duplicate genomes (same sequence, different accession)");
+    std::string dedup_archive;
+    bool dedup_dry_run = false;
+    dedup_cmd->add_option("archive", dedup_archive, "Path to .gpk archive")->required();
+    dedup_cmd->add_flag("--dry-run", dedup_dry_run, "Report duplicates without tombstoning");
+    dedup_cmd->callback([&]() {
+        std::exit(cmd_dedup(dedup_archive, dedup_dry_run));
     });
 
     // genopack rm

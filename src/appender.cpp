@@ -371,6 +371,62 @@ struct ArchiveAppender::Impl {
                 return a.stats.oph_fingerprint < b.stats.oph_fingerprint;
             });
 
+            // ── Sequence dedup ──────────────────────────────────────────────────
+            // Step 1: build set of (oph_fingerprint, genome_length) from existing catalog
+            struct SeqKey { uint64_t oph; uint64_t len;
+                bool operator==(const SeqKey& o) const { return oph==o.oph && len==o.len; } };
+            struct SeqKeyHash { size_t operator()(const SeqKey& k) const {
+                return std::hash<uint64_t>{}(k.oph) ^ (std::hash<uint64_t>{}(k.len) * 0x9e3779b97f4a7c15ULL); } };
+            std::unordered_set<SeqKey, SeqKeyHash> existing_seqs;
+            {
+                MergedCatalogReader cat;
+                for (auto* sd : existing_toc_.find_by_type(SEC_CATL))
+                    cat.add_fragment(mmap_dedup.data(), sd->file_offset, sd->compressed_size);
+                cat.scan([&](const GenomeMeta& m) {
+                    if (!m.is_deleted())
+                        existing_seqs.insert({m.oph_fingerprint, m.genome_length});
+                    return true;
+                });
+            }
+
+            // Step 2: remove new genomes already in catalog (cross-catalog dedup)
+            {
+                size_t n_before = work.size();
+                work.erase(std::remove_if(work.begin(), work.end(), [&](const GenomeMeta1& g) {
+                    if (existing_seqs.count({g.stats.oph_fingerprint, g.stats.genome_length})) {
+                        spdlog::warn("Dedup: {} is sequence-identical to an existing genome, skipping",
+                                     g.record.accession);
+                        return true;
+                    }
+                    return false;
+                }), work.end());
+                if (work.size() < n_before)
+                    spdlog::info("Dedup: removed {} cross-catalog duplicates", n_before - work.size());
+            }
+
+            // Step 3: intra-batch dedup (identical sequences sort adjacent)
+            {
+                size_t n_before = work.size();
+                size_t out = 0;
+                for (size_t i = 0; i < work.size(); ) {
+                    size_t j = i + 1;
+                    while (j < work.size()
+                           && work[j].stats.oph_fingerprint == work[i].stats.oph_fingerprint
+                           && work[j].stats.genome_length   == work[i].stats.genome_length)
+                        ++j;
+                    size_t keep = i;
+                    for (size_t k = i + 1; k < j; ++k)
+                        if (work[k].record.completeness > work[keep].record.completeness)
+                            keep = k;
+                    if (out != keep) work[out] = std::move(work[keep]);
+                    ++out;
+                    i = j;
+                }
+                work.resize(out);
+                if (work.size() < n_before)
+                    spdlog::info("Dedup: removed {} intra-batch duplicates", n_before - work.size());
+            }
+
             // Determine next shard_id from existing sections
             uint32_t new_shard_id = 0;
             for (const auto& sd : existing_toc_.sections) {
@@ -462,31 +518,40 @@ struct ArchiveAppender::Impl {
         }
 
         // ── Process tombstones ────────────────────────────────────────────────
-        if (!pending_remove_accessions_.empty()) {
-            MmapFileReader mmap;
-            mmap.open(gpk_path_);
-
-            std::unordered_map<std::string, GenomeId> acc_map;
-            for (auto* sd : existing_toc_.find_by_type(SEC_ACCX)) {
-                AccessionIndexReader reader;
-                reader.open(mmap.data(), sd->file_offset, sd->compressed_size);
-                reader.scan([&](std::string_view acc, GenomeId id2) {
-                    acc_map[std::string(acc)] = id2;
-                });
-            }
-
+        if (!pending_remove_accessions_.empty() || !tombstone_ids.empty()) {
             TombstoneWriter tw;
             uint64_t n_removed = 0;
-            for (const auto& acc : pending_remove_accessions_) {
-                auto it = acc_map.find(acc);
-                if (it == acc_map.end()) {
-                    spdlog::warn("remove: accession not found: {}", acc);
-                    continue;
+
+            if (!pending_remove_accessions_.empty()) {
+                MmapFileReader mmap;
+                mmap.open(gpk_path_);
+
+                std::unordered_map<std::string, GenomeId> acc_map;
+                for (auto* sd : existing_toc_.find_by_type(SEC_ACCX)) {
+                    AccessionIndexReader reader;
+                    reader.open(mmap.data(), sd->file_offset, sd->compressed_size);
+                    reader.scan([&](std::string_view acc, GenomeId id2) {
+                        acc_map[std::string(acc)] = id2;
+                    });
                 }
-                tw.add(it->second);
+
+                for (const auto& acc : pending_remove_accessions_) {
+                    auto it = acc_map.find(acc);
+                    if (it == acc_map.end()) {
+                        spdlog::warn("remove: accession not found: {}", acc);
+                        continue;
+                    }
+                    tw.add(it->second);
+                    ++n_removed;
+                }
+                pending_remove_accessions_.clear();
+            }
+
+            for (GenomeId gid : tombstone_ids) {
+                tw.add(gid);
                 ++n_removed;
             }
-            pending_remove_accessions_.clear();
+            tombstone_ids.clear();
 
             if (n_removed > 0) {
                 SectionDesc tomb_sd = tw.finalize(writer, next_section_id++);
