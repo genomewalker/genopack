@@ -6,8 +6,12 @@
 #include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <future>
 #include <numeric>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -117,6 +121,13 @@ struct ArchiveBuilder::Impl {
     std::vector<BuildRecord> pending;
     GenomeId next_genome_id = 1;
 
+    // Pass-1 result: metadata only, FASTA discarded after stats computation
+    struct GenomeMeta1 {
+        BuildRecord record;
+        GenomeId    genome_id;
+        FastaStats  stats;
+    };
+
     explicit Impl(const std::filesystem::path& dir, Config c)
         : archive_dir(dir), cfg(c)
     {
@@ -203,48 +214,53 @@ struct ArchiveBuilder::Impl {
     void finalize() {
         if (pending.empty()) { spdlog::warn("No records to build"); return; }
 
-        struct GenomeWork {
-            BuildRecord  record;
-            GenomeId     genome_id;
-            std::string  fasta;
-            FastaStats   stats;
-        };
+        // ── Pass 1: parallel stats computation ────────────────────────────────
+        // Read each FASTA, compute MinHash + stats, immediately discard FASTA.
+        // Only metadata (~300 bytes/genome) is retained.
 
-        // Phase 1: Decompress + compute MinHash stats
-        std::vector<GenomeWork> work;
+        std::vector<GenomeMeta1> work;
         work.reserve(pending.size());
-        for (auto& r : pending) {
-            GenomeWork gw;
-            gw.record    = std::move(r);
-            gw.genome_id = next_genome_id++;
-            try {
-                gw.fasta = decompress_gz(gw.record.file_path);
-            } catch (const std::exception& ex) {
-                spdlog::warn("Skipping {}: {}", gw.record.accession, ex.what());
-                continue;
+
+        size_t batch = std::max(size_t(1), cfg.io_threads);
+        for (size_t i = 0; i < pending.size(); i += batch) {
+            size_t end = std::min(i + batch, pending.size());
+            std::vector<std::future<std::optional<GenomeMeta1>>> futures;
+            futures.reserve(end - i);
+            for (size_t j = i; j < end; ++j) {
+                auto& r = pending[j];
+                GenomeId gid = next_genome_id++;
+                futures.push_back(std::async(std::launch::async,
+                    [&r, gid]() -> std::optional<GenomeMeta1> {
+                        std::string fasta;
+                        try {
+                            fasta = decompress_gz(r.file_path);
+                        } catch (const std::exception& ex) {
+                            spdlog::warn("Skipping {}: {}", r.accession, ex.what());
+                            return std::nullopt;
+                        }
+                        FastaStats stats = compute_fasta_stats(fasta);
+                        // fasta discarded here
+                        return GenomeMeta1{r, gid, stats};
+                    }));
             }
-            gw.stats = compute_fasta_stats(gw.fasta);
-            work.push_back(std::move(gw));
+            for (auto& fut : futures) {
+                auto result = fut.get();
+                if (result) work.push_back(std::move(*result));
+            }
+            if (cfg.verbose)
+                spdlog::info("Stats pass: {}/{}", std::min(i + batch, pending.size()), pending.size());
         }
         pending.clear();
 
-        // Phase 2: Sort by MinHash (oph_fingerprint) — locality-sensitive, approximates phylogenetic order
-        std::sort(work.begin(), work.end(), [](const auto& a, const auto& b) {
+        // ── Sort by MinHash (oph_fingerprint) ─────────────────────────────────
+        std::sort(work.begin(), work.end(), [](const GenomeMeta1& a, const GenomeMeta1& b) {
             return a.stats.oph_fingerprint < b.stats.oph_fingerprint;
         });
-
         spdlog::info("MinHash sorted {} genomes", work.size());
 
-        // Phase 3: Write shards by accumulated compressed size
-        uint32_t date = days_since_epoch();
-        std::vector<GenomeMeta> catalog_rows;
-        catalog_rows.reserve(work.size());
+        // ── Pass 2: re-read FASTAs in sorted order, write shards ──────────────
+        // Only one shard-worth of FASTAs is in RAM at a time.
 
-        ShardId current_shard_id = 0;
-        std::unique_ptr<ShardWriter> shard_writer;
-        size_t shard_compressed_size = 0;
-
-        // Write metadata sidecar
         std::ofstream meta_out(archive_dir / "meta.tsv");
         if (!work.empty()) {
             meta_out << "accession\tgenome_id";
@@ -252,6 +268,13 @@ struct ArchiveBuilder::Impl {
                 meta_out << "\t" << k;
             meta_out << "\n";
         }
+
+        ShardId current_shard_id = 0;
+        std::unique_ptr<ShardWriter> shard_writer;
+        size_t shard_compressed_size = 0;
+        std::vector<GenomeMeta> catalog_rows;
+        catalog_rows.reserve(work.size());
+        uint32_t date = days_since_epoch();
 
         auto flush_shard = [&]() {
             if (shard_writer) {
@@ -264,9 +287,8 @@ struct ArchiveBuilder::Impl {
         auto open_shard = [&]() {
             char fname[64];
             snprintf(fname, sizeof(fname), "shard_%05u.gpks", current_shard_id);
-            auto shard_path = archive_dir / "shards" / fname;
             shard_writer = std::make_unique<ShardWriter>(
-                shard_path, current_shard_id, current_shard_id, cfg.shard_cfg);
+                archive_dir / "shards" / fname, current_shard_id, current_shard_id, cfg.shard_cfg);
             ++current_shard_id;
         };
 
@@ -274,10 +296,15 @@ struct ArchiveBuilder::Impl {
         for (auto& gw : work) {
             bool shard_full = shard_writer &&
                 (shard_compressed_size >= cfg.shard_cfg.max_shard_size_bytes);
+            if (!shard_writer || shard_full) { flush_shard(); open_shard(); }
 
-            if (!shard_writer || shard_full) {
-                flush_shard();
-                open_shard();
+            // Re-read FASTA (only one genome at a time in RAM)
+            std::string fasta;
+            try {
+                fasta = decompress_gz(gw.record.file_path);
+            } catch (const std::exception& ex) {
+                spdlog::warn("Skipping {} on write pass: {}", gw.record.accession, ex.what());
+                continue;
             }
 
             GenomeMeta meta{};
@@ -285,7 +312,7 @@ struct ArchiveBuilder::Impl {
             meta._reserved0        = 0;
             meta.shard_id          = current_shard_id - 1;
             meta.genome_length     = gw.record.genome_length > 0 ? gw.record.genome_length : gw.stats.genome_length;
-            meta.n_contigs         = gw.record.n_contigs > 0 ? gw.record.n_contigs : gw.stats.n_contigs;
+            meta.n_contigs         = gw.record.n_contigs > 0     ? gw.record.n_contigs     : gw.stats.n_contigs;
             meta.gc_pct_x100       = gw.stats.gc_pct_x100;
             meta.completeness_x10  = static_cast<uint16_t>(gw.record.completeness  * 10.0f);
             meta.contamination_x10 = static_cast<uint16_t>(gw.record.contamination * 10.0f);
@@ -293,19 +320,16 @@ struct ArchiveBuilder::Impl {
             meta.date_added        = date;
 
             shard_writer->add_genome(gw.genome_id, gw.stats.oph_fingerprint,
-                                     gw.fasta.data(), gw.fasta.size());
+                                     fasta.data(), fasta.size());
             shard_compressed_size = shard_writer->compressed_size();
-
             catalog_rows.push_back(meta);
 
-            // Write metadata sidecar row
             meta_out << gw.record.accession << "\t" << gw.genome_id;
-            for (const auto& [k, v] : gw.record.extra_fields)
-                meta_out << "\t" << v;
+            for (const auto& [k, v] : gw.record.extra_fields) meta_out << "\t" << v;
             meta_out << "\n";
 
             if (cfg.verbose && ++n_done % 1000 == 0)
-                spdlog::info("Built {}/{} genomes", n_done, work.size());
+                spdlog::info("Write pass: {}/{}", n_done, work.size());
         }
         flush_shard();
 
@@ -341,10 +365,14 @@ struct ArchiveBuilder::Impl {
 
         for (uint32_t i = 0; i < n_shards; ++i) {
             ShardDescriptor sd{};
-            sd.shard_id = i;
+            sd.shard_id   = i;
+            sd.cluster_id = i;
             char fname[64];
             snprintf(fname, sizeof(fname), "shard_%05u.gpks", i);
-            std::memcpy(sd.filename, fname, std::min(sizeof(fname), sizeof(sd.filename)));
+            std::strncpy(sd.filename, fname, sizeof(sd.filename) - 1);
+            auto fpath = archive_dir / "shards" / fname;
+            if (std::filesystem::exists(fpath))
+                sd.file_size = std::filesystem::file_size(fpath);
             f.write(reinterpret_cast<const char*>(&sd), sizeof(sd));
         }
     }
