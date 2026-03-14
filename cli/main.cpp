@@ -1,8 +1,12 @@
 #include <genopack/archive.hpp>
+#include <genopack/merger.hpp>
+#include <genopack/util.hpp>
 #include <CLI/CLI.hpp>
 #include <spdlog/spdlog.h>
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <string>
 
@@ -10,16 +14,86 @@ using namespace genopack;
 
 // ── genopack build ─────────────────────────────────────────────────────────────
 static int cmd_build(const std::string& input_tsv, const std::string& output_dir,
-                     int threads, int zstd_level, bool no_dict, bool verbose) {
+                     int threads, int zstd_level, bool no_dict, bool verbose,
+                     int n_parallel) {
     ArchiveBuilder::Config cfg;
-    cfg.io_threads           = static_cast<size_t>(threads);
+    cfg.io_threads           = static_cast<size_t>(std::max(1, threads));
     cfg.verbose              = verbose;
     cfg.shard_cfg.zstd_level = zstd_level;
     cfg.shard_cfg.train_dict = !no_dict;
 
-    ArchiveBuilder builder(output_dir, cfg);
-    builder.add_from_tsv(input_tsv);
-    builder.finalize();
+    if (n_parallel <= 1) {
+        // Single-process build
+        ArchiveBuilder builder(output_dir, cfg);
+        builder.add_from_tsv(input_tsv);
+        builder.finalize();
+        return 0;
+    }
+
+    // ── Parallel build: split TSV → N temp archives → merge ──────────────────
+    spdlog::info("Parallel build: {} workers, {} io_threads each", n_parallel, cfg.io_threads);
+
+    auto records = parse_tsv_records(input_tsv);
+    if (records.empty()) { spdlog::warn("No records to build"); return 0; }
+
+    const size_t total   = records.size();
+    const size_t n_parts = static_cast<size_t>(n_parallel);
+
+    // Determine temp dir next to the output file
+    std::filesystem::path out_path = output_dir;
+    if (out_path.extension() != ".gpk")
+        out_path = std::filesystem::path(out_path.string() + ".gpk");
+    std::filesystem::path tmp_dir = out_path.parent_path() / (out_path.stem().string() + "_tmp_parts");
+    std::filesystem::create_directories(tmp_dir);
+
+    // Split records into N contiguous parts
+    std::vector<std::filesystem::path> part_paths;
+    part_paths.reserve(n_parts);
+
+    std::vector<std::future<void>> futs;
+    futs.reserve(n_parts);
+
+    for (size_t p = 0; p < n_parts; ++p) {
+        size_t start = (p * total) / n_parts;
+        size_t end   = ((p + 1) * total) / n_parts;
+        if (start >= end) continue;
+
+        std::filesystem::path part_path = tmp_dir / ("part_" + std::to_string(p) + ".gpk");
+        part_paths.push_back(part_path);
+
+        // Slice of records for this part
+        std::vector<BuildRecord> slice(
+            std::make_move_iterator(records.begin() + static_cast<ptrdiff_t>(start)),
+            std::make_move_iterator(records.begin() + static_cast<ptrdiff_t>(end)));
+
+        futs.push_back(std::async(std::launch::async,
+            [cfg, part_path, slice = std::move(slice), p]() mutable {
+                spdlog::info("Part {}: {} genomes → {}", p, slice.size(), part_path.string());
+                ArchiveBuilder builder(part_path, cfg);
+                for (auto& r : slice) builder.add(r);
+                builder.finalize();
+                spdlog::info("Part {} done", p);
+            }));
+    }
+
+    for (auto& f : futs) f.get();
+    spdlog::info("All {} parts built, merging…", part_paths.size());
+
+    merge_archives(part_paths, output_dir);
+
+    // Cleanup temp parts
+    std::error_code ec;
+    std::filesystem::remove_all(tmp_dir, ec);
+
+    return 0;
+}
+
+// ── genopack merge ─────────────────────────────────────────────────────────────
+static int cmd_merge(const std::vector<std::string>& inputs, const std::string& output) {
+    std::vector<std::filesystem::path> paths;
+    paths.reserve(inputs.size());
+    for (const auto& s : inputs) paths.emplace_back(s);
+    merge_archives(paths, output);
     return 0;
 }
 
@@ -182,17 +256,19 @@ int main(int argc, char** argv) {
     // genopack build
     auto* build = app.add_subcommand("build", "Build a new archive from a genome TSV");
     std::string build_input, build_output;
-    int build_threads = 4, build_level = 6;
+    int build_threads = 4, build_level = 6, build_parallel = 1;
     bool build_no_dict = false, build_verbose = false;
     build->add_option("-i,--input",  build_input,  "Input TSV (accession, file_path, ...)")->required();
     build->add_option("-o,--output", build_output, "Output archive directory (.gpk)")->required();
-    build->add_option("-t,--threads", build_threads, "I/O threads");
+    build->add_option("-t,--threads", build_threads, "I/O threads per worker");
     build->add_option("-z,--zstd-level", build_level, "zstd compression level (1-22)");
+    build->add_option("-p,--parallel", build_parallel, "Number of parallel build workers (auto-merge)");
     build->add_flag("--no-dict", build_no_dict, "Disable shared dictionary training");
     build->add_flag("-v,--verbose", build_verbose, "Verbose progress");
     build->callback([&]() {
         std::exit(cmd_build(build_input, build_output,
-                             build_threads, build_level, build_no_dict, build_verbose));
+                             build_threads, build_level, build_no_dict, build_verbose,
+                             build_parallel));
     });
 
     // genopack extract
@@ -219,6 +295,16 @@ int main(int argc, char** argv) {
     stat->add_flag("--json", stat_json, "Output JSON");
     stat->callback([&]() {
         std::exit(cmd_stat(stat_archive, stat_json));
+    });
+
+    // genopack merge
+    auto* merge_cmd = app.add_subcommand("merge", "Merge multiple .gpk archives into one");
+    std::vector<std::string> merge_inputs;
+    std::string merge_output;
+    merge_cmd->add_option("inputs", merge_inputs, "Input .gpk archives")->required()->expected(2, -1);
+    merge_cmd->add_option("-o,--output", merge_output, "Output .gpk archive")->required();
+    merge_cmd->callback([&]() {
+        std::exit(cmd_merge(merge_inputs, merge_output));
     });
 
     // genopack add

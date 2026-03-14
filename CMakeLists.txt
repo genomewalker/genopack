@@ -61,6 +61,7 @@ add_library(genopack_lib STATIC
   src/accx.cpp
   src/tombstone.cpp
   src/toc.cpp
+  src/merger.cpp
 )
 
 target_include_directories(genopack_lib PUBLIC
