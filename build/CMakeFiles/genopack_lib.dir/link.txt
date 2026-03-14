@@ -1,2 +1,0 @@
-/maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/bin/x86_64-conda-linux-gnu-ar qc libgenopack_lib.a CMakeFiles/genopack_lib.dir/src/catalog.cpp.o CMakeFiles/genopack_lib.dir/src/shard.cpp.o CMakeFiles/genopack_lib.dir/src/builder.cpp.o CMakeFiles/genopack_lib.dir/src/archive.cpp.o CMakeFiles/genopack_lib.dir/src/appender.cpp.o CMakeFiles/genopack_lib.dir/src/taxon_registry.cpp.o
-/maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/bin/x86_64-conda-linux-gnu-ranlib libgenopack_lib.a
