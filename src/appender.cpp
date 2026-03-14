@@ -14,6 +14,7 @@
 #include <fstream>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace genopack {
 
@@ -328,6 +329,18 @@ struct ArchiveAppender::Impl {
 
         // ── Process new genomes ───────────────────────────────────────────────
         if (!pending_add_.empty()) {
+            // Build accession set from existing ACCX sections for dedup check
+            MmapFileReader mmap_dedup;
+            mmap_dedup.open(gpk_path_);
+            std::unordered_set<std::string> existing_accessions;
+            for (auto* sd : existing_toc_.find_by_type(SEC_ACCX)) {
+                AccessionIndexReader reader;
+                reader.open(mmap_dedup.data(), sd->file_offset, sd->compressed_size);
+                reader.scan([&](std::string_view acc, GenomeId) {
+                    existing_accessions.emplace(acc);
+                });
+            }
+
             struct GenomeMeta1 {
                 BuildRecord record;
                 GenomeId    genome_id;
@@ -339,6 +352,10 @@ struct ArchiveAppender::Impl {
 
             GenomeId gid = next_genome_id_;
             for (auto& r : pending_add_) {
+                if (existing_accessions.count(r.accession)) {
+                    spdlog::warn("Skipping duplicate accession: {}", r.accession);
+                    continue;
+                }
                 std::string fasta;
                 try { fasta = decompress_gz(r.file_path); }
                 catch (const std::exception& ex) {
