@@ -9,7 +9,7 @@ namespace genopack {
 
 // ── CatalogWriter ─────────────────────────────────────────────────────────────
 // Writes catalog.gpkc: memory-mappable columnar metadata store.
-// Rows sorted by taxon_id for binary-search taxonomy lookup.
+// Rows sorted by oph_fingerprint for locality-sensitive similarity lookup.
 // Column layout: SoA (struct of arrays) for fast predicate filtering.
 
 class CatalogWriter {
@@ -18,7 +18,7 @@ public:
     ~CatalogWriter();
 
     void add(const GenomeMeta& meta);
-    void finalize();  // sort by taxon_id, write footer, close
+    void finalize();  // sort by oph_fingerprint, write footer, close
 
 private:
     struct Impl;
@@ -27,7 +27,7 @@ private:
 
 // ── CatalogReader ─────────────────────────────────────────────────────────────
 // Memory-mapped read-only view of catalog.gpkc.
-// Supports: lookup by genome_id, filter by taxon_id range, predicate scan.
+// Supports: lookup by genome_id, filter by oph_fingerprint range, predicate scan.
 
 class CatalogReader {
 public:
@@ -45,11 +45,8 @@ public:
     // Exact lookup by genome_id. Returns nullptr if not found.
     const GenomeMeta* find_genome(GenomeId id) const;
 
-    // All genomes for a taxon_id (species or genus range)
-    std::vector<const GenomeMeta*> for_taxon(TaxonId taxon_id) const;
-
-    // Range of genomes for a taxon_id subtree [lo, hi)
-    std::vector<const GenomeMeta*> for_taxon_range(TaxonId lo, TaxonId hi) const;
+    // All genomes in a MinHash fingerprint range [lo, hi]
+    std::vector<const GenomeMeta*> for_oph_range(uint64_t lo, uint64_t hi) const;
 
     // General predicate scan
     std::vector<const GenomeMeta*> filter(const ExtractQuery& q) const;
@@ -64,7 +61,7 @@ public:
         double   mean_contamination;
         double   mean_gc;
     };
-    Stats compute_stats(TaxonId taxon_id = INVALID_TAXON_ID) const;
+    Stats compute_stats() const;
 
 private:
     struct Impl;
@@ -75,9 +72,9 @@ private:
 //
 // [GPKC magic 4B] [version 2B] [n_rows 8B] [n_row_groups 4B]
 // [catalog_data_offset 8B] [footer_offset 8B] [schema_hash 16B]
-// --- column arrays (SoA, sorted by taxon_id) ---
+// --- column arrays (SoA, sorted by oph_fingerprint) ---
 // Column 0: genome_id[]       uint64  × n_rows
-// Column 1: taxon_id[]        uint32  × n_rows
+// Column 1: _reserved0[]      uint32  × n_rows  (was: taxon_id; kept for binary compat)
 // Column 2: shard_id[]        uint32  × n_rows
 // Column 3: blob_offset[]     uint64  × n_rows
 // Column 4: blob_len_cmp[]    uint32  × n_rows
@@ -100,14 +97,14 @@ private:
 struct RowGroupStats {
     uint32_t first_row;
     uint32_t last_row;
-    TaxonId  taxon_id_min;
-    TaxonId  taxon_id_max;
-    uint64_t genome_length_min;   // placed before uint16_t to avoid implicit padding
+    uint64_t oph_min;            // MinHash min for this row group
+    uint64_t oph_max;
+    uint64_t genome_length_min;
     uint64_t genome_length_max;
     uint16_t completeness_min;
     uint16_t completeness_max;
     uint32_t flags_any;           // OR of all flags in group (nonzero → has deleted rows)
 };
-static_assert(sizeof(RowGroupStats) == 40, "RowGroupStats layout changed");
+static_assert(sizeof(RowGroupStats) == 48, "RowGroupStats layout changed");
 
 } // namespace genopack

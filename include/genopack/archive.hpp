@@ -15,15 +15,12 @@ namespace genopack {
 //
 // dataset.gpk/
 //   MANIFEST.bin      — version, shard list, generation, checksums
-//   taxon.idx         — taxon name → taxon_id + shard_ids + catalog row range
-//   catalog.gpkc      — columnar metadata (all genomes, SoA, sorted by taxon_id)
+//   catalog.gpkc      — columnar metadata (all genomes, SoA, sorted by oph_fingerprint)
+//   meta.tsv          — sidecar: accession <-> genome_id mapping (optional)
 //   tombstones.bits   — deleted genome_id bitset (indexed by genome_id)
 //   shards/
-//     genus_0001_00001.gpks
-//     genus_0001_00002.gpks   ← split when shard exceeds 512 MB
-//     genus_0042_00001.gpks
-//   sketches/           ← optional, separate from hot read path
-//     sketch_00001.gpkh
+//     shard_00001.gpks
+//     shard_00002.gpks   ← split when shard exceeds 512 MB
 
 struct ManifestHeader {
     uint32_t magic;           // GPKM_MAGIC
@@ -32,34 +29,16 @@ struct ManifestHeader {
     uint64_t generation;      // monotonically increasing, incremented on each write
     uint64_t created_at;      // unix timestamp
     uint32_t n_shards;
-    uint32_t n_taxons;
+    uint32_t _reserved0;      // was: n_taxons
     uint64_t n_genomes;       // total (including deleted)
     uint64_t n_genomes_live;  // excluding deleted
     uint64_t catalog_size;
-    uint64_t taxon_idx_size;
+    uint64_t _reserved1;      // was: taxon_idx_size
     uint8_t  catalog_checksum[16];
-    uint8_t  taxon_idx_checksum[16];
+    uint8_t  _reserved2[16]; // was: taxon_idx_checksum
     uint8_t  _pad1[32];
 };
 static_assert(sizeof(ManifestHeader) == 128, "ManifestHeader layout changed");
-
-// ── TaxonIndex ────────────────────────────────────────────────────────────────
-// Binary-searchable index: taxon_name → {taxon_id, shard_ids[], catalog_rows[]}
-
-struct TaxonIndexEntry {
-    TaxonId  taxon_id;
-    TaxonId  parent_id;
-    uint8_t  rank;           // TaxonRank
-    uint8_t  _pad[3];
-    uint32_t n_shards;
-    uint32_t shard_list_offset;  // offset into shard_list[] array
-    uint32_t catalog_row_lo;     // first row in catalog for this taxon
-    uint32_t catalog_row_hi;     // one past last row
-    uint32_t n_genomes;
-    uint32_t _pad2;
-    uint32_t _pad3;
-};
-static_assert(sizeof(TaxonIndexEntry) == 40, "TaxonIndexEntry layout changed");
 
 // ── ArchiveReader ─────────────────────────────────────────────────────────────
 
@@ -75,16 +54,13 @@ public:
     bool is_open() const;
 
     // Metadata without sequence decompression
-    std::optional<GenomeMeta>  genome_meta(GenomeId id)         const;
-    std::optional<TaxonInfo>   taxon_info(TaxonId id)           const;
-    std::optional<TaxonInfo>   taxon_by_name(std::string_view name) const;
-    std::optional<TaxonId>     resolve_taxon(std::string_view lineage_or_name) const;
+    std::optional<GenomeMeta> genome_meta(GenomeId id) const;
 
     // Count genomes matching query (no decompression)
     size_t count(const ExtractQuery& q) const;
 
     // Metadata-only filter result
-    std::vector<GenomeMeta>  filter_meta(const ExtractQuery& q) const;
+    std::vector<GenomeMeta> filter_meta(const ExtractQuery& q) const;
 
     // Full extraction with FASTA decompression
     std::vector<ExtractedGenome> extract(const ExtractQuery& q) const;
@@ -92,28 +68,13 @@ public:
     // Fetch one genome by id
     std::optional<ExtractedGenome> fetch_genome(GenomeId id) const;
 
-    // Fetch all genomes for a taxon (species most common)
-    std::vector<ExtractedGenome> fetch_taxon(TaxonId taxon_id) const;
-    std::vector<ExtractedGenome> fetch_taxon(std::string_view name) const;
-
-    // Summary statistics
-    struct TaxonStats {
-        TaxonId     taxon_id;
-        std::string name;
-        size_t      n_genomes;
-        size_t      n_deleted;
-        double      mean_completeness;
-        double      mean_contamination;
-        uint64_t    total_bp;
-        double      mean_gc;
-    };
-    std::vector<TaxonStats> taxon_summary(TaxonRank rank) const;
+    // Fetch one genome by accession (requires meta.tsv sidecar)
+    std::optional<ExtractedGenome> fetch_by_accession(std::string_view accession) const;
 
     // Archive-wide stats
     struct ArchiveStats {
         uint64_t generation;
         size_t   n_shards;
-        size_t   n_taxons;
         size_t   n_genomes_total;
         size_t   n_genomes_live;
         uint64_t total_raw_bp;
@@ -145,13 +106,13 @@ public:
                             Config cfg = Config{});
     ~ArchiveBuilder();
 
-    // Add all genomes from a TSV (accession, taxonomy, file_path [, completeness, contamination])
+    // Add all genomes from a TSV (accession, file_path [, completeness, contamination])
     void add_from_tsv(const std::filesystem::path& tsv_path);
 
     // Add individual record
     void add(const BuildRecord& rec);
 
-    // Write all shards, catalog, taxon index, manifest
+    // Write all shards, catalog, manifest, meta.tsv sidecar
     void finalize();
 
 private:

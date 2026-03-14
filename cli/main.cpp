@@ -25,32 +25,43 @@ static int cmd_build(const std::string& input_tsv, const std::string& output_dir
 
 // ── genopack extract ───────────────────────────────────────────────────────────
 static int cmd_extract(const std::string& archive_dir,
-                       const std::string& genus, const std::string& species,
+                       const std::vector<std::string>& accessions,
+                       const std::string& accessions_file,
                        float min_completeness, float max_contamination,
                        const std::string& out_fasta) {
-
     ArchiveReader ar;
     ar.open(archive_dir);
 
     ExtractQuery q;
-    if (!genus.empty())   q.genus   = genus;
-    if (!species.empty()) q.species = species;
     q.min_completeness  = min_completeness;
     q.max_contamination = max_contamination;
+    q.accessions = accessions;
 
-    // TODO: resolve taxon_id from genus/species via taxon index
+    if (!accessions_file.empty()) {
+        std::ifstream af(accessions_file);
+        if (!af) { spdlog::error("Cannot open accessions file: {}", accessions_file); return 1; }
+        std::string line;
+        while (std::getline(af, line))
+            if (!line.empty()) q.accessions.push_back(line);
+    }
 
-    auto results = ar.extract(q);
+    std::vector<ExtractedGenome> results;
+    if (!q.accessions.empty()) {
+        for (const auto& acc : q.accessions) {
+            auto eg = ar.fetch_by_accession(acc);
+            if (eg) results.push_back(std::move(*eg));
+            else spdlog::warn("Accession not found: {}", acc);
+        }
+    } else {
+        results = ar.extract(q);
+    }
     spdlog::info("Extracted {} genomes", results.size());
 
     std::ostream* out_stream = &std::cout;
     std::ofstream out_file;
     if (!out_fasta.empty() && out_fasta != "-") {
         out_file.open(out_fasta);
-        if (!out_file) {
-            spdlog::error("Cannot open output: {}", out_fasta);
-            return 1;
-        }
+        if (!out_file) { spdlog::error("Cannot open output: {}", out_fasta); return 1; }
         out_stream = &out_file;
     }
 
@@ -70,7 +81,6 @@ static int cmd_stat(const std::string& archive_dir, bool json) {
         std::cout << "{\n"
                   << "  \"generation\": "       << s.generation     << ",\n"
                   << "  \"n_shards\": "         << s.n_shards       << ",\n"
-                  << "  \"n_taxons\": "         << s.n_taxons       << ",\n"
                   << "  \"n_genomes_total\": "  << s.n_genomes_total<< ",\n"
                   << "  \"n_genomes_live\": "   << s.n_genomes_live << ",\n"
                   << "  \"total_raw_bp\": "     << s.total_raw_bp   << ",\n"
@@ -81,7 +91,6 @@ static int cmd_stat(const std::string& archive_dir, bool json) {
         std::cout << "Archive: " << archive_dir << "\n"
                   << "  Generation:       " << s.generation     << "\n"
                   << "  Shards:           " << s.n_shards       << "\n"
-                  << "  Taxa:             " << s.n_taxons       << "\n"
                   << "  Genomes (total):  " << s.n_genomes_total<< "\n"
                   << "  Genomes (live):   " << s.n_genomes_live << "\n"
                   << "  Total raw bp:     " << s.total_raw_bp   << "\n"
@@ -108,7 +117,7 @@ static int cmd_rm(const std::string& archive_dir,
 
 // ── main ──────────────────────────────────────────────────────────────────────
 int main(int argc, char** argv) {
-    CLI::App app{"genopack — phylogenetic genome archive"};
+    CLI::App app{"genopack — genome archive"};
     app.require_subcommand(1);
 
     // genopack build
@@ -116,7 +125,7 @@ int main(int argc, char** argv) {
     std::string build_input, build_output;
     int build_threads = 4, build_level = 6;
     bool build_no_dict = false, build_verbose = false;
-    build->add_option("-i,--input",  build_input,  "Input TSV (accession,taxonomy,file_path,...)")->required();
+    build->add_option("-i,--input",  build_input,  "Input TSV (accession, file_path, ...)")->required();
     build->add_option("-o,--output", build_output, "Output archive directory (.gpk)")->required();
     build->add_option("-t,--threads", build_threads, "I/O threads");
     build->add_option("-z,--zstd-level", build_level, "zstd compression level (1-22)");
@@ -128,18 +137,19 @@ int main(int argc, char** argv) {
     });
 
     // genopack extract
-    auto* extract = app.add_subcommand("extract", "Extract genomes by taxonomy/quality filters");
-    std::string ext_archive, ext_genus, ext_species, ext_out;
+    auto* extract = app.add_subcommand("extract", "Extract genomes by quality or accession");
+    std::string ext_archive, ext_out, ext_acc_file;
+    std::vector<std::string> ext_accessions;
     float ext_min_comp = 0, ext_max_contam = 100;
     extract->add_option("archive", ext_archive, "Archive directory")->required();
-    extract->add_option("--genus",   ext_genus,   "Filter by genus name");
-    extract->add_option("--species", ext_species, "Filter by species name");
+    extract->add_option("--accession", ext_accessions, "Accession to extract (repeatable)");
+    extract->add_option("--accessions-file", ext_acc_file, "File with one accession per line");
     extract->add_option("--min-completeness",  ext_min_comp,   "Minimum completeness %");
     extract->add_option("--max-contamination", ext_max_contam, "Maximum contamination %");
-    extract->add_option("-o,--out",  ext_out, "Output FASTA (default: stdout)");
+    extract->add_option("-o,--out", ext_out, "Output FASTA (default: stdout)");
     extract->callback([&]() {
-        std::exit(cmd_extract(ext_archive, ext_genus, ext_species,
-                               ext_min_comp, ext_max_contam, ext_out));
+        std::exit(cmd_extract(ext_archive, ext_accessions, ext_acc_file,
+                              ext_min_comp, ext_max_contam, ext_out));
     });
 
     // genopack stat

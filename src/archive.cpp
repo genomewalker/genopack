@@ -1,8 +1,9 @@
 #include <genopack/archive.hpp>
-#include "taxon_registry.hpp"
 #include <spdlog/spdlog.h>
 #include <fstream>
+#include <sstream>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 
 namespace genopack {
@@ -13,12 +14,42 @@ struct ArchiveReader::Impl {
     std::filesystem::path archive_dir;
     ManifestHeader        manifest{};
     CatalogReader         catalog;
-    TaxonRegistry         registry;
+
+    // Accession <-> GenomeId maps loaded from meta.tsv sidecar (optional)
+    std::unordered_map<std::string, GenomeId> accession_map;
+    std::unordered_map<GenomeId, std::string> genome_accession_map;
 
     // Lazy-loaded shard readers (cache by shard_id)
     mutable std::unordered_map<ShardId, ShardReader> shards;
 
     bool open_ = false;
+
+    void load_meta_tsv(const std::filesystem::path& path) {
+        std::ifstream f(path);
+        if (!f) {
+            spdlog::debug("genopack: meta.tsv not found at {}, accession lookup unavailable",
+                          path.string());
+            return;
+        }
+
+        std::string line;
+        // Skip header
+        if (!std::getline(f, line)) return;
+
+        while (std::getline(f, line)) {
+            if (line.empty()) continue;
+            std::istringstream ss(line);
+            std::string accession, genome_id_str;
+            if (!std::getline(ss, accession, '\t')) continue;
+            if (!std::getline(ss, genome_id_str, '\t')) continue;
+
+            GenomeId gid = std::stoull(genome_id_str);
+            accession_map[accession]   = gid;
+            genome_accession_map[gid]  = accession;
+        }
+        spdlog::debug("genopack: loaded {} accession mappings from meta.tsv",
+                      accession_map.size());
+    }
 
     void open(const std::filesystem::path& dir) {
         archive_dir = dir;
@@ -33,6 +64,9 @@ struct ArchiveReader::Impl {
         // Open catalog
         catalog.open(dir / "catalog.gpkc");
 
+        // Load meta.tsv sidecar if present
+        load_meta_tsv(dir / "meta.tsv");
+
         open_ = true;
         spdlog::info("genopack opened: {} genomes, {} shards",
                      manifest.n_genomes_live, manifest.n_shards);
@@ -42,8 +76,7 @@ struct ArchiveReader::Impl {
         auto it = shards.find(shard_id);
         if (it != shards.end()) return it->second;
 
-        // Find shard file by scanning shards/ directory for filename with matching id
-        // Naming: genus_XXXXXXXX_XXXXX.gpks
+        // Scan shards/ directory for any .gpks file with matching shard_id
         for (const auto& entry : std::filesystem::directory_iterator(archive_dir / "shards")) {
             if (entry.path().extension() != ".gpks") continue;
             ShardReader tmp;
@@ -64,6 +97,8 @@ void ArchiveReader::open(const std::filesystem::path& dir) { impl_->open(dir); }
 void ArchiveReader::close() {
     impl_->catalog.close();
     impl_->shards.clear();
+    impl_->accession_map.clear();
+    impl_->genome_accession_map.clear();
     impl_->open_ = false;
 }
 bool ArchiveReader::is_open() const { return impl_->open_; }
@@ -94,34 +129,18 @@ std::optional<ExtractedGenome> ArchiveReader::fetch_genome(GenomeId id) const {
     ExtractedGenome eg;
     eg.meta  = *meta;
     eg.fasta = shard.fetch_genome(id);
+
+    auto acc_it = impl_->genome_accession_map.find(id);
+    if (acc_it != impl_->genome_accession_map.end())
+        eg.accession = acc_it->second;
+
     return eg;
 }
 
-std::vector<ExtractedGenome> ArchiveReader::fetch_taxon(TaxonId taxon_id) const {
-    auto ptrs = impl_->catalog.for_taxon(taxon_id);
-    std::vector<ExtractedGenome> out;
-    out.reserve(ptrs.size());
-
-    // Group by shard to minimize shard open/close
-    std::unordered_map<ShardId, std::vector<const GenomeMeta*>> by_shard;
-    for (const auto* p : ptrs) by_shard[p->shard_id].push_back(p);
-
-    for (auto& [shard_id, metas] : by_shard) {
-        auto& shard = impl_->get_shard(shard_id);
-        for (const auto* m : metas) {
-            ExtractedGenome eg;
-            eg.meta  = *m;
-            eg.fasta = shard.fetch_genome(m->genome_id);
-            out.push_back(std::move(eg));
-        }
-    }
-    return out;
-}
-
-std::vector<ExtractedGenome> ArchiveReader::fetch_taxon(std::string_view name) const {
-    TaxonId id = impl_->registry.find_by_name(name);
-    if (id == INVALID_TAXON_ID) return {};
-    return fetch_taxon(id);
+std::optional<ExtractedGenome> ArchiveReader::fetch_by_accession(std::string_view accession) const {
+    auto it = impl_->accession_map.find(std::string(accession));
+    if (it == impl_->accession_map.end()) return std::nullopt;
+    return fetch_genome(it->second);
 }
 
 std::vector<ExtractedGenome> ArchiveReader::extract(const ExtractQuery& q) const {
@@ -138,6 +157,11 @@ std::vector<ExtractedGenome> ArchiveReader::extract(const ExtractQuery& q) const
             ExtractedGenome eg;
             eg.meta  = *m;
             eg.fasta = shard.fetch_genome(m->genome_id);
+
+            auto acc_it = impl_->genome_accession_map.find(m->genome_id);
+            if (acc_it != impl_->genome_accession_map.end())
+                eg.accession = acc_it->second;
+
             out.push_back(std::move(eg));
         }
     }
@@ -146,16 +170,14 @@ std::vector<ExtractedGenome> ArchiveReader::extract(const ExtractQuery& q) const
 
 ArchiveReader::ArchiveStats ArchiveReader::archive_stats() const {
     ArchiveStats s{};
-    s.generation    = impl_->manifest.generation;
-    s.n_shards      = impl_->manifest.n_shards;
-    s.n_taxons      = impl_->manifest.n_taxons;
+    s.generation      = impl_->manifest.generation;
+    s.n_shards        = impl_->manifest.n_shards;
     s.n_genomes_total = impl_->manifest.n_genomes;
     s.n_genomes_live  = impl_->manifest.n_genomes_live;
 
-    // Compute total bp and compressed size from catalog
     impl_->catalog.scan([&](const GenomeMeta& m) {
         if (!m.is_deleted()) {
-            s.total_raw_bp          += m.genome_length;
+            s.total_raw_bp           += m.genome_length;
             s.total_compressed_bytes += m.blob_len_cmp;
         }
         return true;

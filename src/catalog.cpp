@@ -16,10 +16,10 @@ struct CatalogWriter::Impl {
     explicit Impl(const std::filesystem::path& p) : path(p) {}
 
     void finalize() {
-        // Sort by taxon_id for binary-search taxonomy lookup
+        // Sort by oph_fingerprint for locality-sensitive similarity lookup
         std::sort(rows.begin(), rows.end(),
                   [](const GenomeMeta& a, const GenomeMeta& b) {
-                      return a.taxon_id < b.taxon_id;
+                      return a.oph_fingerprint < b.oph_fingerprint;
                   });
 
         std::ofstream f(path, std::ios::binary | std::ios::trunc);
@@ -80,7 +80,7 @@ struct CatalogWriter::Impl {
         };
 
         write_col_u64(&GenomeMeta::genome_id);
-        write_col_u32(&GenomeMeta::taxon_id);
+        write_col_u32(&GenomeMeta::_reserved0);
         write_col_u32(&GenomeMeta::shard_id);
         write_col_u64(&GenomeMeta::blob_offset);
         write_col_u32(&GenomeMeta::blob_len_cmp);
@@ -101,13 +101,15 @@ struct CatalogWriter::Impl {
             RowGroupStats rgs{};
             rgs.first_row = lo;
             rgs.last_row  = hi - 1;
-            rgs.taxon_id_min = rows[lo].taxon_id;
-            rgs.taxon_id_max = rows[hi-1].taxon_id;
+            rgs.oph_min = rows[lo].oph_fingerprint;
+            rgs.oph_max = rows[lo].oph_fingerprint;
             rgs.genome_length_min = rows[lo].genome_length;
             rgs.genome_length_max = rows[lo].genome_length;
             rgs.completeness_min = rows[lo].completeness_x10;
             rgs.completeness_max = rows[lo].completeness_x10;
             for (uint32_t i = lo; i < hi; ++i) {
+                rgs.oph_min = std::min(rgs.oph_min, rows[i].oph_fingerprint);
+                rgs.oph_max = std::max(rgs.oph_max, rows[i].oph_fingerprint);
                 rgs.genome_length_min = std::min(rgs.genome_length_min, rows[i].genome_length);
                 rgs.genome_length_max = std::max(rgs.genome_length_max, rows[i].genome_length);
                 rgs.completeness_min = std::min(rgs.completeness_min, rows[i].completeness_x10);
@@ -180,7 +182,7 @@ struct CatalogReader::Impl {
         };
 
         read_col_u64(&GenomeMeta::genome_id);
-        read_col_u32(&GenomeMeta::taxon_id);
+        read_col_u32(&GenomeMeta::_reserved0);
         read_col_u32(&GenomeMeta::shard_id);
         read_col_u64(&GenomeMeta::blob_offset);
         read_col_u32(&GenomeMeta::blob_len_cmp);
@@ -215,24 +217,12 @@ const GenomeMeta* CatalogReader::find_genome(GenomeId id) const {
     return nullptr;
 }
 
-std::vector<const GenomeMeta*> CatalogReader::for_taxon(TaxonId taxon_id) const {
-    std::vector<const GenomeMeta*> out;
-    // Rows are sorted by taxon_id; binary search for range
-    auto lo = std::lower_bound(impl_->rows.begin(), impl_->rows.end(), taxon_id,
-        [](const GenomeMeta& m, TaxonId v){ return m.taxon_id < v; });
-    auto hi = std::upper_bound(lo, impl_->rows.end(), taxon_id,
-        [](TaxonId v, const GenomeMeta& m){ return v < m.taxon_id; });
-    for (auto it = lo; it != hi; ++it)
-        if (!it->is_deleted()) out.push_back(&*it);
-    return out;
-}
-
-std::vector<const GenomeMeta*> CatalogReader::for_taxon_range(TaxonId lo, TaxonId hi) const {
+std::vector<const GenomeMeta*> CatalogReader::for_oph_range(uint64_t lo, uint64_t hi) const {
     std::vector<const GenomeMeta*> out;
     auto it_lo = std::lower_bound(impl_->rows.begin(), impl_->rows.end(), lo,
-        [](const GenomeMeta& m, TaxonId v){ return m.taxon_id < v; });
-    auto it_hi = std::lower_bound(it_lo, impl_->rows.end(), hi,
-        [](const GenomeMeta& m, TaxonId v){ return m.taxon_id < v; });
+        [](const GenomeMeta& m, uint64_t v){ return m.oph_fingerprint < v; });
+    auto it_hi = std::upper_bound(it_lo, impl_->rows.end(), hi,
+        [](uint64_t v, const GenomeMeta& m){ return v < m.oph_fingerprint; });
     for (auto it = it_lo; it != it_hi; ++it)
         if (!it->is_deleted()) out.push_back(&*it);
     return out;
@@ -242,6 +232,8 @@ std::vector<const GenomeMeta*> CatalogReader::filter(const ExtractQuery& q) cons
     std::vector<const GenomeMeta*> out;
     for (const auto& r : impl_->rows) {
         if (!q.include_deleted && r.is_deleted()) continue;
+        if (r.oph_fingerprint < q.min_oph) continue;
+        if (r.oph_fingerprint > q.max_oph) continue;
         if (r.completeness_x10 < static_cast<uint16_t>(q.min_completeness * 10.0f)) continue;
         if (r.contamination_x10 > static_cast<uint16_t>(q.max_contamination * 10.0f)) continue;
         if (r.genome_length < q.min_genome_length) continue;
@@ -258,11 +250,10 @@ void CatalogReader::scan(std::function<bool(const GenomeMeta&)> predicate) const
         if (!predicate(r)) break;
 }
 
-CatalogReader::Stats CatalogReader::compute_stats(TaxonId taxon_id) const {
+CatalogReader::Stats CatalogReader::compute_stats() const {
     Stats s{};
     double csum = 0, contam_sum = 0, gc_sum = 0;
     for (const auto& r : impl_->rows) {
-        if (taxon_id != INVALID_TAXON_ID && r.taxon_id != taxon_id) continue;
         ++s.n_total;
         if (r.is_deleted()) { ++s.n_deleted; continue; }
         s.total_genome_length += r.genome_length;

@@ -16,13 +16,12 @@ namespace genopack {
 struct ShardWriter::Impl {
     std::filesystem::path   path;
     ShardId                 shard_id;
-    TaxonId                 primary_taxon_id;
+    uint32_t                cluster_id;
     Config                  cfg;
 
     // Genome records accumulated before finalize
     struct GenomeRecord {
         GenomeId genome_id;
-        TaxonId  taxon_id;
         uint32_t flags;
         uint64_t oph_fingerprint;
         std::string compressed_blob;  // zstd-compressed FASTA
@@ -36,8 +35,8 @@ struct ShardWriter::Impl {
     // Streaming context for dict-trained compression
     ZSTD_CCtx* cctx = nullptr;
 
-    Impl(const std::filesystem::path& p, ShardId sid, TaxonId ptid, Config c)
-        : path(p), shard_id(sid), primary_taxon_id(ptid), cfg(c)
+    Impl(const std::filesystem::path& p, ShardId sid, uint32_t cid, Config c)
+        : path(p), shard_id(sid), cluster_id(cid), cfg(c)
     {
         cctx = ZSTD_createCCtx();
         if (!cctx) throw std::runtime_error("ZSTD_createCCtx failed");
@@ -99,13 +98,13 @@ struct ShardWriter::Impl {
 };
 
 ShardWriter::ShardWriter(const std::filesystem::path& path, ShardId shard_id,
-                          TaxonId primary_taxon_id, Config cfg)
-    : impl_(std::make_unique<Impl>(path, shard_id, primary_taxon_id, cfg))
+                          uint32_t cluster_id, Config cfg)
+    : impl_(std::make_unique<Impl>(path, shard_id, cluster_id, cfg))
 {}
 
 ShardWriter::~ShardWriter() = default;
 
-void ShardWriter::add_genome(GenomeId id, TaxonId taxon_id, uint64_t oph_fingerprint,
+void ShardWriter::add_genome(GenomeId id, uint64_t oph_fingerprint,
                               const char* fasta_data, size_t fasta_len, uint32_t flags)
 {
     // Collect training samples for dict
@@ -120,7 +119,7 @@ void ShardWriter::add_genome(GenomeId id, TaxonId taxon_id, uint64_t oph_fingerp
     std::string blob = impl_->compress(fasta_data, fasta_len);
 
     impl_->genomes.push_back({
-        id, taxon_id, flags, oph_fingerprint, std::move(blob)
+        id, flags, oph_fingerprint, std::move(blob)
     });
 }
 
@@ -144,7 +143,7 @@ void ShardWriter::finalize() {
     for (size_t i = 0; i < n; ++i) {
         const auto& g = impl_->genomes[i];
         dir[i].genome_id       = g.genome_id;
-        dir[i].taxon_id        = g.taxon_id;
+        dir[i]._reserved0      = 0;
         dir[i].flags           = g.flags;
         dir[i].oph_fingerprint = g.oph_fingerprint;
         dir[i].blob_offset     = blob_cursor;
@@ -167,7 +166,7 @@ void ShardWriter::finalize() {
     hdr.n_deleted              = static_cast<uint32_t>(
         std::count_if(impl_->genomes.begin(), impl_->genomes.end(),
                       [](const auto& g){ return g.flags & GenomeMeta::FLAG_DELETED; }));
-    hdr.primary_taxon_id       = impl_->primary_taxon_id;
+    hdr.cluster_id             = impl_->cluster_id;
     hdr.dict_size              = static_cast<uint32_t>(dict_size);
     hdr.genome_dir_offset      = genome_dir_offset;
     hdr.dict_offset            = dict_offset;
@@ -295,27 +294,15 @@ ShardReader& ShardReader::operator=(ShardReader&&) noexcept = default;
 
 void ShardReader::open(const std::filesystem::path& path) { impl_->open(path); }
 void ShardReader::close() { impl_->close(); }
-ShardId  ShardReader::shard_id()         const { return impl_->header->shard_id; }
-TaxonId  ShardReader::primary_taxon_id() const { return impl_->header->primary_taxon_id; }
-size_t   ShardReader::n_genomes()        const { return impl_->header->n_genomes; }
+ShardId  ShardReader::shard_id()  const { return impl_->header->shard_id; }
+uint32_t ShardReader::cluster_id() const { return impl_->header->cluster_id; }
+size_t   ShardReader::n_genomes() const { return impl_->header->n_genomes; }
 
 std::string ShardReader::fetch_genome(GenomeId id) const {
     const GenomeDirEntry* e = impl_->find_genome(id);
     if (!e) throw std::runtime_error("genome_id not found in shard");
     if (e->flags & GenomeMeta::FLAG_DELETED) return {};
     return impl_->decompress_blob(*e);
-}
-
-std::vector<std::pair<GenomeId, std::string>>
-ShardReader::fetch_taxon(TaxonId taxon_id) const {
-    std::vector<std::pair<GenomeId, std::string>> result;
-    for (size_t i = 0; i < impl_->header->n_genomes; ++i) {
-        const auto& e = impl_->dir[i];
-        if (e.taxon_id != taxon_id) continue;
-        if (e.flags & GenomeMeta::FLAG_DELETED) continue;
-        result.emplace_back(e.genome_id, impl_->decompress_blob(e));
-    }
-    return result;
 }
 
 const GenomeDirEntry* ShardReader::dir_begin() const { return impl_->dir; }

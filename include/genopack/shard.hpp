@@ -10,8 +10,8 @@ namespace genopack {
 
 // ── On-disk shard format (.gpks) ─────────────────────────────────────────────
 //
-// Shards are immutable after build. Each covers one or a few related genera
-// (~128–512 MB compressed). Genomes are phylogenetically ordered within the
+// Shards are immutable after build. Each covers one similarity cluster
+// (~128–512 MB compressed). Genomes are ordered by oph_fingerprint within the
 // shard for zstd dictionary reuse.
 //
 // [GPKS header 128B]
@@ -25,8 +25,7 @@ namespace genopack {
 // [footer: offsets, checksums]
 //
 // Genome ordering within shard:
-//   1. Sort by taxonomy_id (species, then genus)
-//   2. Within species: sort by oph_fingerprint (approximates sketch similarity)
+//   Sort by oph_fingerprint (approximates sketch similarity).
 //   This maximises zstd LDM reuse across nearby genomes.
 
 struct ShardHeader {
@@ -36,7 +35,7 @@ struct ShardHeader {
     uint32_t shard_id;
     uint32_t n_genomes;
     uint32_t n_deleted;                // genomes with FLAG_DELETED
-    TaxonId  primary_taxon_id;         // genus or highest common taxon
+    uint32_t cluster_id;               // similarity cluster index
     uint32_t dict_size;                // 0 = no shared dictionary
     uint32_t _pad1;                    // explicit alignment to 8-byte boundary
     uint64_t genome_dir_offset;
@@ -51,7 +50,7 @@ static_assert(sizeof(ShardHeader) == 128, "ShardHeader layout changed");
 
 struct GenomeDirEntry {
     GenomeId genome_id;
-    TaxonId  taxon_id;
+    uint32_t _reserved0;
     uint32_t flags;
     uint64_t blob_offset;    // byte offset within blob area
     uint32_t blob_len_cmp;   // compressed blob length (bytes)
@@ -88,14 +87,14 @@ public:
     using Config = ShardWriterConfig;
 
     explicit ShardWriter(const std::filesystem::path& path, ShardId shard_id,
-                         TaxonId primary_taxon_id, Config cfg = Config{});
+                         uint32_t cluster_id, Config cfg = Config{});
     ~ShardWriter();
     ShardWriter(const ShardWriter&) = delete;
     ShardWriter& operator=(const ShardWriter&) = delete;
 
     // Add a genome. FASTA content is the decompressed FASTA string.
-    // Caller must add genomes in phylogenetic order (taxonomy then oph_fingerprint).
-    void add_genome(GenomeId id, TaxonId taxon_id, uint64_t oph_fingerprint,
+    // Caller must add genomes in oph_fingerprint order for best compression.
+    void add_genome(GenomeId id, uint64_t oph_fingerprint,
                     const char* fasta_data, size_t fasta_len,
                     uint32_t flags = 0);
 
@@ -124,14 +123,11 @@ public:
     void close();
 
     ShardId  shard_id()   const;
-    TaxonId  primary_taxon_id() const;
+    uint32_t cluster_id() const;
     size_t   n_genomes()  const;
 
     // Fetch decompressed FASTA for one genome. O(1) seek + decompress.
     std::string fetch_genome(GenomeId id) const;
-
-    // Fetch all non-deleted genomes for a taxon (species or genus subtree).
-    std::vector<std::pair<GenomeId, std::string>> fetch_taxon(TaxonId taxon_id) const;
 
     // Iterate genome directory
     const GenomeDirEntry* dir_begin() const;

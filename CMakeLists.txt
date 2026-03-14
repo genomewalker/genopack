@@ -56,7 +56,6 @@ add_library(genopack_lib STATIC
   src/builder.cpp
   src/archive.cpp
   src/appender.cpp
-  src/taxon_registry.cpp
 )
 
 target_include_directories(genopack_lib PUBLIC
