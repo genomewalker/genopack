@@ -414,13 +414,16 @@ ArchiveReader::ArchiveStats ArchiveReader::archive_stats() const {
     s.n_genomes_live  = impl_->live_count_;
 
     if (impl_->is_v2_) {
+        // Raw bp from catalog; compressed bytes from TOC shard section sizes
+        // (catalog blob_len_cmp is not populated by the two-pass writer).
         impl_->catalog_v2_.scan([&](const GenomeMeta& m) {
-            if (!m.is_deleted() && !impl_->is_deleted(m.genome_id)) {
-                s.total_raw_bp           += m.genome_length;
-                s.total_compressed_bytes += m.blob_len_cmp;
-            }
+            if (!m.is_deleted() && !impl_->is_deleted(m.genome_id))
+                s.total_raw_bp += m.genome_length;
             return true;
         });
+        for (const auto& sd : impl_->toc_.sections)
+            if (sd.type == SEC_SHRD)
+                s.total_compressed_bytes += sd.compressed_size;
     } else {
         impl_->catalog_v1_.scan([&](const GenomeMeta& m) {
             if (!m.is_deleted()) {
