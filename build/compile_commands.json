@@ -1,0 +1,86 @@
+[
+{
+  "directory": "/maps/projects/fernandezguerra/apps/repos/genopack/build",
+  "command": "/maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/bin/x86_64-conda-linux-gnu-c++ -DSPDLOG_COMPILED_LIB -I/maps/projects/fernandezguerra/apps/repos/genopack/include -I/maps/projects/fernandezguerra/apps/repos/genopack/build/_deps/spdlog-src/include -fvisibility-inlines-hidden -fmessage-length=0 -march=nocona -mtune=haswell -ftree-vectorize -fPIC -fstack-protector-strong -fno-plt -O2 -ffunction-sections -pipe -isystem /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/include -O3 -DNDEBUG -std=gnu++20 -Wall -Wextra -O3 -march=native -Wno-dangling-reference -o CMakeFiles/genopack_lib.dir/src/catalog.cpp.o -c /maps/projects/fernandezguerra/apps/repos/genopack/src/catalog.cpp",
+  "file": "/maps/projects/fernandezguerra/apps/repos/genopack/src/catalog.cpp",
+  "output": "CMakeFiles/genopack_lib.dir/src/catalog.cpp.o"
+},
+{
+  "directory": "/maps/projects/fernandezguerra/apps/repos/genopack/build",
+  "command": "/maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/bin/x86_64-conda-linux-gnu-c++ -DSPDLOG_COMPILED_LIB -I/maps/projects/fernandezguerra/apps/repos/genopack/include -I/maps/projects/fernandezguerra/apps/repos/genopack/build/_deps/spdlog-src/include -fvisibility-inlines-hidden -fmessage-length=0 -march=nocona -mtune=haswell -ftree-vectorize -fPIC -fstack-protector-strong -fno-plt -O2 -ffunction-sections -pipe -isystem /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/include -O3 -DNDEBUG -std=gnu++20 -Wall -Wextra -O3 -march=native -Wno-dangling-reference -o CMakeFiles/genopack_lib.dir/src/shard.cpp.o -c /maps/projects/fernandezguerra/apps/repos/genopack/src/shard.cpp",
+  "file": "/maps/projects/fernandezguerra/apps/repos/genopack/src/shard.cpp",
+  "output": "CMakeFiles/genopack_lib.dir/src/shard.cpp.o"
+},
+{
+  "directory": "/maps/projects/fernandezguerra/apps/repos/genopack/build",
+  "command": "/maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/bin/x86_64-conda-linux-gnu-c++ -DSPDLOG_COMPILED_LIB -I/maps/projects/fernandezguerra/apps/repos/genopack/include -I/maps/projects/fernandezguerra/apps/repos/genopack/build/_deps/spdlog-src/include -fvisibility-inlines-hidden -fmessage-length=0 -march=nocona -mtune=haswell -ftree-vectorize -fPIC -fstack-protector-strong -fno-plt -O2 -ffunction-sections -pipe -isystem /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/include -O3 -DNDEBUG -std=gnu++20 -Wall -Wextra -O3 -march=native -Wno-dangling-reference -o CMakeFiles/genopack_lib.dir/src/builder.cpp.o -c /maps/projects/fernandezguerra/apps/repos/genopack/src/builder.cpp",
+  "file": "/maps/projects/fernandezguerra/apps/repos/genopack/src/builder.cpp",
+  "output": "CMakeFiles/genopack_lib.dir/src/builder.cpp.o"
+},
+{
+  "directory": "/maps/projects/fernandezguerra/apps/repos/genopack/build",
+  "command": "/maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/bin/x86_64-conda-linux-gnu-c++ -DSPDLOG_COMPILED_LIB -I/maps/projects/fernandezguerra/apps/repos/genopack/include -I/maps/projects/fernandezguerra/apps/repos/genopack/build/_deps/spdlog-src/include -fvisibility-inlines-hidden -fmessage-length=0 -march=nocona -mtune=haswell -ftree-vectorize -fPIC -fstack-protector-strong -fno-plt -O2 -ffunction-sections -pipe -isystem /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/include -O3 -DNDEBUG -std=gnu++20 -Wall -Wextra -O3 -march=native -Wno-dangling-reference -o CMakeFiles/genopack_lib.dir/src/archive.cpp.o -c /maps/projects/fernandezguerra/apps/repos/genopack/src/archive.cpp",
+  "file": "/maps/projects/fernandezguerra/apps/repos/genopack/src/archive.cpp",
+  "output": "CMakeFiles/genopack_lib.dir/src/archive.cpp.o"
+},
+{
+  "directory": "/maps/projects/fernandezguerra/apps/repos/genopack/build",
+  "command": "/maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/bin/x86_64-conda-linux-gnu-c++ -DSPDLOG_COMPILED_LIB -I/maps/projects/fernandezguerra/apps/repos/genopack/include -I/maps/projects/fernandezguerra/apps/repos/genopack/build/_deps/spdlog-src/include -fvisibility-inlines-hidden -fmessage-length=0 -march=nocona -mtune=haswell -ftree-vectorize -fPIC -fstack-protector-strong -fno-plt -O2 -ffunction-sections -pipe -isystem /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/include -O3 -DNDEBUG -std=gnu++20 -Wall -Wextra -O3 -march=native -Wno-dangling-reference -o CMakeFiles/genopack_lib.dir/src/appender.cpp.o -c /maps/projects/fernandezguerra/apps/repos/genopack/src/appender.cpp",
+  "file": "/maps/projects/fernandezguerra/apps/repos/genopack/src/appender.cpp",
+  "output": "CMakeFiles/genopack_lib.dir/src/appender.cpp.o"
+},
+{
+  "directory": "/maps/projects/fernandezguerra/apps/repos/genopack/build",
+  "command": "/maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/bin/x86_64-conda-linux-gnu-c++ -DSPDLOG_COMPILED_LIB -I/maps/projects/fernandezguerra/apps/repos/genopack/include -I/maps/projects/fernandezguerra/apps/repos/genopack/build/_deps/spdlog-src/include -fvisibility-inlines-hidden -fmessage-length=0 -march=nocona -mtune=haswell -ftree-vectorize -fPIC -fstack-protector-strong -fno-plt -O2 -ffunction-sections -pipe -isystem /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/include -O3 -DNDEBUG -std=gnu++20 -Wall -Wextra -O3 -march=native -Wno-dangling-reference -o CMakeFiles/genopack_lib.dir/src/taxon_registry.cpp.o -c /maps/projects/fernandezguerra/apps/repos/genopack/src/taxon_registry.cpp",
+  "file": "/maps/projects/fernandezguerra/apps/repos/genopack/src/taxon_registry.cpp",
+  "output": "CMakeFiles/genopack_lib.dir/src/taxon_registry.cpp.o"
+},
+{
+  "directory": "/maps/projects/fernandezguerra/apps/repos/genopack/build",
+  "command": "/maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/bin/x86_64-conda-linux-gnu-c++ -DSPDLOG_COMPILED_LIB -I/maps/projects/fernandezguerra/apps/repos/genopack/include -I/maps/projects/fernandezguerra/apps/repos/genopack/build/_deps/spdlog-src/include -isystem /maps/projects/fernandezguerra/apps/repos/genopack/build/_deps/cli11-src/include -fvisibility-inlines-hidden -fmessage-length=0 -march=nocona -mtune=haswell -ftree-vectorize -fPIC -fstack-protector-strong -fno-plt -O2 -ffunction-sections -pipe -isystem /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/include -O3 -DNDEBUG -std=gnu++20 -Wall -Wextra -O3 -march=native -Wno-dangling-reference -o CMakeFiles/genopack.dir/cli/main.cpp.o -c /maps/projects/fernandezguerra/apps/repos/genopack/cli/main.cpp",
+  "file": "/maps/projects/fernandezguerra/apps/repos/genopack/cli/main.cpp",
+  "output": "CMakeFiles/genopack.dir/cli/main.cpp.o"
+},
+{
+  "directory": "/maps/projects/fernandezguerra/apps/repos/genopack/build/_deps/spdlog-build",
+  "command": "/maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/bin/x86_64-conda-linux-gnu-c++ -DSPDLOG_COMPILED_LIB -I/maps/projects/fernandezguerra/apps/repos/genopack/build/_deps/spdlog-src/include -fvisibility-inlines-hidden -fmessage-length=0 -march=nocona -mtune=haswell -ftree-vectorize -fPIC -fstack-protector-strong -fno-plt -O2 -ffunction-sections -pipe -isystem /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/include -O3 -DNDEBUG -std=c++20 -Wall -Wextra -O3 -march=native -Wno-dangling-reference -o CMakeFiles/spdlog.dir/src/spdlog.cpp.o -c /maps/projects/fernandezguerra/apps/repos/genopack/build/_deps/spdlog-src/src/spdlog.cpp",
+  "file": "/maps/projects/fernandezguerra/apps/repos/genopack/build/_deps/spdlog-src/src/spdlog.cpp",
+  "output": "_deps/spdlog-build/CMakeFiles/spdlog.dir/src/spdlog.cpp.o"
+},
+{
+  "directory": "/maps/projects/fernandezguerra/apps/repos/genopack/build/_deps/spdlog-build",
+  "command": "/maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/bin/x86_64-conda-linux-gnu-c++ -DSPDLOG_COMPILED_LIB -I/maps/projects/fernandezguerra/apps/repos/genopack/build/_deps/spdlog-src/include -fvisibility-inlines-hidden -fmessage-length=0 -march=nocona -mtune=haswell -ftree-vectorize -fPIC -fstack-protector-strong -fno-plt -O2 -ffunction-sections -pipe -isystem /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/include -O3 -DNDEBUG -std=c++20 -Wall -Wextra -O3 -march=native -Wno-dangling-reference -o CMakeFiles/spdlog.dir/src/stdout_sinks.cpp.o -c /maps/projects/fernandezguerra/apps/repos/genopack/build/_deps/spdlog-src/src/stdout_sinks.cpp",
+  "file": "/maps/projects/fernandezguerra/apps/repos/genopack/build/_deps/spdlog-src/src/stdout_sinks.cpp",
+  "output": "_deps/spdlog-build/CMakeFiles/spdlog.dir/src/stdout_sinks.cpp.o"
+},
+{
+  "directory": "/maps/projects/fernandezguerra/apps/repos/genopack/build/_deps/spdlog-build",
+  "command": "/maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/bin/x86_64-conda-linux-gnu-c++ -DSPDLOG_COMPILED_LIB -I/maps/projects/fernandezguerra/apps/repos/genopack/build/_deps/spdlog-src/include -fvisibility-inlines-hidden -fmessage-length=0 -march=nocona -mtune=haswell -ftree-vectorize -fPIC -fstack-protector-strong -fno-plt -O2 -ffunction-sections -pipe -isystem /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/include -O3 -DNDEBUG -std=c++20 -Wall -Wextra -O3 -march=native -Wno-dangling-reference -o CMakeFiles/spdlog.dir/src/color_sinks.cpp.o -c /maps/projects/fernandezguerra/apps/repos/genopack/build/_deps/spdlog-src/src/color_sinks.cpp",
+  "file": "/maps/projects/fernandezguerra/apps/repos/genopack/build/_deps/spdlog-src/src/color_sinks.cpp",
+  "output": "_deps/spdlog-build/CMakeFiles/spdlog.dir/src/color_sinks.cpp.o"
+},
+{
+  "directory": "/maps/projects/fernandezguerra/apps/repos/genopack/build/_deps/spdlog-build",
+  "command": "/maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/bin/x86_64-conda-linux-gnu-c++ -DSPDLOG_COMPILED_LIB -I/maps/projects/fernandezguerra/apps/repos/genopack/build/_deps/spdlog-src/include -fvisibility-inlines-hidden -fmessage-length=0 -march=nocona -mtune=haswell -ftree-vectorize -fPIC -fstack-protector-strong -fno-plt -O2 -ffunction-sections -pipe -isystem /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/include -O3 -DNDEBUG -std=c++20 -Wall -Wextra -O3 -march=native -Wno-dangling-reference -o CMakeFiles/spdlog.dir/src/file_sinks.cpp.o -c /maps/projects/fernandezguerra/apps/repos/genopack/build/_deps/spdlog-src/src/file_sinks.cpp",
+  "file": "/maps/projects/fernandezguerra/apps/repos/genopack/build/_deps/spdlog-src/src/file_sinks.cpp",
+  "output": "_deps/spdlog-build/CMakeFiles/spdlog.dir/src/file_sinks.cpp.o"
+},
+{
+  "directory": "/maps/projects/fernandezguerra/apps/repos/genopack/build/_deps/spdlog-build",
+  "command": "/maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/bin/x86_64-conda-linux-gnu-c++ -DSPDLOG_COMPILED_LIB -I/maps/projects/fernandezguerra/apps/repos/genopack/build/_deps/spdlog-src/include -fvisibility-inlines-hidden -fmessage-length=0 -march=nocona -mtune=haswell -ftree-vectorize -fPIC -fstack-protector-strong -fno-plt -O2 -ffunction-sections -pipe -isystem /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/include -O3 -DNDEBUG -std=c++20 -Wall -Wextra -O3 -march=native -Wno-dangling-reference -o CMakeFiles/spdlog.dir/src/async.cpp.o -c /maps/projects/fernandezguerra/apps/repos/genopack/build/_deps/spdlog-src/src/async.cpp",
+  "file": "/maps/projects/fernandezguerra/apps/repos/genopack/build/_deps/spdlog-src/src/async.cpp",
+  "output": "_deps/spdlog-build/CMakeFiles/spdlog.dir/src/async.cpp.o"
+},
+{
+  "directory": "/maps/projects/fernandezguerra/apps/repos/genopack/build/_deps/spdlog-build",
+  "command": "/maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/bin/x86_64-conda-linux-gnu-c++ -DSPDLOG_COMPILED_LIB -I/maps/projects/fernandezguerra/apps/repos/genopack/build/_deps/spdlog-src/include -fvisibility-inlines-hidden -fmessage-length=0 -march=nocona -mtune=haswell -ftree-vectorize -fPIC -fstack-protector-strong -fno-plt -O2 -ffunction-sections -pipe -isystem /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/include -O3 -DNDEBUG -std=c++20 -Wall -Wextra -O3 -march=native -Wno-dangling-reference -o CMakeFiles/spdlog.dir/src/cfg.cpp.o -c /maps/projects/fernandezguerra/apps/repos/genopack/build/_deps/spdlog-src/src/cfg.cpp",
+  "file": "/maps/projects/fernandezguerra/apps/repos/genopack/build/_deps/spdlog-src/src/cfg.cpp",
+  "output": "_deps/spdlog-build/CMakeFiles/spdlog.dir/src/cfg.cpp.o"
+},
+{
+  "directory": "/maps/projects/fernandezguerra/apps/repos/genopack/build/_deps/spdlog-build",
+  "command": "/maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/bin/x86_64-conda-linux-gnu-c++ -DSPDLOG_COMPILED_LIB -I/maps/projects/fernandezguerra/apps/repos/genopack/build/_deps/spdlog-src/include -fvisibility-inlines-hidden -fmessage-length=0 -march=nocona -mtune=haswell -ftree-vectorize -fPIC -fstack-protector-strong -fno-plt -O2 -ffunction-sections -pipe -isystem /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/include -O3 -DNDEBUG -std=c++20 -Wall -Wextra -O3 -march=native -Wno-dangling-reference -o CMakeFiles/spdlog.dir/src/bundled_fmtlib_format.cpp.o -c /maps/projects/fernandezguerra/apps/repos/genopack/build/_deps/spdlog-src/src/bundled_fmtlib_format.cpp",
+  "file": "/maps/projects/fernandezguerra/apps/repos/genopack/build/_deps/spdlog-src/src/bundled_fmtlib_format.cpp",
+  "output": "_deps/spdlog-build/CMakeFiles/spdlog.dir/src/bundled_fmtlib_format.cpp.o"
+}
+]
