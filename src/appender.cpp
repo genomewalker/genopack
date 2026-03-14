@@ -210,13 +210,13 @@ struct ArchiveAppender::Impl {
             std::filesystem::create_directories(archive_dir / "shards");
 
             ShardWriterConfig shard_cfg{};
-            std::unique_ptr<ShardWriter> sw;
+            std::unique_ptr<ShardWriterV1> sw;
             size_t sw_compressed = 0;
 
             auto open_shard = [&]() {
                 char fname[64];
                 snprintf(fname, sizeof(fname), "shard_%05u.gpks", next_shard_id);
-                sw = std::make_unique<ShardWriter>(
+                sw = std::make_unique<ShardWriterV1>(
                     archive_dir / "shards" / fname,
                     next_shard_id, next_shard_id, shard_cfg);
                 ++next_shard_id;
@@ -364,7 +364,7 @@ struct ArchiveAppender::Impl {
             std::vector<GenomeMeta>                       new_catalog_rows;
             std::vector<std::pair<std::string, GenomeId>> new_accessions;
 
-            std::unique_ptr<ShardWriterV2> shard_writer;
+            std::unique_ptr<ShardWriter> shard_writer;
             uint32_t current_shard_id = new_shard_id;
 
             auto flush_shard = [&]() {
@@ -383,7 +383,7 @@ struct ArchiveAppender::Impl {
             };
 
             auto open_shard = [&]() {
-                shard_writer = std::make_unique<ShardWriterV2>(
+                shard_writer = std::make_unique<ShardWriter>(
                     current_shard_id, current_shard_id, shard_cfg_);
             };
 

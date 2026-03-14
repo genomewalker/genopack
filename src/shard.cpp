@@ -11,9 +11,9 @@
 
 namespace genopack {
 
-// ── ShardWriter::Impl ─────────────────────────────────────────────────────────
+// ── ShardWriterV1::Impl ─────────────────────────────────────────────────────────
 
-struct ShardWriter::Impl {
+struct ShardWriterV1::Impl {
     std::filesystem::path   path;
     ShardId                 shard_id;
     uint32_t                cluster_id;
@@ -97,14 +97,14 @@ struct ShardWriter::Impl {
     }
 };
 
-ShardWriter::ShardWriter(const std::filesystem::path& path, ShardId shard_id,
+ShardWriterV1::ShardWriterV1(const std::filesystem::path& path, ShardId shard_id,
                           uint32_t cluster_id, Config cfg)
     : impl_(std::make_unique<Impl>(path, shard_id, cluster_id, cfg))
 {}
 
-ShardWriter::~ShardWriter() = default;
+ShardWriterV1::~ShardWriterV1() = default;
 
-void ShardWriter::add_genome(GenomeId id, uint64_t oph_fingerprint,
+void ShardWriterV1::add_genome(GenomeId id, uint64_t oph_fingerprint,
                               const char* fasta_data, size_t fasta_len, uint32_t flags)
 {
     // Collect training samples for dict
@@ -123,7 +123,7 @@ void ShardWriter::add_genome(GenomeId id, uint64_t oph_fingerprint,
     });
 }
 
-void ShardWriter::finalize() {
+void ShardWriterV1::finalize() {
     std::ofstream f(impl_->path, std::ios::binary | std::ios::trunc);
     if (!f) throw std::runtime_error("Cannot open shard for writing: " + impl_->path.string());
 
@@ -191,16 +191,16 @@ void ShardWriter::finalize() {
                  impl_->shard_id, n, static_cast<size_t>(f.tellp()));
 }
 
-size_t ShardWriter::n_genomes() const { return impl_->genomes.size(); }
-size_t ShardWriter::compressed_size() const {
+size_t ShardWriterV1::n_genomes() const { return impl_->genomes.size(); }
+size_t ShardWriterV1::compressed_size() const {
     size_t total = 0;
     for (const auto& g : impl_->genomes) total += g.compressed_blob.size();
     return total;
 }
 
-// ── ShardReader::Impl ─────────────────────────────────────────────────────────
+// ── ShardReaderV1::Impl ─────────────────────────────────────────────────────────
 
-struct ShardReader::Impl {
+struct ShardReaderV1::Impl {
     std::filesystem::path      path;
     std::vector<char>          file_data;  // entire shard file (mmap-style read)
     const ShardHeader*         header = nullptr;
@@ -287,32 +287,32 @@ struct ShardReader::Impl {
     }
 };
 
-ShardReader::ShardReader()              : impl_(std::make_unique<Impl>()) {}
-ShardReader::~ShardReader()             = default;
-ShardReader::ShardReader(ShardReader&&) noexcept = default;
-ShardReader& ShardReader::operator=(ShardReader&&) noexcept = default;
+ShardReaderV1::ShardReaderV1()              : impl_(std::make_unique<Impl>()) {}
+ShardReaderV1::~ShardReaderV1()             = default;
+ShardReaderV1::ShardReaderV1(ShardReaderV1&&) noexcept = default;
+ShardReaderV1& ShardReaderV1::operator=(ShardReaderV1&&) noexcept = default;
 
-void ShardReader::open(const std::filesystem::path& path) { impl_->open(path); }
-void ShardReader::close() { impl_->close(); }
-ShardId  ShardReader::shard_id()  const { return impl_->header->shard_id; }
-uint32_t ShardReader::cluster_id() const { return impl_->header->cluster_id; }
-size_t   ShardReader::n_genomes() const { return impl_->header->n_genomes; }
+void ShardReaderV1::open(const std::filesystem::path& path) { impl_->open(path); }
+void ShardReaderV1::close() { impl_->close(); }
+ShardId  ShardReaderV1::shard_id()  const { return impl_->header->shard_id; }
+uint32_t ShardReaderV1::cluster_id() const { return impl_->header->cluster_id; }
+size_t   ShardReaderV1::n_genomes() const { return impl_->header->n_genomes; }
 
-std::string ShardReader::fetch_genome(GenomeId id) const {
+std::string ShardReaderV1::fetch_genome(GenomeId id) const {
     const GenomeDirEntry* e = impl_->find_genome(id);
     if (!e) throw std::runtime_error("genome_id not found in shard");
     if (e->flags & GenomeMeta::FLAG_DELETED) return {};
     return impl_->decompress_blob(*e);
 }
 
-const GenomeDirEntry* ShardReader::dir_begin() const { return impl_->dir; }
-const GenomeDirEntry* ShardReader::dir_end()   const {
+const GenomeDirEntry* ShardReaderV1::dir_begin() const { return impl_->dir; }
+const GenomeDirEntry* ShardReaderV1::dir_end()   const {
     return impl_->dir + impl_->header->n_genomes;
 }
 
-// ── ShardWriterV2::Impl ───────────────────────────────────────────────────────
+// ── ShardWriter::Impl ───────────────────────────────────────────────────────
 
-struct ShardWriterV2::Impl {
+struct ShardWriter::Impl {
     uint32_t shard_id;
     uint32_t cluster_id;
     Config   cfg;
@@ -338,13 +338,13 @@ struct ShardWriterV2::Impl {
     {}
 };
 
-ShardWriterV2::ShardWriterV2(uint32_t shard_id, uint32_t cluster_id, Config cfg)
+ShardWriter::ShardWriter(uint32_t shard_id, uint32_t cluster_id, Config cfg)
     : impl_(std::make_unique<Impl>(shard_id, cluster_id, cfg))
 {}
 
-ShardWriterV2::~ShardWriterV2() = default;
+ShardWriter::~ShardWriter() = default;
 
-void ShardWriterV2::add_genome(GenomeId id, uint64_t oph_fingerprint,
+void ShardWriter::add_genome(GenomeId id, uint64_t oph_fingerprint,
                                 const char* fasta_data, size_t fasta_len,
                                 uint32_t flags)
 {
@@ -367,7 +367,7 @@ void ShardWriterV2::add_genome(GenomeId id, uint64_t oph_fingerprint,
     impl_->pending.push_back(std::move(pg));
 }
 
-uint64_t ShardWriterV2::finalize(AppendWriter& writer) {
+uint64_t ShardWriter::finalize(AppendWriter& writer) {
     const size_t n = impl_->pending.size();
 
     // ── 1. Train dictionary ───────────────────────────────────────────────────
@@ -385,12 +385,12 @@ uint64_t ShardWriterV2::finalize(AppendWriter& writer) {
             impl_->shared_dict.data(), impl_->cfg.dict_size,
             concat.data(), sizes.data(), sizes.size());
         if (ZDICT_isError(trained)) {
-            spdlog::warn("ShardWriterV2 shard {}: ZDICT training failed: {} — no dict",
+            spdlog::warn("ShardWriter shard {}: ZDICT training failed: {} — no dict",
                          impl_->shard_id, ZDICT_getErrorName(trained));
             impl_->shared_dict.clear();
         } else {
             impl_->shared_dict.resize(trained);
-            spdlog::debug("ShardWriterV2 shard {}: trained {}B dict from {} samples",
+            spdlog::debug("ShardWriter shard {}: trained {}B dict from {} samples",
                           impl_->shard_id, trained, impl_->dict_samples.size());
             use_dict = true;
         }
@@ -500,18 +500,18 @@ uint64_t ShardWriterV2::finalize(AppendWriter& writer) {
     for (const auto& cb : blobs)
         writer.append(cb.data.data(), cb.data.size());
 
-    spdlog::info("ShardWriterV2 shard {}: wrote {} genomes, raw {}B, compressed {}B",
+    spdlog::info("ShardWriter shard {}: wrote {} genomes, raw {}B, compressed {}B",
                  impl_->shard_id, n, impl_->total_raw_bytes, total_compressed);
 
     return section_start;
 }
 
-size_t ShardWriterV2::n_genomes()   const { return impl_->pending.size(); }
-size_t ShardWriterV2::n_bytes_raw() const { return impl_->total_raw_bytes; }
+size_t ShardWriter::n_genomes()   const { return impl_->pending.size(); }
+size_t ShardWriter::n_bytes_raw() const { return impl_->total_raw_bytes; }
 
-// ── ShardReaderV2::Impl ───────────────────────────────────────────────────────
+// ── ShardReader::Impl ───────────────────────────────────────────────────────
 
-struct ShardReaderV2::Impl {
+struct ShardReader::Impl {
     const uint8_t*          base_         = nullptr;  // start of shard section
     uint64_t                section_size_ = 0;
     const ShardHeaderV2*    header_       = nullptr;
@@ -528,9 +528,9 @@ struct ShardReaderV2::Impl {
 
         header_ = reinterpret_cast<const ShardHeaderV2*>(base_);
         if (header_->magic != GPKS_MAGIC)
-            throw std::runtime_error("ShardReaderV2: invalid shard magic");
+            throw std::runtime_error("ShardReader: invalid shard magic");
         if (header_->version != 2)
-            throw std::runtime_error("ShardReaderV2: expected shard version 2");
+            throw std::runtime_error("ShardReader: expected shard version 2");
 
         dir_ = reinterpret_cast<const GenomeDirEntryV2*>(
             base_ + header_->genome_dir_offset);
@@ -585,7 +585,7 @@ struct ShardReaderV2::Impl {
                     : ZSTD_decompressDCtx(dctx_, out.data(), frame_size, src, src_size);
             }
             if (ZSTD_isError(written))
-                throw std::runtime_error(std::string("ShardReaderV2 decompress: ") +
+                throw std::runtime_error(std::string("ShardReader decompress: ") +
                                          ZSTD_getErrorName(written));
             out.resize(written);
         }
@@ -593,47 +593,49 @@ struct ShardReaderV2::Impl {
     }
 };
 
-ShardReaderV2::~ShardReaderV2() {
+ShardReader::ShardReader() = default;
+
+ShardReader::~ShardReader() {
     if (impl_) impl_->reset();
 }
 
-ShardReaderV2::ShardReaderV2(ShardReaderV2&&) noexcept = default;
-ShardReaderV2& ShardReaderV2::operator=(ShardReaderV2&&) noexcept = default;
+ShardReader::ShardReader(ShardReader&&) noexcept = default;
+ShardReader& ShardReader::operator=(ShardReader&&) noexcept = default;
 
-void ShardReaderV2::open(const uint8_t* base, uint64_t section_offset, uint64_t section_size) {
+void ShardReader::open(const uint8_t* base, uint64_t section_offset, uint64_t section_size) {
     if (!impl_) impl_ = std::make_unique<Impl>();
     else        impl_->reset();
     impl_->setup(base + section_offset, section_size);
 }
 
-void ShardReaderV2::open_file(const std::filesystem::path& path) {
+void ShardReader::open_file(const std::filesystem::path& path) {
     if (!impl_) impl_ = std::make_unique<Impl>();
     else        impl_->reset();
 
     std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f) throw std::runtime_error("ShardReaderV2: cannot open: " + path.string());
+    if (!f) throw std::runtime_error("ShardReader: cannot open: " + path.string());
     size_t size = static_cast<size_t>(f.tellg());
     f.seekg(0);
     impl_->owned_data_.resize(size);
     f.read(reinterpret_cast<char*>(impl_->owned_data_.data()), size);
-    if (!f) throw std::runtime_error("ShardReaderV2: read error: " + path.string());
+    if (!f) throw std::runtime_error("ShardReader: read error: " + path.string());
 
     impl_->setup(impl_->owned_data_.data(), size);
 }
 
-bool     ShardReaderV2::is_open()   const { return impl_ && impl_->header_ != nullptr; }
-uint32_t ShardReaderV2::shard_id()  const { return impl_->header_->shard_id; }
-uint32_t ShardReaderV2::n_genomes() const { return impl_->header_->n_genomes; }
+bool     ShardReader::is_open()   const { return impl_ && impl_->header_ != nullptr; }
+uint32_t ShardReader::shard_id()  const { return impl_->header_->shard_id; }
+uint32_t ShardReader::n_genomes() const { return impl_->header_->n_genomes; }
 
-std::string ShardReaderV2::fetch_genome(GenomeId id) const {
+std::string ShardReader::fetch_genome(GenomeId id) const {
     const GenomeDirEntryV2* e = impl_->find_genome(id);
-    if (!e) throw std::runtime_error("ShardReaderV2: genome_id not found");
+    if (!e) throw std::runtime_error("ShardReader: genome_id not found");
     if (e->flags & GenomeMeta::FLAG_DELETED) return {};
     return impl_->decompress_blob(*e);
 }
 
-const GenomeDirEntryV2* ShardReaderV2::dir_begin() const { return impl_->dir_; }
-const GenomeDirEntryV2* ShardReaderV2::dir_end()   const {
+const GenomeDirEntryV2* ShardReader::dir_begin() const { return impl_->dir_; }
+const GenomeDirEntryV2* ShardReader::dir_end()   const {
     return impl_->dir_ + impl_->header_->n_genomes;
 }
 

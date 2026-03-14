@@ -15,32 +15,32 @@
 namespace genopack {
 
 // ── ShardBox ─────────────────────────────────────────────────────────────────
-// ShardReaderV2() = default is inline in shard.hpp, which forces the compiler
-// to instantiate the destructor of unique_ptr<ShardReaderV2::Impl> here — but
-// ShardReaderV2::Impl is incomplete in this TU. Workaround: zero-initialize
-// aligned storage for a ShardReaderV2, then call only the out-of-line methods
-// open() and ~ShardReaderV2(). A zero-initialized unique_ptr<Impl> is nullptr
+// ShardReader() = default is inline in shard.hpp, which forces the compiler
+// to instantiate the destructor of unique_ptr<ShardReader::Impl> here — but
+// ShardReader::Impl is incomplete in this TU. Workaround: zero-initialize
+// aligned storage for a ShardReader, then call only the out-of-line methods
+// open() and ~ShardReader(). A zero-initialized unique_ptr<Impl> is nullptr
 // on all platforms, so open() (which does `if (!impl_) impl_ = make_unique<Impl>()`)
 // initialises it correctly in shard.cpp where Impl is complete.
 
 struct ShardBox {
-    alignas(ShardReaderV2) unsigned char storage_[sizeof(ShardReaderV2)];
+    alignas(ShardReader) unsigned char storage_[sizeof(ShardReader)];
     bool live_ = false;
 
     ShardBox() { std::memset(storage_, 0, sizeof(storage_)); }
 
     ~ShardBox() {
-        if (live_) reinterpret_cast<ShardReaderV2*>(storage_)->~ShardReaderV2();
+        if (live_) reinterpret_cast<ShardReader*>(storage_)->~ShardReader();
     }
 
     ShardBox(const ShardBox&)            = delete;
     ShardBox& operator=(const ShardBox&) = delete;
 
-    ShardReaderV2& reader() {
-        return *reinterpret_cast<ShardReaderV2*>(storage_);
+    ShardReader& reader() {
+        return *reinterpret_cast<ShardReader*>(storage_);
     }
-    const ShardReaderV2& reader() const {
-        return *reinterpret_cast<const ShardReaderV2*>(storage_);
+    const ShardReader& reader() const {
+        return *reinterpret_cast<const ShardReader*>(storage_);
     }
 
     void open(const uint8_t* base, uint64_t offset, uint64_t size) {
@@ -73,7 +73,7 @@ struct ArchiveReader::Impl {
     std::filesystem::path archive_dir_v1_;
     ManifestHeader        manifest_v1_{};
     CatalogReader         catalog_v1_;
-    mutable std::unordered_map<ShardId, ShardReader> shards_v1_;
+    mutable std::unordered_map<ShardId, ShardReaderV1> shards_v1_;
 
     // ── common state ──────────────────────────────────────────────────────────
     bool     is_v2_       = false;
@@ -213,14 +213,14 @@ struct ArchiveReader::Impl {
 
     // ── v1 shard access ───────────────────────────────────────────────────────
 
-    ShardReader& get_shard_v1(ShardId shard_id) const {
+    ShardReaderV1& get_shard_v1(ShardId shard_id) const {
         auto it = shards_v1_.find(shard_id);
         if (it != shards_v1_.end()) return it->second;
 
         for (const auto& entry :
              std::filesystem::directory_iterator(archive_dir_v1_ / "shards")) {
             if (entry.path().extension() != ".gpks") continue;
-            ShardReader tmp;
+            ShardReaderV1 tmp;
             tmp.open(entry.path());
             if (tmp.shard_id() == shard_id) {
                 auto [ins_it, ok] = shards_v1_.emplace(shard_id, std::move(tmp));
@@ -232,7 +232,7 @@ struct ArchiveReader::Impl {
 
     // ── v2 shard access ───────────────────────────────────────────────────────
 
-    ShardReaderV2& get_shard_v2(uint32_t shard_id) const {
+    ShardReader& get_shard_v2(uint32_t shard_id) const {
         auto it = shards_v2_.find(shard_id);
         if (it != shards_v2_.end()) return it->second.reader();
 

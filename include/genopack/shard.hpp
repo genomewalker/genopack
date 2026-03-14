@@ -112,7 +112,7 @@ struct CheckpointEntry {
 };
 static_assert(sizeof(CheckpointEntry) == 16, "CheckpointEntry layout changed");
 
-// ── ShardWriter ───────────────────────────────────────────────────────────────
+// ── ShardWriterV1 ───────────────────────────────────────────────────────────────
 
 struct ShardWriterConfig {
     int    zstd_level           = 6;
@@ -124,15 +124,15 @@ struct ShardWriterConfig {
     size_t max_shard_size_bytes = 512ULL << 20; // 512 MB
 };
 
-class ShardWriter {
+class ShardWriterV1 {
 public:
     using Config = ShardWriterConfig;
 
-    explicit ShardWriter(const std::filesystem::path& path, ShardId shard_id,
+    explicit ShardWriterV1(const std::filesystem::path& path, ShardId shard_id,
                          uint32_t cluster_id, Config cfg = Config{});
-    ~ShardWriter();
-    ShardWriter(const ShardWriter&) = delete;
-    ShardWriter& operator=(const ShardWriter&) = delete;
+    ~ShardWriterV1();
+    ShardWriterV1(const ShardWriterV1&) = delete;
+    ShardWriterV1& operator=(const ShardWriterV1&) = delete;
 
     // Add a genome. FASTA content is the decompressed FASTA string.
     // Caller must add genomes in oph_fingerprint order for best compression.
@@ -150,16 +150,16 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-// ── ShardReader ───────────────────────────────────────────────────────────────
+// ── ShardReaderV1 ───────────────────────────────────────────────────────────────
 
-class ShardReader {
+class ShardReaderV1 {
 public:
-    ShardReader();
-    ~ShardReader();
-    ShardReader(const ShardReader&) = delete;
-    ShardReader& operator=(const ShardReader&) = delete;
-    ShardReader(ShardReader&&) noexcept;
-    ShardReader& operator=(ShardReader&&) noexcept;
+    ShardReaderV1();
+    ~ShardReaderV1();
+    ShardReaderV1(const ShardReaderV1&) = delete;
+    ShardReaderV1& operator=(const ShardReaderV1&) = delete;
+    ShardReaderV1(ShardReaderV1&&) noexcept;
+    ShardReaderV1& operator=(ShardReaderV1&&) noexcept;
 
     void open(const std::filesystem::path& path);
     void close();
@@ -180,18 +180,18 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-// ── ShardWriterV2 ─────────────────────────────────────────────────────────────
+// ── ShardWriter ─────────────────────────────────────────────────────────────
 // Two-pass writer: buffers raw FASTA, trains a shared zstd dictionary at
 // finalize() time, then compresses and writes into an AppendWriter section.
 
-class ShardWriterV2 {
+class ShardWriter {
 public:
     using Config = ShardWriterConfig;
 
-    explicit ShardWriterV2(uint32_t shard_id, uint32_t cluster_id, Config cfg = {});
-    ~ShardWriterV2();
-    ShardWriterV2(const ShardWriterV2&) = delete;
-    ShardWriterV2& operator=(const ShardWriterV2&) = delete;
+    explicit ShardWriter(uint32_t shard_id, uint32_t cluster_id, Config cfg = {});
+    ~ShardWriter();
+    ShardWriter(const ShardWriter&) = delete;
+    ShardWriter& operator=(const ShardWriter&) = delete;
 
     // Buffer raw FASTA for this genome. oph_fingerprint is the MinHash value.
     void add_genome(GenomeId id, uint64_t oph_fingerprint,
@@ -210,18 +210,18 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-// ── ShardReaderV2 ─────────────────────────────────────────────────────────────
+// ── ShardReader ─────────────────────────────────────────────────────────────
 // Reads a shard section from a memory-mapped .gpk file or a standalone .gpks
 // file (backward-compat). All accesses are zero-copy into the mapped region.
 
-class ShardReaderV2 {
+class ShardReader {
 public:
-    ShardReaderV2() = default;
-    ~ShardReaderV2();
-    ShardReaderV2(ShardReaderV2&&) noexcept;
-    ShardReaderV2& operator=(ShardReaderV2&&) noexcept;
-    ShardReaderV2(const ShardReaderV2&) = delete;
-    ShardReaderV2& operator=(const ShardReaderV2&) = delete;
+    ShardReader();
+    ~ShardReader();
+    ShardReader(ShardReader&&) noexcept;
+    ShardReader& operator=(ShardReader&&) noexcept;
+    ShardReader(const ShardReader&) = delete;
+    ShardReader& operator=(const ShardReader&) = delete;
 
     // Open from a memory-mapped .gpk file at the given shard section.
     // base: start of the entire file mapping.
