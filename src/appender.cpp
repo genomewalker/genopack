@@ -350,10 +350,11 @@ struct ArchiveAppender::Impl {
             std::vector<GenomeMeta1> work;
             work.reserve(pending_add_.size());
 
+            size_t n_dup_accession = 0;
             GenomeId gid = next_genome_id_;
             for (auto& r : pending_add_) {
                 if (existing_accessions.count(r.accession)) {
-                    spdlog::warn("Skipping duplicate accession: {}", r.accession);
+                    ++n_dup_accession;
                     continue;
                 }
                 std::string fasta;
@@ -366,6 +367,8 @@ struct ArchiveAppender::Impl {
                 work.push_back({r, gid++, stats});
             }
             pending_add_.clear();
+            if (n_dup_accession > 0)
+                spdlog::info("Dedup: skipped {} duplicate accessions already in archive", n_dup_accession);
 
             std::sort(work.begin(), work.end(), [](const GenomeMeta1& a, const GenomeMeta1& b) {
                 return a.stats.oph_fingerprint < b.stats.oph_fingerprint;
@@ -393,15 +396,11 @@ struct ArchiveAppender::Impl {
             {
                 size_t n_before = work.size();
                 work.erase(std::remove_if(work.begin(), work.end(), [&](const GenomeMeta1& g) {
-                    if (existing_seqs.count({g.stats.oph_fingerprint, g.stats.genome_length})) {
-                        spdlog::warn("Dedup: {} is sequence-identical to an existing genome, skipping",
-                                     g.record.accession);
-                        return true;
-                    }
-                    return false;
+                    return existing_seqs.count({g.stats.oph_fingerprint, g.stats.genome_length}) > 0;
                 }), work.end());
-                if (work.size() < n_before)
-                    spdlog::info("Dedup: removed {} cross-catalog duplicates", n_before - work.size());
+                size_t n_removed = n_before - work.size();
+                if (n_removed > 0)
+                    spdlog::info("Dedup: removed {} cross-catalog sequence duplicates", n_removed);
             }
 
             // Step 3: intra-batch dedup (identical sequences sort adjacent)
