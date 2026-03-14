@@ -310,4 +310,331 @@ const GenomeDirEntry* ShardReader::dir_end()   const {
     return impl_->dir + impl_->header->n_genomes;
 }
 
+// ── ShardWriterV2::Impl ───────────────────────────────────────────────────────
+
+struct ShardWriterV2::Impl {
+    uint32_t shard_id;
+    uint32_t cluster_id;
+    Config   cfg;
+
+    struct PendingGenome {
+        GenomeId genome_id;
+        uint64_t oph_fingerprint;
+        uint32_t flags;
+        uint32_t meta_row_id = 0;
+        uint64_t raw_offset;   // byte offset into raw_buffer
+        uint32_t raw_len;
+    };
+    std::vector<PendingGenome> pending;
+
+    std::vector<char> raw_buffer;     // append-only store of raw FASTAs
+    uint64_t          total_raw_bytes = 0;
+
+    std::vector<std::string> dict_samples;
+    std::string              shared_dict;
+
+    Impl(uint32_t sid, uint32_t cid, Config c)
+        : shard_id(sid), cluster_id(cid), cfg(c)
+    {}
+};
+
+ShardWriterV2::ShardWriterV2(uint32_t shard_id, uint32_t cluster_id, Config cfg)
+    : impl_(std::make_unique<Impl>(shard_id, cluster_id, cfg))
+{}
+
+ShardWriterV2::~ShardWriterV2() = default;
+
+void ShardWriterV2::add_genome(GenomeId id, uint64_t oph_fingerprint,
+                                const char* fasta_data, size_t fasta_len,
+                                uint32_t flags)
+{
+    static constexpr size_t MAX_SAMPLE = 65536;
+
+    if (impl_->cfg.train_dict &&
+        impl_->dict_samples.size() < impl_->cfg.dict_samples) {
+        impl_->dict_samples.emplace_back(fasta_data, std::min(fasta_len, MAX_SAMPLE));
+    }
+
+    Impl::PendingGenome pg;
+    pg.genome_id       = id;
+    pg.oph_fingerprint = oph_fingerprint;
+    pg.flags           = flags;
+    pg.meta_row_id     = 0;
+    pg.raw_offset      = static_cast<uint64_t>(impl_->raw_buffer.size());
+    pg.raw_len         = static_cast<uint32_t>(fasta_len);
+    impl_->raw_buffer.insert(impl_->raw_buffer.end(), fasta_data, fasta_data + fasta_len);
+    impl_->total_raw_bytes += fasta_len;
+    impl_->pending.push_back(std::move(pg));
+}
+
+uint64_t ShardWriterV2::finalize(AppendWriter& writer) {
+    const size_t n = impl_->pending.size();
+
+    // ── 1. Train dictionary ───────────────────────────────────────────────────
+    bool use_dict = false;
+    if (impl_->cfg.train_dict && !impl_->dict_samples.empty()) {
+        std::string concat;
+        std::vector<size_t> sizes;
+        concat.reserve(impl_->dict_samples.size() * 32768);
+        for (const auto& s : impl_->dict_samples) {
+            sizes.push_back(s.size());
+            concat += s;
+        }
+        impl_->shared_dict.resize(impl_->cfg.dict_size);
+        size_t trained = ZDICT_trainFromBuffer(
+            impl_->shared_dict.data(), impl_->cfg.dict_size,
+            concat.data(), sizes.data(), sizes.size());
+        if (ZDICT_isError(trained)) {
+            spdlog::warn("ShardWriterV2 shard {}: ZDICT training failed: {} — no dict",
+                         impl_->shard_id, ZDICT_getErrorName(trained));
+            impl_->shared_dict.clear();
+        } else {
+            impl_->shared_dict.resize(trained);
+            spdlog::debug("ShardWriterV2 shard {}: trained {}B dict from {} samples",
+                          impl_->shard_id, trained, impl_->dict_samples.size());
+            use_dict = true;
+        }
+    }
+
+    // ── 2. Set up ZSTD compression context ───────────────────────────────────
+    ZSTD_CCtx* cctx = ZSTD_createCCtx();
+    if (!cctx) throw std::runtime_error("ZSTD_createCCtx failed");
+
+    ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, impl_->cfg.zstd_level);
+    if (impl_->cfg.use_long_match) {
+        ZSTD_CCtx_setParameter(cctx, ZSTD_c_enableLongDistanceMatching, 1);
+        ZSTD_CCtx_setParameter(cctx, ZSTD_c_windowLog, impl_->cfg.zstd_wlog);
+    }
+    if (use_dict)
+        ZSTD_CCtx_loadDictionary(cctx, impl_->shared_dict.data(), impl_->shared_dict.size());
+
+    // ── 3. Compress all pending genomes ──────────────────────────────────────
+    struct CompressedBlob {
+        std::vector<char> data;
+        uint32_t          raw_len;
+    };
+    std::vector<CompressedBlob> blobs;
+    blobs.reserve(n);
+
+    for (const auto& pg : impl_->pending) {
+        const char* src     = impl_->raw_buffer.data() + pg.raw_offset;
+        size_t      src_len = pg.raw_len;
+        size_t      bound   = ZSTD_compressBound(src_len);
+        CompressedBlob cb;
+        cb.data.resize(bound);
+        cb.raw_len = static_cast<uint32_t>(src_len);
+        size_t csize = ZSTD_compress2(cctx, cb.data.data(), bound, src, src_len);
+        if (ZSTD_isError(csize)) {
+            ZSTD_freeCCtx(cctx);
+            throw std::runtime_error(std::string("ZSTD_compress2: ") + ZSTD_getErrorName(csize));
+        }
+        cb.data.resize(csize);
+        blobs.push_back(std::move(cb));
+    }
+    ZSTD_freeCCtx(cctx);
+
+    // ── 4. Compute layout (all offsets relative to section start) ─────────────
+    const uint64_t header_size       = sizeof(ShardHeaderV2);
+    const uint64_t dir_size          = n * sizeof(GenomeDirEntryV2);
+    const uint64_t dict_bytes        = use_dict ? impl_->shared_dict.size() : 0;
+    const uint64_t genome_dir_offset = header_size;
+    const uint64_t dict_offset       = genome_dir_offset + dir_size;
+    const uint64_t blob_area_offset  = dict_offset + dict_bytes;
+
+    // Compute per-genome blob offsets (relative to blob_area_offset)
+    std::vector<GenomeDirEntryV2> dir(n);
+    uint64_t blob_cursor      = 0;
+    uint64_t total_compressed = 0;
+    for (size_t i = 0; i < n; ++i) {
+        const auto& pg = impl_->pending[i];
+        const auto& cb = blobs[i];
+        dir[i].genome_id       = pg.genome_id;
+        dir[i].oph_fingerprint = pg.oph_fingerprint;
+        dir[i].blob_offset     = blob_cursor;
+        dir[i].blob_len_cmp    = static_cast<uint32_t>(cb.data.size());
+        dir[i].blob_len_raw    = cb.raw_len;
+        dir[i].checkpoint_idx  = 0;
+        dir[i].n_checkpoints   = 0;
+        dir[i].flags           = pg.flags;
+        dir[i].meta_row_id     = pg.meta_row_id;
+        std::memset(dir[i].reserved, 0, sizeof(dir[i].reserved));
+        blob_cursor      += cb.data.size();
+        total_compressed += cb.data.size();
+    }
+
+    // ── 5. Write section ──────────────────────────────────────────────────────
+    const uint64_t section_start = writer.current_offset();
+
+    // 5a. Build and write header
+    ShardHeaderV2 hdr{};
+    hdr.magic                  = GPKS_MAGIC;
+    hdr.version                = 2;
+    hdr.flags                  = 0;
+    hdr.shard_id               = impl_->shard_id;
+    hdr.cluster_id             = impl_->cluster_id;
+    hdr.n_genomes              = static_cast<uint32_t>(n);
+    hdr.n_deleted              = static_cast<uint32_t>(
+        std::count_if(impl_->pending.begin(), impl_->pending.end(),
+                      [](const Impl::PendingGenome& pg){
+                          return pg.flags & GenomeMeta::FLAG_DELETED;
+                      }));
+    hdr.codec                  = use_dict ? 1u : 0u;
+    hdr.dict_size              = static_cast<uint32_t>(dict_bytes);
+    hdr.genome_dir_offset      = genome_dir_offset;
+    hdr.dict_offset            = dict_offset;
+    hdr.blob_area_offset       = blob_area_offset;
+    hdr.shard_raw_bp           = impl_->total_raw_bytes;
+    hdr.shard_compressed_bytes = total_compressed;
+    std::memset(hdr.checksum, 0, sizeof(hdr.checksum));
+    std::memset(hdr.reserved, 0, sizeof(hdr.reserved));
+    writer.append(&hdr, sizeof(hdr));
+
+    // 5b. Directory
+    writer.append(dir.data(), dir_size);
+
+    // 5c. Dictionary
+    if (use_dict)
+        writer.append(impl_->shared_dict.data(), dict_bytes);
+
+    // 5d. Blob area
+    for (const auto& cb : blobs)
+        writer.append(cb.data.data(), cb.data.size());
+
+    spdlog::info("ShardWriterV2 shard {}: wrote {} genomes, raw {}B, compressed {}B",
+                 impl_->shard_id, n, impl_->total_raw_bytes, total_compressed);
+
+    return section_start;
+}
+
+size_t ShardWriterV2::n_genomes()   const { return impl_->pending.size(); }
+size_t ShardWriterV2::n_bytes_raw() const { return impl_->total_raw_bytes; }
+
+// ── ShardReaderV2::Impl ───────────────────────────────────────────────────────
+
+struct ShardReaderV2::Impl {
+    const uint8_t*          base_         = nullptr;  // start of shard section
+    uint64_t                section_size_ = 0;
+    const ShardHeaderV2*    header_       = nullptr;
+    const GenomeDirEntryV2* dir_          = nullptr;
+
+    std::vector<uint8_t>    owned_data_;  // non-empty when file-based open
+
+    ZSTD_DDict* ddict_ = nullptr;
+    ZSTD_DCtx*  dctx_  = nullptr;
+
+    void setup(const uint8_t* section_base, uint64_t section_size) {
+        base_         = section_base;
+        section_size_ = section_size;
+
+        header_ = reinterpret_cast<const ShardHeaderV2*>(base_);
+        if (header_->magic != GPKS_MAGIC)
+            throw std::runtime_error("ShardReaderV2: invalid shard magic");
+        if (header_->version != 2)
+            throw std::runtime_error("ShardReaderV2: expected shard version 2");
+
+        dir_ = reinterpret_cast<const GenomeDirEntryV2*>(
+            base_ + header_->genome_dir_offset);
+
+        dctx_ = ZSTD_createDCtx();
+        if (!dctx_) throw std::runtime_error("ZSTD_createDCtx failed");
+
+        if (header_->dict_size > 0) {
+            const uint8_t* dict_ptr = base_ + header_->dict_offset;
+            ddict_ = ZSTD_createDDict(dict_ptr, header_->dict_size);
+            if (!ddict_) throw std::runtime_error("ZSTD_createDDict failed");
+        }
+    }
+
+    void reset() {
+        if (ddict_) { ZSTD_freeDDict(ddict_); ddict_ = nullptr; }
+        if (dctx_)  { ZSTD_freeDCtx(dctx_);  dctx_  = nullptr; }
+        base_         = nullptr;
+        section_size_ = 0;
+        header_       = nullptr;
+        dir_          = nullptr;
+        owned_data_.clear();
+    }
+
+    const GenomeDirEntryV2* find_genome(GenomeId id) const {
+        for (uint32_t i = 0; i < header_->n_genomes; ++i) {
+            if (dir_[i].genome_id == id) return &dir_[i];
+        }
+        return nullptr;
+    }
+
+    std::string decompress_blob(const GenomeDirEntryV2& e) const {
+        const uint8_t* src      = base_ + header_->blob_area_offset + e.blob_offset;
+        const size_t   src_size = e.blob_len_cmp;
+        const size_t   raw_size = e.blob_len_raw;
+
+        std::string out(raw_size, '\0');
+        size_t written = ddict_
+            ? ZSTD_decompress_usingDDict(dctx_, out.data(), raw_size, src, src_size, ddict_)
+            : ZSTD_decompressDCtx(dctx_, out.data(), raw_size, src, src_size);
+
+        if (ZSTD_isError(written)) {
+            // Fall back to frame-size detection if stored raw_len was wrong
+            size_t frame_size = ZSTD_getFrameContentSize(src, src_size);
+            if (frame_size != ZSTD_CONTENTSIZE_UNKNOWN &&
+                frame_size != ZSTD_CONTENTSIZE_ERROR &&
+                frame_size != raw_size) {
+                out.resize(frame_size);
+                written = ddict_
+                    ? ZSTD_decompress_usingDDict(dctx_, out.data(), frame_size,
+                                                 src, src_size, ddict_)
+                    : ZSTD_decompressDCtx(dctx_, out.data(), frame_size, src, src_size);
+            }
+            if (ZSTD_isError(written))
+                throw std::runtime_error(std::string("ShardReaderV2 decompress: ") +
+                                         ZSTD_getErrorName(written));
+            out.resize(written);
+        }
+        return out;
+    }
+};
+
+ShardReaderV2::~ShardReaderV2() {
+    if (impl_) impl_->reset();
+}
+
+ShardReaderV2::ShardReaderV2(ShardReaderV2&&) noexcept = default;
+ShardReaderV2& ShardReaderV2::operator=(ShardReaderV2&&) noexcept = default;
+
+void ShardReaderV2::open(const uint8_t* base, uint64_t section_offset, uint64_t section_size) {
+    if (!impl_) impl_ = std::make_unique<Impl>();
+    else        impl_->reset();
+    impl_->setup(base + section_offset, section_size);
+}
+
+void ShardReaderV2::open_file(const std::filesystem::path& path) {
+    if (!impl_) impl_ = std::make_unique<Impl>();
+    else        impl_->reset();
+
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) throw std::runtime_error("ShardReaderV2: cannot open: " + path.string());
+    size_t size = static_cast<size_t>(f.tellg());
+    f.seekg(0);
+    impl_->owned_data_.resize(size);
+    f.read(reinterpret_cast<char*>(impl_->owned_data_.data()), size);
+    if (!f) throw std::runtime_error("ShardReaderV2: read error: " + path.string());
+
+    impl_->setup(impl_->owned_data_.data(), size);
+}
+
+bool     ShardReaderV2::is_open()   const { return impl_ && impl_->header_ != nullptr; }
+uint32_t ShardReaderV2::shard_id()  const { return impl_->header_->shard_id; }
+uint32_t ShardReaderV2::n_genomes() const { return impl_->header_->n_genomes; }
+
+std::string ShardReaderV2::fetch_genome(GenomeId id) const {
+    const GenomeDirEntryV2* e = impl_->find_genome(id);
+    if (!e) throw std::runtime_error("ShardReaderV2: genome_id not found");
+    if (e->flags & GenomeMeta::FLAG_DELETED) return {};
+    return impl_->decompress_blob(*e);
+}
+
+const GenomeDirEntryV2* ShardReaderV2::dir_begin() const { return impl_->dir_; }
+const GenomeDirEntryV2* ShardReaderV2::dir_end()   const {
+    return impl_->dir_ + impl_->header_->n_genomes;
+}
+
 } // namespace genopack

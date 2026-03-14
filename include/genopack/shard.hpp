@@ -1,4 +1,5 @@
 #pragma once
+#include "mmap_file.hpp"
 #include "types.hpp"
 #include <filesystem>
 #include <memory>
@@ -28,6 +29,8 @@ namespace genopack {
 //   Sort by oph_fingerprint (approximates sketch similarity).
 //   This maximises zstd LDM reuse across nearby genomes.
 
+// V1 header kept for backward-compat reading of legacy .gpks files.
+// Deprecated: use ShardHeaderV2 for all new code.
 struct ShardHeader {
     uint32_t magic;                    // GPKS_MAGIC
     uint16_t version;
@@ -48,6 +51,30 @@ struct ShardHeader {
 };
 static_assert(sizeof(ShardHeader) == 128, "ShardHeader layout changed");
 
+// V2 shard section header. All offsets are relative to the shard section start.
+// Layout: 4+2+2+4+4+4+4+4+4=32, then 5×8=40, then 16+40=56; total=128.
+struct ShardHeaderV2 {
+    uint32_t magic;                      // GPKS_MAGIC
+    uint16_t version;                    // 2
+    uint16_t flags;
+    uint32_t shard_id;
+    uint32_t cluster_id;
+    uint32_t n_genomes;
+    uint32_t n_deleted;
+    uint32_t codec;                      // 0=zstd, 1=zstd+dict
+    uint32_t dict_size;                  // bytes, 0 if no dict
+    uint64_t genome_dir_offset;          // relative to shard section start
+    uint64_t dict_offset;                // relative to shard section start
+    uint64_t blob_area_offset;           // relative to shard section start
+    uint64_t shard_raw_bp;               // total uncompressed genome bytes
+    uint64_t shard_compressed_bytes;     // total compressed bytes
+    uint8_t  checksum[16];
+    uint8_t  reserved[40];
+};
+static_assert(sizeof(ShardHeaderV2) == 128, "ShardHeaderV2 layout changed");
+
+// V1 directory entry kept for backward-compat reading of legacy .gpks files.
+// Deprecated: use GenomeDirEntryV2 for all new code.
 struct GenomeDirEntry {
     GenomeId genome_id;
     uint32_t _reserved0;
@@ -61,6 +88,21 @@ struct GenomeDirEntry {
     uint8_t  _pad[16];
 };
 static_assert(sizeof(GenomeDirEntry) == 64, "GenomeDirEntry layout changed");
+
+// V2 directory entry. Layout: 8+8+8+4+4+4+4+4+4+16=64 bytes.
+struct GenomeDirEntryV2 {
+    uint64_t genome_id;
+    uint64_t oph_fingerprint;
+    uint64_t blob_offset;      // relative to shard blob_area_offset
+    uint32_t blob_len_cmp;
+    uint32_t blob_len_raw;
+    uint32_t checkpoint_idx;
+    uint32_t n_checkpoints;
+    uint32_t flags;
+    uint32_t meta_row_id;      // row index in logical catalog
+    uint8_t  reserved[16];
+};
+static_assert(sizeof(GenomeDirEntryV2) == 64, "GenomeDirEntryV2 layout changed");
 
 // One checkpoint per 65536 bases. Allows random access within large genomes.
 struct CheckpointEntry {
@@ -132,6 +174,74 @@ public:
     // Iterate genome directory
     const GenomeDirEntry* dir_begin() const;
     const GenomeDirEntry* dir_end()   const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+// ── ShardWriterV2 ─────────────────────────────────────────────────────────────
+// Two-pass writer: buffers raw FASTA, trains a shared zstd dictionary at
+// finalize() time, then compresses and writes into an AppendWriter section.
+
+class ShardWriterV2 {
+public:
+    using Config = ShardWriterConfig;
+
+    explicit ShardWriterV2(uint32_t shard_id, uint32_t cluster_id, Config cfg = {});
+    ~ShardWriterV2();
+    ShardWriterV2(const ShardWriterV2&) = delete;
+    ShardWriterV2& operator=(const ShardWriterV2&) = delete;
+
+    // Buffer raw FASTA for this genome. oph_fingerprint is the MinHash value.
+    void add_genome(GenomeId id, uint64_t oph_fingerprint,
+                    const char* fasta_data, size_t fasta_len,
+                    uint32_t flags = 0);
+
+    // Finalize: train dict (if enabled), compress all genomes, write shard
+    // section to writer. Returns the byte offset where the section starts.
+    uint64_t finalize(AppendWriter& writer);
+
+    size_t n_genomes()   const;
+    size_t n_bytes_raw() const;  // sum of all raw FASTA sizes
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+// ── ShardReaderV2 ─────────────────────────────────────────────────────────────
+// Reads a shard section from a memory-mapped .gpk file or a standalone .gpks
+// file (backward-compat). All accesses are zero-copy into the mapped region.
+
+class ShardReaderV2 {
+public:
+    ShardReaderV2() = default;
+    ~ShardReaderV2();
+    ShardReaderV2(ShardReaderV2&&) noexcept;
+    ShardReaderV2& operator=(ShardReaderV2&&) noexcept;
+    ShardReaderV2(const ShardReaderV2&) = delete;
+    ShardReaderV2& operator=(const ShardReaderV2&) = delete;
+
+    // Open from a memory-mapped .gpk file at the given shard section.
+    // base: start of the entire file mapping.
+    // section_offset: byte offset of this shard section in the file.
+    // section_size: byte length of this shard section.
+    void open(const uint8_t* base, uint64_t section_offset, uint64_t section_size);
+
+    // Open a standalone v2 .gpks file (loads into owned memory).
+    void open_file(const std::filesystem::path& path);
+
+    bool     is_open()   const;
+    uint32_t shard_id()  const;
+    uint32_t n_genomes() const;
+
+    // Fetch decompressed FASTA for a genome. Throws if not found.
+    std::string fetch_genome(GenomeId id) const;
+
+    // Iterate directory entries.
+    const GenomeDirEntryV2* dir_begin() const;
+    const GenomeDirEntryV2* dir_end()   const;
 
 private:
     struct Impl;
