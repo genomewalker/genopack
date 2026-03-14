@@ -56,6 +56,11 @@ add_library(genopack_lib STATIC
   src/builder.cpp
   src/archive.cpp
   src/appender.cpp
+  src/mmap_file.cpp
+  src/util.cpp
+  src/accx.cpp
+  src/tombstone.cpp
+  src/toc.cpp
 )
 
 target_include_directories(genopack_lib PUBLIC
