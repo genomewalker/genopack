@@ -7,25 +7,25 @@ A `.gpk` file is a **seekable single-file container** inspired by Parquet. Secti
 ## File layout
 
 ```
-┌──────────────────────────────┐
-│  FileHeader  (128 B)         │  magic, version, UUID, timestamp
-├──────────────────────────────┤
-│  SHRD × N                    │  zstd-compressed genome shards
-│  SHRD × N  (generation 2)    │  appended; old shards untouched
-├──────────────────────────────┤
-│  CATL                        │  columnar genome metadata (SoA)
-│  GIDX                        │  genome_id → (section_id, dir_index, catl_row)
-│  ACCX                        │  FNV-1a hash table: accession → genome_id
-│  CIDX                        │  sorted FNV-1a-64(contig) → genome_id pairs
-│  TAXN                        │  FNV-1a hash table: accession → lineage string
-│  TXDB                        │  full taxonomy tree
-│  KMRX                        │  float[n × 136] k=4 profiles
-│  HNSW                        │  hnswlib ANN index blob
-│  TOMB                        │  tombstone (soft-delete) records
-├──────────────────────────────┤
-│  TOC                         │  section descriptor table (zstd-compressed)
-│  TailLocator  (64 B)         │  fixed-size footer: points to TOC offset
-└──────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│  FileHeader     128 B    magic, version, UUID, timestamp    │
+├─────────────────────────────────────────────────────────────┤
+│  SHRD × N                compressed genome shards           │
+│  SHRD × N  (gen 2+)      appended; old shards untouched     │
+├─────────────────────────────────────────────────────────────┤
+│  CATL                    columnar genome metadata (SoA)     │
+│  GIDX                    genome_id -> section, dir_index    │
+│  ACCX                    accession -> genome_id             │
+│  CIDX                    FNV1a-64(contig) -> genome_id      │
+│  TAXN                    accession -> lineage string        │
+│  TXDB                    full taxonomy tree                 │
+│  KMRX                    float[n x 136] k=4 profiles        │
+│  HNSW                    hnswlib ANN index blob             │
+│  TOMB                    tombstone records                  │
+├─────────────────────────────────────────────────────────────┤
+│  TOC                     section descriptors (zstd)         │
+│  TailLocator    64 B     fixed footer, points to TOC        │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -52,7 +52,7 @@ A `.gpk` file is a **seekable single-file container** inspired by Parquet. Secti
 Each shard section starts with a 128-byte `ShardHeader`, followed by the genome directory, an optional dictionary, and the blob area.
 
 ```
-┌─────────────────────────────────────────────┐
+┌──────────────────────────────────────────────┐
 │  ShardHeader  (128 B)                        │
 │    magic, version, shard_id, n_genomes       │
 │    codec, dict_size                          │
@@ -60,22 +60,22 @@ Each shard section starts with a 128-byte `ShardHeader`, followed by the genome 
 │    dict_offset                               │
 │    blob_area_offset                          │
 │    checkpoint_area_offset                    │
-├─────────────────────────────────────────────┤
+├──────────────────────────────────────────────┤
 │  GenomeDirEntry[n_genomes]  (64 B each)      │
 │    genome_id, oph_fingerprint                │
 │    blob_offset, blob_len_cmp, blob_len_raw   │
 │    checkpoint_idx, n_checkpoints             │
-├─────────────────────────────────────────────┤
+├──────────────────────────────────────────────┤
 │  zstd dictionary  (dict_size B, optional)    │
-├─────────────────────────────────────────────┤
+├──────────────────────────────────────────────┤
 │  Blob area                                   │
-│    blob[0]  - independently decompressible   │
+│    blob[0]  (independently decompressible)   │
 │    blob[1]                                   │
 │    ...                                       │
-├─────────────────────────────────────────────┤
+├──────────────────────────────────────────────┤
 │  CheckpointEntry[]  (16 B each, optional)    │
 │    symbol_offset, block_offset               │
-└─────────────────────────────────────────────┘
+└──────────────────────────────────────────────┘
 ```
 
 Genomes are sorted by `oph_fingerprint` within each shard. Nearby OPH values indicate similar k-mer content, which maximises zstd LDM reuse and shared dictionary effectiveness.
@@ -97,15 +97,17 @@ Genomes are sorted by `oph_fingerprint` within each shard. Nearby OPH values ind
 The catalog stores `GenomeMeta` rows in a columnar struct-of-arrays layout, sorted by `oph_fingerprint`. Row-group statistics (min/max OPH, completeness, genome_length) enable predicate pushdown - scans can skip entire row groups without accessing individual rows.
 
 ```
-┌───────────────────────────────┐
-│  CatlHeader  (32 B)           │
-│    magic, n_rows, n_groups    │
-│    stats_offset, rows_offset  │
-├───────────────────────────────┤
-│  RowGroupStatsV2[n_groups]    │  72 B each; min/max per 32768 rows
-├───────────────────────────────┤
-│  GenomeMeta[n_rows]           │  72 B each; in oph_fingerprint order
-└───────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│  CatlHeader  (32 B)                              │
+│    magic, n_rows, n_groups                       │
+│    stats_offset, rows_offset                     │
+├──────────────────────────────────────────────────┤
+│  RowGroupStatsV2[n_groups]  (72 B each)          │
+│    min/max oph, completeness, genome_length      │
+├──────────────────────────────────────────────────┤
+│  GenomeMeta[n_rows]  (72 B each)                 │
+│    sorted by oph_fingerprint                     │
+└──────────────────────────────────────────────────┘
 ```
 
 Multiple CATL fragments (one per generation) are merged by `MergedCatalogReader` at read time; newer fragments take precedence on duplicate `genome_id`.
