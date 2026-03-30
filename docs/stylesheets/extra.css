@@ -1,4 +1,4 @@
 /* Continuous box-drawing characters in code blocks */
 .md-typeset pre > code {
-  line-height: 1.2;
+  line-height: 1.0;
 }
