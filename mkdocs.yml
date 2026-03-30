@@ -1,0 +1,50 @@
+site_name: genopack
+site_description: High-performance single-file genome archive for large-scale microbial collections
+site_url: https://genomewalker.github.io/genopack/
+repo_url: https://github.com/genomewalker/genopack
+repo_name: genomewalker/genopack
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: teal
+      accent: teal
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.indexes
+    - content.code.copy
+    - toc.integrate
+    - search.highlight
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+  - attr_list
+
+nav:
+  - Home: index.md
+  - Getting Started: getting-started.md
+  - API Reference: api.md
+  - CLI Reference: cli.md
+  - Format: format.md
+  - Changelog: changelog.md
