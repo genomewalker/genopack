@@ -6,15 +6,30 @@ A `.gpk` file is a seekable single-file container inspired by Parquet. The `Tail
 
 ## File layout
 
-![.gpk file layout](img/format_file_layout.svg)
-
-| Section | Size | Description |
-|---------|------|-------------|
-| `FileHeader` | 128 B | Magic, version, UUID, creation timestamp, generation counter |
-| `SHRD` × N | variable | Compressed genome shards. Each `add`/`repack` appends new shards; old shards are never modified |
-| Index sections | variable | `CATL` · `GIDX` · `ACCX` · `CIDX` · `TAXN` · `TXDB` · `KMRX` · `HNSW` · `TOMB` (one or more of each, one per generation) |
-| `TOC` | variable | zstd-compressed array of `SectionDesc` records describing every section in the file |
-| `TailLocator` | 64 B | Fixed footer at EOF; contains TOC file offset + archive UUID. Read with `lseek(-64, SEEK_END)` |
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  FileHeader          128 B                                           │
+│  magic · version · uuid · created_ts · generation                   │
+├──────────────────────────────────────────────────────────────────────┤
+│  SHRD × N  (generation 1)    compressed genome shards               │
+│  SHRD × N  (generation 2+)   appended; old shards untouched         │
+│  ...                                                                 │
+├──────────────────────────────────────────────────────────────────────┤
+│  CATL  columnar genome metadata (SoA, sorted by oph_fingerprint)    │
+│  GIDX  genome_id → (section_id, dir_index, catl_row)                │
+│  ACCX  FNV-1a hash table: accession → genome_id                     │
+│  CIDX  sorted (FNV-1a-64(contig), genome_id) array                  │
+│  TAXN  FNV-1a hash table: accession → lineage string                │
+│  TXDB  full taxonomy tree (taxid/parent/rank/name + acc→taxid)      │
+│  KMRX  float[n × 136]  L2-normalised k=4 tetranucleotide profiles  │
+│  HNSW  hnswlib serialised blob + label map                          │
+│  TOMB  tombstone records for soft-deleted genomes                   │
+├──────────────────────────────────────────────────────────────────────┤
+│  TOC                         zstd-compressed SectionDesc[]          │
+├──────────────────────────────────────────────────────────────────────┤
+│  TailLocator          64 B   fixed footer at EOF, points to TOC     │
+└──────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
@@ -51,7 +66,27 @@ A `.gpk` file is a seekable single-file container inspired by Parquet. The `Tail
 
 ## Shard section (`SHRD`)
 
-![SHRD section layout](img/format_shard_layout.svg)
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  ShardHeader         128 B                                           │
+│  magic · shard_id · n_genomes · codec · dict_size                   │
+│  dir_offset · dict_offset · blob_area_offset · checkpoint_offset    │
+├──────────────────────────────────────────────────────────────────────┤
+│  GenomeDirEntry[n_genomes]   64 B each                               │
+│  genome_id · oph_fingerprint · blob_offset · blob_len_cmp/raw       │
+│  checkpoint_idx · n_checkpoints  —  sorted by oph_fingerprint       │
+├──────────────────────────────────────────────────────────────────────┤
+│  zstd dictionary   dict_size B   (optional)                         │
+├──────────────────────────────────────────────────────────────────────┤
+│  Blob area                                                           │
+│  blob[0] · blob[1] · ...   (each independently decompressible)      │
+├──────────────────────────────────────────────────────────────────────┤
+│  CheckpointEntry[]   16 B each   (optional)                         │
+│  symbol_offset · block_offset   (enables sub-genome slice)          │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+Genomes are sorted by `oph_fingerprint` within each shard. Nearby OPH values indicate similar k-mer content, maximising zstd LDM reuse and shared dictionary effectiveness.
 
 ### `ShardHeader` — 128 bytes
 
@@ -69,8 +104,6 @@ A `.gpk` file is a seekable single-file container inspired by Parquet. The `Tail
 | 48 | 8 B | `checkpoint_area_offset` | Byte offset of `CheckpointEntry[]` (0 if none) |
 | 56 | 72 B | _reserved_ | Zero-padded |
 
-After the header: `GenomeDirEntry[n_genomes]`, then the optional zstd dictionary, then the blob area, then optional checkpoint entries.
-
 ### `GenomeDirEntry` — 64 bytes each
 
 | Offset | Size | Field | Description |
@@ -80,20 +113,16 @@ After the header: `GenomeDirEntry[n_genomes]`, then the optional zstd dictionary
 | 16 | 8 B | `blob_offset` | Byte offset of compressed blob from blob area start |
 | 24 | 8 B | `blob_len_cmp` | Compressed size in bytes |
 | 32 | 8 B | `blob_len_raw` | Uncompressed size in bytes |
-| 40 | 4 B | `checkpoint_idx` | Index into `CheckpointEntry[]` for first checkpoint of this genome |
-| 44 | 4 B | `n_checkpoints` | Number of checkpoints (0 if `slice` not needed) |
+| 40 | 4 B | `checkpoint_idx` | Index into `CheckpointEntry[]` for first checkpoint |
+| 44 | 4 B | `n_checkpoints` | Number of checkpoints (0 if slice not needed) |
 | 48 | 16 B | _reserved_ | |
-
-Genomes are sorted by `oph_fingerprint`. Nearby OPH values indicate similar k-mer content, maximising zstd LDM reuse and shared dictionary effectiveness.
 
 ### `CheckpointEntry` — 16 bytes each (optional)
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
-| 0 | 8 B | `symbol_offset` | Byte offset within the decompressed genome at which this checkpoint starts |
-| 8 | 8 B | `block_offset` | Byte offset of the corresponding zstd block within the compressed blob |
-
-Checkpoints enable `genopack slice` to decompress only the blocks covering a requested region, without decompressing the entire genome.
+| 0 | 8 B | `symbol_offset` | Byte offset within the decompressed genome at this checkpoint |
+| 8 | 8 B | `block_offset` | Byte offset of the corresponding zstd block within the blob |
 
 ### Codec values
 
@@ -109,9 +138,21 @@ Checkpoints enable `genopack slice` to decompress only the blocks covering a req
 
 ## Catalog section (`CATL`)
 
-![CATL section layout](img/format_catl_layout.svg)
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  CatlHeader          32 B                                            │
+│  magic · n_rows · n_groups · stats_offset · rows_offset             │
+├──────────────────────────────────────────────────────────────────────┤
+│  RowGroupStatsV2[n_groups]   72 B each                               │
+│  min/max oph · min/max completeness · min/max genome_length          │
+│  (enables predicate pushdown — skip entire groups without row scan)  │
+├──────────────────────────────────────────────────────────────────────┤
+│  GenomeMeta[n_rows]   72 B each                                      │
+│  sorted by oph_fingerprint                                           │
+└──────────────────────────────────────────────────────────────────────┘
+```
 
-Stores `GenomeMeta` rows in a columnar struct-of-arrays layout, sorted by `oph_fingerprint`. Row-group statistics enable predicate pushdown: scans can skip entire row groups without touching individual rows.
+Multiple CATL fragments (one per generation) are merged by `MergedCatalogReader` at read time; newer fragments take precedence on duplicate `genome_id`.
 
 ### `CatlHeader` — 32 bytes
 
@@ -123,20 +164,6 @@ Stores `GenomeMeta` rows in a columnar struct-of-arrays layout, sorted by `oph_f
 | 12 | 4 B | _reserved_ | |
 | 16 | 8 B | `stats_offset` | Byte offset of `RowGroupStatsV2[]` from section start |
 | 24 | 8 B | `rows_offset` | Byte offset of `GenomeMeta[]` from section start |
-
-### `RowGroupStatsV2` — 72 bytes each
-
-Covers a contiguous slice of `GenomeMeta` rows. Used for predicate pushdown on completeness and genome length filters.
-
-| Offset | Size | Field |
-|--------|------|-------|
-| 0 | 8 B | `min_oph` |
-| 8 | 8 B | `max_oph` |
-| 16 | 4 B | `min_completeness` |
-| 20 | 4 B | `max_completeness` |
-| 24 | 8 B | `min_genome_length` |
-| 32 | 8 B | `max_genome_length` |
-| 40 | 32 B | _reserved_ |
 
 ### `GenomeMeta` — 72 bytes each
 
@@ -150,8 +177,6 @@ Covers a contiguous slice of `GenomeMeta` rows. Used for predicate pushdown on c
 | 32 | 4 B | `n_contigs` | |
 | 36 | 4 B | `shard_id` | Which shard holds this genome |
 | 40 | 32 B | _reserved_ | |
-
-Multiple CATL fragments (one per generation) are merged by `MergedCatalogReader` at read time; newer fragments take precedence on duplicate `genome_id`.
 
 ---
 
@@ -205,7 +230,7 @@ Stores L2-normalised k=4 canonical tetranucleotide frequency vectors (136 dimens
 |--------|------|-------|-------------|
 | 0 | 32 B | `KmrxHeader` | magic, n_genomes, flags |
 | 32 | n × 8 B | `genome_ids[n]` | Sorted ascending; binary search for O(log n) lookup |
-| 32 + n×8 | n × 136 × 4 B | `profiles[n][136]` | Parallel to `genome_ids`; stored uncompressed |
+| 32 + n×8 | n × 544 B | `profiles[n][136]` | Parallel to `genome_ids`; stored uncompressed |
 
 ---
 
