@@ -45,9 +45,6 @@ markdown_extensions:
   - tables
   - attr_list
 
-extra_javascript:
-  - https://unpkg.com/mermaid@10/dist/mermaid.min.js
-
 nav:
   - Home: index.md
   - Getting Started: getting-started.md
