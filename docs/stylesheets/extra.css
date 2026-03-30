@@ -1,4 +1,7 @@
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap');
+
 /* Continuous box-drawing characters in code blocks */
 .md-typeset pre > code {
   line-height: 1.0;
+  font-family: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', monospace;
 }
