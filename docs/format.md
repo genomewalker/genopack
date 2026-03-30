@@ -8,11 +8,11 @@ A `.gpk` file is a **seekable single-file container** inspired by Parquet. Secti
 
 ```mermaid
 flowchart TB
-    fh["**FileHeader** &nbsp; 128 B\nmagic · version · UUID · timestamp · generation"]
-    shards["**SHRD × N** &nbsp; compressed genome shards\ngen 1 shards · gen 2 shards appended · ..."]
-    idx["**Index sections**\nCATL · GIDX · ACCX · CIDX · TAXN · TXDB · KMRX · HNSW · TOMB"]
-    toc["**TOC** &nbsp; zstd-compressed section descriptor table"]
-    tail["**TailLocator** &nbsp; 64 B\nfixed footer at EOF, points to TOC offset"]
+    fh["FileHeader — 128 B<br/>magic, version, UUID, timestamp, generation"]
+    shards["SHRD x N<br/>compressed genome shards, one set per generation"]
+    idx["CATL · GIDX · ACCX · CIDX<br/>TAXN · TXDB · KMRX · HNSW · TOMB"]
+    toc["TOC<br/>zstd-compressed section descriptor table"]
+    tail["TailLocator — 64 B<br/>fixed footer at EOF, points to TOC offset"]
 
     fh --> shards --> idx --> toc --> tail
 
@@ -50,11 +50,11 @@ Each shard section starts with a 128-byte `ShardHeader`, followed by the genome 
 
 ```mermaid
 flowchart TB
-    sh["**ShardHeader** &nbsp; 128 B\nmagic · version · shard_id · n_genomes · codec · dict_size\ngenome_dir_offset · dict_offset · blob_area_offset · checkpoint_area_offset"]
-    dir["**GenomeDirEntry[n_genomes]** &nbsp; 64 B each\ngenome_id · oph_fingerprint · blob_offset · blob_len_cmp · blob_len_raw\ncheckpoint_idx · n_checkpoints"]
-    dict["**zstd dictionary** &nbsp; dict_size bytes &nbsp; (optional)"]
-    blobs["**Blob area**\nblob[0] · blob[1] · ... &nbsp; (each independently decompressible)"]
-    ckpt["**CheckpointEntry[]** &nbsp; 16 B each &nbsp; (optional)\nsymbol_offset · block_offset — enables sub-genome slice"]
+    sh["ShardHeader — 128 B<br/>magic, version, shard_id, n_genomes, codec, dict_size<br/>dir_offset, dict_offset, blob_area_offset, checkpoint_area_offset"]
+    dir["GenomeDirEntry[n_genomes] — 64 B each<br/>genome_id, oph_fingerprint, blob_offset, blob_len_cmp, blob_len_raw<br/>checkpoint_idx, n_checkpoints"]
+    dict["zstd dictionary — dict_size bytes (optional)"]
+    blobs["Blob area<br/>blob[0], blob[1], ... — each independently decompressible"]
+    ckpt["CheckpointEntry[] — 16 B each (optional)<br/>symbol_offset, block_offset — enables sub-genome slice"]
 
     sh --> dir --> dict --> blobs --> ckpt
 
@@ -85,9 +85,9 @@ The catalog stores `GenomeMeta` rows in a columnar struct-of-arrays layout, sort
 
 ```mermaid
 flowchart TB
-    ch["**CatlHeader** &nbsp; 32 B\nmagic · n_rows · n_groups · stats_offset · rows_offset"]
-    rgs["**RowGroupStatsV2[n_groups]** &nbsp; 72 B each\nmin_oph · max_oph · min/max completeness · min/max genome_length\nenables predicate pushdown over row groups"]
-    rows["**GenomeMeta[n_rows]** &nbsp; 72 B each\nsorted by oph_fingerprint"]
+    ch["CatlHeader — 32 B<br/>magic, n_rows, n_groups, stats_offset, rows_offset"]
+    rgs["RowGroupStatsV2[n_groups] — 72 B each<br/>min/max oph, min/max completeness, min/max genome_length<br/>enables predicate pushdown over row groups"]
+    rows["GenomeMeta[n_rows] — 72 B each<br/>sorted by oph_fingerprint"]
 
     ch --> rgs --> rows
 
