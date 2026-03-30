@@ -2,6 +2,6 @@
 
 /* Continuous box-drawing characters in code blocks */
 .md-typeset pre > code {
-  line-height: 1.0;
+  line-height: 1.15;
   font-family: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', monospace;
 }
