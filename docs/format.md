@@ -6,6 +6,8 @@ A `.gpk` file is a seekable single-file container inspired by Parquet. The `Tail
 
 ## File layout
 
+![.gpk file layout](img/format_file_layout.svg)
+
 | Section | Size | Description |
 |---------|------|-------------|
 | `FileHeader` | 128 B | Magic, version, UUID, creation timestamp, generation counter |
@@ -48,6 +50,8 @@ A `.gpk` file is a seekable single-file container inspired by Parquet. The `Tail
 ---
 
 ## Shard section (`SHRD`)
+
+![SHRD section layout](img/format_shard_layout.svg)
 
 ### `ShardHeader` — 128 bytes
 
@@ -104,6 +108,8 @@ Checkpoints enable `genopack slice` to decompress only the blocks covering a req
 ---
 
 ## Catalog section (`CATL`)
+
+![CATL section layout](img/format_catl_layout.svg)
 
 Stores `GenomeMeta` rows in a columnar struct-of-arrays layout, sorted by `oph_fingerprint`. Row-group statistics enable predicate pushdown: scans can skip entire row groups without touching individual rows.
 
