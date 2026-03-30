@@ -88,25 +88,33 @@ A `.gpk` file is a **seekable single-file container** inspired by Parquet. Secti
 ## Shard section (`SHRD`)
 
 <div class="fmt-box">
-  <div class="fmt-row">
-    <span class="fmt-name">ShardHeader<span class="fmt-sub">magic · shard_id · n_genomes · codec · dict_size<br>dir_offset · dict_offset · blob_area_offset · checkpoint_offset</span></span>
-    <span class="fmt-size">128 B</span>
-  </div>
-  <div class="fmt-row">
-    <span class="fmt-name">GenomeDirEntry[n_genomes]<span class="fmt-sub">genome_id · oph_fingerprint · blob_offset · blob_len_cmp · blob_len_raw<br>checkpoint_idx · n_checkpoints — sorted by oph_fingerprint</span></span>
-    <span class="fmt-size">64 B × n</span>
-  </div>
-  <div class="fmt-row">
-    <span class="fmt-name" style="font-style:italic;font-weight:400">zstd dictionary (optional)<span class="fmt-sub">present only for ZSTD_DICT and REF_DICT codecs</span></span>
-    <span class="fmt-size">dict_size B</span>
-  </div>
-  <div class="fmt-row">
-    <span class="fmt-name">Blob area<span class="fmt-sub">blob[0] · blob[1] · ... — each independently decompressible</span></span>
-    <span class="fmt-size">variable</span>
-  </div>
-  <div class="fmt-row">
-    <span class="fmt-name" style="font-style:italic;font-weight:400">CheckpointEntry[] (optional)<span class="fmt-sub">symbol_offset · block_offset — enables sub-genome slice without full decompress</span></span>
-    <span class="fmt-size">16 B × n</span>
+  <div class="fmt-row parent">
+    <div class="fmt-header">
+      <span class="fmt-name">SHRD</span>
+      <span class="fmt-size">variable</span>
+    </div>
+    <div class="fmt-box">
+      <div class="fmt-row">
+        <span class="fmt-name">ShardHeader<span class="fmt-sub">magic · shard_id · n_genomes · codec · dict_size<br>dir_offset · dict_offset · blob_area_offset · checkpoint_offset</span></span>
+        <span class="fmt-size">128 B</span>
+      </div>
+      <div class="fmt-row">
+        <span class="fmt-name">GenomeDirEntry[n_genomes]<span class="fmt-sub">genome_id · oph_fingerprint · blob_offset · blob_len_cmp · blob_len_raw<br>checkpoint_idx · n_checkpoints — sorted by oph_fingerprint</span></span>
+        <span class="fmt-size">64 B × n</span>
+      </div>
+      <div class="fmt-row">
+        <span class="fmt-name" style="font-style:italic;font-weight:400">zstd dictionary<span class="fmt-sub">optional — ZSTD_DICT and REF_DICT codecs only</span></span>
+        <span class="fmt-size">dict_size B</span>
+      </div>
+      <div class="fmt-row">
+        <span class="fmt-name">Blob area<span class="fmt-sub">blob[0] · blob[1] · ... — each independently decompressible</span></span>
+        <span class="fmt-size">variable</span>
+      </div>
+      <div class="fmt-row">
+        <span class="fmt-name" style="font-style:italic;font-weight:400">CheckpointEntry[]<span class="fmt-sub">optional — symbol_offset · block_offset · enables sub-genome slice</span></span>
+        <span class="fmt-size">16 B × n</span>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -163,17 +171,25 @@ Genomes are sorted by `oph_fingerprint` within each shard. Nearby OPH values ind
 ## Catalog section (`CATL`)
 
 <div class="fmt-box">
-  <div class="fmt-row">
-    <span class="fmt-name">CatlHeader<span class="fmt-sub">magic · n_rows · n_groups · stats_offset · rows_offset</span></span>
-    <span class="fmt-size">32 B</span>
-  </div>
-  <div class="fmt-row">
-    <span class="fmt-name">RowGroupStatsV2[n_groups]<span class="fmt-sub">min/max oph · min/max completeness · min/max genome_length<br>enables predicate pushdown — skip entire groups without row scan</span></span>
-    <span class="fmt-size">72 B × n</span>
-  </div>
-  <div class="fmt-row">
-    <span class="fmt-name">GenomeMeta[n_rows]<span class="fmt-sub">sorted by oph_fingerprint</span></span>
-    <span class="fmt-size">72 B × n</span>
+  <div class="fmt-row parent">
+    <div class="fmt-header">
+      <span class="fmt-name">CATL</span>
+      <span class="fmt-size">variable</span>
+    </div>
+    <div class="fmt-box">
+      <div class="fmt-row">
+        <span class="fmt-name">CatlHeader<span class="fmt-sub">magic · n_rows · n_groups · stats_offset · rows_offset</span></span>
+        <span class="fmt-size">32 B</span>
+      </div>
+      <div class="fmt-row">
+        <span class="fmt-name">RowGroupStatsV2[n_groups]<span class="fmt-sub">min/max oph · min/max completeness · min/max genome_length<br>enables predicate pushdown — skip entire groups without row scan</span></span>
+        <span class="fmt-size">72 B × n</span>
+      </div>
+      <div class="fmt-row">
+        <span class="fmt-name">GenomeMeta[n_rows]<span class="fmt-sub">sorted by oph_fingerprint</span></span>
+        <span class="fmt-size">72 B × n</span>
+      </div>
+    </div>
   </div>
 </div>
 
