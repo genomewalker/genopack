@@ -7,19 +7,20 @@ A `.gpk` file is a **seekable single-file container** inspired by Parquet. Secti
 ## File layout
 
 ```mermaid
-block-beta
-  columns 1
-  fh["FileHeader — 128 B\nmagic · version · UUID · timestamp · generation"]
-  shards["SHRD x N — compressed genome shards\ngen 1 shards | gen 2 shards (appended) | ..."]
-  idx["CATL · GIDX · ACCX · CIDX · TAXN · TXDB · KMRX · HNSW · TOMB\nindex and metadata sections"]
-  toc["TOC — zstd-compressed section descriptor table"]
-  tail["TailLocator — 64 B — fixed footer at EOF, points to TOC offset"]
+flowchart TB
+    fh["**FileHeader** &nbsp; 128 B\nmagic · version · UUID · timestamp · generation"]
+    shards["**SHRD × N** &nbsp; compressed genome shards\ngen 1 shards · gen 2 shards appended · ..."]
+    idx["**Index sections**\nCATL · GIDX · ACCX · CIDX · TAXN · TXDB · KMRX · HNSW · TOMB"]
+    toc["**TOC** &nbsp; zstd-compressed section descriptor table"]
+    tail["**TailLocator** &nbsp; 64 B\nfixed footer at EOF, points to TOC offset"]
 
-  style fh    fill:#1e6e8c,color:#fff,stroke:none
-  style shards fill:#2d7a4f,color:#fff,stroke:none
-  style idx   fill:#6b4c96,color:#fff,stroke:none
-  style toc   fill:#8c6b1e,color:#fff,stroke:none
-  style tail  fill:#1e6e8c,color:#fff,stroke:none
+    fh --> shards --> idx --> toc --> tail
+
+    style fh     fill:#1a6e8c,color:#fff,stroke:none
+    style shards fill:#2d7a4f,color:#fff,stroke:none
+    style idx    fill:#6b4c96,color:#fff,stroke:none
+    style toc    fill:#8c6b1e,color:#fff,stroke:none
+    style tail   fill:#1a6e8c,color:#fff,stroke:none
 ```
 
 Old generation shards are never rewritten; each `add` or `repack` appends new shard sections and writes a fresh TOC.
@@ -48,19 +49,20 @@ Old generation shards are never rewritten; each `add` or `repack` appends new sh
 Each shard section starts with a 128-byte `ShardHeader`, followed by the genome directory, an optional dictionary, and the blob area.
 
 ```mermaid
-block-beta
-  columns 1
-  sh["ShardHeader — 128 B\nmagic · version · shard_id · n_genomes · codec · dict_size\ngenome_dir_offset · dict_offset · blob_area_offset · checkpoint_area_offset"]
-  dir["GenomeDirEntry[n_genomes] — 64 B each\ngenome_id · oph_fingerprint · blob_offset · blob_len_cmp · blob_len_raw\ncheckpoint_idx · n_checkpoints"]
-  dict["zstd dictionary — dict_size bytes (optional)"]
-  blobs["Blob area\nblob[0] · blob[1] · ... (each independently decompressible)"]
-  ckpt["CheckpointEntry[] — 16 B each (optional)\nsymbol_offset · block_offset — enables sub-genome slice"]
+flowchart TB
+    sh["**ShardHeader** &nbsp; 128 B\nmagic · version · shard_id · n_genomes · codec · dict_size\ngenome_dir_offset · dict_offset · blob_area_offset · checkpoint_area_offset"]
+    dir["**GenomeDirEntry[n_genomes]** &nbsp; 64 B each\ngenome_id · oph_fingerprint · blob_offset · blob_len_cmp · blob_len_raw\ncheckpoint_idx · n_checkpoints"]
+    dict["**zstd dictionary** &nbsp; dict_size bytes &nbsp; (optional)"]
+    blobs["**Blob area**\nblob[0] · blob[1] · ... &nbsp; (each independently decompressible)"]
+    ckpt["**CheckpointEntry[]** &nbsp; 16 B each &nbsp; (optional)\nsymbol_offset · block_offset — enables sub-genome slice"]
 
-  style sh    fill:#1e6e8c,color:#fff,stroke:none
-  style dir   fill:#2d7a4f,color:#fff,stroke:none
-  style dict  fill:#555,color:#fff,stroke:none
-  style blobs fill:#6b4c96,color:#fff,stroke:none
-  style ckpt  fill:#8c6b1e,color:#fff,stroke:none
+    sh --> dir --> dict --> blobs --> ckpt
+
+    style sh    fill:#1a6e8c,color:#fff,stroke:none
+    style dir   fill:#2d7a4f,color:#fff,stroke:none
+    style dict  fill:#4a4a4a,color:#fff,stroke:none
+    style blobs fill:#6b4c96,color:#fff,stroke:none
+    style ckpt  fill:#8c6b1e,color:#fff,stroke:none
 ```
 
 Genomes are sorted by `oph_fingerprint` within each shard. Nearby OPH values indicate similar k-mer content, which maximises zstd LDM reuse and shared dictionary effectiveness.
@@ -82,15 +84,16 @@ Genomes are sorted by `oph_fingerprint` within each shard. Nearby OPH values ind
 The catalog stores `GenomeMeta` rows in a columnar struct-of-arrays layout, sorted by `oph_fingerprint`. Row-group statistics (min/max OPH, completeness, genome_length) enable predicate pushdown - scans can skip entire row groups without accessing individual rows.
 
 ```mermaid
-block-beta
-  columns 1
-  ch["CatlHeader — 32 B\nmagic · n_rows · n_groups · stats_offset · rows_offset"]
-  rgs["RowGroupStatsV2[n_groups] — 72 B each\nmin_oph · max_oph · min_completeness · max_completeness · min_length · max_length"]
-  rows["GenomeMeta[n_rows] — 72 B each\nsorted by oph_fingerprint"]
+flowchart TB
+    ch["**CatlHeader** &nbsp; 32 B\nmagic · n_rows · n_groups · stats_offset · rows_offset"]
+    rgs["**RowGroupStatsV2[n_groups]** &nbsp; 72 B each\nmin_oph · max_oph · min/max completeness · min/max genome_length\nenables predicate pushdown over row groups"]
+    rows["**GenomeMeta[n_rows]** &nbsp; 72 B each\nsorted by oph_fingerprint"]
 
-  style ch   fill:#1e6e8c,color:#fff,stroke:none
-  style rgs  fill:#2d7a4f,color:#fff,stroke:none
-  style rows fill:#6b4c96,color:#fff,stroke:none
+    ch --> rgs --> rows
+
+    style ch   fill:#1a6e8c,color:#fff,stroke:none
+    style rgs  fill:#2d7a4f,color:#fff,stroke:none
+    style rows fill:#6b4c96,color:#fff,stroke:none
 ```
 
 Multiple CATL fragments (one per generation) are merged by `MergedCatalogReader` at read time; newer fragments take precedence on duplicate `genome_id`.
