@@ -1,7 +1,51 @@
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap');
+/* File format layout boxes */
+.fmt-box {
+  border: 1px solid var(--md-default-fg-color--lighter);
+  border-radius: 4px;
+  font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+  font-size: 0.82em;
+  margin: 1.2em 0;
+  overflow: hidden;
+}
 
-/* Continuous box-drawing characters in code blocks */
-.md-typeset pre > code {
-  line-height: 1.15;
-  font-family: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', monospace;
+.fmt-row {
+  display: flex;
+  align-items: baseline;
+  padding: 5px 14px;
+  border-bottom: 1px solid var(--md-default-fg-color--lighter);
+  gap: 1em;
+}
+
+.fmt-row:last-child {
+  border-bottom: none;
+}
+
+.fmt-row.divider {
+  border-top: 2px solid var(--md-default-fg-color--light);
+}
+
+.fmt-name {
+  flex: 1;
+  font-weight: 600;
+  color: var(--md-default-fg-color);
+}
+
+.fmt-size {
+  white-space: nowrap;
+  color: var(--md-default-fg-color--light);
+  font-size: 0.9em;
+}
+
+.fmt-desc {
+  color: var(--md-default-fg-color--light);
+  font-size: 0.9em;
+  flex: 2;
+}
+
+.fmt-sub {
+  display: block;
+  font-size: 0.88em;
+  font-weight: 400;
+  color: var(--md-default-fg-color--light);
+  margin-top: 1px;
 }
