@@ -1,0 +1,1557 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="High-performance single-file genome archive for large-scale microbial collections">
+      
+      
+      
+        <link rel="canonical" href="https://genomewalker.github.io/genopack/format/">
+      
+      
+        <link rel="prev" href="../cli/">
+      
+      
+        <link rel="next" href="../changelog/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+    
+    
+      
+        <title>Format - genopack</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.484c7ddc.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../stylesheets/extra.css">
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="teal" data-md-color-accent="teal">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#binary-format" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+<header class="md-header" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="genopack" class="md-header__button md-logo" aria-label="genopack" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            genopack
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Format
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="default" data-md-color-primary="teal" data-md-color-accent="teal"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a4 4 0 0 0-4 4 4 4 0 0 0 4 4 4 4 0 0 0 4-4 4 4 0 0 0-4-4m0 10a6 6 0 0 1-6-6 6 6 0 0 1 6-6 6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="slate" data-md-color-primary="teal" data-md-color-accent="teal"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 18c-.89 0-1.74-.2-2.5-.55C11.56 16.5 13 14.42 13 12s-1.44-4.5-3.5-5.45C10.26 6.2 11.11 6 12 6a6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/genomewalker/genopack" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    genomewalker/genopack
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+            
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href=".." class="md-tabs__link">
+        
+  
+  
+    
+  
+  Home
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../getting-started/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Getting Started
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../api/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  API Reference
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../cli/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  CLI Reference
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+    
+  
+  
+    <li class="md-tabs__item md-tabs__item--active">
+      <a href="./" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Format
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../changelog/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Changelog
+
+      </a>
+    </li>
+  
+
+      
+    </ul>
+  </div>
+</nav>
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+  
+
+<nav class="md-nav md-nav--primary md-nav--lifted md-nav--integrated" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="genopack" class="md-nav__button md-logo" aria-label="genopack" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    genopack
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/genomewalker/genopack" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    genomewalker/genopack
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../getting-started/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting Started
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../api/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    API Reference
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../cli/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CLI Reference
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Format
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Format
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#file-layout" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        File layout
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#section-types" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Section types
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#fileheader-128-bytes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        FileHeader — 128 bytes
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#shard-section-shrd" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Shard section (SHRD)
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Shard section (SHRD)">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#shardheader-128-bytes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        ShardHeader — 128 bytes
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#genomedirentry-64-bytes-each" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        GenomeDirEntry — 64 bytes each
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#checkpointentry-16-bytes-each-optional" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        CheckpointEntry — 16 bytes each (optional)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#codec-values" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Codec values
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#catalog-section-catl" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Catalog section (CATL)
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Catalog section (CATL)">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#catlheader-32-bytes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        CatlHeader — 32 bytes
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#genomemeta-72-bytes-each" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        GenomeMeta — 72 bytes each
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#genome-index-gidx" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Genome index (GIDX)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#toc-and-taillocator" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        TOC and TailLocator
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="TOC and TailLocator">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#sectiondesc" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        SectionDesc
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#open-sequence" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Open sequence
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#versioning" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Versioning
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#kmrx-section" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        KMRX section
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#hnsw-section" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        HNSW section
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../changelog/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Changelog
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="binary-format">Binary Format</h1>
+<p>A <code>.gpk</code> file is a <strong>seekable single-file container</strong> inspired by Parquet. Sections can be appended without rewriting existing data, and the TOC at the end is updated with each generation. A 64-byte <code>TailLocator</code> at EOF points to the current TOC, allowing the reader to open the archive with two seeks.</p>
+<hr />
+<h2 id="file-layout">File layout</h2>
+<div class="fmt-box">
+  <div class="fmt-row">
+    <span class="fmt-name">FileHeader<span class="fmt-sub">magic · version · UUID · created_ts · generation</span></span>
+    <span class="fmt-size">128 B</span>
+  </div>
+  <div class="fmt-row">
+    <span class="fmt-name">SHRD × N<span class="fmt-sub">compressed genome shards — each generation appended, old shards untouched</span></span>
+    <span class="fmt-size">variable</span>
+  </div>
+  <div class="fmt-row divider">
+    <span class="fmt-name">CATL<span class="fmt-sub">columnar genome metadata (SoA, sorted by oph_fingerprint)</span></span>
+    <span class="fmt-desc"></span>
+  </div>
+  <div class="fmt-row">
+    <span class="fmt-name">GIDX<span class="fmt-sub">genome_id → (section_id, dir_index, catl_row)</span></span>
+  </div>
+  <div class="fmt-row">
+    <span class="fmt-name">ACCX<span class="fmt-sub">FNV-1a hash table: accession → genome_id</span></span>
+  </div>
+  <div class="fmt-row">
+    <span class="fmt-name">CIDX<span class="fmt-sub">sorted (FNV-1a-64(contig), genome_id) array</span></span>
+  </div>
+  <div class="fmt-row">
+    <span class="fmt-name">TAXN<span class="fmt-sub">FNV-1a hash table: accession → lineage string</span></span>
+  </div>
+  <div class="fmt-row">
+    <span class="fmt-name">TXDB<span class="fmt-sub">full taxonomy tree (taxid/parent/rank/name + acc→taxid)</span></span>
+  </div>
+  <div class="fmt-row">
+    <span class="fmt-name">KMRX<span class="fmt-sub">float[n × 136] L2-normalised k=4 tetranucleotide profiles</span></span>
+  </div>
+  <div class="fmt-row">
+    <span class="fmt-name">HNSW<span class="fmt-sub">hnswlib serialised blob + label map</span></span>
+  </div>
+  <div class="fmt-row">
+    <span class="fmt-name">TOMB<span class="fmt-sub">tombstone records for soft-deleted genomes</span></span>
+  </div>
+  <div class="fmt-row divider">
+    <span class="fmt-name">TOC<span class="fmt-sub">zstd-compressed SectionDesc[] — one record per section</span></span>
+  </div>
+  <div class="fmt-row">
+    <span class="fmt-name">TailLocator<span class="fmt-sub">fixed footer at EOF, points to TOC offset</span></span>
+    <span class="fmt-size">64 B</span>
+  </div>
+</div>
+
+<hr />
+<h2 id="section-types">Section types</h2>
+<table>
+<thead>
+<tr>
+<th>Magic</th>
+<th>Name</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>SHRD</code></td>
+<td>Shard</td>
+<td>Compressed genome blobs and directory</td>
+</tr>
+<tr>
+<td><code>CATL</code></td>
+<td>Catalog</td>
+<td>Columnar genome metadata (SoA, sorted by oph)</td>
+</tr>
+<tr>
+<td><code>GIDX</code></td>
+<td>Genome index</td>
+<td>genome_id to (section_id, dir_index, catl_row)</td>
+</tr>
+<tr>
+<td><code>ACCX</code></td>
+<td>Accession index</td>
+<td>FNV-1a hash table: accession string to genome_id</td>
+</tr>
+<tr>
+<td><code>CIDX</code></td>
+<td>Contig index</td>
+<td>Sorted (FNV-1a-64(contig_acc), genome_id) array</td>
+</tr>
+<tr>
+<td><code>TAXN</code></td>
+<td>Taxonomy strings</td>
+<td>FNV-1a hash table: accession to lineage string</td>
+</tr>
+<tr>
+<td><code>TXDB</code></td>
+<td>Taxonomy tree</td>
+<td>Parsed taxid/parent/rank/name nodes + acc-to-taxid table</td>
+</tr>
+<tr>
+<td><code>KMRX</code></td>
+<td>K-mer profiles</td>
+<td>float[n × 136] L2-normalised k=4 tetranucleotide frequencies</td>
+</tr>
+<tr>
+<td><code>HNSW</code></td>
+<td>HNSW index</td>
+<td>hnswlib serialised blob + label map (genome_id per vector)</td>
+</tr>
+<tr>
+<td><code>TOMB</code></td>
+<td>Tombstone</td>
+<td>Soft-deleted genome_id records</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="fileheader-128-bytes"><code>FileHeader</code> — 128 bytes</h2>
+<table>
+<thead>
+<tr>
+<th>Offset</th>
+<th>Size</th>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td>4 B</td>
+<td><code>magic</code></td>
+<td><code>GPK\x01</code></td>
+</tr>
+<tr>
+<td>4</td>
+<td>2 B</td>
+<td><code>version_major</code></td>
+<td>Breaking format change</td>
+</tr>
+<tr>
+<td>6</td>
+<td>2 B</td>
+<td><code>version_minor</code></td>
+<td>Backward-compatible extension</td>
+</tr>
+<tr>
+<td>8</td>
+<td>16 B</td>
+<td><code>uuid</code></td>
+<td>Archive UUID (stable across generations)</td>
+</tr>
+<tr>
+<td>24</td>
+<td>8 B</td>
+<td><code>created_ts</code></td>
+<td>Unix timestamp of initial build</td>
+</tr>
+<tr>
+<td>32</td>
+<td>8 B</td>
+<td><code>generation</code></td>
+<td>Monotonically incremented on each <code>add</code>/<code>rm</code>/<code>repack</code></td>
+</tr>
+<tr>
+<td>40</td>
+<td>88 B</td>
+<td><em>reserved</em></td>
+<td>Zero-padded</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="shard-section-shrd">Shard section (<code>SHRD</code>)</h2>
+<div class="fmt-box">
+  <div class="fmt-row parent">
+    <div class="fmt-header">
+      <span class="fmt-name">SHRD</span>
+      <span class="fmt-size">variable</span>
+    </div>
+    <div class="fmt-box">
+      <div class="fmt-row">
+        <span class="fmt-name">ShardHeader<span class="fmt-sub">magic · shard_id · n_genomes · codec · dict_size<br>dir_offset · dict_offset · blob_area_offset · checkpoint_offset</span></span>
+        <span class="fmt-size">128 B</span>
+      </div>
+      <div class="fmt-row">
+        <span class="fmt-name">GenomeDirEntry[n_genomes]<span class="fmt-sub">genome_id · oph_fingerprint · blob_offset · blob_len_cmp · blob_len_raw<br>checkpoint_idx · n_checkpoints — sorted by oph_fingerprint</span></span>
+        <span class="fmt-size">64 B × n</span>
+      </div>
+      <div class="fmt-row">
+        <span class="fmt-name" style="font-style:italic;font-weight:400">zstd dictionary<span class="fmt-sub">optional — ZSTD_DICT and REF_DICT codecs only</span></span>
+        <span class="fmt-size">dict_size B</span>
+      </div>
+      <div class="fmt-row">
+        <span class="fmt-name">Blob area<span class="fmt-sub">blob[0] · blob[1] · ... — each independently decompressible</span></span>
+        <span class="fmt-size">variable</span>
+      </div>
+      <div class="fmt-row">
+        <span class="fmt-name" style="font-style:italic;font-weight:400">CheckpointEntry[]<span class="fmt-sub">optional — symbol_offset · block_offset · enables sub-genome slice</span></span>
+        <span class="fmt-size">16 B × n</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<p>Genomes are sorted by <code>oph_fingerprint</code> within each shard. Nearby OPH values indicate similar k-mer content, maximising zstd LDM reuse and shared dictionary effectiveness.</p>
+<h3 id="shardheader-128-bytes"><code>ShardHeader</code> — 128 bytes</h3>
+<table>
+<thead>
+<tr>
+<th>Offset</th>
+<th>Size</th>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td>4 B</td>
+<td><code>magic</code></td>
+<td><code>SHRD</code></td>
+</tr>
+<tr>
+<td>4</td>
+<td>2 B</td>
+<td><code>version</code></td>
+<td></td>
+</tr>
+<tr>
+<td>6</td>
+<td>2 B</td>
+<td><code>codec</code></td>
+<td>Compression codec (see table below)</td>
+</tr>
+<tr>
+<td>8</td>
+<td>8 B</td>
+<td><code>shard_id</code></td>
+<td>Unique shard identifier</td>
+</tr>
+<tr>
+<td>16</td>
+<td>4 B</td>
+<td><code>n_genomes</code></td>
+<td>Number of genomes in this shard</td>
+</tr>
+<tr>
+<td>20</td>
+<td>4 B</td>
+<td><code>dict_size</code></td>
+<td>Dictionary size in bytes (0 if none)</td>
+</tr>
+<tr>
+<td>24</td>
+<td>8 B</td>
+<td><code>genome_dir_offset</code></td>
+<td>Byte offset of <code>GenomeDirEntry[]</code> from section start</td>
+</tr>
+<tr>
+<td>32</td>
+<td>8 B</td>
+<td><code>dict_offset</code></td>
+<td>Byte offset of zstd dictionary</td>
+</tr>
+<tr>
+<td>40</td>
+<td>8 B</td>
+<td><code>blob_area_offset</code></td>
+<td>Byte offset of blob area</td>
+</tr>
+<tr>
+<td>48</td>
+<td>8 B</td>
+<td><code>checkpoint_area_offset</code></td>
+<td>Byte offset of <code>CheckpointEntry[]</code> (0 if none)</td>
+</tr>
+<tr>
+<td>56</td>
+<td>72 B</td>
+<td><em>reserved</em></td>
+<td>Zero-padded</td>
+</tr>
+</tbody>
+</table>
+<h3 id="genomedirentry-64-bytes-each"><code>GenomeDirEntry</code> — 64 bytes each</h3>
+<table>
+<thead>
+<tr>
+<th>Offset</th>
+<th>Size</th>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td>8 B</td>
+<td><code>genome_id</code></td>
+<td></td>
+</tr>
+<tr>
+<td>8</td>
+<td>8 B</td>
+<td><code>oph_fingerprint</code></td>
+<td>Order-preserving hash; entries sorted by this value</td>
+</tr>
+<tr>
+<td>16</td>
+<td>8 B</td>
+<td><code>blob_offset</code></td>
+<td>Byte offset of compressed blob from blob area start</td>
+</tr>
+<tr>
+<td>24</td>
+<td>8 B</td>
+<td><code>blob_len_cmp</code></td>
+<td>Compressed size in bytes</td>
+</tr>
+<tr>
+<td>32</td>
+<td>8 B</td>
+<td><code>blob_len_raw</code></td>
+<td>Uncompressed size in bytes</td>
+</tr>
+<tr>
+<td>40</td>
+<td>4 B</td>
+<td><code>checkpoint_idx</code></td>
+<td>Index into <code>CheckpointEntry[]</code> for first checkpoint</td>
+</tr>
+<tr>
+<td>44</td>
+<td>4 B</td>
+<td><code>n_checkpoints</code></td>
+<td>Number of checkpoints (0 if slice not needed)</td>
+</tr>
+<tr>
+<td>48</td>
+<td>16 B</td>
+<td><em>reserved</em></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<h3 id="checkpointentry-16-bytes-each-optional"><code>CheckpointEntry</code> — 16 bytes each (optional)</h3>
+<table>
+<thead>
+<tr>
+<th>Offset</th>
+<th>Size</th>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td>8 B</td>
+<td><code>symbol_offset</code></td>
+<td>Byte offset within the decompressed genome at this checkpoint</td>
+</tr>
+<tr>
+<td>8</td>
+<td>8 B</td>
+<td><code>block_offset</code></td>
+<td>Byte offset of the corresponding zstd block within the blob</td>
+</tr>
+</tbody>
+</table>
+<h3 id="codec-values">Codec values</h3>
+<table>
+<thead>
+<tr>
+<th>Value</th>
+<th>Name</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td><code>PLAIN</code></td>
+<td>Each blob is independent zstd</td>
+</tr>
+<tr>
+<td>1</td>
+<td><code>ZSTD_DICT</code></td>
+<td>Shared dictionary trained on first N genomes</td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>REF_DICT</code></td>
+<td>First genome used as reference content dictionary</td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>DELTA</code></td>
+<td>Non-reference blobs zstd-compressed with <code>refPrefix</code> from genome 0</td>
+</tr>
+<tr>
+<td>4</td>
+<td><code>MEM_DELTA</code></td>
+<td>Seed with k=31 k-mers; store MEM list + zstd verbatim residue</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="catalog-section-catl">Catalog section (<code>CATL</code>)</h2>
+<div class="fmt-box">
+  <div class="fmt-row parent">
+    <div class="fmt-header">
+      <span class="fmt-name">CATL</span>
+      <span class="fmt-size">variable</span>
+    </div>
+    <div class="fmt-box">
+      <div class="fmt-row">
+        <span class="fmt-name">CatlHeader<span class="fmt-sub">magic · n_rows · n_groups · stats_offset · rows_offset</span></span>
+        <span class="fmt-size">32 B</span>
+      </div>
+      <div class="fmt-row">
+        <span class="fmt-name">RowGroupStatsV2[n_groups]<span class="fmt-sub">min/max oph · min/max completeness · min/max genome_length<br>enables predicate pushdown — skip entire groups without row scan</span></span>
+        <span class="fmt-size">72 B × n</span>
+      </div>
+      <div class="fmt-row">
+        <span class="fmt-name">GenomeMeta[n_rows]<span class="fmt-sub">sorted by oph_fingerprint</span></span>
+        <span class="fmt-size">72 B × n</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<p>Multiple CATL fragments (one per generation) are merged by <code>MergedCatalogReader</code> at read time; newer fragments take precedence on duplicate <code>genome_id</code>.</p>
+<h3 id="catlheader-32-bytes"><code>CatlHeader</code> — 32 bytes</h3>
+<table>
+<thead>
+<tr>
+<th>Offset</th>
+<th>Size</th>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td>4 B</td>
+<td><code>magic</code></td>
+<td><code>CATL</code></td>
+</tr>
+<tr>
+<td>4</td>
+<td>4 B</td>
+<td><code>n_rows</code></td>
+<td>Total number of <code>GenomeMeta</code> rows</td>
+</tr>
+<tr>
+<td>8</td>
+<td>4 B</td>
+<td><code>n_groups</code></td>
+<td>Number of row groups</td>
+</tr>
+<tr>
+<td>12</td>
+<td>4 B</td>
+<td><em>reserved</em></td>
+<td></td>
+</tr>
+<tr>
+<td>16</td>
+<td>8 B</td>
+<td><code>stats_offset</code></td>
+<td>Byte offset of <code>RowGroupStatsV2[]</code> from section start</td>
+</tr>
+<tr>
+<td>24</td>
+<td>8 B</td>
+<td><code>rows_offset</code></td>
+<td>Byte offset of <code>GenomeMeta[]</code> from section start</td>
+</tr>
+</tbody>
+</table>
+<h3 id="genomemeta-72-bytes-each"><code>GenomeMeta</code> — 72 bytes each</h3>
+<table>
+<thead>
+<tr>
+<th>Offset</th>
+<th>Size</th>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td>8 B</td>
+<td><code>genome_id</code></td>
+<td></td>
+</tr>
+<tr>
+<td>8</td>
+<td>8 B</td>
+<td><code>oph_fingerprint</code></td>
+<td></td>
+</tr>
+<tr>
+<td>16</td>
+<td>4 B</td>
+<td><code>completeness</code></td>
+<td>CheckM completeness × 100 (fixed-point)</td>
+</tr>
+<tr>
+<td>20</td>
+<td>4 B</td>
+<td><code>contamination</code></td>
+<td>CheckM contamination × 100</td>
+</tr>
+<tr>
+<td>24</td>
+<td>8 B</td>
+<td><code>genome_length</code></td>
+<td>Total assembly length in bp</td>
+</tr>
+<tr>
+<td>32</td>
+<td>4 B</td>
+<td><code>n_contigs</code></td>
+<td></td>
+</tr>
+<tr>
+<td>36</td>
+<td>4 B</td>
+<td><code>shard_id</code></td>
+<td>Which shard holds this genome</td>
+</tr>
+<tr>
+<td>40</td>
+<td>32 B</td>
+<td><em>reserved</em></td>
+<td></td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="genome-index-gidx">Genome index (<code>GIDX</code>)</h2>
+<p>A flat array of fixed-size records sorted by <code>genome_id</code>, enabling O(log n) binary search. Each record maps:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>genome_id  -&gt;  (section_id, dir_index, catl_row_index)
+</code></pre></div>
+<p><code>section_id</code> is resolved via the TOC to find the shard's file offset. <code>dir_index</code> is the entry's position in <code>GenomeDirEntry[]</code>. <code>catl_row_index</code> is the row in the merged catalog.</p>
+<hr />
+<h2 id="toc-and-taillocator">TOC and TailLocator</h2>
+<p>The TOC is a zstd-compressed array of <code>SectionDesc</code> records.</p>
+<h3 id="sectiondesc"><code>SectionDesc</code></h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="k">struct</span><span class="w"> </span><span class="nc">SectionDesc</span><span class="w"> </span><span class="p">{</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">    </span><span class="kt">uint32_t</span><span class="w"> </span><span class="n">type</span><span class="p">;</span><span class="w">              </span><span class="c1">// section magic (e.g. SEC_SHRD)</span>
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="w">    </span><span class="kt">uint16_t</span><span class="w"> </span><span class="n">version</span><span class="p">;</span>
+<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="w">    </span><span class="kt">uint16_t</span><span class="w"> </span><span class="n">flags</span><span class="p">;</span>
+<a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="w">    </span><span class="kt">uint64_t</span><span class="w"> </span><span class="n">section_id</span><span class="p">;</span><span class="w">        </span><span class="c1">// unique, monotonically increasing</span>
+<a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="w">    </span><span class="kt">uint64_t</span><span class="w"> </span><span class="n">file_offset</span><span class="p">;</span>
+<a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="w">    </span><span class="kt">uint64_t</span><span class="w"> </span><span class="n">compressed_size</span><span class="p">;</span>
+<a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="w">    </span><span class="kt">uint64_t</span><span class="w"> </span><span class="n">uncompressed_size</span><span class="p">;</span>
+<a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="w">    </span><span class="kt">uint64_t</span><span class="w"> </span><span class="n">item_count</span><span class="p">;</span><span class="w">        </span><span class="c1">// genomes in a shard, rows in a catalog, etc.</span>
+<a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a><span class="w">    </span><span class="kt">uint64_t</span><span class="w"> </span><span class="n">aux0</span><span class="p">;</span><span class="w">              </span><span class="c1">// type-specific (shard_id for SHRD)</span>
+<a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a><span class="w">    </span><span class="kt">uint64_t</span><span class="w"> </span><span class="n">aux1</span><span class="p">;</span>
+<a id="__codelineno-1-12" name="__codelineno-1-12" href="#__codelineno-1-12"></a><span class="w">    </span><span class="kt">uint8_t</span><span class="w">  </span><span class="n">checksum</span><span class="p">[</span><span class="mi">16</span><span class="p">];</span>
+<a id="__codelineno-1-13" name="__codelineno-1-13" href="#__codelineno-1-13"></a><span class="p">};</span>
+</code></pre></div>
+<h3 id="open-sequence">Open sequence</h3>
+<ol>
+<li><code>lseek(-64, SEEK_END)</code> — read the 64-byte <code>TailLocator</code></li>
+<li><code>lseek(toc_offset, SEEK_SET)</code> — read and decompress the TOC</li>
+<li>Parse <code>SectionDesc[]</code> — mmap the entire file</li>
+</ol>
+<hr />
+<h2 id="versioning">Versioning</h2>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>FileHeader.version_major</code></td>
+<td>Breaking format change</td>
+</tr>
+<tr>
+<td><code>FileHeader.version_minor</code></td>
+<td>Backward-compatible extension</td>
+</tr>
+<tr>
+<td><code>FileHeader.generation</code></td>
+<td>Monotonically incremented on each <code>add</code>/<code>rm</code>/<code>repack</code></td>
+</tr>
+<tr>
+<td><code>SectionDesc.version</code></td>
+<td>Per-section format version (e.g. shard v4 added checkpoints)</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="kmrx-section">KMRX section</h2>
+<p>Stores L2-normalised k=4 canonical tetranucleotide frequency vectors (136 dimensions; reverse-complement collapsing reduces unique k-mers from 256 to 136).</p>
+<table>
+<thead>
+<tr>
+<th>Offset</th>
+<th>Size</th>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td>32 B</td>
+<td><code>KmrxHeader</code></td>
+<td>magic, n_genomes, flags</td>
+</tr>
+<tr>
+<td>32</td>
+<td>n × 8 B</td>
+<td><code>genome_ids[n]</code></td>
+<td>Sorted ascending; binary search for O(log n) lookup</td>
+</tr>
+<tr>
+<td>32 + n×8</td>
+<td>n × 544 B</td>
+<td><code>profiles[n][136]</code></td>
+<td>Parallel to <code>genome_ids</code>; stored uncompressed</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="hnsw-section">HNSW section</h2>
+<p>Embeds a serialised <a href="https://github.com/nmslib/hnswlib">hnswlib</a> index blob. Default build parameters: M=16, efConstruction=200.</p>
+<table>
+<thead>
+<tr>
+<th>Offset</th>
+<th>Size</th>
+<th>Field</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>0</td>
+<td>64 B</td>
+<td><code>HnswSectionHeader</code></td>
+<td>magic, n_elements, M, efConstruction</td>
+</tr>
+<tr>
+<td>64</td>
+<td>variable</td>
+<td>hnswlib blob</td>
+<td>Serialised hnswlib index</td>
+</tr>
+<tr>
+<td>64 + blob</td>
+<td>n × 8 B</td>
+<td><code>label_map[n]</code></td>
+<td>Translates hnswlib internal label i to <code>genome_id</code></td>
+</tr>
+</tbody>
+</table>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.tabs", "navigation.sections", "navigation.top", "navigation.indexes", "content.code.copy", "toc.integrate", "search.highlight"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.79ae519e.min.js"></script>
+      
+    
+  </body>
+</html>
