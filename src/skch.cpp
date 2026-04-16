@@ -877,7 +877,7 @@ SectionDesc SkchWriterMultiK::finalize(AppendWriter& writer, uint64_t section_id
     writer.seek_to(section_end);
 
     SectionDesc desc{};
-    desc.type              = SEC_SKCH_V3;
+    desc.type              = SEC_SKCH;
     desc.version           = 3;
     desc.section_id        = section_id;
     desc.file_offset       = section_start;

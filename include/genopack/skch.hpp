@@ -219,10 +219,17 @@ public:
     std::optional<SketchResult> sketch_for(GenomeId genome_id,
                                            uint32_t k, uint32_t requested_sz) const;
 
-    uint32_t n_genomes()    const { return n_genomes_; }
-    uint32_t sketch_size()  const { return sketch_size_; }
-    uint32_t kmer_size()    const { return kmer_size_; }   // first k (compat)
-    uint32_t n_kmer_sizes() const { return n_kmer_sizes_; }
+    uint32_t version()        const { return version_; }
+    uint32_t n_genomes()      const { return n_genomes_; }
+    uint32_t sketch_size()    const { return sketch_size_; }
+    uint32_t kmer_size()      const { return kmer_size_; }   // first k (compat)
+    uint32_t n_kmer_sizes()   const { return n_kmer_sizes_; }
+    uint32_t kmer_size_at(uint32_t i) const { return (i < n_kmer_sizes_) ? kmer_sizes_[i] : 0; }
+    uint32_t syncmer_s()  const { return syncmer_s_; }
+    uint64_t seed1()      const { return seed1_; }
+    uint64_t seed2()      const { return seed2_; }
+    // Sorted genome_id index (available without full decompression).
+    const std::vector<uint64_t>& genome_ids() const { return id_index_; }
 
     // True if this section stores sketches for k (v1: kmer_size_==k; v2: k in kmer_sizes_[]).
     bool has_kmer_size(uint32_t k) const;
