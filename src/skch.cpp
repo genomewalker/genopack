@@ -600,20 +600,9 @@ void SkchReader::sketch_for_ids(const std::vector<GenomeId>& sorted_ids,
                                  uint32_t k, uint32_t sz,
                                  const SketchCallback& cb) const
 {
-    if (sorted_ids.empty()) return;
+    if (sorted_ids.empty() || !v3_) return;
 
-    // V1/V2: no seekable frames — fall back to per-genome lookup.
-    if (!v3_) {
-        for (size_t i = 0; i < sorted_ids.size(); ++i) {
-            auto sk = (k > 0 && sz > 0)
-                      ? sketch_for(sorted_ids[i], k, sz)
-                      : sketch_for(sorted_ids[i]);
-            if (sk) cb(i, *sk);
-        }
-        return;
-    }
-
-    // V3: group requests by frame, decompress each needed frame exactly once.
+    // Group requests by frame, decompress each needed frame exactly once.
     uint32_t ki = UINT32_MAX;
     if (k > 0) {
         for (uint32_t i = 0; i < n_kmer_sizes_; ++i)
