@@ -8,7 +8,6 @@
 #include <stdexcept>
 #include <unistd.h>
 #include <fcntl.h>
-#include <future>
 #include <sys/mman.h>
 #include <spdlog/spdlog.h>
 #ifdef _OPENMP
@@ -17,7 +16,32 @@
 
 namespace genopack {
 
-// ── SkchWriter ───────────────────────────────────────────────────────────────
+// ── Spill dir resolution ─────────────────────────────────────────────────────
+// Priority: explicit arg > GENOPACK_SKETCH_SPILL_DIR > GENOPACK_SPILL_DIR > std::tmpfile
+static std::string resolve_spill_dir(std::string spill_dir) {
+    if (!spill_dir.empty()) return spill_dir;
+    if (const char* env = std::getenv("GENOPACK_SKETCH_SPILL_DIR"); env && *env) return env;
+    if (const char* env = std::getenv("GENOPACK_SPILL_DIR");        env && *env) return env;
+    return {};
+}
+
+static FILE* open_spill(const std::string& spill_dir, const char* tag) {
+    if (!spill_dir.empty()) {
+        char path[4096];
+        std::snprintf(path, sizeof(path), "%s/genopack_%s_XXXXXX", spill_dir.c_str(), tag);
+        int fd = ::mkstemp(path);
+        if (fd < 0) throw std::runtime_error(std::string("SkchWriter: mkstemp failed: ") + path);
+        ::unlink(path);
+        FILE* fp = ::fdopen(fd, "w+b");
+        if (!fp) { ::close(fd); throw std::runtime_error("SkchWriter: fdopen failed"); }
+        return fp;
+    }
+    FILE* fp = std::tmpfile();
+    if (!fp) throw std::runtime_error("SkchWriter: cannot create spill tmpfile");
+    return fp;
+}
+
+// ── SkchWriter (V4, single-k, dual-seed) ─────────────────────────────────────
 
 SkchWriter::SkchWriter(uint32_t sketch_size, uint32_t kmer_size,
                        uint32_t syncmer_s, uint64_t seed1, uint64_t seed2,
@@ -28,28 +52,10 @@ SkchWriter::SkchWriter(uint32_t sketch_size, uint32_t kmer_size,
     , seed1_(seed1)
     , seed2_(seed2)
     , mask_words_((sketch_size + 63) / 64)
-    , record_size_(sizeof(uint16_t) * sketch_size + sizeof(uint64_t) * ((sketch_size + 63) / 64))
+    , record_size_(2 * sizeof(uint16_t) * sketch_size
+                   + sizeof(uint64_t) * ((sketch_size + 63) / 64))
 {
-    // Resolve spill directory: explicit arg > env var > none (falls back to std::tmpfile)
-    if (spill_dir.empty()) {
-        const char* env = std::getenv("GENOPACK_SPILL_DIR");
-        if (env && *env) spill_dir = env;
-    }
-
-    if (!spill_dir.empty()) {
-        char path[4096];
-        std::snprintf(path, sizeof(path), "%s/genopack_skch_XXXXXX", spill_dir.c_str());
-        int fd = ::mkstemp(path);
-        if (fd < 0)
-            throw std::runtime_error(std::string("SkchWriter: mkstemp failed: ") + path);
-        ::unlink(path);
-        spill_fp_ = ::fdopen(fd, "w+b");
-        if (!spill_fp_) { ::close(fd); throw std::runtime_error("SkchWriter: fdopen failed"); }
-    } else {
-        spill_fp_ = std::tmpfile();
-        if (!spill_fp_)
-            throw std::runtime_error("SkchWriter: cannot create spill tmpfile");
-    }
+    spill_fp_ = open_spill(resolve_spill_dir(std::move(spill_dir)), "skch_v4");
 }
 
 SkchWriter::~SkchWriter() {
@@ -57,138 +63,154 @@ SkchWriter::~SkchWriter() {
 }
 
 void SkchWriter::add(GenomeId genome_id,
-                     const std::vector<uint16_t>& oph_sig,
+                     const std::vector<uint16_t>& oph_sig1,
+                     const std::vector<uint16_t>& oph_sig2,
                      uint32_t n_real_bins,
                      uint64_t genome_length,
                      const std::vector<uint64_t>& mask) {
-    if (oph_sig.size() != sketch_size_)
+    if (oph_sig1.size() != sketch_size_ || oph_sig2.size() != sketch_size_)
         throw std::runtime_error("SkchWriter::add: sig size mismatch");
     if (mask.size() != mask_words_)
         throw std::runtime_error("SkchWriter::add: mask size mismatch");
 
     ids_.push_back(genome_id);
-    SkchEntryFixed ef{};
-    ef.n_real_bins   = n_real_bins;
-    ef.mask_words    = mask_words_;
-    ef.genome_length = genome_length;
-    fixed_.push_back(ef);
+    n_real_bins_.push_back(n_real_bins);
+    genome_lengths_.push_back(genome_length);
 
-    // Spill sig + mask to tmpfile — no RAM retained for these
-    std::fwrite(oph_sig.data(), sizeof(uint16_t), sketch_size_, spill_fp_);
-    std::fwrite(mask.data(),    sizeof(uint64_t), mask_words_,  spill_fp_);
+    // Spill record: sig1 | sig2 | mask
+    std::fwrite(oph_sig1.data(), sizeof(uint16_t), sketch_size_, spill_fp_);
+    std::fwrite(oph_sig2.data(), sizeof(uint16_t), sketch_size_, spill_fp_);
+    std::fwrite(mask.data(),     sizeof(uint64_t), mask_words_,  spill_fp_);
 }
 
 SectionDesc SkchWriter::finalize(AppendWriter& writer, uint64_t section_id) {
-    uint32_t n = static_cast<uint32_t>(ids_.size());
+    const uint32_t n = static_cast<uint32_t>(ids_.size());
 
-    // Sort order by genome_id
     std::vector<uint32_t> order(n);
     std::iota(order.begin(), order.end(), 0u);
     std::sort(order.begin(), order.end(),
               [&](uint32_t a, uint32_t b) { return ids_[a] < ids_[b]; });
 
-    size_t ids_bytes     = sizeof(uint64_t)      * n;
-    size_t entries_bytes = sizeof(SkchEntryFixed) * n;
-    size_t sigs_bytes    = sizeof(uint16_t) * static_cast<size_t>(n) * sketch_size_;
-    size_t masks_bytes   = sizeof(uint64_t) * static_cast<size_t>(n) * mask_words_;
-    size_t total         = sizeof(SkchHeader) + ids_bytes + entries_bytes + sigs_bytes + masks_bytes;
+    const size_t sig_bytes   = sizeof(uint16_t) * sketch_size_;
+    const size_t mask_bytes  = sizeof(uint64_t) * mask_words_;
+    const uint32_t n_frames  = (n + SKCH_V4_FRAME_SIZE - 1) / SKCH_V4_FRAME_SIZE;
+    const uint64_t section_start = writer.current_offset();
 
-    // Stream-compress using ZSTD streaming API to avoid a ~27 GB flat buffer.
-    ZSTD_CStream* cstream = ZSTD_createCStream();
-    if (!cstream) throw std::runtime_error("SkchWriter: ZSTD_createCStream failed");
-    ZSTD_initCStream(cstream, 3);
-    ZSTD_CCtx_setPledgedSrcSize(cstream, total); // embeds content size in frame header for fast decompression
+    // Header (SKCH_V4_MAGIC, single k).
+    SkchSeekHdr hdr{};
+    hdr.magic        = SKCH_V4_MAGIC;
+    hdr.n_frames     = n_frames;
+    hdr.frame_size   = SKCH_V4_FRAME_SIZE;
+    hdr.n_genomes    = n;
+    hdr.sketch_size  = sketch_size_;
+    hdr.n_kmer_sizes = 1;
+    hdr.kmer_sizes[0] = kmer_size_;
+    hdr.syncmer_s    = syncmer_s_;
+    hdr.mask_words   = mask_words_;
+    hdr.seed1        = seed1_;
+    hdr.seed2        = seed2_;
+    writer.append(&hdr, sizeof(hdr));
 
-    // Write compressed output via a small staging buffer into AppendWriter.
-    const size_t OUT_BUF = 4 << 20; // 4 MB
+    const uint64_t frame_table_offset = writer.current_offset();
+    std::vector<SkchFrameDesc> frame_descs(n_frames);
+    writer.append(frame_descs.data(), sizeof(SkchFrameDesc) * n_frames);
+
+    // Sorted genome_ids and genome_lengths (uncompressed).
+    for (uint32_t i : order) writer.append(&ids_[i],            sizeof(uint64_t));
+    for (uint32_t i : order) writer.append(&genome_lengths_[i], sizeof(uint64_t));
+
+    const size_t OUT_BUF = 4 << 20;
     std::vector<uint8_t> out_buf(OUT_BUF);
-    uint64_t section_start = writer.current_offset();
-
-    auto flush_stream = [&](bool final_flush) {
-        ZSTD_outBuffer zout{out_buf.data(), out_buf.size(), 0};
-        size_t ret = final_flush
-            ? ZSTD_endStream(cstream, &zout)
-            : ZSTD_flushStream(cstream, &zout);
-        if (ZSTD_isError(ret))
-            throw std::runtime_error(std::string("SkchWriter: zstd stream: ") + ZSTD_getErrorName(ret));
-        if (zout.pos > 0)
-            writer.append(out_buf.data(), zout.pos);
-        return ret;
-    };
-
-    auto compress_chunk = [&](const void* data, size_t size) {
-        ZSTD_inBuffer zin{data, size, 0};
-        while (zin.pos < zin.size) {
-            ZSTD_outBuffer zout{out_buf.data(), out_buf.size(), 0};
-            size_t ret = ZSTD_compressStream(cstream, &zout, &zin);
-            if (ZSTD_isError(ret))
-                throw std::runtime_error(std::string("SkchWriter: zstd compress: ") + ZSTD_getErrorName(ret));
-            if (zout.pos > 0)
-                writer.append(out_buf.data(), zout.pos);
-        }
-    };
-
-    // Header
-    SkchHeader hdr{};
-    hdr.magic       = SEC_SKCH;
-    hdr.version     = 1;
-    hdr.n_genomes   = n;
-    hdr.sketch_size = sketch_size_;
-    hdr.kmer_size   = kmer_size_;
-    hdr.syncmer_s   = syncmer_s_;
-    hdr.seed1       = seed1_;
-    hdr.seed2       = seed2_;
-    compress_chunk(&hdr, sizeof(hdr));
-
-    // Sorted genome IDs
-    for (uint32_t i : order) compress_chunk(&ids_[i], sizeof(uint64_t));
-
-    // Sorted SkchEntryFixed
-    for (uint32_t i : order) compress_chunk(&fixed_[i], sizeof(SkchEntryFixed));
-
-    // Sigs (sorted): read each record from spill, emit sig bytes
     std::vector<uint8_t> rec(record_size_);
-    size_t sig_bytes  = sizeof(uint16_t) * sketch_size_;
-    size_t mask_bytes = sizeof(uint64_t) * mask_words_;
 
-    for (uint32_t rank = 0; rank < n; ++rank) {
-        uint32_t i = order[rank];
-        long offset = static_cast<long>(static_cast<size_t>(i) * record_size_);
-        if (std::fseek(spill_fp_, offset, SEEK_SET) != 0)
-            throw std::runtime_error("SkchWriter::finalize: fseek failed");
-        if (std::fread(rec.data(), 1, record_size_, spill_fp_) != record_size_)
-            throw std::runtime_error("SkchWriter::finalize: spill read failed");
-        compress_chunk(rec.data(), sig_bytes);
+    for (uint32_t fi = 0; fi < n_frames; ++fi) {
+        const uint32_t row_start = fi * SKCH_V4_FRAME_SIZE;
+        const uint32_t row_end   = std::min(n, row_start + SKCH_V4_FRAME_SIZE);
+        const uint32_t frame_n   = row_end - row_start;
+
+        const size_t frame_raw_sz =
+            sizeof(uint32_t) * frame_n
+            + 2 * sig_bytes * frame_n
+            + mask_bytes * frame_n;
+
+        const uint64_t frame_start = writer.current_offset();
+        frame_descs[fi].data_offset  = frame_start - section_start;
+        frame_descs[fi].n_genomes    = frame_n;
+
+        ZSTD_CStream* cs = ZSTD_createCStream();
+        ZSTD_initCStream(cs, 3);
+        ZSTD_CCtx_setPledgedSrcSize(cs, frame_raw_sz);
+
+        auto compress = [&](const void* data, size_t size) {
+            ZSTD_inBuffer zi{data, size, 0};
+            while (zi.pos < zi.size) {
+                ZSTD_outBuffer zo{out_buf.data(), out_buf.size(), 0};
+                size_t r = ZSTD_compressStream(cs, &zo, &zi);
+                if (ZSTD_isError(r))
+                    throw std::runtime_error(std::string("SkchWriter V4: ") + ZSTD_getErrorName(r));
+                if (zo.pos) writer.append(out_buf.data(), zo.pos);
+            }
+        };
+
+        // n_real_bins: one plane (NK=1).
+        for (uint32_t rank = row_start; rank < row_end; ++rank)
+            compress(&n_real_bins_[order[rank]], sizeof(uint32_t));
+
+        // sigs1 plane
+        for (uint32_t rank = row_start; rank < row_end; ++rank) {
+            long off = static_cast<long>(static_cast<size_t>(order[rank]) * record_size_);
+            if (std::fseek(spill_fp_, off, SEEK_SET) != 0)
+                throw std::runtime_error("SkchWriter V4: fseek sig1");
+            if (std::fread(rec.data(), 1, record_size_, spill_fp_) != record_size_)
+                throw std::runtime_error("SkchWriter V4: fread sig1");
+            compress(rec.data(), sig_bytes);
+        }
+        // sigs2 plane
+        for (uint32_t rank = row_start; rank < row_end; ++rank) {
+            long off = static_cast<long>(static_cast<size_t>(order[rank]) * record_size_);
+            if (std::fseek(spill_fp_, off, SEEK_SET) != 0)
+                throw std::runtime_error("SkchWriter V4: fseek sig2");
+            if (std::fread(rec.data(), 1, record_size_, spill_fp_) != record_size_)
+                throw std::runtime_error("SkchWriter V4: fread sig2");
+            compress(rec.data() + sig_bytes, sig_bytes);
+        }
+        // masks plane
+        for (uint32_t rank = row_start; rank < row_end; ++rank) {
+            long off = static_cast<long>(static_cast<size_t>(order[rank]) * record_size_);
+            if (std::fseek(spill_fp_, off, SEEK_SET) != 0)
+                throw std::runtime_error("SkchWriter V4: fseek mask");
+            if (std::fread(rec.data(), 1, record_size_, spill_fp_) != record_size_)
+                throw std::runtime_error("SkchWriter V4: fread mask");
+            compress(rec.data() + 2 * sig_bytes, mask_bytes);
+        }
+
+        size_t remaining = 1;
+        while (remaining) {
+            ZSTD_outBuffer zo{out_buf.data(), out_buf.size(), 0};
+            remaining = ZSTD_endStream(cs, &zo);
+            if (ZSTD_isError(remaining))
+                throw std::runtime_error(std::string("SkchWriter V4 end: ") + ZSTD_getErrorName(remaining));
+            if (zo.pos) writer.append(out_buf.data(), zo.pos);
+        }
+        ZSTD_freeCStream(cs);
+
+        frame_descs[fi].compressed_size = static_cast<uint32_t>(writer.current_offset() - frame_start);
     }
 
-    // Masks (sorted): second pass over spill
-    for (uint32_t rank = 0; rank < n; ++rank) {
-        uint32_t i = order[rank];
-        long offset = static_cast<long>(static_cast<size_t>(i) * record_size_);
-        if (std::fseek(spill_fp_, offset, SEEK_SET) != 0)
-            throw std::runtime_error("SkchWriter::finalize: fseek failed (masks)");
-        if (std::fread(rec.data(), 1, record_size_, spill_fp_) != record_size_)
-            throw std::runtime_error("SkchWriter::finalize: spill read failed (masks)");
-        compress_chunk(rec.data() + sig_bytes, mask_bytes);
-    }
+    std::fclose(spill_fp_); spill_fp_ = nullptr;
 
-    // Flush and end stream
-    size_t remaining = 1;
-    while (remaining != 0) remaining = flush_stream(true);
-    ZSTD_freeCStream(cstream);
-
-    std::fclose(spill_fp_);
-    spill_fp_ = nullptr;
-    uint64_t section_end = writer.current_offset();
+    const uint64_t section_end = writer.current_offset();
+    writer.seek_to(frame_table_offset);
+    writer.append(frame_descs.data(), sizeof(SkchFrameDesc) * n_frames);
+    writer.seek_to(section_end);
 
     SectionDesc desc{};
     desc.type              = SEC_SKCH;
-    desc.version           = 1;
-    desc.flags             = 0;
+    desc.version           = 4;
     desc.section_id        = section_id;
     desc.file_offset       = section_start;
     desc.compressed_size   = section_end - section_start;
-    desc.uncompressed_size = total; // logical uncompressed size
+    desc.uncompressed_size = 0;
     desc.item_count        = n;
     desc.aux0              = sketch_size_;
     desc.aux1              = kmer_size_;
@@ -196,187 +218,274 @@ SectionDesc SkchWriter::finalize(AppendWriter& writer, uint64_t section_id) {
     return desc;
 }
 
-// ── SkchReader ───────────────────────────────────────────────────────────────
+// ── SkchWriterMultiK (V4, multi-k, dual-seed) ────────────────────────────────
+
+SkchWriterMultiK::SkchWriterMultiK(std::vector<uint32_t> kmer_sizes, uint32_t sketch_size,
+                                    uint32_t syncmer_s, uint64_t seed1, uint64_t seed2,
+                                    std::string spill_dir)
+    : kmer_sizes_(std::move(kmer_sizes))
+    , sketch_size_(sketch_size)
+    , syncmer_s_(syncmer_s)
+    , seed1_(seed1), seed2_(seed2)
+    , mask_words_((sketch_size + 63) / 64)
+    , spill_record_size_(kmer_sizes_.size() *
+                         (2 * sizeof(uint16_t) * sketch_size
+                          + sizeof(uint64_t) * ((sketch_size + 63) / 64)))
+{
+    std::sort(kmer_sizes_.begin(), kmer_sizes_.end());
+    kmer_sizes_.erase(std::unique(kmer_sizes_.begin(), kmer_sizes_.end()), kmer_sizes_.end());
+    if (kmer_sizes_.size() > 8)
+        throw std::runtime_error("SkchWriterMultiK: at most 8 k values supported");
+    n_real_bins_.resize(kmer_sizes_.size());
+
+    // Rough tmpfs budget warning: 2 * sig_bytes * n_k per genome.
+    const size_t per_genome = 2 * sizeof(uint16_t) * sketch_size * kmer_sizes_.size();
+    if (per_genome > (256u << 20))
+        spdlog::warn("SkchWriterMultiK: per-genome spill {} MB is large; "
+                     "set GENOPACK_SKETCH_SPILL_DIR to a big-enough volume",
+                     per_genome >> 20);
+
+    spill_fp_ = open_spill(resolve_spill_dir(std::move(spill_dir)), "skch_v4_mk");
+}
+
+SkchWriterMultiK::~SkchWriterMultiK() {
+    if (spill_fp_) { std::fclose(spill_fp_); spill_fp_ = nullptr; }
+}
+
+void SkchWriterMultiK::add(GenomeId genome_id, uint64_t genome_length,
+                            const std::vector<std::vector<uint16_t>>& sigs1_per_k,
+                            const std::vector<std::vector<uint16_t>>& sigs2_per_k,
+                            const std::vector<uint32_t>&              n_real_bins_per_k,
+                            const std::vector<std::vector<uint64_t>>& masks_per_k)
+{
+    const size_t nk = kmer_sizes_.size();
+    if (sigs1_per_k.size() != nk || sigs2_per_k.size() != nk
+        || n_real_bins_per_k.size() != nk || masks_per_k.size() != nk)
+        throw std::runtime_error("SkchWriterMultiK::add: k-count mismatch");
+
+    ids_.push_back(genome_id);
+    genome_lengths_.push_back(genome_length);
+    for (size_t ki = 0; ki < nk; ++ki)
+        n_real_bins_[ki].push_back(n_real_bins_per_k[ki]);
+
+    // Spill record: sigs1_k0 | sigs2_k0 | masks_k0 | sigs1_k1 | sigs2_k1 | masks_k1 | ...
+    // (contiguous per-k triples — finalize can read one k at a time per genome).
+    for (size_t ki = 0; ki < nk; ++ki) {
+        if (sigs1_per_k[ki].size() != sketch_size_ || sigs2_per_k[ki].size() != sketch_size_
+            || masks_per_k[ki].size() != mask_words_)
+            throw std::runtime_error("SkchWriterMultiK::add: per-k size mismatch");
+        std::fwrite(sigs1_per_k[ki].data(), sizeof(uint16_t), sketch_size_, spill_fp_);
+        std::fwrite(sigs2_per_k[ki].data(), sizeof(uint16_t), sketch_size_, spill_fp_);
+        std::fwrite(masks_per_k[ki].data(), sizeof(uint64_t), mask_words_,  spill_fp_);
+    }
+}
+
+SectionDesc SkchWriterMultiK::finalize(AppendWriter& writer, uint64_t section_id) {
+    const uint32_t n  = static_cast<uint32_t>(ids_.size());
+    const uint32_t nk = static_cast<uint32_t>(kmer_sizes_.size());
+
+    std::vector<uint32_t> order(n);
+    std::iota(order.begin(), order.end(), 0u);
+    std::sort(order.begin(), order.end(),
+              [&](uint32_t a, uint32_t b) { return ids_[a] < ids_[b]; });
+
+    const size_t sig_bytes_k  = sizeof(uint16_t) * sketch_size_;
+    const size_t mask_bytes_k = sizeof(uint64_t) * mask_words_;
+    const size_t k_triple_sz  = 2 * sig_bytes_k + mask_bytes_k;  // per-k bytes in spill
+    const uint32_t n_frames   = (n + SKCH_V4_FRAME_SIZE - 1) / SKCH_V4_FRAME_SIZE;
+    const uint64_t section_start = writer.current_offset();
+
+    SkchSeekHdr hdr{};
+    hdr.magic        = SKCH_V4_MAGIC;
+    hdr.n_frames     = n_frames;
+    hdr.frame_size   = SKCH_V4_FRAME_SIZE;
+    hdr.n_genomes    = n;
+    hdr.sketch_size  = sketch_size_;
+    hdr.n_kmer_sizes = nk;
+    for (uint32_t i = 0; i < nk; ++i) hdr.kmer_sizes[i] = kmer_sizes_[i];
+    hdr.syncmer_s    = syncmer_s_;
+    hdr.mask_words   = mask_words_;
+    hdr.seed1        = seed1_;
+    hdr.seed2        = seed2_;
+    writer.append(&hdr, sizeof(hdr));
+
+    const uint64_t frame_table_offset = writer.current_offset();
+    std::vector<SkchFrameDesc> frame_descs(n_frames);
+    writer.append(frame_descs.data(), sizeof(SkchFrameDesc) * n_frames);
+
+    for (uint32_t i : order) writer.append(&ids_[i],            sizeof(uint64_t));
+    for (uint32_t i : order) writer.append(&genome_lengths_[i], sizeof(uint64_t));
+
+    const size_t OUT_BUF = 4 << 20;
+    std::vector<uint8_t> out_buf(OUT_BUF);
+    std::vector<uint8_t> rec(spill_record_size_);
+
+    for (uint32_t fi = 0; fi < n_frames; ++fi) {
+        const uint32_t row_start = fi * SKCH_V4_FRAME_SIZE;
+        const uint32_t row_end   = std::min(n, row_start + SKCH_V4_FRAME_SIZE);
+        const uint32_t frame_n   = row_end - row_start;
+
+        const size_t frame_raw_sz =
+            sizeof(uint32_t) * nk * frame_n
+            + 2 * sig_bytes_k  * nk * frame_n
+            + mask_bytes_k * nk * frame_n;
+
+        const uint64_t frame_start = writer.current_offset();
+        frame_descs[fi].data_offset  = frame_start - section_start;
+        frame_descs[fi].n_genomes    = frame_n;
+
+        ZSTD_CStream* cs = ZSTD_createCStream();
+        ZSTD_initCStream(cs, 3);
+        ZSTD_CCtx_setPledgedSrcSize(cs, frame_raw_sz);
+
+        auto compress = [&](const void* data, size_t size) {
+            ZSTD_inBuffer zi{data, size, 0};
+            while (zi.pos < zi.size) {
+                ZSTD_outBuffer zo{out_buf.data(), out_buf.size(), 0};
+                size_t r = ZSTD_compressStream(cs, &zo, &zi);
+                if (ZSTD_isError(r))
+                    throw std::runtime_error(std::string("SkchWriterMultiK V4: ") + ZSTD_getErrorName(r));
+                if (zo.pos) writer.append(out_buf.data(), zo.pos);
+            }
+        };
+
+        // n_real_bins planar by k.
+        for (uint32_t ki = 0; ki < nk; ++ki)
+            for (uint32_t rank = row_start; rank < row_end; ++rank)
+                compress(&n_real_bins_[ki][order[rank]], sizeof(uint32_t));
+
+        // sigs1 planar by k.
+        for (uint32_t ki = 0; ki < nk; ++ki) {
+            const size_t k_off = ki * k_triple_sz;  // offset of this k's triple in the record
+            for (uint32_t rank = row_start; rank < row_end; ++rank) {
+                long off = static_cast<long>(static_cast<size_t>(order[rank]) * spill_record_size_);
+                if (std::fseek(spill_fp_, off, SEEK_SET) != 0)
+                    throw std::runtime_error("SkchWriterMultiK V4: fseek sig1");
+                if (std::fread(rec.data(), 1, spill_record_size_, spill_fp_) != spill_record_size_)
+                    throw std::runtime_error("SkchWriterMultiK V4: fread sig1");
+                compress(rec.data() + k_off, sig_bytes_k);
+            }
+        }
+        // sigs2 planar by k.
+        for (uint32_t ki = 0; ki < nk; ++ki) {
+            const size_t k_off = ki * k_triple_sz + sig_bytes_k;
+            for (uint32_t rank = row_start; rank < row_end; ++rank) {
+                long off = static_cast<long>(static_cast<size_t>(order[rank]) * spill_record_size_);
+                if (std::fseek(spill_fp_, off, SEEK_SET) != 0)
+                    throw std::runtime_error("SkchWriterMultiK V4: fseek sig2");
+                if (std::fread(rec.data(), 1, spill_record_size_, spill_fp_) != spill_record_size_)
+                    throw std::runtime_error("SkchWriterMultiK V4: fread sig2");
+                compress(rec.data() + k_off, sig_bytes_k);
+            }
+        }
+        // masks planar by k.
+        for (uint32_t ki = 0; ki < nk; ++ki) {
+            const size_t k_off = ki * k_triple_sz + 2 * sig_bytes_k;
+            for (uint32_t rank = row_start; rank < row_end; ++rank) {
+                long off = static_cast<long>(static_cast<size_t>(order[rank]) * spill_record_size_);
+                if (std::fseek(spill_fp_, off, SEEK_SET) != 0)
+                    throw std::runtime_error("SkchWriterMultiK V4: fseek mask");
+                if (std::fread(rec.data(), 1, spill_record_size_, spill_fp_) != spill_record_size_)
+                    throw std::runtime_error("SkchWriterMultiK V4: fread mask");
+                compress(rec.data() + k_off, mask_bytes_k);
+            }
+        }
+
+        size_t remaining = 1;
+        while (remaining) {
+            ZSTD_outBuffer zo{out_buf.data(), out_buf.size(), 0};
+            remaining = ZSTD_endStream(cs, &zo);
+            if (ZSTD_isError(remaining))
+                throw std::runtime_error(std::string("SkchWriterMultiK V4 end: ") + ZSTD_getErrorName(remaining));
+            if (zo.pos) writer.append(out_buf.data(), zo.pos);
+        }
+        ZSTD_freeCStream(cs);
+
+        frame_descs[fi].compressed_size = static_cast<uint32_t>(writer.current_offset() - frame_start);
+    }
+
+    std::fclose(spill_fp_); spill_fp_ = nullptr;
+
+    const uint64_t section_end = writer.current_offset();
+    writer.seek_to(frame_table_offset);
+    writer.append(frame_descs.data(), sizeof(SkchFrameDesc) * n_frames);
+    writer.seek_to(section_end);
+
+    SectionDesc desc{};
+    desc.type              = SEC_SKCH;
+    desc.version           = 4;
+    desc.section_id        = section_id;
+    desc.file_offset       = section_start;
+    desc.compressed_size   = section_end - section_start;
+    desc.uncompressed_size = 0;
+    desc.item_count        = n;
+    desc.aux0              = sketch_size_;
+    desc.aux1              = (nk > 0) ? kmer_sizes_[0] : 0;
+    std::memset(desc.checksum, 0, sizeof(desc.checksum));
+    return desc;
+}
+
+// ── SkchReader (V4) ──────────────────────────────────────────────────────────
+
+// Rejection helper: called whenever we encounter a non-SKC4 section.
+[[noreturn]] static void reject_old_version(uint32_t magic_seen) {
+    std::string hint;
+    if (magic_seen == SKCH_V3_MAGIC) hint = " (found SKC3/V3)";
+    throw std::runtime_error("genopack SKCH version unsupported (V4 required; "
+                             "rebuild archive with genopack build)" + hint);
+}
 
 void SkchReader::open(const uint8_t* base, uint64_t offset, uint64_t compressed_size) {
     cdata_    = base + offset;
     cdata_sz_ = compressed_size;
 
-    // V3: uncompressed header — detect by magic before attempting zstd.
-    if (compressed_size >= sizeof(SkchSeekHdr)) {
-        uint32_t maybe_magic;
-        std::memcpy(&maybe_magic, cdata_, sizeof(uint32_t));
-        if (maybe_magic == SKCH_V3_MAGIC) {
-            const auto* h = reinterpret_cast<const SkchSeekHdr*>(cdata_);
-            v3_           = true;
-            version_      = 3;
-            n_genomes_    = h->n_genomes;
-            sketch_size_  = h->sketch_size;
-            mask_words_   = h->mask_words;
-            n_kmer_sizes_ = std::min(h->n_kmer_sizes, 8u);
-            for (uint32_t i = 0; i < 8; ++i) kmer_sizes_[i] = h->kmer_sizes[i];
-            kmer_size_    = (n_kmer_sizes_ > 0) ? kmer_sizes_[0] : 0;
-            syncmer_s_    = h->syncmer_s;
-            seed1_        = h->seed1;
-            seed2_        = h->seed2;
-            v3_frame_sz_  = h->frame_size;
-            v3_section_base_ = cdata_;
+    if (compressed_size < sizeof(SkchSeekHdr))
+        throw std::runtime_error("SkchReader: section too small for V4 header");
 
-            // Frame table immediately after header.
-            const auto* ft = reinterpret_cast<const SkchFrameDesc*>(cdata_ + sizeof(SkchSeekHdr));
-            v3_frames_.assign(ft, ft + h->n_frames);
+    uint32_t maybe_magic;
+    std::memcpy(&maybe_magic, cdata_, sizeof(uint32_t));
+    if (maybe_magic != SKCH_V4_MAGIC) reject_old_version(maybe_magic);
 
-            // Uncompressed genome_ids and genome_lengths follow the frame table.
-            const uint8_t* ids_ptr = cdata_ + sizeof(SkchSeekHdr)
-                                     + sizeof(SkchFrameDesc) * h->n_frames;
-            id_index_.resize(n_genomes_);
-            std::memcpy(id_index_.data(), ids_ptr, sizeof(uint64_t) * n_genomes_);
+    const auto* h = reinterpret_cast<const SkchSeekHdr*>(cdata_);
+    n_genomes_    = h->n_genomes;
+    sketch_size_  = h->sketch_size;
+    mask_words_   = h->mask_words;
+    n_kmer_sizes_ = std::min(h->n_kmer_sizes, 8u);
+    for (uint32_t i = 0; i < 8; ++i) kmer_sizes_[i] = h->kmer_sizes[i];
+    kmer_size_    = (n_kmer_sizes_ > 0) ? kmer_sizes_[0] : 0;
+    syncmer_s_    = h->syncmer_s;
+    seed1_        = h->seed1;
+    seed2_        = h->seed2;
+    frame_sz_     = h->frame_size;
+    section_base_ = cdata_;
 
-            const uint8_t* len_ptr = ids_ptr + sizeof(uint64_t) * n_genomes_;
-            v3_genome_lengths_.resize(n_genomes_);
-            std::memcpy(v3_genome_lengths_.data(), len_ptr, sizeof(uint64_t) * n_genomes_);
-            return;
-        }
-    }
+    const auto* ft = reinterpret_cast<const SkchFrameDesc*>(cdata_ + sizeof(SkchSeekHdr));
+    frames_.assign(ft, ft + h->n_frames);
 
-    ZSTD_DStream* ds = ZSTD_createDStream();
-    ZSTD_initDStream(ds);
-    ZSTD_inBuffer zin{cdata_, cdata_sz_, 0};
-
-    // Helper: read exactly n bytes from the decompression stream.
-    auto read_exact = [&](void* dst, size_t n) -> bool {
-        ZSTD_outBuffer zo{dst, n, 0};
-        while (zo.pos < n) {
-            size_t r = ZSTD_decompressStream(ds, &zo, &zin);
-            if (ZSTD_isError(r) || r == 0) return false;
-        }
-        return true;
-    };
-
-    // Step 1: Read the 16-byte common prefix (magic, version, n_genomes, sketch_size).
-    // Both v1 (64 bytes) and v2 (96 bytes) share these four fields at offset 0.
-    struct CommonPrefix { uint32_t magic, version, n_genomes, sketch_size; };
-    static_assert(sizeof(CommonPrefix) == 16);
-    CommonPrefix pfx{};
-    if (!read_exact(&pfx, sizeof(pfx))) {
-        ZSTD_freeDStream(ds);
-        throw std::runtime_error("SkchReader: truncated header prefix");
-    }
-    if (pfx.magic != SEC_SKCH) {
-        ZSTD_freeDStream(ds);
-        throw std::runtime_error("SkchReader: bad magic");
-    }
-
-    version_     = pfx.version;
-    n_genomes_   = pfx.n_genomes;
-    sketch_size_ = pfx.sketch_size;
-    mask_words_  = (sketch_size_ + 63) / 64;
-
-    if (version_ == 1) {
-        // v1 tail: kmer_size(4) syncmer_s(4) seed1(8) seed2(8) reserved(24) = 48 bytes
-        struct V1Tail { uint32_t kmer_size, syncmer_s; uint64_t seed1, seed2; uint8_t reserved[24]; };
-        static_assert(sizeof(V1Tail) == 48);
-        V1Tail t{};
-        if (!read_exact(&t, sizeof(t))) {
-            ZSTD_freeDStream(ds);
-            throw std::runtime_error("SkchReader: truncated v1 header");
-        }
-        kmer_size_    = t.kmer_size;
-        syncmer_s_    = t.syncmer_s;
-        seed1_        = t.seed1;
-        seed2_        = t.seed2;
-        n_kmer_sizes_ = 1;
-        kmer_sizes_[0] = kmer_size_;
-    } else if (version_ == 2) {
-        // v2 tail: n_kmer_sizes(4) kmer_sizes[8](32) syncmer_s(4) mask_words(4)
-        //          pad_(4) seed1(8) seed2(8) reserved(16) = 80 bytes
-        struct V2Tail {
-            uint32_t n_kmer_sizes, kmer_sizes[8], syncmer_s, mask_words_stored;
-            uint32_t pad_;
-            uint64_t seed1, seed2;
-            uint8_t  reserved[16];
-        };
-        static_assert(sizeof(V2Tail) == 80);
-        V2Tail t{};
-        if (!read_exact(&t, sizeof(t))) {
-            ZSTD_freeDStream(ds);
-            throw std::runtime_error("SkchReader: truncated v2 header");
-        }
-        n_kmer_sizes_ = std::min(t.n_kmer_sizes, 8u);
-        for (uint32_t i = 0; i < 8; ++i) kmer_sizes_[i] = t.kmer_sizes[i];
-        syncmer_s_    = t.syncmer_s;
-        seed1_        = t.seed1;
-        seed2_        = t.seed2;
-        kmer_size_    = (n_kmer_sizes_ > 0) ? kmer_sizes_[0] : 0;
-    } else {
-        ZSTD_freeDStream(ds);
-        throw std::runtime_error("SkchReader: unknown SKCH version " + std::to_string(version_));
-    }
-
-    // Read genome_ids immediately after the header (same relative position in both versions).
+    const uint8_t* ids_ptr = cdata_ + sizeof(SkchSeekHdr)
+                             + sizeof(SkchFrameDesc) * h->n_frames;
     id_index_.resize(n_genomes_);
-    if (!read_exact(id_index_.data(), sizeof(uint64_t) * n_genomes_)) {
-        ZSTD_freeDStream(ds);
-        throw std::runtime_error("SkchReader: truncated genome id index");
-    }
-    ZSTD_freeDStream(ds);
+    std::memcpy(id_index_.data(), ids_ptr, sizeof(uint64_t) * n_genomes_);
+
+    const uint8_t* len_ptr = ids_ptr + sizeof(uint64_t) * n_genomes_;
+    genome_lengths_.resize(n_genomes_);
+    std::memcpy(genome_lengths_.data(), len_ptr, sizeof(uint64_t) * n_genomes_);
 }
 
 std::pair<uint32_t, std::vector<uint32_t>>
 SkchReader::peek_params(const uint8_t* base, uint64_t offset, uint64_t compressed_sz) {
     const uint8_t* src = base + offset;
-    ZSTD_DStream* ds = ZSTD_createDStream();
-    ZSTD_initDStream(ds);
-    ZSTD_inBuffer zin{src, compressed_sz, 0};
+    if (compressed_sz < sizeof(SkchSeekHdr))
+        throw std::runtime_error("SkchReader::peek_params: section too small for V4 header");
 
-    auto read_exact = [&](void* dst, size_t n) -> bool {
-        ZSTD_outBuffer zo{dst, n, 0};
-        while (zo.pos < n) {
-            size_t r = ZSTD_decompressStream(ds, &zo, &zin);
-            if (ZSTD_isError(r) || r == 0) return false;
-        }
-        return true;
-    };
+    uint32_t maybe_magic;
+    std::memcpy(&maybe_magic, src, sizeof(uint32_t));
+    if (maybe_magic != SKCH_V4_MAGIC) reject_old_version(maybe_magic);
 
-    // Check for V3 (uncompressed header) before attempting zstd.
-    if (compressed_sz >= sizeof(SkchSeekHdr)) {
-        uint32_t maybe_magic;
-        std::memcpy(&maybe_magic, src, sizeof(uint32_t));
-        if (maybe_magic == SKCH_V3_MAGIC) {
-            ZSTD_freeDStream(ds);
-            const auto* h = reinterpret_cast<const SkchSeekHdr*>(src);
-            uint32_t n = std::min(h->n_kmer_sizes, 8u);
-            std::vector<uint32_t> ks(h->kmer_sizes, h->kmer_sizes + n);
-            return {3, ks};
-        }
-    }
-
-    struct CommonPrefix { uint32_t magic, version, n_genomes, sketch_size; };
-    CommonPrefix pfx{};
-    if (!read_exact(&pfx, sizeof(pfx)) || pfx.magic != SEC_SKCH) {
-        ZSTD_freeDStream(ds);
-        return {0, {}};
-    }
-
-    std::vector<uint32_t> ks;
-    if (pfx.version == 1) {
-        struct V1Tail { uint32_t kmer_size, syncmer_s; uint64_t seed1, seed2; uint8_t reserved[24]; };
-        V1Tail t{};
-        if (read_exact(&t, sizeof(t))) ks.push_back(t.kmer_size);
-    } else if (pfx.version == 2) {
-        struct V2Tail {
-            uint32_t n_kmer_sizes, kmer_sizes[8], syncmer_s, mask_words;
-            uint32_t pad_;
-            uint64_t seed1, seed2; uint8_t reserved[16];
-        };
-        V2Tail t{};
-        if (read_exact(&t, sizeof(t))) {
-            uint32_t n = std::min(t.n_kmer_sizes, 8u);
-            ks.assign(t.kmer_sizes, t.kmer_sizes + n);
-        }
-    }
-    ZSTD_freeDStream(ds);
-    return {pfx.version, ks};
+    const auto* h = reinterpret_cast<const SkchSeekHdr*>(src);
+    uint32_t n = std::min(h->n_kmer_sizes, 8u);
+    std::vector<uint32_t> ks(h->kmer_sizes, h->kmer_sizes + n);
+    return {4, ks};
 }
 
 bool SkchReader::has_kmer_size(uint32_t k) const {
@@ -397,124 +506,6 @@ bool SkchReader::contains(GenomeId genome_id) const {
     return false;
 }
 
-void SkchReader::decompress_full() const {
-    if (v3_) {
-        // Assemble all frames into a v2-compatible flat buffer so that parse_buf()
-        // and single-genome sketch_for() work correctly without code duplication.
-        const uint32_t nk = n_kmer_sizes_;
-        const size_t nrb_sz  = sizeof(uint32_t) * nk * n_genomes_;
-        const size_t sigs_sz = sizeof(uint16_t) * nk * static_cast<size_t>(n_genomes_) * sketch_size_;
-        const size_t msks_sz = sizeof(uint64_t) * nk * static_cast<size_t>(n_genomes_) * mask_words_;
-        const size_t total   = sizeof(MultiKSkchHeader)
-                             + sizeof(uint64_t) * n_genomes_ * 2  // ids + genome_lengths
-                             + nrb_sz + sigs_sz + msks_sz;
-        buf_.resize(total, 0);
-
-        // Synthetic MultiKSkchHeader (parse_buf skips it via sizeof offset).
-        auto* fhdr = reinterpret_cast<MultiKSkchHeader*>(buf_.data());
-        fhdr->magic        = SEC_SKCH;
-        fhdr->version      = 2;
-        fhdr->n_genomes    = n_genomes_;
-        fhdr->sketch_size  = sketch_size_;
-        fhdr->n_kmer_sizes = nk;
-        for (uint32_t i = 0; i < 8; ++i) fhdr->kmer_sizes[i] = kmer_sizes_[i];
-        fhdr->syncmer_s    = syncmer_s_;
-        fhdr->mask_words   = mask_words_;
-        fhdr->seed1        = seed1_;
-        fhdr->seed2        = seed2_;
-
-        uint8_t* p = buf_.data() + sizeof(MultiKSkchHeader);
-        std::memcpy(p, id_index_.data(), sizeof(uint64_t) * n_genomes_);
-        p += sizeof(uint64_t) * n_genomes_;
-        std::memcpy(p, v3_genome_lengths_.data(), sizeof(uint64_t) * n_genomes_);
-        p += sizeof(uint64_t) * n_genomes_;
-
-        uint32_t* dst_nrb = reinterpret_cast<uint32_t*>(p);  p += nrb_sz;
-        uint16_t* dst_sig = reinterpret_cast<uint16_t*>(p);  p += sigs_sz;
-        uint64_t* dst_msk = reinterpret_cast<uint64_t*>(p);
-
-        uint32_t grow = 0;
-        for (uint32_t fi = 0; fi < static_cast<uint32_t>(v3_frames_.size()); ++fi) {
-            const SkchFrameDesc& fd = v3_frames_[fi];
-            const uint32_t fn       = fd.n_genomes;
-            const uint8_t* csrc     = v3_section_base_ + fd.data_offset;
-            unsigned long long rsz  = ZSTD_getFrameContentSize(csrc, fd.compressed_size);
-            if (rsz == ZSTD_CONTENTSIZE_ERROR || rsz == ZSTD_CONTENTSIZE_UNKNOWN)
-                throw std::runtime_error("SkchReader V3 decompress_full: unknown frame size");
-            std::vector<uint8_t> fb(static_cast<size_t>(rsz));
-            if (ZSTD_isError(ZSTD_decompress(fb.data(), fb.size(), csrc, fd.compressed_size)))
-                throw std::runtime_error("SkchReader V3 decompress_full: frame zstd error");
-
-            const uint32_t* fnrb = reinterpret_cast<const uint32_t*>(fb.data());
-            const uint16_t* fsig = reinterpret_cast<const uint16_t*>(
-                fb.data() + sizeof(uint32_t) * nk * fn);
-            const uint64_t* fmsk = reinterpret_cast<const uint64_t*>(
-                fb.data() + sizeof(uint32_t) * nk * fn
-                          + sizeof(uint16_t) * nk * fn * sketch_size_);
-
-            for (uint32_t ki = 0; ki < nk; ++ki) {
-                std::memcpy(dst_nrb + ki * n_genomes_ + grow,
-                            fnrb   + ki * fn, sizeof(uint32_t) * fn);
-                std::memcpy(dst_sig + (static_cast<size_t>(ki) * n_genomes_ + grow) * sketch_size_,
-                            fsig   + ki * static_cast<size_t>(fn) * sketch_size_,
-                            sizeof(uint16_t) * fn * sketch_size_);
-                std::memcpy(dst_msk + (static_cast<size_t>(ki) * n_genomes_ + grow) * mask_words_,
-                            fmsk   + ki * static_cast<size_t>(fn) * mask_words_,
-                            sizeof(uint64_t) * fn * mask_words_);
-            }
-            grow += fn;
-        }
-        parse_buf();
-        return;
-    }
-
-    unsigned long long raw_size = ZSTD_getFrameContentSize(cdata_, cdata_sz_);
-    buf_.resize(static_cast<size_t>(raw_size));
-    size_t dsize = ZSTD_decompress(buf_.data(), buf_.size(), cdata_, cdata_sz_);
-    if (ZSTD_isError(dsize))
-        throw std::runtime_error(std::string("SkchReader: zstd: ") + ZSTD_getErrorName(dsize));
-    parse_buf();
-}
-
-void SkchReader::parse_buf() const {
-    if (version_ == 1) {
-        const uint8_t* p = buf_.data() + sizeof(SkchHeader);  // 64 bytes
-        ids_     = reinterpret_cast<const uint64_t*>(p);
-        p += sizeof(uint64_t) * n_genomes_;
-        entries_ = reinterpret_cast<const SkchEntryFixed*>(p);
-        p += sizeof(SkchEntryFixed) * n_genomes_;
-        sigs_    = reinterpret_cast<const uint16_t*>(p);
-        p += sizeof(uint16_t) * static_cast<size_t>(n_genomes_) * sketch_size_;
-        masks_   = reinterpret_cast<const uint64_t*>(p);
-    } else {  // v2 (or v3 assembled into v2 layout): MultiKSkchHeader = 96 bytes
-        const uint8_t* p = buf_.data() + sizeof(MultiKSkchHeader);
-        p += sizeof(uint64_t) * n_genomes_;               // genome_ids (same as id_index_)
-        genome_lengths_v2_ = reinterpret_cast<const uint64_t*>(p);
-        p += sizeof(uint64_t) * n_genomes_;
-        n_real_bins_v2_ = reinterpret_cast<const uint32_t*>(p);
-        p += sizeof(uint32_t) * n_kmer_sizes_ * n_genomes_;
-        sigs_v2_  = reinterpret_cast<const uint16_t*>(p);
-        p += sizeof(uint16_t) * n_kmer_sizes_ * static_cast<size_t>(n_genomes_) * sketch_size_;
-        masks_v2_ = reinterpret_cast<const uint64_t*>(p);
-    }
-}
-
-void SkchReader::ensure_loaded() const {
-    std::lock_guard lock(*load_mu_);
-    if (!buf_.empty()) return;
-    decompress_full();
-}
-
-void SkchReader::release() const {
-    std::lock_guard lock(*load_mu_);
-    buf_.clear();
-    buf_.shrink_to_fit();
-    ids_     = nullptr; entries_ = nullptr; sigs_ = nullptr; masks_ = nullptr;
-    genome_lengths_v2_ = nullptr; n_real_bins_v2_ = nullptr;
-    sigs_v2_ = nullptr; masks_v2_ = nullptr;
-}
-
-// Binary search in id_index_; returns UINT32_MAX if not found.
 static uint32_t find_genome_pos(const std::vector<uint64_t>& idx, uint64_t id) {
     uint32_t lo = 0, hi = static_cast<uint32_t>(idx.size());
     while (lo < hi) {
@@ -530,7 +521,7 @@ static uint32_t find_genome_pos(const std::vector<uint64_t>& idx, uint64_t id) {
 // valid sub-sketch because OPH assigns bins by permutation index.
 std::optional<SketchResult> SkchReader::apply_slice(SketchResult r,
                                                      uint32_t     requested_sz,
-                                                     uint32_t     stored_mask_words) {
+                                                     uint32_t     /*stored_mask_words*/) {
     if (requested_sz == r.sketch_size) return r;
     uint32_t new_mw = (requested_sz + 63) / 64;
     uint32_t cnt = 0;
@@ -543,29 +534,27 @@ std::optional<SketchResult> SkchReader::apply_slice(SketchResult r,
     r.sketch_size = requested_sz;
     r.mask_words  = new_mw;
     r.n_real_bins = cnt;
-    (void)stored_mask_words;
     return r;
+}
+
+// sketch_for(): single-genome access. Decompresses exactly the one frame
+// that contains the genome, copies the relevant slice out to a per-thread
+// static buffer, and returns a SketchResult referring to it.
+//
+// NOTE: this is for convenience only; batch lookups via sketch_for_ids()
+// are far more efficient and the main code path.
+namespace {
+thread_local std::vector<uint8_t> tl_skch_frame_buf;
+thread_local std::vector<uint16_t> tl_skch_sig1_buf;
+thread_local std::vector<uint16_t> tl_skch_sig2_buf;
+thread_local std::vector<uint64_t> tl_skch_mask_buf;
+thread_local uint32_t tl_skch_n_real_bins = 0;
+thread_local uint64_t tl_skch_genome_len  = 0;
 }
 
 std::optional<SketchResult> SkchReader::sketch_for(GenomeId genome_id) const {
     if (n_genomes_ == 0) return std::nullopt;
-    // For v2/v3: delegate to first k
-    if ((version_ == 2 || v3_) && n_kmer_sizes_ > 0)
-        return sketch_for(genome_id, kmer_sizes_[0], sketch_size_);
-
-    uint32_t pos = find_genome_pos(id_index_, genome_id);
-    if (pos == UINT32_MAX) return std::nullopt;
-    ensure_loaded();
-
-    SketchResult r{};
-    r.sig           = sigs_ + static_cast<size_t>(pos) * sketch_size_;
-    r.mask          = masks_ + static_cast<size_t>(pos) * mask_words_;
-    r.n_real_bins   = entries_[pos].n_real_bins;
-    r.mask_words    = entries_[pos].mask_words;
-    r.genome_length = entries_[pos].genome_length;
-    r.sketch_size   = sketch_size_;
-    r.kmer_size     = kmer_size_;
-    return r;
+    return sketch_for(genome_id, kmer_size_, sketch_size_);
 }
 
 std::optional<SketchResult> SkchReader::sketch_for(GenomeId genome_id,
@@ -573,43 +562,67 @@ std::optional<SketchResult> SkchReader::sketch_for(GenomeId genome_id,
                                                     uint32_t requested_sz) const {
     if (requested_sz > sketch_size_) return std::nullopt;
 
-    if (version_ == 2 || v3_) {
-        // Find k index in kmer_sizes_[]
-        uint32_t ki = UINT32_MAX;
-        for (uint32_t i = 0; i < n_kmer_sizes_; ++i)
-            if (kmer_sizes_[i] == k) { ki = i; break; }
-        if (ki == UINT32_MAX) return std::nullopt;
+    uint32_t ki = UINT32_MAX;
+    for (uint32_t i = 0; i < n_kmer_sizes_; ++i)
+        if (kmer_sizes_[i] == k) { ki = i; break; }
+    if (ki == UINT32_MAX) return std::nullopt;
 
-        uint32_t pos = find_genome_pos(id_index_, genome_id);
-        if (pos == UINT32_MAX) return std::nullopt;
-        ensure_loaded();
+    const uint32_t pos = find_genome_pos(id_index_, genome_id);
+    if (pos == UINT32_MAX) return std::nullopt;
 
-        size_t gi = static_cast<size_t>(ki) * n_genomes_ + pos;
-        SketchResult r{};
-        r.sig           = sigs_v2_  + gi * sketch_size_;
-        r.mask          = masks_v2_ + gi * mask_words_;
-        r.n_real_bins   = n_real_bins_v2_[gi];
-        r.mask_words    = mask_words_;
-        r.genome_length = genome_lengths_v2_[pos];
-        r.sketch_size   = sketch_size_;
-        r.kmer_size     = k;
-        return apply_slice(r, requested_sz, mask_words_);
-    }
+    const uint32_t fi    = pos / frame_sz_;
+    const uint32_t lr    = pos % frame_sz_;
+    const SkchFrameDesc& fd = frames_[fi];
+    const uint8_t* csrc  = section_base_ + fd.data_offset;
 
-    // v1
-    if (kmer_size_ != k) return std::nullopt;
-    auto base = sketch_for(genome_id);
-    if (!base) return std::nullopt;
-    return apply_slice(*base, requested_sz, mask_words_);
+    unsigned long long raw_sz = ZSTD_getFrameContentSize(csrc, fd.compressed_size);
+    if (raw_sz == ZSTD_CONTENTSIZE_ERROR || raw_sz == ZSTD_CONTENTSIZE_UNKNOWN)
+        return std::nullopt;
+    tl_skch_frame_buf.resize(static_cast<size_t>(raw_sz));
+    if (ZSTD_isError(ZSTD_decompress(tl_skch_frame_buf.data(), tl_skch_frame_buf.size(),
+                                     csrc, fd.compressed_size)))
+        return std::nullopt;
+
+    const uint32_t nk = n_kmer_sizes_;
+    const uint32_t fn = fd.n_genomes;
+    const uint32_t* nrb = reinterpret_cast<const uint32_t*>(tl_skch_frame_buf.data());
+    const uint16_t* sigs1 = reinterpret_cast<const uint16_t*>(
+        tl_skch_frame_buf.data() + sizeof(uint32_t) * nk * fn);
+    const uint16_t* sigs2 = reinterpret_cast<const uint16_t*>(
+        tl_skch_frame_buf.data() + sizeof(uint32_t) * nk * fn
+                                 + sizeof(uint16_t) * nk * fn * sketch_size_);
+    const uint64_t* msks = reinterpret_cast<const uint64_t*>(
+        tl_skch_frame_buf.data() + sizeof(uint32_t) * nk * fn
+                                 + 2 * sizeof(uint16_t) * nk * fn * sketch_size_);
+
+    const size_t gj = static_cast<size_t>(ki) * fn + lr;
+    tl_skch_sig1_buf.assign(sigs1 + gj * sketch_size_,
+                            sigs1 + (gj + 1) * sketch_size_);
+    tl_skch_sig2_buf.assign(sigs2 + gj * sketch_size_,
+                            sigs2 + (gj + 1) * sketch_size_);
+    tl_skch_mask_buf.assign(msks + gj * mask_words_,
+                            msks + (gj + 1) * mask_words_);
+    tl_skch_n_real_bins = nrb[gj];
+    tl_skch_genome_len  = genome_lengths_[pos];
+
+    SketchResult r{};
+    r.sig           = tl_skch_sig1_buf.data();
+    r.sig2          = tl_skch_sig2_buf.data();
+    r.mask          = tl_skch_mask_buf.data();
+    r.n_real_bins   = tl_skch_n_real_bins;
+    r.mask_words    = mask_words_;
+    r.genome_length = tl_skch_genome_len;
+    r.sketch_size   = sketch_size_;
+    r.kmer_size     = k;
+    return apply_slice(r, requested_sz, mask_words_);
 }
 
 void SkchReader::sketch_for_ids(const std::vector<GenomeId>& sorted_ids,
                                  uint32_t k, uint32_t sz,
                                  const SketchCallback& cb) const
 {
-    if (sorted_ids.empty() || !v3_) return;
+    if (sorted_ids.empty()) return;
 
-    // Group requests by frame, decompress each needed frame exactly once.
     uint32_t ki = UINT32_MAX;
     if (k > 0) {
         for (uint32_t i = 0; i < n_kmer_sizes_; ++i)
@@ -621,22 +634,18 @@ void SkchReader::sketch_for_ids(const std::vector<GenomeId>& sorted_ids,
     }
     if (sz == 0 || sz > sketch_size_) sz = sketch_size_;
 
-    // Map each sorted_id → (frame_idx, local_row, original index in sorted_ids).
-    // sorted_ids is ascending, so id_index_ binary searches produce non-decreasing pos,
-    // meaning frame_idx is also non-decreasing — the group scan below is a single pass.
     struct Hit { uint32_t frame_idx; uint32_t local_row; size_t orig_idx; };
     std::vector<Hit> hits;
     hits.reserve(sorted_ids.size());
     for (size_t i = 0; i < sorted_ids.size(); ++i) {
         uint32_t pos = find_genome_pos(id_index_, sorted_ids[i]);
         if (pos == UINT32_MAX) continue;
-        hits.push_back({pos / v3_frame_sz_, pos % v3_frame_sz_, i});
+        hits.push_back({pos / frame_sz_, pos % frame_sz_, i});
     }
 
-    // Group hits by frame so each frame decompresses exactly once.
     struct FrameGroup { uint32_t fi; size_t hi_start; size_t hi_end; };
     std::vector<FrameGroup> groups;
-    groups.reserve(v3_frames_.size());
+    groups.reserve(frames_.size());
     {
         size_t s = 0;
         while (s < hits.size()) {
@@ -648,20 +657,15 @@ void SkchReader::sketch_for_ids(const std::vector<GenomeId>& sorted_ids,
         }
     }
 
-    // Parallel: each thread decompresses one frame at a time and invokes the
-    // callback concurrently. Callers must treat the callback as potentially
-    // concurrent: each invocation has a UNIQUE `orig_idx` (no duplicates across
-    // threads), so writes to a pre-sized output slot indexed by orig_idx are
-    // race-free without locks. Shared counters/maps still need synchronisation.
     #pragma omp parallel for schedule(dynamic, 1)
     for (size_t gi_idx = 0; gi_idx < groups.size(); ++gi_idx) {
         const uint32_t fi     = groups[gi_idx].fi;
         const size_t   hi_s   = groups[gi_idx].hi_start;
         const size_t   hi_e   = groups[gi_idx].hi_end;
 
-        const SkchFrameDesc& fd = v3_frames_[fi];
+        const SkchFrameDesc& fd = frames_[fi];
         const uint32_t frame_n  = fd.n_genomes;
-        const uint8_t* csrc     = v3_section_base_ + fd.data_offset;
+        const uint8_t* csrc     = section_base_ + fd.data_offset;
 
         unsigned long long raw_sz = ZSTD_getFrameContentSize(csrc, fd.compressed_size);
         if (raw_sz == ZSTD_CONTENTSIZE_ERROR || raw_sz == ZSTD_CONTENTSIZE_UNKNOWN)
@@ -670,493 +674,40 @@ void SkchReader::sketch_for_ids(const std::vector<GenomeId>& sorted_ids,
         if (ZSTD_isError(ZSTD_decompress(fbuf.data(), fbuf.size(), csrc, fd.compressed_size)))
             continue;
 
-        // Frame layout (planar by k):
-        //   n_real_bins: uint32_t [n_kmer_sizes_ * frame_n]
-        //   sigs:        uint16_t [n_kmer_sizes_ * frame_n * sketch_size_]
-        //   masks:       uint64_t [n_kmer_sizes_ * frame_n * mask_words_]
+        // V4 frame layout (planar by k):
+        //   n_real_bins: uint32_t [NK * frame_n]
+        //   sigs1:       uint16_t [NK * frame_n * sketch_size_]
+        //   sigs2:       uint16_t [NK * frame_n * sketch_size_]
+        //   masks:       uint64_t [NK * frame_n * mask_words_]
+        const uint32_t nk = n_kmer_sizes_;
         const uint32_t* nrb = reinterpret_cast<const uint32_t*>(fbuf.data());
-        const uint16_t* sigs = reinterpret_cast<const uint16_t*>(
-            fbuf.data() + sizeof(uint32_t) * n_kmer_sizes_ * frame_n);
+        const uint16_t* sigs1 = reinterpret_cast<const uint16_t*>(
+            fbuf.data() + sizeof(uint32_t) * nk * frame_n);
+        const uint16_t* sigs2 = reinterpret_cast<const uint16_t*>(
+            fbuf.data() + sizeof(uint32_t) * nk * frame_n
+                        + sizeof(uint16_t) * nk * frame_n * sketch_size_);
         const uint64_t* msks = reinterpret_cast<const uint64_t*>(
-            fbuf.data() + sizeof(uint32_t) * n_kmer_sizes_ * frame_n
-                        + sizeof(uint16_t) * n_kmer_sizes_ * frame_n * sketch_size_);
+            fbuf.data() + sizeof(uint32_t) * nk * frame_n
+                        + 2 * sizeof(uint16_t) * nk * frame_n * sketch_size_);
 
         for (size_t hi = hi_s; hi < hi_e; ++hi) {
             const uint32_t lr = hits[hi].local_row;
             const size_t   gj = static_cast<size_t>(ki) * frame_n + lr;
-            const uint32_t global_pos = fi * v3_frame_sz_ + lr;
+            const uint32_t global_pos = fi * frame_sz_ + lr;
 
             SketchResult r{};
-            r.sig           = sigs + gj * sketch_size_;
-            r.mask          = msks + gj * mask_words_;
+            r.sig           = sigs1 + gj * sketch_size_;
+            r.sig2          = sigs2 + gj * sketch_size_;
+            r.mask          = msks  + gj * mask_words_;
             r.n_real_bins   = nrb[gj];
             r.mask_words    = mask_words_;
-            r.genome_length = v3_genome_lengths_[global_pos];
+            r.genome_length = genome_lengths_[global_pos];
             r.sketch_size   = sketch_size_;
             r.kmer_size     = k;
             auto sliced = apply_slice(r, sz, mask_words_);
             if (sliced) cb(hits[hi].orig_idx, *sliced);
         }
     }
-}
-
-// ── SkchWriterMultiK ─────────────────────────────────────────────────────────
-
-SkchWriterMultiK::SkchWriterMultiK(std::vector<uint32_t> kmer_sizes, uint32_t sketch_size,
-                                    uint32_t syncmer_s, uint64_t seed1, uint64_t seed2,
-                                    std::string spill_dir)
-    : kmer_sizes_(std::move(kmer_sizes))
-    , sketch_size_(sketch_size)
-    , syncmer_s_(syncmer_s)
-    , seed1_(seed1), seed2_(seed2)
-    , mask_words_((sketch_size + 63) / 64)
-    , spill_record_size_(kmer_sizes_.size() *
-                         (sizeof(uint16_t) * sketch_size + sizeof(uint64_t) * ((sketch_size + 63) / 64)))
-{
-    std::sort(kmer_sizes_.begin(), kmer_sizes_.end());
-    kmer_sizes_.erase(std::unique(kmer_sizes_.begin(), kmer_sizes_.end()), kmer_sizes_.end());
-    if (kmer_sizes_.size() > 8)
-        throw std::runtime_error("SkchWriterMultiK: at most 8 k values supported");
-
-    n_real_bins_.resize(kmer_sizes_.size());
-
-    if (spill_dir.empty()) {
-        const char* env = std::getenv("GENOPACK_SPILL_DIR");
-        if (env && *env) spill_dir = env;
-    }
-    if (!spill_dir.empty()) {
-        char path[4096];
-        std::snprintf(path, sizeof(path), "%s/genopack_skch_mk_XXXXXX", spill_dir.c_str());
-        int fd = ::mkstemp(path);
-        if (fd < 0) throw std::runtime_error(std::string("SkchWriterMultiK: mkstemp: ") + path);
-        ::unlink(path);
-        spill_fp_ = ::fdopen(fd, "w+b");
-        if (!spill_fp_) { ::close(fd); throw std::runtime_error("SkchWriterMultiK: fdopen failed"); }
-    } else {
-        spill_fp_ = std::tmpfile();
-        if (!spill_fp_) throw std::runtime_error("SkchWriterMultiK: cannot create spill tmpfile");
-    }
-}
-
-SkchWriterMultiK::~SkchWriterMultiK() {
-    if (spill_fp_) { std::fclose(spill_fp_); spill_fp_ = nullptr; }
-}
-
-void SkchWriterMultiK::add(GenomeId genome_id, uint64_t genome_length,
-                            const std::vector<std::vector<uint16_t>>& sigs_per_k,
-                            const std::vector<uint32_t>&              n_real_bins_per_k,
-                            const std::vector<std::vector<uint64_t>>& masks_per_k)
-{
-    const size_t nk = kmer_sizes_.size();
-    if (sigs_per_k.size() != nk || n_real_bins_per_k.size() != nk || masks_per_k.size() != nk)
-        throw std::runtime_error("SkchWriterMultiK::add: k-count mismatch");
-
-    ids_.push_back(genome_id);
-    genome_lengths_.push_back(genome_length);
-    for (size_t ki = 0; ki < nk; ++ki)
-        n_real_bins_[ki].push_back(n_real_bins_per_k[ki]);
-
-    // Spill record: sigs_k0 | sigs_k1 | ... | masks_k0 | masks_k1 | ...
-    for (size_t ki = 0; ki < nk; ++ki)
-        std::fwrite(sigs_per_k[ki].data(), sizeof(uint16_t), sketch_size_, spill_fp_);
-    for (size_t ki = 0; ki < nk; ++ki)
-        std::fwrite(masks_per_k[ki].data(), sizeof(uint64_t), mask_words_, spill_fp_);
-}
-
-SectionDesc SkchWriterMultiK::finalize(AppendWriter& writer, uint64_t section_id) {
-    const uint32_t n  = static_cast<uint32_t>(ids_.size());
-    const uint32_t nk = static_cast<uint32_t>(kmer_sizes_.size());
-
-    std::vector<uint32_t> order(n);
-    std::iota(order.begin(), order.end(), 0u);
-    std::sort(order.begin(), order.end(),
-              [&](uint32_t a, uint32_t b) { return ids_[a] < ids_[b]; });
-
-    const size_t sig_bytes_k  = sizeof(uint16_t) * sketch_size_;
-    const size_t mask_bytes_k = sizeof(uint64_t) * mask_words_;
-    const uint32_t n_frames   = (n + SKCH_V3_FRAME_SIZE - 1) / SKCH_V3_FRAME_SIZE;
-    const uint64_t section_start = writer.current_offset();
-
-    // ── 1. Write uncompressed header ─────────────────────────────────────────
-    SkchSeekHdr hdr{};
-    hdr.magic        = SKCH_V3_MAGIC;
-    hdr.n_frames     = n_frames;
-    hdr.frame_size   = SKCH_V3_FRAME_SIZE;
-    hdr.n_genomes    = n;
-    hdr.sketch_size  = sketch_size_;
-    hdr.n_kmer_sizes = nk;
-    for (uint32_t i = 0; i < nk; ++i) hdr.kmer_sizes[i] = kmer_sizes_[i];
-    hdr.syncmer_s    = syncmer_s_;
-    hdr.mask_words   = mask_words_;
-    hdr.seed1        = seed1_;
-    hdr.seed2        = seed2_;
-    writer.append(&hdr, sizeof(hdr));
-
-    // ── 2. Write frame table placeholder (will be filled in below) ───────────
-    const uint64_t frame_table_offset = writer.current_offset();
-    std::vector<SkchFrameDesc> frame_descs(n_frames);
-    writer.append(frame_descs.data(), sizeof(SkchFrameDesc) * n_frames);
-
-    // ── 3. Write sorted genome_ids and genome_lengths (uncompressed) ─────────
-    for (uint32_t i : order) writer.append(&ids_[i],            sizeof(uint64_t));
-    for (uint32_t i : order) writer.append(&genome_lengths_[i], sizeof(uint64_t));
-
-    // ── 4. Compress and write each frame, recording offset + size ────────────
-    const size_t OUT_BUF = 4 << 20;
-    std::vector<uint8_t> out_buf(OUT_BUF);
-    std::vector<uint8_t> rec(spill_record_size_);
-
-    for (uint32_t fi = 0; fi < n_frames; ++fi) {
-        const uint32_t row_start = fi * SKCH_V3_FRAME_SIZE;
-        const uint32_t row_end   = std::min(n, row_start + SKCH_V3_FRAME_SIZE);
-        const uint32_t frame_n   = row_end - row_start;
-
-        const size_t frame_raw_sz =
-            sizeof(uint32_t) * nk * frame_n
-            + sig_bytes_k  * nk * frame_n
-            + mask_bytes_k * nk * frame_n;
-
-        const uint64_t frame_start = writer.current_offset();
-        frame_descs[fi].data_offset  = frame_start - section_start;
-        frame_descs[fi].n_genomes    = frame_n;
-
-        ZSTD_CStream* cs = ZSTD_createCStream();
-        ZSTD_initCStream(cs, 3);
-        ZSTD_CCtx_setPledgedSrcSize(cs, frame_raw_sz);
-
-        auto compress = [&](const void* data, size_t size) {
-            ZSTD_inBuffer zi{data, size, 0};
-            while (zi.pos < zi.size) {
-                ZSTD_outBuffer zo{out_buf.data(), out_buf.size(), 0};
-                size_t r = ZSTD_compressStream(cs, &zo, &zi);
-                if (ZSTD_isError(r))
-                    throw std::runtime_error(std::string("SkchWriterMultiK V3: ") + ZSTD_getErrorName(r));
-                if (zo.pos) writer.append(out_buf.data(), zo.pos);
-            }
-        };
-
-        // n_real_bins planar
-        for (uint32_t ki = 0; ki < nk; ++ki)
-            for (uint32_t rank = row_start; rank < row_end; ++rank)
-                compress(&n_real_bins_[ki][order[rank]], sizeof(uint32_t));
-
-        // sigs planar
-        for (uint32_t ki = 0; ki < nk; ++ki) {
-            size_t sig_off = ki * sig_bytes_k;
-            for (uint32_t rank = row_start; rank < row_end; ++rank) {
-                long off = static_cast<long>(static_cast<size_t>(order[rank]) * spill_record_size_);
-                if (std::fseek(spill_fp_, off, SEEK_SET) != 0)
-                    throw std::runtime_error("SkchWriterMultiK V3: fseek sigs");
-                if (std::fread(rec.data(), 1, spill_record_size_, spill_fp_) != spill_record_size_)
-                    throw std::runtime_error("SkchWriterMultiK V3: fread sigs");
-                compress(rec.data() + sig_off, sig_bytes_k);
-            }
-        }
-
-        // masks planar
-        size_t masks_base = nk * sig_bytes_k;
-        for (uint32_t ki = 0; ki < nk; ++ki) {
-            size_t mask_off = masks_base + ki * mask_bytes_k;
-            for (uint32_t rank = row_start; rank < row_end; ++rank) {
-                long off = static_cast<long>(static_cast<size_t>(order[rank]) * spill_record_size_);
-                if (std::fseek(spill_fp_, off, SEEK_SET) != 0)
-                    throw std::runtime_error("SkchWriterMultiK V3: fseek masks");
-                if (std::fread(rec.data(), 1, spill_record_size_, spill_fp_) != spill_record_size_)
-                    throw std::runtime_error("SkchWriterMultiK V3: fread masks");
-                compress(rec.data() + mask_off, mask_bytes_k);
-            }
-        }
-
-        size_t remaining = 1;
-        while (remaining) {
-            ZSTD_outBuffer zo{out_buf.data(), out_buf.size(), 0};
-            remaining = ZSTD_endStream(cs, &zo);
-            if (ZSTD_isError(remaining))
-                throw std::runtime_error(std::string("SkchWriterMultiK V3 end: ") + ZSTD_getErrorName(remaining));
-            if (zo.pos) writer.append(out_buf.data(), zo.pos);
-        }
-        ZSTD_freeCStream(cs);
-
-        frame_descs[fi].compressed_size = static_cast<uint32_t>(writer.current_offset() - frame_start);
-    }
-
-    std::fclose(spill_fp_); spill_fp_ = nullptr;
-
-    // ── 5. Seek back and write the completed frame table ─────────────────────
-    const uint64_t section_end = writer.current_offset();
-    writer.seek_to(frame_table_offset);
-    writer.append(frame_descs.data(), sizeof(SkchFrameDesc) * n_frames);
-    writer.seek_to(section_end);
-
-    SectionDesc desc{};
-    desc.type              = SEC_SKCH;
-    desc.version           = 3;
-    desc.section_id        = section_id;
-    desc.file_offset       = section_start;
-    desc.compressed_size   = section_end - section_start;
-    desc.uncompressed_size = 0;
-    desc.item_count        = n;
-    desc.aux0              = sketch_size_;
-    desc.aux1              = (nk > 0) ? kmer_sizes_[0] : 0;
-    std::memset(desc.checksum, 0, sizeof(desc.checksum));
-    return desc;
-}
-
-// ── SkchV2Repacker ────────────────────────────────────────────────────────────
-
-SkchV2Repacker::~SkchV2Repacker() {
-    if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
-}
-
-void SkchV2Repacker::prepare(const SkchReader& src, const std::string& tmp_dir) {
-    if (src.version_ != 2)
-        throw std::runtime_error("SkchV2Repacker: source must be V2");
-
-    n_genomes_    = src.n_genomes_;
-    sketch_size_  = src.sketch_size_;
-    n_kmer_sizes_ = src.n_kmer_sizes_;
-    mask_words_   = src.mask_words_;
-    std::copy(src.kmer_sizes_, src.kmer_sizes_ + 8, kmer_sizes_);
-    syncmer_s_    = src.syncmer_s_;
-    seed1_        = src.seed1_;
-    seed2_        = src.seed2_;
-
-    std::string path = tmp_dir + "/genopack_v2_XXXXXX";
-    fd_ = ::mkstemp(path.data());
-    if (fd_ < 0)
-        throw std::runtime_error("SkchV2Repacker: mkstemp failed in " + tmp_dir);
-    ::unlink(path.c_str());
-
-    // Preallocate temp file to expected uncompressed V2 layout size.
-    // Skipped silently if filesystem doesn't support fallocate (e.g. older NFS).
-    const size_t expected_sz =
-        sizeof(MultiKSkchHeader)
-        + sizeof(uint64_t) * n_genomes_                                 // ids
-        + sizeof(uint64_t) * n_genomes_                                 // genome_lengths
-        + sizeof(uint32_t) * n_kmer_sizes_ * n_genomes_                 // n_real_bins
-        + sizeof(uint16_t) * n_kmer_sizes_ * static_cast<size_t>(n_genomes_) * sketch_size_
-        + sizeof(uint64_t) * n_kmer_sizes_ * static_cast<size_t>(n_genomes_) * mask_words_;
-    (void)::fallocate(fd_, 0, 0, static_cast<off_t>(expected_sz));
-
-    const size_t IN_BUF  = 16u << 20;
-    const size_t OUT_BUF = 64u << 20;
-    std::vector<uint8_t> ibuf(IN_BUF), obuf(OUT_BUF);
-
-    ZSTD_DStream* ds = ZSTD_createDStream();
-    ZSTD_initDStream(ds);
-
-    size_t src_pos = 0;
-    while (src_pos < src.cdata_sz_) {
-        size_t chunk = std::min(IN_BUF, src.cdata_sz_ - src_pos);
-        ZSTD_inBuffer zi{src.cdata_ + src_pos, chunk, 0};
-        src_pos += chunk;
-        while (zi.pos < zi.size) {
-            ZSTD_outBuffer zo{obuf.data(), OUT_BUF, 0};
-            size_t ret = ZSTD_decompressStream(ds, &zo, &zi);
-            if (ZSTD_isError(ret)) {
-                ZSTD_freeDStream(ds);
-                throw std::runtime_error(std::string("SkchV2Repacker decompress: ") + ZSTD_getErrorName(ret));
-            }
-            if (zo.pos > 0) {
-                if (::write(fd_, obuf.data(), zo.pos) < 0)
-                    throw std::runtime_error("SkchV2Repacker: write to temp file failed");
-                sz_ += zo.pos;
-            }
-        }
-    }
-    ZSTD_freeDStream(ds);
-    spdlog::info("SKCH repack: decompressed to {} MB temp file", sz_ >> 20);
-}
-
-SectionDesc SkchV2Repacker::write_v3(AppendWriter& writer, uint64_t section_id) {
-    if (fd_ < 0)
-        throw std::runtime_error("SkchV2Repacker::write_v3: not prepared");
-
-    void* mapped = ::mmap(nullptr, sz_, PROT_READ, MAP_SHARED, fd_, 0);
-    if (mapped == MAP_FAILED)
-        throw std::runtime_error("SkchV2Repacker: mmap failed");
-
-    // Hint aggressive read-ahead — frames are consumed strictly in order.
-    ::madvise(mapped, sz_, MADV_SEQUENTIAL);
-
-    const uint8_t* p = static_cast<const uint8_t*>(mapped) + sizeof(MultiKSkchHeader);
-
-    const uint64_t* ids_v2   = reinterpret_cast<const uint64_t*>(p); p += 8 * n_genomes_;
-    const uint64_t* glens_v2 = reinterpret_cast<const uint64_t*>(p); p += 8 * n_genomes_;
-    const uint32_t* nrb_v2   = reinterpret_cast<const uint32_t*>(p); p += 4 * n_kmer_sizes_ * n_genomes_;
-    const uint16_t* sigs_v2  = reinterpret_cast<const uint16_t*>(p);
-    p += 2 * n_kmer_sizes_ * static_cast<size_t>(n_genomes_) * sketch_size_;
-    const uint64_t* masks_v2 = reinterpret_cast<const uint64_t*>(p);
-
-    const uint32_t nk       = n_kmer_sizes_;
-    const uint32_t n        = n_genomes_;
-    const uint32_t frame_sz = SKCH_V3_FRAME_SIZE;
-    const uint32_t n_frames = (n + frame_sz - 1) / frame_sz;
-
-    const uint64_t section_start = writer.current_offset();
-
-    SkchSeekHdr hdr{};
-    hdr.magic        = SKCH_V3_MAGIC;
-    hdr.n_frames     = n_frames;
-    hdr.frame_size   = frame_sz;
-    hdr.n_genomes    = n;
-    hdr.sketch_size  = sketch_size_;
-    hdr.n_kmer_sizes = nk;
-    for (uint32_t i = 0; i < nk; ++i) hdr.kmer_sizes[i] = kmer_sizes_[i];
-    hdr.syncmer_s    = syncmer_s_;
-    hdr.mask_words   = mask_words_;
-    hdr.seed1        = seed1_;
-    hdr.seed2        = seed2_;
-    writer.append(&hdr, sizeof(hdr));
-
-    const uint64_t frame_table_offset = writer.current_offset();
-    std::vector<SkchFrameDesc> frame_descs(n_frames);
-    writer.append(frame_descs.data(), sizeof(SkchFrameDesc) * n_frames);
-
-    writer.append(ids_v2,   sizeof(uint64_t) * n);
-    writer.append(glens_v2, sizeof(uint64_t) * n);
-
-    // Compress frames in parallel batches (one batch = nthreads frames).
-    // Pipeline: while the main thread writes batch K, OpenMP team compresses
-    // batch K+1 in an async task. Double-buffered cbuf to avoid races.
-#ifdef _OPENMP
-    const int nthreads = omp_get_max_threads();
-#else
-    const int nthreads = 1;
-#endif
-    const uint32_t batch_sz = static_cast<uint32_t>(nthreads);
-
-    auto compress_batch = [&](uint32_t fb, uint32_t fb_end,
-                              std::vector<std::vector<uint8_t>>& cbuf,
-                              std::vector<std::string>&          cerr) {
-        const uint32_t nb = fb_end - fb;
-        cbuf.assign(nb, {});
-        cerr.assign(nb, {});
-
-        #pragma omp parallel for schedule(static,1) num_threads(nthreads)
-        for (int bi = 0; bi < static_cast<int>(nb); ++bi) {
-            const uint32_t fi        = fb + static_cast<uint32_t>(bi);
-            const uint32_t row_start = fi * frame_sz;
-            const uint32_t row_end   = std::min(n, row_start + frame_sz);
-            const uint32_t fn        = row_end - row_start;
-
-            const size_t frame_raw_sz =
-                sizeof(uint32_t) * nk * fn
-                + sizeof(uint16_t) * nk * static_cast<size_t>(fn) * sketch_size_
-                + sizeof(uint64_t) * nk * static_cast<size_t>(fn) * mask_words_;
-
-            cbuf[bi].reserve(ZSTD_compressBound(frame_raw_sz));
-
-            const size_t TMP = 4u << 20;
-            std::vector<uint8_t> tmp(TMP);
-
-            ZSTD_CStream* cs = ZSTD_createCStream();
-            ZSTD_initCStream(cs, 1);
-            ZSTD_CCtx_setPledgedSrcSize(cs, frame_raw_sz);
-
-            auto compress = [&](const void* data, size_t size) {
-                ZSTD_inBuffer zi{data, size, 0};
-                while (zi.pos < zi.size && cerr[bi].empty()) {
-                    ZSTD_outBuffer zo{tmp.data(), TMP, 0};
-                    size_t r = ZSTD_compressStream(cs, &zo, &zi);
-                    if (ZSTD_isError(r)) { cerr[bi] = ZSTD_getErrorName(r); return; }
-                    cbuf[bi].insert(cbuf[bi].end(), tmp.data(), tmp.data() + zo.pos);
-                }
-            };
-
-            for (uint32_t ki = 0; ki < nk; ++ki)
-                compress(nrb_v2 + ki * n + row_start, sizeof(uint32_t) * fn);
-            for (uint32_t ki = 0; ki < nk; ++ki)
-                compress(sigs_v2 + (static_cast<size_t>(ki) * n + row_start) * sketch_size_,
-                         sizeof(uint16_t) * fn * sketch_size_);
-            for (uint32_t ki = 0; ki < nk; ++ki)
-                compress(masks_v2 + (static_cast<size_t>(ki) * n + row_start) * mask_words_,
-                         sizeof(uint64_t) * fn * mask_words_);
-
-            size_t remaining = 1;
-            while (remaining && cerr[bi].empty()) {
-                ZSTD_outBuffer zo{tmp.data(), TMP, 0};
-                remaining = ZSTD_endStream(cs, &zo);
-                if (ZSTD_isError(remaining)) { cerr[bi] = ZSTD_getErrorName(remaining); break; }
-                cbuf[bi].insert(cbuf[bi].end(), tmp.data(), tmp.data() + zo.pos);
-            }
-            ZSTD_freeCStream(cs);
-        }
-    };
-
-    auto write_batch = [&](uint32_t fb, uint32_t fb_end,
-                           const std::vector<std::vector<uint8_t>>& cbuf,
-                           const std::vector<std::string>&          cerr) {
-        const uint32_t nb = fb_end - fb;
-        for (uint32_t bi = 0; bi < nb; ++bi) {
-            if (!cerr[bi].empty())
-                throw std::runtime_error("SkchV2Repacker compress: " + cerr[bi]);
-            const uint32_t fi      = fb + bi;
-            const uint32_t row_end = std::min(n, (fi + 1) * frame_sz);
-            frame_descs[fi].data_offset     = writer.current_offset() - section_start;
-            frame_descs[fi].n_genomes       = row_end - fi * frame_sz;
-            frame_descs[fi].compressed_size = static_cast<uint32_t>(cbuf[bi].size());
-            writer.append(cbuf[bi].data(), cbuf[bi].size());
-        }
-        spdlog::info("SKCH repack: frames {}-{}/{}", fb + 1, fb_end, n_frames);
-    };
-
-    std::vector<std::vector<uint8_t>> cbuf_a, cbuf_b;
-    std::vector<std::string>          cerr_a, cerr_b;
-
-    // Prime: compress first batch synchronously.
-    uint32_t cur_fb     = 0;
-    uint32_t cur_fb_end = std::min(n_frames, batch_sz);
-    compress_batch(cur_fb, cur_fb_end, cbuf_a, cerr_a);
-    bool cur_is_a = true;
-
-    for (uint32_t next_fb = cur_fb_end; next_fb < n_frames; next_fb += batch_sz) {
-        const uint32_t next_fb_end = std::min(n_frames, next_fb + batch_sz);
-
-        // Launch next batch compression in parallel with write of current batch.
-        auto& nxt_cbuf = cur_is_a ? cbuf_b : cbuf_a;
-        auto& nxt_cerr = cur_is_a ? cerr_b : cerr_a;
-        auto fut = std::async(std::launch::async, [&]{
-            compress_batch(next_fb, next_fb_end, nxt_cbuf, nxt_cerr);
-        });
-
-        // Meanwhile write the already-compressed current batch.
-        auto& cur_cbuf = cur_is_a ? cbuf_a : cbuf_b;
-        auto& cur_cerr = cur_is_a ? cerr_a : cerr_b;
-        write_batch(cur_fb, cur_fb_end, cur_cbuf, cur_cerr);
-
-        fut.wait();
-
-        cur_fb     = next_fb;
-        cur_fb_end = next_fb_end;
-        cur_is_a   = !cur_is_a;
-    }
-
-    // Write the final batch (no pending compression).
-    auto& cur_cbuf = cur_is_a ? cbuf_a : cbuf_b;
-    auto& cur_cerr = cur_is_a ? cerr_a : cerr_b;
-    write_batch(cur_fb, cur_fb_end, cur_cbuf, cur_cerr);
-
-    ::munmap(mapped, sz_);
-    ::close(fd_); fd_ = -1;
-
-    const uint64_t section_end = writer.current_offset();
-    writer.seek_to(frame_table_offset);
-    writer.append(frame_descs.data(), sizeof(SkchFrameDesc) * n_frames);
-    writer.seek_to(section_end);
-
-    SectionDesc desc{};
-    desc.type              = SEC_SKCH;
-    desc.version           = 3;
-    desc.section_id        = section_id;
-    desc.file_offset       = section_start;
-    desc.compressed_size   = section_end - section_start;
-    desc.uncompressed_size = 0;
-    desc.item_count        = n;
-    desc.aux0              = sketch_size_;
-    desc.aux1              = (nk > 0) ? kmer_sizes_[0] : 0;
-    std::memset(desc.checksum, 0, sizeof(desc.checksum));
-    return desc;
 }
 
 } // namespace genopack

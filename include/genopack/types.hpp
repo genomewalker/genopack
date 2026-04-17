@@ -17,17 +17,46 @@ static constexpr ShardId  INVALID_SHARD_ID  = UINT32_MAX;
 
 // ── File format magic numbers & version ──────────────────────────────────────
 
-static constexpr uint32_t GPKM_MAGIC    = 0x4D4B5047u; // "GPKM"
 static constexpr uint32_t GPKC_MAGIC    = 0x434B5047u; // "GPKC"
 static constexpr uint32_t GPKS_MAGIC    = 0x534B5047u; // "GPKS"
 static constexpr uint16_t FORMAT_VERSION = 2;
+
+// ── Genome type ───────────────────────────────────────────────────────────────
+enum class GenomeType : uint32_t {
+    NUCLEAR       = 0,  // default (nuclear/chromosomal)
+    MITOCHONDRION = 1,
+    PLASTID       = 2,  // chloroplast, chromoplast, leucoplast
+    PLASMID       = 3,
+    VIRUS         = 4,
+    PHAGE         = 5,
+};
+
+inline const char* genome_type_str(GenomeType t) {
+    switch (t) {
+        case GenomeType::MITOCHONDRION: return "mitochondrion";
+        case GenomeType::PLASTID:       return "plastid";
+        case GenomeType::PLASMID:       return "plasmid";
+        case GenomeType::VIRUS:         return "virus";
+        case GenomeType::PHAGE:         return "phage";
+        default:                        return "nuclear";
+    }
+}
+
+inline GenomeType parse_genome_type(std::string_view s) {
+    if (s == "mitochondrion" || s == "mitochondria" || s == "mt") return GenomeType::MITOCHONDRION;
+    if (s == "plastid" || s == "chloroplast" || s == "cp")        return GenomeType::PLASTID;
+    if (s == "plasmid")                                            return GenomeType::PLASMID;
+    if (s == "virus" || s == "viral")                              return GenomeType::VIRUS;
+    if (s == "phage")                                              return GenomeType::PHAGE;
+    return GenomeType::NUCLEAR;
+}
 
 // ── Per-genome metadata ───────────────────────────────────────────────────────
 // Taxonomy-free. Shard grouping is by MinHash similarity, not taxon label.
 
 struct GenomeMeta {
     GenomeId genome_id    = INVALID_GENOME_ID;
-    uint32_t _reserved0   = 0;    // was: TaxonId taxon_id (kept for binary compat)
+    uint32_t genome_type  = 0;    // GenomeType enum; was _reserved0 (always 0 in old archives)
     ShardId  shard_id     = INVALID_SHARD_ID;
 
     uint64_t genome_length     = 0;   // total bp
@@ -50,23 +79,10 @@ struct GenomeMeta {
     // Total struct size: 72 bytes (alignment 8)
 
     static constexpr uint32_t FLAG_DELETED = 1u;
+    static constexpr uint32_t FLAG_DELTA   = 2u;  // blob requires shard reference prefix for decompression
     bool is_deleted() const { return (flags & FLAG_DELETED) != 0; }
 };
 static_assert(sizeof(GenomeMeta) == 72, "GenomeMeta layout changed");
-
-// ── Shard descriptor (stored in MANIFEST) ────────────────────────────────────
-
-struct ShardDescriptor {
-    ShardId  shard_id   = INVALID_SHARD_ID;
-    uint32_t cluster_id = 0;      // similarity cluster index
-    uint32_t n_genomes  = 0;
-    uint32_t n_deleted  = 0;
-    uint64_t file_size        = 0;
-    uint64_t blob_area_offset = 0;
-    char     filename[64]     = {};
-    uint8_t  checksum[16]     = {};
-};
-static_assert(sizeof(ShardDescriptor) == 112, "ShardDescriptor layout changed");
 
 // ── Extract query ─────────────────────────────────────────────────────────────
 
@@ -107,6 +123,8 @@ struct BuildRecord {
     float    contamination = 0.0f;
     uint64_t genome_length = 0;
     uint32_t n_contigs     = 0;
+
+    GenomeType genome_type = GenomeType::NUCLEAR;
 
     // Extra TSV columns written verbatim to meta.tsv sidecar
     std::vector<std::pair<std::string, std::string>> extra_fields;

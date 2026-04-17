@@ -1,5 +1,8 @@
 #include <genopack/accx.hpp>
 #include <genopack/archive.hpp>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #include <genopack/repack.hpp>
 #include <genopack/catalog.hpp>
 #include <genopack/cidx.hpp>
@@ -459,7 +462,8 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
                        int skch_kmer, int skch_size, int skch_syncmer,
                        std::vector<int> skch_kmers = {},
                        bool skip_gidx = false,
-                       bool repack_skch = false) {
+                       int repack_threads = 16) {
+    (void)repack_threads;
     // Resolve .gpk path
     std::filesystem::path gpk = archive_path;
     if (!std::filesystem::exists(gpk) && gpk.extension() != ".gpk")
@@ -494,7 +498,7 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
     bool need_gidx = (!has_gidx || force) && !skip_gidx;
     bool need_txdb = build_txdb && (!has_txdb || force);
     bool need_cidx = !cidx_tsv.empty() && (!has_cidx || force);
-    bool need_skch = build_skch || repack_skch;
+    bool need_skch = build_skch;
 
     if (!need_gidx && !need_txdb && !need_cidx && !need_skch) {
         spdlog::info("GIDX: already present (use --force to rebuild)");
@@ -512,45 +516,48 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
         uint64_t catl_row_index;
     };
     std::unordered_map<GenomeId, CatlEntry> genome_map;
-
-    MergedCatalogReader catalog;
-    auto catl_sections = toc.find_by_type(SEC_CATL);
-    for (auto* sd : catl_sections)
-        catalog.add_fragment(mmap.data(), sd->file_offset, sd->compressed_size);
-
-    uint64_t catl_row = 0;
-    catalog.scan([&](const GenomeMeta& m) {
-        genome_map[m.genome_id] = {m.shard_id, catl_row};
-        ++catl_row;
-        return true;
-    });
-
-    spdlog::info("GIDX: scanned {} catalog rows", genome_map.size());
-
-    // Step 2: for each SHRD, scan its genome directory to find dir_index per genome_id
-    auto shrd_sections = toc.find_by_type(SEC_SHRD);
+    std::vector<const SectionDesc*> shrd_sections;
     GidxWriter gidx_writer;
-    size_t n_indexed = 0;
 
-    for (auto* sd : shrd_sections) {
-        // Open shard section to read its directory
-        ShardReader shard;
-        shard.open(mmap.data(), sd->file_offset, sd->compressed_size);
+    if (need_gidx) {
+        MergedCatalogReader catalog;
+        auto catl_sections = toc.find_by_type(SEC_CATL);
+        for (auto* sd : catl_sections)
+            catalog.add_fragment(mmap.data(), sd->file_offset, sd->compressed_size);
 
-        uint32_t dir_idx = 0;
-        for (auto* de = shard.dir_begin(); de != shard.dir_end(); ++de, ++dir_idx) {
-            auto it = genome_map.find(de->genome_id);
-            if (it == genome_map.end()) continue;
+        uint64_t catl_row = 0;
+        catalog.scan([&](const GenomeMeta& m) {
+            genome_map[m.genome_id] = {m.shard_id, catl_row};
+            ++catl_row;
+            return true;
+        });
 
-            gidx_writer.add(de->genome_id,
-                            static_cast<uint32_t>(sd->section_id),
-                            dir_idx,
-                            it->second.catl_row_index);
-            ++n_indexed;
+        spdlog::info("GIDX: scanned {} catalog rows", genome_map.size());
+
+        // Step 2: for each SHRD, scan its genome directory to find dir_index per genome_id
+        shrd_sections = toc.find_by_type(SEC_SHRD);
+        size_t n_indexed = 0;
+
+        for (auto* sd : shrd_sections) {
+            // Open shard section to read its directory
+            ShardReader shard;
+            shard.open(mmap.data(), sd->file_offset, sd->compressed_size);
+
+            uint32_t dir_idx = 0;
+            for (auto* de = shard.dir_begin(); de != shard.dir_end(); ++de, ++dir_idx) {
+                auto it = genome_map.find(de->genome_id);
+                if (it == genome_map.end()) continue;
+
+                gidx_writer.add(de->genome_id,
+                                static_cast<uint32_t>(sd->section_id),
+                                dir_idx,
+                                it->second.catl_row_index);
+                ++n_indexed;
+            }
         }
-    }
 
-    spdlog::info("GIDX: indexed {} genomes across {} shards", n_indexed, shrd_sections.size());
+        spdlog::info("GIDX: indexed {} genomes across {} shards", n_indexed, shrd_sections.size());
+    }
 
     // ── Append GIDX section + rewrite TOC ───────────────────────────────────
     // Close mmap before appending (we'll write to the same file)
@@ -701,64 +708,8 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
         spdlog::info("CIDX: {} contigs indexed, {} genomes missing/skipped", n_contigs.load(), n_missing.load());
     }
 
-    // Writers declared here so the repack block can assign into skch_writer_mk
-    // before the normal sketching block runs (which is skipped when repack_skch).
     std::unique_ptr<SkchWriter>       skch_writer;
     std::unique_ptr<SkchWriterMultiK> skch_writer_mk;
-
-    // ── Repack existing SKCH into seekable format (if --repack-skch) ────────────
-    // Reads all sketches from the existing section and re-emits in seekable
-    // multi-frame format without re-computing OPH signatures from FASTA.
-    if (repack_skch) {
-        auto skch_secs = toc.find_by_type(SEC_SKCH);
-        if (skch_secs.empty()) {
-            spdlog::error("--repack-skch: no SKCH section found in archive");
-            return 1;
-        }
-        SkchReader src;
-        src.open(mmap.data(), skch_secs[0]->file_offset, skch_secs[0]->compressed_size);
-
-        if (src.version() == 3) {
-            spdlog::info("SKCH: already seekable — nothing to repack");
-            repack_skch = false;
-            need_skch   = false;
-        } else {
-            src.ensure_loaded();
-
-            const uint32_t nk = src.n_kmer_sizes();
-            std::vector<uint32_t> ks;
-            for (uint32_t i = 0; i < nk; ++i) ks.push_back(src.kmer_size_at(i));
-            if (ks.empty()) ks.push_back(src.kmer_size());
-            const uint32_t sketch_sz = src.sketch_size();
-            const uint32_t mw        = (sketch_sz + 63) / 64;
-
-            skch_writer_mk = std::make_unique<SkchWriterMultiK>(
-                ks, sketch_sz, src.syncmer_s(), src.seed1(), src.seed2());
-
-            size_t done = 0;
-            for (GenomeId gid : src.genome_ids()) {
-                std::vector<std::vector<uint16_t>> sigs(nk);
-                std::vector<uint32_t>              nreal(nk);
-                std::vector<std::vector<uint64_t>> masks(nk);
-                uint64_t genome_length = 0;
-                for (uint32_t ki = 0; ki < nk; ++ki) {
-                    auto sk = src.sketch_for(gid, ks[ki], sketch_sz);
-                    if (!sk) continue;
-                    genome_length   = sk->genome_length;
-                    sigs[ki].assign(sk->sig,  sk->sig  + sketch_sz);
-                    nreal[ki]       = sk->n_real_bins;
-                    masks[ki].assign(sk->mask, sk->mask + mw);
-                }
-                skch_writer_mk->add(gid, genome_length, sigs, nreal, masks);
-                ++done;
-                if (done % 100000 == 0)
-                    spdlog::info("SKCH repack: {}/{} converted", done, src.n_genomes());
-            }
-            src.release();
-            spdlog::info("SKCH repack: {} genomes read from existing section", done);
-            need_skch = false;  // skip the normal FASTA-based sketching block
-        }
-    }
 
     // ── Build SKCH for missing genomes (if --skch) ────────────────────────────
     size_t skch_n_missing = 0;
@@ -774,7 +725,7 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
         uint32_t sk_kmer_size   = (skch_kmer    > 0) ? static_cast<uint32_t>(skch_kmer)    : 16;
         uint32_t sk_syncmer_s   = (skch_syncmer > 0) ? static_cast<uint32_t>(skch_syncmer) : 0;
         uint64_t sk_seed1       = 42;
-        uint64_t sk_seed2       = 1337;
+        uint64_t sk_seed2       = 43;
 
         auto skch_sections = toc.find_by_type(SEC_SKCH);
         std::vector<SkchReader> skch_readers;
@@ -872,7 +823,8 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
                     struct MultiResult {
                         GenomeId gid;
                         uint64_t genome_length;
-                        std::vector<std::vector<uint16_t>> sigs;   // [ki]
+                        std::vector<std::vector<uint16_t>> sigs1;  // [ki]
+                        std::vector<std::vector<uint16_t>> sigs2;  // [ki]
                         std::vector<uint32_t>              n_real;  // [ki]
                         std::vector<std::vector<uint64_t>> masks;   // [ki]
                     };
@@ -886,41 +838,42 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
                             if (fasta.empty()) { local_failed++; continue; }
                             MultiResult& mr = results[static_cast<size_t>(j)];
                             mr.gid = gid;
-                            mr.sigs.resize(nk);
+                            mr.sigs1.resize(nk);
+                            mr.sigs2.resize(nk);
                             mr.n_real.resize(nk);
                             mr.masks.resize(nk);
                             for (size_t ki = 0; ki < nk; ++ki) {
-                                OPHSketchConfig sc;
-                                sc.kmer_size   = skch_kmers[ki];
-                                sc.sketch_size = static_cast<int>(sk_sketch_size);
-                                sc.syncmer_s   = static_cast<int>(sk_syncmer_s);
-                                sc.seed        = sk_seed1;
-                                auto sk = sketch_oph_from_buffer(fasta.data(), fasta.size(), sc);
+                                auto sk = sketch_oph_dual_from_buffer(
+                                    fasta.data(), fasta.size(),
+                                    skch_kmers[ki],
+                                    static_cast<int>(sk_sketch_size),
+                                    static_cast<int>(sk_syncmer_s),
+                                    sk_seed1, sk_seed2);
                                 mr.genome_length = sk.genome_length;
                                 mr.n_real[ki]    = sk.n_real_bins;
                                 mr.masks[ki]     = sk.real_bins_bitmask;
-                                mr.sigs[ki].resize(sk.signature.size());
-                                for (size_t si = 0; si < sk.signature.size(); ++si)
-                                    mr.sigs[ki][si] = static_cast<uint16_t>(sk.signature[si] >> 16);
+                                const size_t ns = sk.signature1.size();
+                                mr.sigs1[ki].resize(ns);
+                                mr.sigs2[ki].resize(ns);
+                                for (size_t si = 0; si < ns; ++si) {
+                                    mr.sigs1[ki][si] = static_cast<uint16_t>(sk.signature1[si] >> 16);
+                                    mr.sigs2[ki][si] = static_cast<uint16_t>(sk.signature2[si] >> 16);
+                                }
                             }
                         } catch (...) {
                             local_failed++;
                         }
                     }
                     for (auto& mr : results) {
-                        if (mr.sigs.empty() || mr.sigs[0].empty()) continue;
+                        if (mr.sigs1.empty() || mr.sigs1[0].empty()) continue;
                         skch_writer_mk->add(mr.gid, mr.genome_length,
-                                            mr.sigs, mr.n_real, mr.masks);
+                                            mr.sigs1, mr.sigs2,
+                                            mr.n_real, mr.masks);
                         ++done;
                     }
                 } else {
-                    // Single-k path (unchanged).
-                    OPHSketchConfig sc;
-                    sc.kmer_size   = static_cast<int>(sk_kmer_size);
-                    sc.sketch_size = static_cast<int>(sk_sketch_size);
-                    sc.syncmer_s   = static_cast<int>(sk_syncmer_s);
-                    sc.seed        = sk_seed1;
-                    std::vector<std::pair<GenomeId, OPHSketchResult>> results(static_cast<size_t>(n_gids));
+                    // Single-k path (dual-seed).
+                    std::vector<std::pair<GenomeId, OPHDualSketchResult>> results(static_cast<size_t>(n_gids));
 
                     #pragma omp parallel for schedule(dynamic, 1) num_threads(skch_threads)
                     for (int j = 0; j < n_gids; ++j) {
@@ -928,18 +881,27 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
                         try {
                             std::string fasta = shard.fetch_genome(gid);
                             if (fasta.empty()) { local_failed++; continue; }
-                            auto sk = sketch_oph_from_buffer(fasta.data(), fasta.size(), sc);
+                            auto sk = sketch_oph_dual_from_buffer(
+                                fasta.data(), fasta.size(),
+                                static_cast<int>(sk_kmer_size),
+                                static_cast<int>(sk_sketch_size),
+                                static_cast<int>(sk_syncmer_s),
+                                sk_seed1, sk_seed2);
                             results[static_cast<size_t>(j)] = {gid, std::move(sk)};
                         } catch (...) {
                             local_failed++;
                         }
                     }
                     for (auto& [gid, sk] : results) {
-                        if (sk.signature.empty()) continue;
-                        std::vector<uint16_t> sig16(sk.signature.size());
-                        for (size_t si = 0; si < sk.signature.size(); ++si)
-                            sig16[si] = static_cast<uint16_t>(sk.signature[si] >> 16);
-                        skch_writer->add(gid, sig16, sk.n_real_bins, sk.genome_length,
+                        if (sk.signature1.empty()) continue;
+                        const size_t n = sk.signature1.size();
+                        std::vector<uint16_t> sig1_16(n), sig2_16(n);
+                        for (size_t si = 0; si < n; ++si) {
+                            sig1_16[si] = static_cast<uint16_t>(sk.signature1[si] >> 16);
+                            sig2_16[si] = static_cast<uint16_t>(sk.signature2[si] >> 16);
+                        }
+                        skch_writer->add(gid, sig1_16, sig2_16,
+                                         sk.n_real_bins, sk.genome_length,
                                          sk.real_bins_bitmask);
                         ++done;
                     }
@@ -961,7 +923,6 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
         if (force && s.type == SEC_GIDX) continue;
         if (force && need_txdb && s.type == SEC_TXDB) continue;
         if (force && need_cidx && s.type == SEC_CIDX) continue;
-        if (repack_skch && s.type == SEC_SKCH) continue;  // drop old section; new one appended below
         new_toc.add_section(s);
     }
 
@@ -2367,11 +2328,6 @@ int main(int argc, char** argv) {
     reindex_cmd->add_option("--cidx", reindex_cidx_tsv, "Build contig accession index (CIDX) from build TSV (accession<TAB>taxonomy<TAB>file_path)");
     reindex_cmd->add_option("--cidx-threads", reindex_cidx_threads, "Threads for parallel FASTA decompression (default: 8)");
     reindex_cmd->add_flag("--skch", reindex_skch, "Compute OPH sketches for genomes missing from existing SKCH sections");
-    bool reindex_repack_skch = false;
-    reindex_cmd->add_flag("--repack-skch", reindex_repack_skch,
-        "Convert existing SKCH section to seekable multi-frame format without re-computing sketches. "
-        "Reads all signatures from the current section and re-emits them as independent compressed frames "
-        "so that per-taxon sketch access decompresses only the relevant rows.");
     reindex_cmd->add_option("--skch-threads", reindex_skch_threads, "Threads for parallel sketch computation (default: 8)");
     reindex_cmd->add_option("--sketch-kmer", reindex_skch_kmer, "OPH k-mer size for single-k SKCH section (default: inherit from existing or 16)");
     reindex_cmd->add_option("--sketch-kmers", reindex_skch_kmers_str,
@@ -2395,8 +2351,7 @@ int main(int argc, char** argv) {
                               reindex_skch, reindex_skch_threads,
                               reindex_skch_kmer, reindex_skch_size, reindex_skch_syncmer,
                               std::move(reindex_skch_kmers),
-                              reindex_no_gidx,
-                              reindex_repack_skch));
+                              reindex_no_gidx));
     });
 
     // genopack repack

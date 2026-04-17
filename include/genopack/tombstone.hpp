@@ -1,8 +1,9 @@
 #pragma once
 #include <genopack/types.hpp>
-#include <genopack/format_v2.hpp>
+#include <genopack/format.hpp>
 #include <genopack/mmap_file.hpp>
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 namespace genopack {
@@ -36,6 +37,7 @@ public:
     void open(const uint8_t* base, uint64_t offset, uint64_t size);
 
     bool is_deleted(GenomeId id) const;
+    void scan(const std::function<void(GenomeId)>& cb) const;
 
     size_t size() const { return count_; }
 

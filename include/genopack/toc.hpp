@@ -1,5 +1,5 @@
 #pragma once
-#include <genopack/format_v2.hpp>
+#include <genopack/format.hpp>
 #include <genopack/mmap_file.hpp>
 #include <cstdint>
 #include <vector>

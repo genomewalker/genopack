@@ -848,15 +848,23 @@ std::optional<SketchResult> ArchiveReader::sketch_for(GenomeId genome_id) const 
 }
 
 void ArchiveReader::release_sketches() const {
-    for (auto& r : impl_->skch_readers_)
-        r.release();
+    // V4 readers don't hold decompressed buffers between calls
+    // (sketch_for / sketch_for_ids decompress on demand), so there's
+    // nothing to release. Kept for API compatibility.
 }
 
 size_t ArchiveReader::sketch_memory_bytes() const {
+    // V4 readers hold only the lightweight id/frame index; per-frame
+    // buffers are transient. Report the index size across readers.
     size_t total = 0;
-    for (const auto& r : impl_->skch_readers_)
-        total += r.memory_bytes();
+    for (const auto& r : impl_->skch_readers_) {
+        total += r.genome_ids().size() * sizeof(uint64_t);
+    }
     return total;
+}
+
+bool ArchiveReader::has_sig2() const {
+    return !impl_->skch_descs_.empty();  // V4 always has sig2
 }
 
 std::optional<SketchResult> ArchiveReader::sketch_for(GenomeId genome_id,

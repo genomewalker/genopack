@@ -1,6 +1,6 @@
 #pragma once
 #include <genopack/types.hpp>
-#include <genopack/format_v2.hpp>
+#include <genopack/format.hpp>
 #include <genopack/mmap_file.hpp>
 #include <cstdint>
 #include <functional>
@@ -32,6 +32,9 @@ public:
     // Sort, pack strings, build hash table, write to writer.
     // Returns a filled SectionDesc (file_offset etc. set).
     SectionDesc finalize(AppendWriter& writer, uint64_t section_id);
+
+    // Same as finalize() but skips the sort step (entries already sorted by accession).
+    SectionDesc finalize_presorted(AppendWriter& writer, uint64_t section_id);
 
 private:
     struct Entry {

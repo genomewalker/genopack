@@ -142,17 +142,30 @@ genopack rm mydb.gpk GCA_000001405 GCA_000002655
 
 ## Distributed build
 
-For collections too large for a single node, use the distributed build script:
+For collections too large for a single node, use the distributed build with NFS manifest coordination:
 
 ```bash
-.scripts/gpk-build-distributed.sh genomes.tsv output.gpk \
-    -t 24 -z 3 \
-    node1 node2 node3 node4
+# 1. Start coordinator on any node with NFS access
+genopack coordinator -o /nfs/output.gpk --nfs-dir /nfs/manifest/ --workers 4
+
+# 2. On each worker node (or via sbatch/parallel)
+genopack build -i part_N.tsv -o /scratch/part_N.gpk -t 24 -z 3 \
+    --coordinator /nfs/manifest/:/nfs/output.gpk
 ```
 
-Each node builds its slice to local NVMe (`/scratch`), then rsyncs the part back. Merge uses parallel `pwrite` - one thread per part archive, reading shards sequentially for NFS readahead efficiency.
+Each worker builds its slice locally, then transfers sections into the shared output file via `pwrite()` at coordinator-allocated offsets on the shared NFS filesystem. No TCP connections required — coordination uses manifest files (`.pending`/`.alloc`/`.done`) on the shared filesystem.
 
-See [Distributed Build](https://genomewalker.github.io/genopack/getting-started/#distributed-build) in the docs for details.
+Alternatively, build parts independently and merge:
+
+```bash
+# Build parts independently
+for i in 0 1 2 3; do
+    genopack build -i part_$i.tsv -o parts/part_$i.gpk -t 24 -z 3
+done
+
+# Merge
+genopack merge -l <(ls parts/*.gpk) -o merged.gpk
+```
 
 ## Input TSV format
 
@@ -181,6 +194,7 @@ See [Distributed Build](https://genomewalker.github.io/genopack/getting-started/
 | `taxdump` | Export taxonomy as NCBI taxdump or columnar binary |
 | `similar` | Find similar genomes by KMRX cosine similarity |
 | `repack` | Re-shard by taxonomy for fast per-taxon NFS access |
+| `coordinator` | Start NFS manifest coordinator for distributed build |
 | `reindex` | Append missing GIDX/HNSW sections to archive |
 
 Full option reference: [CLI Reference](https://genomewalker.github.io/genopack/cli/)

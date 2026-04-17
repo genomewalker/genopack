@@ -1,6 +1,6 @@
 #pragma once
 #include "types.hpp"
-#include "format_v2.hpp"
+#include "format.hpp"
 #include "mmap_file.hpp"
 #include <filesystem>
 #include <functional>
@@ -146,9 +146,9 @@ static_assert(sizeof(CatlHeader) == 32, "CatlHeader layout changed");
 
 class CatalogSectionWriter {
 public:
-    static constexpr size_t DEFAULT_ROW_GROUP_SIZE = 32768;
+    static constexpr size_t CATL_DEFAULT_ROW_GROUP_SIZE = 32768;
 
-    explicit CatalogSectionWriter(size_t row_group_size = DEFAULT_ROW_GROUP_SIZE);
+    explicit CatalogSectionWriter(size_t row_group_size = CATL_DEFAULT_ROW_GROUP_SIZE);
 
     // Add a genome metadata row. Must be called in oph_fingerprint order.
     void add(const GenomeMeta& m);
@@ -180,6 +180,9 @@ public:
 
     // Find by genome_id (linear scan).
     const GenomeMeta* find_genome(GenomeId id) const;
+
+    // Direct zero-copy row access.
+    const GenomeMeta* row_at(uint32_t index) const;
 
     // Full scan; return false from cb to stop.
     void scan(std::function<bool(const GenomeMeta&)> cb) const;

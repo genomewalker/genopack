@@ -112,6 +112,9 @@ public:
 
     // OPH sketch access (SKCH section)
     bool has_sketches() const;
+    // V4 archives always carry both sig1 (seed1) and sig2 (seed2); returns
+    // false only if no SKCH section is present.
+    bool has_sig2() const;
     // Returns the first available sketch for genome_id, regardless of parameters.
     std::optional<SketchResult> sketch_for(GenomeId genome_id) const;
     // Param-aware: finds the section where kmer_size==k and sketch_size>=sz, then

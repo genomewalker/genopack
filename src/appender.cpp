@@ -1,318 +1,64 @@
 #include <genopack/archive.hpp>
 #include <genopack/catalog.hpp>
+#include <genopack/cidx.hpp>
+#include <genopack/gidx.hpp>
+#include <genopack/kmrx.hpp>
 #include <genopack/shard.hpp>
+#include <genopack/taxn.hpp>
+#include <genopack/txdb.hpp>
 #include <genopack/util.hpp>
-#include <genopack/format_v2.hpp>
+#include <genopack/format.hpp>
 #include <genopack/mmap_file.hpp>
 #include <genopack/toc.hpp>
 #include <genopack/accx.hpp>
 #include <genopack/tombstone.hpp>
+#include <tuple>
 #include <spdlog/spdlog.h>
 #include <algorithm>
 #include <cstring>
-#include <ctime>
-#include <fstream>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
 
 namespace genopack {
 
-// ── Load meta.tsv ─────────────────────────────────────────────────────────────
-
-static void load_meta_tsv(const std::filesystem::path& path,
-                           std::unordered_map<std::string, GenomeId>& acc_map,
-                           GenomeId& max_genome_id)
-{
-    std::ifstream f(path);
-    if (!f) return;
-    std::string line;
-    std::getline(f, line); // skip header
-    while (std::getline(f, line)) {
-        if (line.empty()) continue;
-        auto tab1 = line.find('\t');
-        if (tab1 == std::string::npos) continue;
-        auto tab2 = line.find('\t', tab1 + 1);
-        std::string acc    = line.substr(0, tab1);
-        std::string gidstr = line.substr(tab1 + 1, tab2 - tab1 - 1);
-        try {
-            GenomeId gid = std::stoull(gidstr);
-            acc_map[acc] = gid;
-            if (gid > max_genome_id) max_genome_id = gid;
-        } catch (...) {}
-    }
-}
-
 // ── ArchiveAppender::Impl ─────────────────────────────────────────────────────
 
 struct ArchiveAppender::Impl {
-    // v1 fields
-    std::filesystem::path    archive_dir;
-    std::vector<std::string> tombstone_accessions;
-    std::vector<GenomeId>    tombstone_ids;
-    std::vector<BuildRecord> pending;
-
-    // v2 fields
-    std::filesystem::path gpk_path_;
+    std::filesystem::path     gpk_path_;
     std::vector<BuildRecord>  pending_add_;
     std::vector<std::string>  pending_remove_accessions_;
+    std::vector<GenomeId>     tombstone_ids;
     Toc                       existing_toc_;
-    bool                      is_v2_ = false;
+    uint64_t                  current_toc_offset_ = 0;
     GenomeId                  next_genome_id_ = 1;
     ShardWriterConfig         shard_cfg_;
 
     explicit Impl(const std::filesystem::path& path) {
-        // Try v2 .gpk file first
         std::filesystem::path gpk = path;
         if (!std::filesystem::exists(gpk) && gpk.extension() != ".gpk")
             gpk = std::filesystem::path(path.string() + ".gpk");
 
-        if (std::filesystem::exists(gpk) && std::filesystem::is_regular_file(gpk)) {
-            MmapFileReader mmap;
-            mmap.open(gpk);
-            if (mmap.size() >= sizeof(FileHeader)) {
-                auto* fh = mmap.ptr_at<FileHeader>(0);
-                if (fh->magic == GPK2_MAGIC) {
-                    gpk_path_ = gpk;
-                    existing_toc_ = TocReader::read(mmap);
-                    is_v2_ = true;
-                    next_genome_id_ = existing_toc_.header.total_genome_count + 1;
-                    return;
-                }
-            }
-        }
+        if (!std::filesystem::exists(gpk) || !std::filesystem::is_regular_file(gpk))
+            throw std::runtime_error("Archive not found: " + path.string());
 
-        // Fall back to v1 directory
-        if (std::filesystem::is_directory(path)) {
-            if (!std::filesystem::exists(path / "MANIFEST.bin"))
-                throw std::runtime_error("Not a genopack archive: " + path.string());
-            archive_dir = path;
-            is_v2_ = false;
-            return;
-        }
+        MmapFileReader mmap;
+        mmap.open(gpk);
+        if (mmap.size() < sizeof(FileHeader))
+            throw std::runtime_error("File too small to be a .gpk: " + gpk.string());
 
-        throw std::runtime_error("Archive not found: " + path.string());
+        auto* fh = mmap.ptr_at<FileHeader>(0);
+        if (fh->magic != GPK2_MAGIC)
+            throw std::runtime_error("Not a .gpk file: " + gpk.string());
+
+        gpk_path_ = gpk;
+        existing_toc_ = TocReader::read(mmap);
+        const auto* tail = mmap.ptr_at<TailLocator>(mmap.size() - sizeof(TailLocator));
+        current_toc_offset_ = tail->toc_offset;
+        next_genome_id_ = existing_toc_.header.total_genome_count + 1;
     }
 
-    // ── v1 commit ─────────────────────────────────────────────────────────────
-
-    void commit_v1() {
-        // ── 1. Load existing manifest ────────────────────────────────────────
-        ManifestHeader manifest{};
-        {
-            std::ifstream mf(archive_dir / "MANIFEST.bin", std::ios::binary);
-            if (!mf) throw std::runtime_error("Cannot read MANIFEST.bin");
-            mf.read(reinterpret_cast<char*>(&manifest), sizeof(manifest));
-            if (manifest.magic != GPKM_MAGIC)
-                throw std::runtime_error("Invalid MANIFEST.bin magic");
-        }
-
-        // ── 2. Load existing catalog rows ────────────────────────────────────
-        std::vector<GenomeMeta> all_rows;
-        {
-            auto catalog_path = archive_dir / "catalog.gpkc";
-            if (std::filesystem::exists(catalog_path)) {
-                CatalogReader cr;
-                cr.open(catalog_path);
-                cr.scan([&](const GenomeMeta& m) { all_rows.push_back(m); return true; });
-                cr.close();
-            }
-        }
-
-        // ── 3. Load meta.tsv → accession map + max genome_id ────────────────
-        std::unordered_map<std::string, GenomeId> acc_map;
-        GenomeId max_id = 0;
-        load_meta_tsv(archive_dir / "meta.tsv", acc_map, max_id);
-        GenomeId next_id = max_id + 1;
-
-        // ── 4. Apply tombstones ──────────────────────────────────────────────
-        for (const auto& acc : tombstone_accessions) {
-            auto it = acc_map.find(acc);
-            if (it == acc_map.end()) {
-                spdlog::warn("Tombstone: accession not found: {}", acc);
-                continue;
-            }
-            GenomeId gid = it->second;
-            for (auto& row : all_rows) {
-                if (row.genome_id == gid) {
-                    row.flags |= GenomeMeta::FLAG_DELETED;
-                    break;
-                }
-            }
-        }
-        for (GenomeId gid : tombstone_ids) {
-            for (auto& row : all_rows) {
-                if (row.genome_id == gid) {
-                    row.flags |= GenomeMeta::FLAG_DELETED;
-                    break;
-                }
-            }
-        }
-
-        if (!tombstone_accessions.empty() || !tombstone_ids.empty()) {
-            std::ofstream tlog(archive_dir / "tombstones.txt", std::ios::app);
-            for (const auto& a : tombstone_accessions) tlog << a << "\n";
-            for (GenomeId id : tombstone_ids) tlog << id << "\n";
-            spdlog::info("Tombstoned {} accessions, {} ids",
-                         tombstone_accessions.size(), tombstone_ids.size());
-        }
-
-        // ── 5. Process pending records ───────────────────────────────────────
-        ShardId next_shard_id = manifest.n_shards;
-
-        struct GenomeWork {
-            BuildRecord record;
-            FastaStats  stats;
-            std::string fasta;
-            GenomeMeta  meta;
-        };
-
-        std::vector<GenomeWork> work;
-        work.reserve(pending.size());
-
-        for (auto& r : pending) {
-            GenomeWork gw;
-            gw.record = std::move(r);
-            try {
-                gw.fasta = decompress_gz(gw.record.file_path);
-            } catch (const std::exception& ex) {
-                spdlog::warn("Skipping {}: {}", gw.record.accession, ex.what());
-                continue;
-            }
-            gw.stats = compute_fasta_stats(gw.fasta);
-
-            gw.meta = GenomeMeta{};
-            gw.meta.genome_id         = next_id++;
-            gw.meta._reserved0        = 0;
-            gw.meta.shard_id          = INVALID_SHARD_ID;
-            gw.meta.genome_length     = gw.record.genome_length > 0 ? gw.record.genome_length : gw.stats.genome_length;
-            gw.meta.n_contigs         = gw.record.n_contigs > 0     ? gw.record.n_contigs     : gw.stats.n_contigs;
-            gw.meta.gc_pct_x100       = gw.stats.gc_pct_x100;
-            gw.meta.completeness_x10  = static_cast<uint16_t>(gw.record.completeness  * 10.0f);
-            gw.meta.contamination_x10 = static_cast<uint16_t>(gw.record.contamination * 10.0f);
-            gw.meta.oph_fingerprint   = gw.stats.oph_fingerprint;
-            gw.meta.date_added        = days_since_epoch();
-            gw.meta.flags             = 0;
-
-            work.push_back(std::move(gw));
-        }
-        pending.clear();
-
-        // ── 6. Sort by oph_fingerprint ───────────────────────────────────────
-        std::sort(work.begin(), work.end(), [](const GenomeWork& a, const GenomeWork& b) {
-            return a.meta.oph_fingerprint < b.meta.oph_fingerprint;
-        });
-
-        // ── 7. Write new shard(s) ────────────────────────────────────────────
-        std::vector<std::pair<std::string, GenomeId>> new_accessions;
-        std::vector<GenomeMeta>                       new_rows;
-
-        if (!work.empty()) {
-            std::filesystem::create_directories(archive_dir / "shards");
-
-            ShardWriterConfig shard_cfg{};
-            std::unique_ptr<ShardWriterV1> sw;
-            size_t sw_compressed = 0;
-
-            auto open_shard = [&]() {
-                char fname[64];
-                snprintf(fname, sizeof(fname), "shard_%05u.gpks", next_shard_id);
-                sw = std::make_unique<ShardWriterV1>(
-                    archive_dir / "shards" / fname,
-                    next_shard_id, next_shard_id, shard_cfg);
-                ++next_shard_id;
-                sw_compressed = 0;
-            };
-            auto flush_shard = [&]() {
-                if (sw) { sw->finalize(); sw.reset(); sw_compressed = 0; }
-            };
-
-            for (auto& gw : work) {
-                if (!sw || sw_compressed >= shard_cfg.max_shard_size_bytes) {
-                    flush_shard();
-                    open_shard();
-                }
-                gw.meta.shard_id = next_shard_id - 1;
-                sw->add_genome(gw.meta.genome_id, gw.meta.oph_fingerprint,
-                               gw.fasta.data(), gw.fasta.size());
-                sw_compressed = sw->compressed_size();
-
-                new_rows.push_back(gw.meta);
-                new_accessions.emplace_back(gw.record.accession, gw.meta.genome_id);
-            }
-            flush_shard();
-
-            spdlog::info("Appender wrote {} new shard(s), {} genomes",
-                         next_shard_id - manifest.n_shards, new_rows.size());
-        }
-
-        // ── 8. Merge + rewrite catalog ────────────────────────────────────────
-        for (const auto& r : new_rows)
-            all_rows.push_back(r);
-
-        std::sort(all_rows.begin(), all_rows.end(), [](const GenomeMeta& a, const GenomeMeta& b) {
-            return a.oph_fingerprint < b.oph_fingerprint;
-        });
-
-        {
-            CatalogWriter cw(archive_dir / "catalog.gpkc");
-            for (const auto& m : all_rows)
-                cw.add(m);
-            cw.finalize();
-        }
-
-        // ── 9. Append to meta.tsv ─────────────────────────────────────────────
-        if (!new_accessions.empty()) {
-            bool meta_exists = std::filesystem::exists(archive_dir / "meta.tsv");
-            std::ofstream mf(archive_dir / "meta.tsv", std::ios::app);
-            if (!meta_exists)
-                mf << "accession\tgenome_id\n";
-            for (const auto& [acc, gid] : new_accessions)
-                mf << acc << "\t" << gid << "\n";
-        }
-
-        // ── 10. Write new MANIFEST.bin ────────────────────────────────────────
-        uint64_t n_live = std::count_if(all_rows.begin(), all_rows.end(),
-            [](const GenomeMeta& m) { return !m.is_deleted(); });
-
-        ManifestHeader new_manifest{};
-        new_manifest.magic          = GPKM_MAGIC;
-        new_manifest.version        = FORMAT_VERSION;
-        new_manifest.generation     = manifest.generation + 1;
-        new_manifest.created_at     = static_cast<uint64_t>(std::time(nullptr));
-        new_manifest.n_shards       = next_shard_id;
-        new_manifest._reserved0     = 0;
-        new_manifest.n_genomes      = static_cast<uint64_t>(all_rows.size());
-        new_manifest.n_genomes_live = n_live;
-
-        {
-            std::ofstream mf_out(archive_dir / "MANIFEST.bin",
-                                 std::ios::binary | std::ios::trunc);
-            if (!mf_out) throw std::runtime_error("Cannot write MANIFEST.bin");
-            mf_out.write(reinterpret_cast<const char*>(&new_manifest), sizeof(new_manifest));
-
-            for (uint32_t i = 0; i < next_shard_id; ++i) {
-                ShardDescriptor sd{};
-                sd.shard_id   = i;
-                sd.cluster_id = i;
-                char fname[64];
-                snprintf(fname, sizeof(fname), "shard_%05u.gpks", i);
-                std::memcpy(sd.filename, fname, std::min(sizeof(fname), sizeof(sd.filename)));
-                auto fpath = archive_dir / "shards" / fname;
-                if (std::filesystem::exists(fpath))
-                    sd.file_size = std::filesystem::file_size(fpath);
-                mf_out.write(reinterpret_cast<const char*>(&sd), sizeof(sd));
-            }
-        }
-
-        spdlog::info("Commit complete: gen={}, shards={}, genomes={}, live={}",
-                     new_manifest.generation, next_shard_id,
-                     all_rows.size(), n_live);
-    }
-
-    // ── v2 commit ─────────────────────────────────────────────────────────────
-
-    void commit_v2() {
+    void commit() {
         AppendWriter writer;
         writer.open_append(gpk_path_);
 
@@ -433,8 +179,16 @@ struct ArchiveAppender::Impl {
                     new_shard_id = std::max(new_shard_id, static_cast<uint32_t>(sd.aux0) + 1);
             }
 
-            std::vector<GenomeMeta>                       new_catalog_rows;
-            std::vector<std::pair<std::string, GenomeId>> new_accessions;
+            std::vector<GenomeMeta>                         new_catalog_rows;
+            std::vector<std::pair<std::string, GenomeId>>   new_accessions;
+            std::vector<std::pair<std::string, std::string>> new_taxonomies; // (accession, taxonomy)
+            std::vector<std::pair<GenomeId, std::array<float,136>>> new_kmer_profiles;
+            // (genome_id, new_shard_section_id, dir_index_in_shard)
+            std::vector<std::tuple<GenomeId,uint32_t,uint32_t>> new_gidx_entries;
+            std::unordered_map<uint32_t, uint64_t> shard_id_to_new_section_id; // shard_id → section_id
+
+            // For contig index
+            std::vector<std::pair<uint64_t, uint32_t>> new_cidx_hashes; // (acc_hash, genome_id)
 
             std::unique_ptr<ShardWriter> shard_writer;
             uint32_t current_shard_id = new_shard_id;
@@ -445,12 +199,14 @@ struct ArchiveAppender::Impl {
                 uint64_t shard_size   = writer.current_offset() - shard_offset;
                 SectionDesc sd{};
                 sd.type            = SEC_SHRD;
+                sd.version         = 4;
                 sd.section_id      = next_section_id++;
                 sd.file_offset     = shard_offset;
                 sd.compressed_size = shard_size;
                 sd.item_count      = static_cast<uint64_t>(shard_writer->n_genomes());
                 sd.aux0            = current_shard_id;
                 new_toc.add_section(sd);
+                shard_id_to_new_section_id[current_shard_id] = sd.section_id;
                 shard_writer.reset();
             };
 
@@ -486,10 +242,19 @@ struct ArchiveAppender::Impl {
                 meta.oph_fingerprint   = gw.stats.oph_fingerprint;
                 meta.date_added        = date;
 
+                uint32_t dir_idx = shard_writer->n_genomes(); // index before add
                 shard_writer->add_genome(gw.genome_id, gw.stats.oph_fingerprint,
                                          fasta.data(), fasta.size());
                 new_catalog_rows.push_back(meta);
                 new_accessions.emplace_back(gw.record.accession, gw.genome_id);
+                new_gidx_entries.emplace_back(gw.genome_id, current_shard_id, dir_idx);
+                new_kmer_profiles.emplace_back(gw.genome_id, gw.stats.kmer4_profile);
+                for (const auto& [k, v] : gw.record.extra_fields)
+                    if (k == "taxonomy") { new_taxonomies.emplace_back(gw.record.accession, v); break; }
+                parse_fasta_contig_accessions(fasta, [&](std::string_view contig_acc) {
+                    new_cidx_hashes.emplace_back(cidx_hash(contig_acc),
+                                                 static_cast<uint32_t>(gw.genome_id));
+                });
             }
             flush_shard();
 
@@ -512,6 +277,62 @@ struct ArchiveAppender::Impl {
                 new_toc.add_section(accx_sd);
                 accession_root_id = accx_sd.section_id;
             }
+
+            // Write GIDX fragment for new genomes
+            if (!new_gidx_entries.empty()) {
+                // Build catl_row_index for new genomes (appended after existing)
+                uint64_t base_catl_row = existing_toc_.header.total_genome_count;
+                GidxWriter gw_idx;
+                for (uint64_t i = 0; i < new_gidx_entries.size(); ++i) {
+                    auto [gid_e, shard_id_e, dir_idx_e] = new_gidx_entries[i];
+                    auto it = shard_id_to_new_section_id.find(shard_id_e);
+                    if (it != shard_id_to_new_section_id.end())
+                        gw_idx.add(gid_e, static_cast<uint32_t>(it->second), dir_idx_e,
+                                   base_catl_row + i);
+                }
+                SectionDesc gidx_sd = gw_idx.finalize(writer, next_section_id++);
+                new_toc.add_section(gidx_sd);
+            }
+
+            // Write TAXN fragment for new genomes (if taxonomy available)
+            if (!new_taxonomies.empty()) {
+                TaxonomyIndexWriter tiw;
+                for (const auto& [acc, tax] : new_taxonomies)
+                    tiw.add(acc, tax);
+                SectionDesc taxn_sd = tiw.finalize(writer, next_section_id++);
+                new_toc.add_section(taxn_sd);
+
+                TxdbWriter txw;
+                for (const auto& [acc, tax] : new_taxonomies)
+                    txw.add(acc, tax);
+                SectionDesc txdb_sd = txw.finalize(writer, next_section_id++);
+                new_toc.add_section(txdb_sd);
+            }
+
+            // Write CIDX fragment for new genomes
+            if (!new_cidx_hashes.empty()) {
+                CidxWriter cw;
+                for (const auto& [h, gid_e] : new_cidx_hashes)
+                    cw.add_hash(h, gid_e);
+                SectionDesc cidx_sd = cw.finalize(writer, next_section_id++, /*batch_id=*/0);
+                new_toc.add_section(cidx_sd);
+            }
+
+            // Write KMRX fragment for new genomes
+            if (!new_kmer_profiles.empty()) {
+                KmrxWriter kw;
+                for (const auto& [gid_e, prof] : new_kmer_profiles)
+                    kw.add(gid_e, prof);
+                SectionDesc kmrx_sd = kw.finalize(writer, next_section_id++);
+                new_toc.add_section(kmrx_sd);
+            }
+            // HNSW is a global ANN graph and cannot be incrementally updated.
+            // After append:
+            //   - similar ACC_NEW works immediately (ACC_NEW has a KMRX profile and
+            //     can query the existing HNSW to find older genomes).
+            //   - similar ACC_BASE does NOT return ACC_NEW until the index is rebuilt.
+            // Run 'genopack reindex --hnsw' to rebuild the full similarity index.
+            // This is intentional: cheap incremental writes, explicit expensive reindex.
 
             next_genome_id_ = gid;
         }
@@ -565,11 +386,11 @@ struct ArchiveAppender::Impl {
         new_toc.finalize(writer,
                          existing_toc_.header.generation + 1,
                          new_live_count, new_total_count,
-                         existing_toc_.header.prev_toc_offset,
+                         current_toc_offset_,
                          catalog_root_id, accession_root_id, tombstone_root_id);
 
         writer.flush();
-        spdlog::info("genopack v2 committed: gen {}, {} live genomes",
+        spdlog::info("genopack committed: gen {}, {} live genomes",
                      existing_toc_.header.generation + 1, new_live_count);
     }
 };
@@ -582,28 +403,16 @@ ArchiveAppender::ArchiveAppender(const std::filesystem::path& dir)
 ArchiveAppender::~ArchiveAppender() = default;
 
 void ArchiveAppender::add_from_tsv(const std::filesystem::path& tsv_path) {
-    if (impl_->is_v2_) {
-        size_t before = impl_->pending_add_.size();
-        auto records = parse_tsv_records(tsv_path);
-        for (auto& r : records)
-            impl_->pending_add_.push_back(std::move(r));
-        spdlog::info("Appender loaded {} records from {}",
-                     impl_->pending_add_.size() - before, tsv_path.string());
-    } else {
-        size_t before = impl_->pending.size();
-        auto records = parse_tsv_records(tsv_path);
-        for (auto& r : records)
-            impl_->pending.push_back(std::move(r));
-        spdlog::info("Appender loaded {} records from {}",
-                     impl_->pending.size() - before, tsv_path.string());
-    }
+    size_t before = impl_->pending_add_.size();
+    auto records = parse_tsv_records(tsv_path);
+    for (auto& r : records)
+        impl_->pending_add_.push_back(std::move(r));
+    spdlog::info("Appender loaded {} records from {}",
+                 impl_->pending_add_.size() - before, tsv_path.string());
 }
 
 void ArchiveAppender::add(const BuildRecord& rec) {
-    if (impl_->is_v2_)
-        impl_->pending_add_.push_back(rec);
-    else
-        impl_->pending.push_back(rec);
+    impl_->pending_add_.push_back(rec);
 }
 
 void ArchiveAppender::remove(GenomeId id) {
@@ -611,20 +420,12 @@ void ArchiveAppender::remove(GenomeId id) {
 }
 
 void ArchiveAppender::remove_by_accession(std::string_view accession) {
-    if (impl_->is_v2_) {
-        impl_->pending_remove_accessions_.emplace_back(accession);
-    } else {
-        impl_->tombstone_accessions.emplace_back(accession);
-    }
+    impl_->pending_remove_accessions_.emplace_back(accession);
     spdlog::info("Queued tombstone: {}", accession);
 }
 
 void ArchiveAppender::commit() {
-    if (impl_->is_v2_) {
-        impl_->commit_v2();
-    } else {
-        impl_->commit_v1();
-    }
+    impl_->commit();
 }
 
 } // namespace genopack

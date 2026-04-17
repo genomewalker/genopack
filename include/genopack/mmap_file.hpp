@@ -36,12 +36,16 @@ public:
 
     const uint8_t* data() const { return data_; }
     uint64_t       size() const { return size_; }
+    int            fd()   const { return fd_; }
 
     std::span<const uint8_t> view(uint64_t offset, uint64_t len) const {
         if (offset + len > size_)
             throw std::out_of_range("MmapFileReader::view out of bounds");
         return {data_ + offset, static_cast<size_t>(len)};
     }
+
+    // Advise kernel on access pattern for a region (MADV_SEQUENTIAL, MADV_DONTNEED, etc.)
+    void advise(uint64_t offset, uint64_t len, int advice) const;
 
     template<typename T>
     const T* ptr_at(uint64_t offset) const {
@@ -80,7 +84,15 @@ public:
     // Patch already-written region (pwrite).
     void write_at(uint64_t offset, const void* data, uint64_t len);
 
+    // Advance logical offset (e.g. after parallel pwrite fills a region).
+    void seek_to(uint64_t offset);
+
     uint64_t current_offset() const { return offset_; }
+
+    // Enable O_DSYNC on the underlying fd: all subsequent writes block until
+    // the NFS server acknowledges. Call once before writing critical metadata
+    // (after bulk shard copy) to prevent write-back cache corruption on ENOSPC.
+    void enable_sync_writes();
 
     void flush();
 

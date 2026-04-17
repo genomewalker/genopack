@@ -47,7 +47,7 @@ uint64_t TocWriter::finalize(AppendWriter& writer,
 
     TocHeader hdr{};
     hdr.magic                    = TOCB_MAGIC;
-    hdr.version                  = FORMAT_V2_MAJOR;
+    hdr.version                  = FORMAT_MAJOR;
     hdr.flags                    = 0;
     hdr.generation               = generation;
     hdr.prev_toc_offset          = prev_toc_offset;
@@ -71,9 +71,15 @@ uint64_t TocWriter::finalize(AppendWriter& writer,
     uint64_t toc_end  = writer.current_offset();
     uint64_t toc_size = toc_end - toc_start;
 
+    // Flush all pending writes to the server before writing the TailLocator.
+    // On NFS, write-back caching means ENOSPC may be reported on a later write
+    // for data buffered earlier. fsync() forces all dirty pages to the server,
+    // ensuring the file size and content are stable before we commit the footer.
+    writer.flush();
+
     TailLocator tail{};
     tail.magic       = GPKT_MAGIC;
-    tail.version     = FORMAT_V2_MAJOR;
+    tail.version     = FORMAT_MAJOR;
     tail.flags       = 0;
     tail.toc_offset  = toc_start;
     tail.toc_size    = toc_size;

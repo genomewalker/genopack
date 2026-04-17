@@ -97,6 +97,68 @@ SectionDesc AccessionIndexWriter::finalize(AppendWriter& writer, uint64_t sectio
     return desc;
 }
 
+SectionDesc AccessionIndexWriter::finalize_presorted(AppendWriter& writer, uint64_t section_id) {
+    // Entries are already sorted by accession — skip the sort step.
+    uint32_t n = static_cast<uint32_t>(entries_.size());
+
+    std::string strings_area;
+    std::vector<uint32_t> str_offsets;
+    str_offsets.reserve(n);
+    for (const auto& e : entries_) {
+        str_offsets.push_back(static_cast<uint32_t>(strings_area.size()));
+        strings_area.append(e.accession);
+        strings_area.push_back('\0');
+    }
+
+    uint32_t n_buckets = 1;
+    while (n_buckets < 2 * n) n_buckets <<= 1;
+    std::vector<uint32_t> buckets(n_buckets, UINT32_MAX);
+    for (uint32_t i = 0; i < n; ++i) {
+        uint32_t h = fnv1a(entries_[i].accession) & (n_buckets - 1);
+        while (buckets[h] != UINT32_MAX)
+            h = (h + 1) & (n_buckets - 1);
+        buckets[h] = i;
+    }
+
+    uint64_t ids_offset      = sizeof(AccxHeader);
+    uint64_t strofft_offset  = ids_offset + 8ULL * n;
+    uint64_t buckets_offset  = strofft_offset + 4ULL * n;
+    uint64_t strings_offset  = buckets_offset + 4ULL * n_buckets;
+
+    AccxHeader hdr{};
+    hdr.magic          = SEC_ACCX;
+    hdr.n_entries      = n;
+    hdr.n_buckets      = n_buckets;
+    hdr._pad           = 0;
+    hdr.strings_offset = strings_offset;
+    hdr.buckets_offset = buckets_offset;
+
+    uint64_t section_start = writer.current_offset();
+
+    writer.append(&hdr, sizeof(hdr));
+    for (const auto& e : entries_)
+        writer.append(&e.genome_id, sizeof(e.genome_id));
+    writer.append(str_offsets.data(), 4ULL * n);
+    writer.append(buckets.data(), 4ULL * n_buckets);
+    writer.append(strings_area.data(), strings_area.size());
+
+    uint64_t section_end  = writer.current_offset();
+    uint64_t payload_size = section_end - section_start;
+
+    SectionDesc desc{};
+    desc.type              = SEC_ACCX;
+    desc.version           = 1;
+    desc.flags             = 0;
+    desc.section_id        = section_id;
+    desc.file_offset       = section_start;
+    desc.compressed_size   = payload_size;
+    desc.uncompressed_size = payload_size;
+    desc.item_count        = n;
+    desc.aux0              = 0;
+    desc.aux1              = 0;
+    return desc;
+}
+
 // ── AccessionIndexReader ──────────────────────────────────────────────────────
 
 void AccessionIndexReader::open(const uint8_t* base, uint64_t offset, uint64_t size) {

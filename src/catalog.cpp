@@ -81,7 +81,7 @@ struct CatalogWriter::Impl {
         };
 
         write_col_u64(&GenomeMeta::genome_id);
-        write_col_u32(&GenomeMeta::_reserved0);
+        write_col_u32(&GenomeMeta::genome_type);
         write_col_u32(&GenomeMeta::shard_id);
         write_col_u64(&GenomeMeta::blob_offset);
         write_col_u32(&GenomeMeta::blob_len_cmp);
@@ -183,7 +183,7 @@ struct CatalogReader::Impl {
         };
 
         read_col_u64(&GenomeMeta::genome_id);
-        read_col_u32(&GenomeMeta::_reserved0);
+        read_col_u32(&GenomeMeta::genome_type);
         read_col_u32(&GenomeMeta::shard_id);
         read_col_u64(&GenomeMeta::blob_offset);
         read_col_u32(&GenomeMeta::blob_len_cmp);
@@ -353,7 +353,7 @@ SectionDesc CatalogSectionWriter::finalize(AppendWriter& writer, uint64_t sectio
 
     SectionDesc desc{};
     desc.type               = SEC_CATL;
-    desc.version            = FORMAT_V2_MAJOR;
+    desc.version            = FORMAT_MAJOR;
     desc.flags              = 0;
     desc.section_id         = section_id;
     desc.file_offset        = section_start;
@@ -449,6 +449,11 @@ const GenomeMeta* CatalogSectionReader::find_genome(GenomeId id) const {
     for (uint32_t i = 0; i < header_->n_rows; ++i)
         if (rows_[i].genome_id == id) return &rows_[i];
     return nullptr;
+}
+
+const GenomeMeta* CatalogSectionReader::row_at(uint32_t index) const {
+    if (!header_ || index >= header_->n_rows) return nullptr;
+    return &rows_[index];
 }
 
 void CatalogSectionReader::scan(std::function<bool(const GenomeMeta&)> cb) const {

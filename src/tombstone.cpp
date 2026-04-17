@@ -71,4 +71,9 @@ bool TombstoneReader::is_deleted(GenomeId id) const {
     return std::binary_search(ids_, ids_ + count_, id);
 }
 
+void TombstoneReader::scan(const std::function<void(GenomeId)>& cb) const {
+    for (size_t i = 0; i < count_; ++i)
+        cb(ids_[i]);
+}
+
 } // namespace genopack
