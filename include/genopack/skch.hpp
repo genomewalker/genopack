@@ -194,6 +194,37 @@ private:
     FILE*                              spill_fp_ = nullptr;
 };
 
+class SkchReader;  // forward declaration for SkchV2Repacker
+
+// ── SkchV2Repacker ────────────────────────────────────────────────────────────
+// Two-phase V2→V3 repack that avoids loading 50+ GB into RAM.
+// Phase 1: prepare() — stream-decompress V2 frame to a temp file (call while source mmap is open).
+// Phase 2: write_v3() — write seekable V3 section to AppendWriter from the temp file mmap.
+
+class SkchV2Repacker {
+public:
+    SkchV2Repacker() = default;
+    ~SkchV2Repacker();
+    SkchV2Repacker(const SkchV2Repacker&) = delete;
+    SkchV2Repacker& operator=(const SkchV2Repacker&) = delete;
+
+    void        prepare(const SkchReader& src, const std::string& tmp_dir);
+    bool        ready()  const { return fd_ >= 0; }
+    SectionDesc write_v3(AppendWriter& writer, uint64_t section_id);
+
+private:
+    int      fd_           = -1;
+    size_t   sz_           = 0;
+    uint32_t n_genomes_    = 0;
+    uint32_t sketch_size_  = 0;
+    uint32_t n_kmer_sizes_ = 0;
+    uint32_t mask_words_   = 0;
+    uint32_t kmer_sizes_[8] = {};
+    uint32_t syncmer_s_    = 0;
+    uint64_t seed1_        = 0;
+    uint64_t seed2_        = 0;
+};
+
 // ── SkchReader ───────────────────────────────────────────────────────────────
 
 class SkchReader {
@@ -238,6 +269,13 @@ public:
     // the requested genome_ids. sorted_ids must be sorted ascending.
     // Falls back to per-genome sketch_for() for V1/V2.
     // cb(row_in_sorted_ids, SketchResult) — called for each hit.
+    //
+    // Threading: cb may be invoked CONCURRENTLY from multiple OMP worker
+    // threads. Each invocation carries a UNIQUE row index (no duplicates),
+    // so pre-sized output indexed by row is race-free without locks. Shared
+    // counters/maps inside cb require their own synchronisation.
+    // SketchResult.sig/.mask point into a thread-local frame buffer that is
+    // only valid while cb runs; consumers must copy out before returning.
     using SketchCallback = std::function<void(size_t, const SketchResult&)>;
     void sketch_for_ids(const std::vector<GenomeId>& sorted_ids,
                         uint32_t k, uint32_t sz,
@@ -255,6 +293,8 @@ public:
     }
 
 private:
+    friend class SkchV2Repacker;
+
     void decompress_full() const;
     void parse_buf() const;
 

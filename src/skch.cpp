@@ -7,6 +7,13 @@
 #include <numeric>
 #include <stdexcept>
 #include <unistd.h>
+#include <fcntl.h>
+#include <future>
+#include <sys/mman.h>
+#include <spdlog/spdlog.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace genopack {
 
@@ -626,24 +633,42 @@ void SkchReader::sketch_for_ids(const std::vector<GenomeId>& sorted_ids,
         hits.push_back({pos / v3_frame_sz_, pos % v3_frame_sz_, i});
     }
 
-    size_t hi_start = 0;
-    while (hi_start < hits.size()) {
-        const uint32_t fi     = hits[hi_start].frame_idx;
-        size_t         hi_end = hi_start;
-        while (hi_end < hits.size() && hits[hi_end].frame_idx == fi) ++hi_end;
+    // Group hits by frame so each frame decompresses exactly once.
+    struct FrameGroup { uint32_t fi; size_t hi_start; size_t hi_end; };
+    std::vector<FrameGroup> groups;
+    groups.reserve(v3_frames_.size());
+    {
+        size_t s = 0;
+        while (s < hits.size()) {
+            const uint32_t fi = hits[s].frame_idx;
+            size_t e = s;
+            while (e < hits.size() && hits[e].frame_idx == fi) ++e;
+            groups.push_back({fi, s, e});
+            s = e;
+        }
+    }
+
+    // Parallel: each thread decompresses one frame at a time and invokes the
+    // callback concurrently. Callers must treat the callback as potentially
+    // concurrent: each invocation has a UNIQUE `orig_idx` (no duplicates across
+    // threads), so writes to a pre-sized output slot indexed by orig_idx are
+    // race-free without locks. Shared counters/maps still need synchronisation.
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (size_t gi_idx = 0; gi_idx < groups.size(); ++gi_idx) {
+        const uint32_t fi     = groups[gi_idx].fi;
+        const size_t   hi_s   = groups[gi_idx].hi_start;
+        const size_t   hi_e   = groups[gi_idx].hi_end;
 
         const SkchFrameDesc& fd = v3_frames_[fi];
         const uint32_t frame_n  = fd.n_genomes;
         const uint8_t* csrc     = v3_section_base_ + fd.data_offset;
 
         unsigned long long raw_sz = ZSTD_getFrameContentSize(csrc, fd.compressed_size);
-        if (raw_sz == ZSTD_CONTENTSIZE_ERROR || raw_sz == ZSTD_CONTENTSIZE_UNKNOWN) {
-            hi_start = hi_end; continue;
-        }
+        if (raw_sz == ZSTD_CONTENTSIZE_ERROR || raw_sz == ZSTD_CONTENTSIZE_UNKNOWN)
+            continue;
         std::vector<uint8_t> fbuf(static_cast<size_t>(raw_sz));
-        if (ZSTD_isError(ZSTD_decompress(fbuf.data(), fbuf.size(), csrc, fd.compressed_size))) {
-            hi_start = hi_end; continue;
-        }
+        if (ZSTD_isError(ZSTD_decompress(fbuf.data(), fbuf.size(), csrc, fd.compressed_size)))
+            continue;
 
         // Frame layout (planar by k):
         //   n_real_bins: uint32_t [n_kmer_sizes_ * frame_n]
@@ -656,15 +681,15 @@ void SkchReader::sketch_for_ids(const std::vector<GenomeId>& sorted_ids,
             fbuf.data() + sizeof(uint32_t) * n_kmer_sizes_ * frame_n
                         + sizeof(uint16_t) * n_kmer_sizes_ * frame_n * sketch_size_);
 
-        for (size_t hi = hi_start; hi < hi_end; ++hi) {
+        for (size_t hi = hi_s; hi < hi_e; ++hi) {
             const uint32_t lr = hits[hi].local_row;
-            const size_t   gi = static_cast<size_t>(ki) * frame_n + lr;
+            const size_t   gj = static_cast<size_t>(ki) * frame_n + lr;
             const uint32_t global_pos = fi * v3_frame_sz_ + lr;
 
             SketchResult r{};
-            r.sig           = sigs + gi * sketch_size_;
-            r.mask          = msks + gi * mask_words_;
-            r.n_real_bins   = nrb[gi];
+            r.sig           = sigs + gj * sketch_size_;
+            r.mask          = msks + gj * mask_words_;
+            r.n_real_bins   = nrb[gj];
             r.mask_words    = mask_words_;
             r.genome_length = v3_genome_lengths_[global_pos];
             r.sketch_size   = sketch_size_;
@@ -672,8 +697,6 @@ void SkchReader::sketch_for_ids(const std::vector<GenomeId>& sorted_ids,
             auto sliced = apply_slice(r, sz, mask_words_);
             if (sliced) cb(hits[hi].orig_idx, *sliced);
         }
-
-        hi_start = hi_end;
     }
 }
 
@@ -860,6 +883,263 @@ SectionDesc SkchWriterMultiK::finalize(AppendWriter& writer, uint64_t section_id
     std::fclose(spill_fp_); spill_fp_ = nullptr;
 
     // ── 5. Seek back and write the completed frame table ─────────────────────
+    const uint64_t section_end = writer.current_offset();
+    writer.seek_to(frame_table_offset);
+    writer.append(frame_descs.data(), sizeof(SkchFrameDesc) * n_frames);
+    writer.seek_to(section_end);
+
+    SectionDesc desc{};
+    desc.type              = SEC_SKCH;
+    desc.version           = 3;
+    desc.section_id        = section_id;
+    desc.file_offset       = section_start;
+    desc.compressed_size   = section_end - section_start;
+    desc.uncompressed_size = 0;
+    desc.item_count        = n;
+    desc.aux0              = sketch_size_;
+    desc.aux1              = (nk > 0) ? kmer_sizes_[0] : 0;
+    std::memset(desc.checksum, 0, sizeof(desc.checksum));
+    return desc;
+}
+
+// ── SkchV2Repacker ────────────────────────────────────────────────────────────
+
+SkchV2Repacker::~SkchV2Repacker() {
+    if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+}
+
+void SkchV2Repacker::prepare(const SkchReader& src, const std::string& tmp_dir) {
+    if (src.version_ != 2)
+        throw std::runtime_error("SkchV2Repacker: source must be V2");
+
+    n_genomes_    = src.n_genomes_;
+    sketch_size_  = src.sketch_size_;
+    n_kmer_sizes_ = src.n_kmer_sizes_;
+    mask_words_   = src.mask_words_;
+    std::copy(src.kmer_sizes_, src.kmer_sizes_ + 8, kmer_sizes_);
+    syncmer_s_    = src.syncmer_s_;
+    seed1_        = src.seed1_;
+    seed2_        = src.seed2_;
+
+    std::string path = tmp_dir + "/genopack_v2_XXXXXX";
+    fd_ = ::mkstemp(path.data());
+    if (fd_ < 0)
+        throw std::runtime_error("SkchV2Repacker: mkstemp failed in " + tmp_dir);
+    ::unlink(path.c_str());
+
+    // Preallocate temp file to expected uncompressed V2 layout size.
+    // Skipped silently if filesystem doesn't support fallocate (e.g. older NFS).
+    const size_t expected_sz =
+        sizeof(MultiKSkchHeader)
+        + sizeof(uint64_t) * n_genomes_                                 // ids
+        + sizeof(uint64_t) * n_genomes_                                 // genome_lengths
+        + sizeof(uint32_t) * n_kmer_sizes_ * n_genomes_                 // n_real_bins
+        + sizeof(uint16_t) * n_kmer_sizes_ * static_cast<size_t>(n_genomes_) * sketch_size_
+        + sizeof(uint64_t) * n_kmer_sizes_ * static_cast<size_t>(n_genomes_) * mask_words_;
+    (void)::fallocate(fd_, 0, 0, static_cast<off_t>(expected_sz));
+
+    const size_t IN_BUF  = 16u << 20;
+    const size_t OUT_BUF = 64u << 20;
+    std::vector<uint8_t> ibuf(IN_BUF), obuf(OUT_BUF);
+
+    ZSTD_DStream* ds = ZSTD_createDStream();
+    ZSTD_initDStream(ds);
+
+    size_t src_pos = 0;
+    while (src_pos < src.cdata_sz_) {
+        size_t chunk = std::min(IN_BUF, src.cdata_sz_ - src_pos);
+        ZSTD_inBuffer zi{src.cdata_ + src_pos, chunk, 0};
+        src_pos += chunk;
+        while (zi.pos < zi.size) {
+            ZSTD_outBuffer zo{obuf.data(), OUT_BUF, 0};
+            size_t ret = ZSTD_decompressStream(ds, &zo, &zi);
+            if (ZSTD_isError(ret)) {
+                ZSTD_freeDStream(ds);
+                throw std::runtime_error(std::string("SkchV2Repacker decompress: ") + ZSTD_getErrorName(ret));
+            }
+            if (zo.pos > 0) {
+                if (::write(fd_, obuf.data(), zo.pos) < 0)
+                    throw std::runtime_error("SkchV2Repacker: write to temp file failed");
+                sz_ += zo.pos;
+            }
+        }
+    }
+    ZSTD_freeDStream(ds);
+    spdlog::info("SKCH repack: decompressed to {} MB temp file", sz_ >> 20);
+}
+
+SectionDesc SkchV2Repacker::write_v3(AppendWriter& writer, uint64_t section_id) {
+    if (fd_ < 0)
+        throw std::runtime_error("SkchV2Repacker::write_v3: not prepared");
+
+    void* mapped = ::mmap(nullptr, sz_, PROT_READ, MAP_SHARED, fd_, 0);
+    if (mapped == MAP_FAILED)
+        throw std::runtime_error("SkchV2Repacker: mmap failed");
+
+    // Hint aggressive read-ahead — frames are consumed strictly in order.
+    ::madvise(mapped, sz_, MADV_SEQUENTIAL);
+
+    const uint8_t* p = static_cast<const uint8_t*>(mapped) + sizeof(MultiKSkchHeader);
+
+    const uint64_t* ids_v2   = reinterpret_cast<const uint64_t*>(p); p += 8 * n_genomes_;
+    const uint64_t* glens_v2 = reinterpret_cast<const uint64_t*>(p); p += 8 * n_genomes_;
+    const uint32_t* nrb_v2   = reinterpret_cast<const uint32_t*>(p); p += 4 * n_kmer_sizes_ * n_genomes_;
+    const uint16_t* sigs_v2  = reinterpret_cast<const uint16_t*>(p);
+    p += 2 * n_kmer_sizes_ * static_cast<size_t>(n_genomes_) * sketch_size_;
+    const uint64_t* masks_v2 = reinterpret_cast<const uint64_t*>(p);
+
+    const uint32_t nk       = n_kmer_sizes_;
+    const uint32_t n        = n_genomes_;
+    const uint32_t frame_sz = SKCH_V3_FRAME_SIZE;
+    const uint32_t n_frames = (n + frame_sz - 1) / frame_sz;
+
+    const uint64_t section_start = writer.current_offset();
+
+    SkchSeekHdr hdr{};
+    hdr.magic        = SKCH_V3_MAGIC;
+    hdr.n_frames     = n_frames;
+    hdr.frame_size   = frame_sz;
+    hdr.n_genomes    = n;
+    hdr.sketch_size  = sketch_size_;
+    hdr.n_kmer_sizes = nk;
+    for (uint32_t i = 0; i < nk; ++i) hdr.kmer_sizes[i] = kmer_sizes_[i];
+    hdr.syncmer_s    = syncmer_s_;
+    hdr.mask_words   = mask_words_;
+    hdr.seed1        = seed1_;
+    hdr.seed2        = seed2_;
+    writer.append(&hdr, sizeof(hdr));
+
+    const uint64_t frame_table_offset = writer.current_offset();
+    std::vector<SkchFrameDesc> frame_descs(n_frames);
+    writer.append(frame_descs.data(), sizeof(SkchFrameDesc) * n_frames);
+
+    writer.append(ids_v2,   sizeof(uint64_t) * n);
+    writer.append(glens_v2, sizeof(uint64_t) * n);
+
+    // Compress frames in parallel batches (one batch = nthreads frames).
+    // Pipeline: while the main thread writes batch K, OpenMP team compresses
+    // batch K+1 in an async task. Double-buffered cbuf to avoid races.
+#ifdef _OPENMP
+    const int nthreads = omp_get_max_threads();
+#else
+    const int nthreads = 1;
+#endif
+    const uint32_t batch_sz = static_cast<uint32_t>(nthreads);
+
+    auto compress_batch = [&](uint32_t fb, uint32_t fb_end,
+                              std::vector<std::vector<uint8_t>>& cbuf,
+                              std::vector<std::string>&          cerr) {
+        const uint32_t nb = fb_end - fb;
+        cbuf.assign(nb, {});
+        cerr.assign(nb, {});
+
+        #pragma omp parallel for schedule(static,1) num_threads(nthreads)
+        for (int bi = 0; bi < static_cast<int>(nb); ++bi) {
+            const uint32_t fi        = fb + static_cast<uint32_t>(bi);
+            const uint32_t row_start = fi * frame_sz;
+            const uint32_t row_end   = std::min(n, row_start + frame_sz);
+            const uint32_t fn        = row_end - row_start;
+
+            const size_t frame_raw_sz =
+                sizeof(uint32_t) * nk * fn
+                + sizeof(uint16_t) * nk * static_cast<size_t>(fn) * sketch_size_
+                + sizeof(uint64_t) * nk * static_cast<size_t>(fn) * mask_words_;
+
+            cbuf[bi].reserve(ZSTD_compressBound(frame_raw_sz));
+
+            const size_t TMP = 4u << 20;
+            std::vector<uint8_t> tmp(TMP);
+
+            ZSTD_CStream* cs = ZSTD_createCStream();
+            ZSTD_initCStream(cs, 1);
+            ZSTD_CCtx_setPledgedSrcSize(cs, frame_raw_sz);
+
+            auto compress = [&](const void* data, size_t size) {
+                ZSTD_inBuffer zi{data, size, 0};
+                while (zi.pos < zi.size && cerr[bi].empty()) {
+                    ZSTD_outBuffer zo{tmp.data(), TMP, 0};
+                    size_t r = ZSTD_compressStream(cs, &zo, &zi);
+                    if (ZSTD_isError(r)) { cerr[bi] = ZSTD_getErrorName(r); return; }
+                    cbuf[bi].insert(cbuf[bi].end(), tmp.data(), tmp.data() + zo.pos);
+                }
+            };
+
+            for (uint32_t ki = 0; ki < nk; ++ki)
+                compress(nrb_v2 + ki * n + row_start, sizeof(uint32_t) * fn);
+            for (uint32_t ki = 0; ki < nk; ++ki)
+                compress(sigs_v2 + (static_cast<size_t>(ki) * n + row_start) * sketch_size_,
+                         sizeof(uint16_t) * fn * sketch_size_);
+            for (uint32_t ki = 0; ki < nk; ++ki)
+                compress(masks_v2 + (static_cast<size_t>(ki) * n + row_start) * mask_words_,
+                         sizeof(uint64_t) * fn * mask_words_);
+
+            size_t remaining = 1;
+            while (remaining && cerr[bi].empty()) {
+                ZSTD_outBuffer zo{tmp.data(), TMP, 0};
+                remaining = ZSTD_endStream(cs, &zo);
+                if (ZSTD_isError(remaining)) { cerr[bi] = ZSTD_getErrorName(remaining); break; }
+                cbuf[bi].insert(cbuf[bi].end(), tmp.data(), tmp.data() + zo.pos);
+            }
+            ZSTD_freeCStream(cs);
+        }
+    };
+
+    auto write_batch = [&](uint32_t fb, uint32_t fb_end,
+                           const std::vector<std::vector<uint8_t>>& cbuf,
+                           const std::vector<std::string>&          cerr) {
+        const uint32_t nb = fb_end - fb;
+        for (uint32_t bi = 0; bi < nb; ++bi) {
+            if (!cerr[bi].empty())
+                throw std::runtime_error("SkchV2Repacker compress: " + cerr[bi]);
+            const uint32_t fi      = fb + bi;
+            const uint32_t row_end = std::min(n, (fi + 1) * frame_sz);
+            frame_descs[fi].data_offset     = writer.current_offset() - section_start;
+            frame_descs[fi].n_genomes       = row_end - fi * frame_sz;
+            frame_descs[fi].compressed_size = static_cast<uint32_t>(cbuf[bi].size());
+            writer.append(cbuf[bi].data(), cbuf[bi].size());
+        }
+        spdlog::info("SKCH repack: frames {}-{}/{}", fb + 1, fb_end, n_frames);
+    };
+
+    std::vector<std::vector<uint8_t>> cbuf_a, cbuf_b;
+    std::vector<std::string>          cerr_a, cerr_b;
+
+    // Prime: compress first batch synchronously.
+    uint32_t cur_fb     = 0;
+    uint32_t cur_fb_end = std::min(n_frames, batch_sz);
+    compress_batch(cur_fb, cur_fb_end, cbuf_a, cerr_a);
+    bool cur_is_a = true;
+
+    for (uint32_t next_fb = cur_fb_end; next_fb < n_frames; next_fb += batch_sz) {
+        const uint32_t next_fb_end = std::min(n_frames, next_fb + batch_sz);
+
+        // Launch next batch compression in parallel with write of current batch.
+        auto& nxt_cbuf = cur_is_a ? cbuf_b : cbuf_a;
+        auto& nxt_cerr = cur_is_a ? cerr_b : cerr_a;
+        auto fut = std::async(std::launch::async, [&]{
+            compress_batch(next_fb, next_fb_end, nxt_cbuf, nxt_cerr);
+        });
+
+        // Meanwhile write the already-compressed current batch.
+        auto& cur_cbuf = cur_is_a ? cbuf_a : cbuf_b;
+        auto& cur_cerr = cur_is_a ? cerr_a : cerr_b;
+        write_batch(cur_fb, cur_fb_end, cur_cbuf, cur_cerr);
+
+        fut.wait();
+
+        cur_fb     = next_fb;
+        cur_fb_end = next_fb_end;
+        cur_is_a   = !cur_is_a;
+    }
+
+    // Write the final batch (no pending compression).
+    auto& cur_cbuf = cur_is_a ? cbuf_a : cbuf_b;
+    auto& cur_cerr = cur_is_a ? cerr_a : cerr_b;
+    write_batch(cur_fb, cur_fb_end, cur_cbuf, cur_cerr);
+
+    ::munmap(mapped, sz_);
+    ::close(fd_); fd_ = -1;
+
     const uint64_t section_end = writer.current_offset();
     writer.seek_to(frame_table_offset);
     writer.append(frame_descs.data(), sizeof(SkchFrameDesc) * n_frames);
