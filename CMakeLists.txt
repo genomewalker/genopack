@@ -62,6 +62,7 @@ add_library(genopack_lib STATIC
   src/shard.cpp
   src/builder.cpp
   src/archive.cpp
+  src/archive_set_reader.cpp
   src/appender.cpp
   src/mmap_file.cpp
   src/util.cpp

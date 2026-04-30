@@ -1,5 +1,6 @@
 #include <genopack/accx.hpp>
 #include <genopack/archive.hpp>
+#include <genopack/archive_set_reader.hpp>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -195,8 +196,7 @@ static int cmd_extract(const std::string& archive_dir,
                        float min_completeness, float max_contamination,
                        const std::string& out_fasta,
                        const std::string& out_dir) {
-    ArchiveReader ar;
-    ar.open(archive_dir);
+    ArchiveSetReader ar = open_archive_auto(archive_dir);
 
     ExtractQuery q;
     q.min_completeness  = min_completeness;
@@ -265,8 +265,7 @@ static int cmd_slice(const std::string& archive_dir,
                      uint64_t start,
                      uint64_t length,
                      bool fasta_header) {
-    ArchiveReader ar;
-    ar.open(archive_dir);
+    ArchiveSetReader ar = open_archive_auto(archive_dir);
 
     auto seq = ar.fetch_sequence_slice_by_accession(accession, start, length);
     if (!seq) {
@@ -282,8 +281,7 @@ static int cmd_slice(const std::string& archive_dir,
 
 // ── genopack stat ──────────────────────────────────────────────────────────────
 static int cmd_stat(const std::string& archive_dir, bool json) {
-    ArchiveReader ar;
-    ar.open(archive_dir);
+    ArchiveSetReader ar = open_archive_auto(archive_dir);
 
     auto s = ar.archive_stats();
     if (json) {
@@ -305,6 +303,126 @@ static int cmd_stat(const std::string& archive_dir, bool json) {
                   << "  Total raw bp:     " << s.total_raw_bp   << "\n"
                   << "  Compressed bytes: " << s.total_compressed_bytes << "\n"
                   << "  Compression ratio: " << s.compression_ratio << "x\n";
+    }
+    return 0;
+}
+
+// ── genopack inspect ───────────────────────────────────────────────────────────
+// Per-archive or per-directory sketch-layout report + preload-cost estimate.
+// Accepts either a single .gpk archive or a directory containing one or more .gpk parts.
+static int cmd_inspect(const std::string& path, bool json) {
+    namespace fs = std::filesystem;
+    std::vector<fs::path> archives;
+    fs::path p = path;
+    if (fs::is_directory(p)) {
+        bool self_is_archive = fs::exists(p / "toc.bin") || p.extension() == ".gpk";
+        if (self_is_archive) {
+            archives.push_back(p);
+        } else {
+            for (auto& e : fs::directory_iterator(p)) {
+                if (e.path().extension() != ".gpk") continue;
+                if (e.is_directory() || e.is_regular_file())
+                    archives.push_back(e.path());
+            }
+            std::sort(archives.begin(), archives.end());
+        }
+    } else {
+        archives.push_back(p);
+    }
+    if (archives.empty()) {
+        spdlog::error("No archive found at {}", path);
+        return 1;
+    }
+
+    struct Row {
+        std::string name;
+        size_t n_genomes = 0;
+        uint32_t sketch_size = 0;
+        std::vector<uint32_t> kmer_sizes;
+        uint32_t mask_words = 0;
+        size_t bytes_per_sketch_per_k = 0;
+        size_t bytes_per_genome = 0;  // summed over all k
+        size_t preload_bytes = 0;
+    };
+    std::vector<Row> rows;
+    rows.reserve(archives.size());
+
+    size_t total_genomes = 0;
+    size_t total_preload_bytes = 0;
+
+    for (const auto& ap : archives) {
+        Row r;
+        r.name = ap.filename().string();
+        ArchiveReader ar;
+        ar.open(ap.string());
+        auto stats = ar.archive_stats();
+        r.n_genomes = stats.n_genomes_live;
+        r.sketch_size = ar.sketch_sketch_size();
+        r.kmer_sizes = ar.available_sketch_kmer_sizes();
+        if (r.sketch_size > 0) {
+            r.mask_words = (r.sketch_size + 63u) / 64u;
+            // per k: sig1 + sig2 (uint16) + mask (uint64) + n_real_bins (uint32) + genome_length (uint64, shared once per genome but charge once)
+            r.bytes_per_sketch_per_k = 2ull * 2ull * r.sketch_size   // sig1+sig2
+                                     + 8ull * r.mask_words            // mask
+                                     + 4ull;                          // n_real_bins (u32) per k
+            const size_t n_k = r.kmer_sizes.empty() ? 1 : r.kmer_sizes.size();
+            r.bytes_per_genome = r.bytes_per_sketch_per_k * n_k + 8ull; // + genome_length once
+            r.preload_bytes = r.bytes_per_genome * r.n_genomes;
+        }
+        total_genomes += r.n_genomes;
+        total_preload_bytes += r.preload_bytes;
+        rows.push_back(std::move(r));
+    }
+
+    auto fmt_bytes = [](size_t b) {
+        char buf[64];
+        if (b >= (1ull << 40)) std::snprintf(buf, sizeof(buf), "%.2f TiB", b / double(1ull << 40));
+        else if (b >= (1ull << 30)) std::snprintf(buf, sizeof(buf), "%.2f GiB", b / double(1ull << 30));
+        else if (b >= (1ull << 20)) std::snprintf(buf, sizeof(buf), "%.2f MiB", b / double(1ull << 20));
+        else std::snprintf(buf, sizeof(buf), "%zu B", b);
+        return std::string(buf);
+    };
+
+    if (json) {
+        std::cout << "{\n  \"archives\": [\n";
+        for (size_t i = 0; i < rows.size(); ++i) {
+            const auto& r = rows[i];
+            std::cout << "    {\"name\":\"" << r.name << "\",\"n_genomes\":" << r.n_genomes
+                      << ",\"sketch_size\":" << r.sketch_size
+                      << ",\"mask_words\":" << r.mask_words
+                      << ",\"kmer_sizes\":[";
+            for (size_t j = 0; j < r.kmer_sizes.size(); ++j) {
+                if (j) std::cout << ",";
+                std::cout << r.kmer_sizes[j];
+            }
+            std::cout << "],\"bytes_per_genome\":" << r.bytes_per_genome
+                      << ",\"preload_bytes\":" << r.preload_bytes << "}"
+                      << (i + 1 < rows.size() ? "," : "") << "\n";
+        }
+        std::cout << "  ],\n  \"total_genomes\":" << total_genomes
+                  << ",\n  \"total_preload_bytes\":" << total_preload_bytes << "\n}\n";
+    } else {
+        std::cout << "Inspect: " << path << "\n";
+        for (const auto& r : rows) {
+            std::cout << "  " << r.name << "\n"
+                      << "    genomes (live):     " << r.n_genomes << "\n"
+                      << "    sketch_size (bins): " << r.sketch_size << "\n"
+                      << "    mask_words:         " << r.mask_words << "\n"
+                      << "    kmer_sizes:         [";
+            for (size_t j = 0; j < r.kmer_sizes.size(); ++j) {
+                if (j) std::cout << ", ";
+                std::cout << r.kmer_sizes[j];
+            }
+            std::cout << "]\n"
+                      << "    bytes/sketch/k:     " << r.bytes_per_sketch_per_k << "\n"
+                      << "    bytes/genome:       " << r.bytes_per_genome << "\n"
+                      << "    preload size:       " << fmt_bytes(r.preload_bytes) << "\n";
+        }
+        if (rows.size() > 1) {
+            std::cout << "  ─────────────────────────────\n"
+                      << "  TOTAL genomes:        " << total_genomes << "\n"
+                      << "  TOTAL preload size:   " << fmt_bytes(total_preload_bytes) << "\n";
+        }
     }
     return 0;
 }
@@ -386,17 +504,15 @@ static int cmd_rm(const std::string& archive_dir,
 // ── genopack taxonomy ──────────────────────────────────────────────────────────
 static int cmd_taxonomy(const std::string& archive_dir, const std::string& accession,
                         bool json) {
-    ArchiveReader ar;
-    ar.open(archive_dir);
-
-    auto tree_opt = ar.taxonomy_tree();
-    if (!tree_opt) {
-        spdlog::error("No taxonomy data in archive");
-        return 1;
-    }
-    auto& tree = *tree_opt;
+    ArchiveSetReader ar = open_archive_auto(archive_dir);
 
     if (!accession.empty()) {
+        auto loc = ar.taxonomy_tree_for_accession(accession);
+        if (!loc) {
+            spdlog::error("Accession not found or no taxonomy data: {}", accession);
+            return 1;
+        }
+        const auto& tree = *loc->tree;
         uint64_t taxid = tree.taxid_for_accession(accession);
         if (taxid == 0) {
             spdlog::error("Accession not found: {}", accession);
@@ -440,17 +556,24 @@ static int cmd_taxonomy(const std::string& archive_dir, const std::string& acces
     }
 
     // Archive-wide summary
-    size_t nn = tree.n_nodes();
-    size_t na = tree.n_accessions();
+    auto sum = ar.taxonomy_summary();
+    if (sum.n_parts_with_taxonomy == 0) {
+        spdlog::error("No taxonomy data in archive");
+        return 1;
+    }
     if (json) {
         std::cout << "{\n"
-                  << "  \"n_nodes\": "       << nn << ",\n"
-                  << "  \"n_accessions\": "  << na << "\n"
+                  << "  \"n_nodes\": "       << sum.n_nodes_union << ",\n"
+                  << "  \"n_accessions\": "  << sum.n_accessions  << ",\n"
+                  << "  \"n_parts\": "       << ar.part_count()   << ",\n"
+                  << "  \"n_parts_with_taxonomy\": " << sum.n_parts_with_taxonomy << "\n"
                   << "}\n";
     } else {
         std::cout << "Taxonomy summary for: " << archive_dir << "\n"
-                  << "  Nodes:       " << nn << "\n"
-                  << "  Accessions:  " << na << "\n";
+                  << "  Parts:       " << ar.part_count() << " (with taxonomy: "
+                                       << sum.n_parts_with_taxonomy << ")\n"
+                  << "  Nodes:       " << sum.n_nodes_union << " (union across parts)\n"
+                  << "  Accessions:  " << sum.n_accessions  << "\n";
     }
     return 0;
 }
@@ -1639,6 +1762,18 @@ int main(int argc, char** argv) {
     stat->add_flag("--json", stat_json, "Output JSON");
     stat->callback([&]() {
         std::exit(cmd_stat(stat_archive, stat_json));
+    });
+
+    // genopack inspect
+    auto* inspect = app.add_subcommand("inspect",
+        "Report sketch layout and preload memory cost for a .gpk archive or directory of parts");
+    std::string inspect_path;
+    bool inspect_json = false;
+    inspect->add_option("path", inspect_path,
+        "Archive (.gpk) or directory containing one or more .gpk parts")->required();
+    inspect->add_flag("--json", inspect_json, "Output JSON");
+    inspect->callback([&]() {
+        std::exit(cmd_inspect(inspect_path, inspect_json));
     });
 
     // genopack merge
