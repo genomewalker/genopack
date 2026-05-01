@@ -184,14 +184,17 @@ void batch_find_contig_genome_ids(const std::string_view* accs,
                                   size_t n_threads = 0) const;
 ```
 
-### KMRX similarity
+### Similarity & contig lookup
+
+> Library-only. There is no `genopack similar` or `genopack cidx` CLI; these are exposed through `ArchiveReader` and accelerated by optional KMRX/HNSW sections (not built by default).
 
 ```cpp
 // Pointer to float[136] L2-normalised k=4 profile, nullptr if not stored
 const float* kmer_profile(GenomeId id) const;
 const float* kmer_profile_by_accession(std::string_view accession) const;
 
-// Linear scan: up to k most similar genomes by cosine similarity
+// Up to k most similar genomes by cosine similarity.
+// HNSW-accelerated when an HNSW section is present; linear-scan fallback otherwise.
 std::vector<std::pair<GenomeId, float>>
 find_similar(GenomeId id, size_t k = 10) const;
 
@@ -229,6 +232,96 @@ struct ArchiveStats {
     double   compression_ratio;
 };
 ArchiveStats archive_stats() const;
+```
+
+---
+
+## ArchiveSetReader
+
+Read facade over **either** a single archive directory **or** a multipart set (a directory of `part_*.gpk` archives). Same query surface as `ArchiveReader`, with per-accession routing across parts and aggregated stats.
+
+```cpp
+#include <genopack/archive_set_reader.hpp>
+```
+
+### Construction
+
+```cpp
+genopack::ArchiveSetReader reader;
+reader.open("mydb.gpk");        // single archive directory
+reader.open("multipart_dir");   // directory of part_*.gpk
+bool ok = reader.is_open();
+reader.close();
+```
+
+`open_archive_auto(path)` is a free function that detects layout and returns an opened reader; throws `std::runtime_error` on failure. Multipart layout is discovered from `part_*.gpk` entries only — `part_N.meta.tsv` sidecars are ignored.
+
+### Layout introspection
+
+```cpp
+bool   is_multipart() const;
+size_t part_count() const;
+const std::vector<std::filesystem::path>& part_paths() const;
+
+// Aggregate stats: sums n_shards, n_genomes_total, n_genomes_live, raw_bp,
+// compressed_bytes; takes max(generation); recomputes compression_ratio.
+ArchiveReader::ArchiveStats archive_stats() const;
+```
+
+### Query
+
+```cpp
+size_t count(const ExtractQuery& q) const;
+
+// GenomeMeta wrapped with (part_index, part_path) so callers can
+// disambiguate local genome_id values that may collide across parts.
+struct LocatedGenomeMeta {
+    size_t                part_index;
+    std::filesystem::path part_path;
+    GenomeMeta            meta;  // local genome_id within its part
+};
+std::vector<LocatedGenomeMeta> filter_meta(const ExtractQuery& q) const;
+
+// Routes per-accession to the owning part when q.accessions is set,
+// otherwise concatenates per-part results (q.limit applied globally).
+std::vector<ExtractedGenome> extract(const ExtractQuery& q) const;
+
+std::optional<ExtractedGenome>
+fetch_by_accession(std::string_view accession) const;
+
+// Groups accessions by owning part, calls each part's batch fetch once,
+// reassembles in original order. Misses → nullopt at that index.
+std::vector<std::optional<ExtractedGenome>>
+batch_fetch_by_accessions(const std::vector<std::string>& accessions) const;
+
+std::optional<std::string>
+fetch_sequence_slice_by_accession(std::string_view accession,
+                                  uint64_t start, uint64_t length) const;
+```
+
+### Taxonomy
+
+```cpp
+std::optional<std::string>
+taxonomy_for_accession(std::string_view accession) const;
+
+void scan_taxonomy(
+    const std::function<void(std::string_view accession,
+                             std::string_view taxonomy)>& cb) const;
+
+struct LocatedTaxonomy {
+    size_t              part_index;
+    const TaxonomyTree* tree;   // owned by part; valid while reader is open
+};
+std::optional<LocatedTaxonomy>
+taxonomy_tree_for_accession(std::string_view accession) const;
+
+struct TaxonomySummary {
+    size_t n_nodes_union          = 0;  // unique taxids across parts
+    size_t n_accessions           = 0;  // sum across parts
+    size_t n_parts_with_taxonomy  = 0;
+};
+TaxonomySummary taxonomy_summary() const;
 ```
 
 ---
@@ -429,3 +522,94 @@ float sim = genopack::cosine_similarity(p1, p2);
 ```
 
 Profiles are stored uncompressed as `float[n_genomes × 136]` with sorted `genome_ids[]` for O(log n) binary search.
+
+---
+
+## DerepView
+
+Read-only view over a `.gpd` Geodesic Derep Archive (see [format → `.gpd`](format.md#gpd-geodesic-derep-archive-format-v1)). Exposes representatives, embeddings and rep-membership lookups, and detects staleness against a live `ArchiveSetReader`.
+
+```cpp
+#include <genopack/derep_view.hpp>
+```
+
+### Construction
+
+```cpp
+genopack::DerepView view;
+view.open("derep.gpd");        // mmap; cheap
+bool ok = view.is_open();
+view.close();
+```
+
+### Staleness check
+
+```cpp
+enum class DerepStaleness {
+    Valid,
+    LayoutChangedSameLiveSet,   // same live accession set, different UUID/generation
+    StaleNewGenomes,            // pack has accessions not in .gpd
+    StaleTombstones,            // .gpd has accessions no longer live in pack
+    Mismatch,                   // structural difference (missing part, etc.)
+};
+DerepStaleness check(const ArchiveSetReader& archive) const;
+```
+
+`check` recomputes each part's `accession_set_hash` (xxh3-64 of sorted live accessions joined with `\n`) and compares it to the value stored in the .gpd header.
+
+### Rep membership
+
+```cpp
+struct RepStatus {
+    enum class Kind {
+        Representative,
+        Member,
+        Unclustered,
+        UnknownSinceGeneration,
+        Absent,
+        Tombstoned,
+    };
+    Kind             kind;
+    uint32_t         rep_id;        // UINT32_MAX if not applicable
+    std::string_view rep_accession; // valid while view is open
+};
+RepStatus status_for_accession(std::string_view accession) const;
+```
+
+### Representative scan
+
+```cpp
+void scan_representatives(
+    const std::function<void(uint32_t rep_id,
+                             std::string_view rep_accession,
+                             uint32_t cluster_size)>& cb) const;
+```
+
+### Embeddings
+
+```cpp
+// Fills out[0..embedding_dim()) for the given rep_id. Returns false if the
+// rep_id is out of range. Stored f16 → caller-side f32 buffer is fine.
+bool embedding_for_rep(uint32_t rep_id, std::span<float> out) const;
+uint32_t embedding_dim() const;
+```
+
+### Header introspection
+
+```cpp
+struct DerepStats {
+    uint64_t n_genomes_indexed;
+    uint32_t n_reps;
+    uint32_t n_unclustered;
+    uint32_t n_singletons;
+    uint64_t n_members;
+};
+DerepStats stats() const;
+
+uint64_t accession_set_hash() const;  // header-level; see file format spec
+uint32_t format_major() const;
+uint32_t format_minor() const;
+std::array<uint8_t, 16> run_id() const;
+uint64_t created_at_unix() const;
+uint16_t source_n_parts() const;
+```

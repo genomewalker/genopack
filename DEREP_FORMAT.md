@@ -43,7 +43,7 @@ struct GpdFileHeader {
     uint16_t format_minor;   // 0
     uint64_t toc_offset;     // bytes to start of TOC section
     uint64_t toc_size;       // bytes
-    uint64_t reserved[6];    // zero
+    uint64_t reserved[5];    // zero — yields 64-byte FileHeader
 };
 ```
 

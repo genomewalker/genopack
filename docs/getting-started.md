@@ -29,25 +29,52 @@ GCA_000006945.2	/data/GCA_000006945.2.fna.gz	99.1	0.1	d__Bacteria;p__Proteobacte
 genopack build -i genomes.tsv -o mydb.gpk -t 24 -z 6
 ```
 
+The output `mydb.gpk` is a directory containing `toc.bin` and section files. Defaults: per-taxon shard grouping (genus rank), kmer-NN sort within each shard, OPH sketches (k=16, sketch size 10 000), CIDX contig index, auto codec.
+
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-i / --input` | required | Input TSV |
-| `-o / --output` | required | Output `.gpk` path |
-| `-t / --threads` | 1 | Parallel decompression threads |
+| `-o / --output` | required | Output archive directory (`.gpk`) |
+| `-t / --threads` | 16 | I/O threads (decompression + compression) |
 | `-z / --zstd-level` | 6 | zstd compression level (1–22) |
-| `--no-hnsw` | off | Skip HNSW index (recommended for > 1M genomes) |
-| `--no-cidx` | off | Skip contig index (saves memory for large archives) |
-| `--taxonomy-group` | off | Group genomes by genus before shard formation |
+| `-p / --parallel` | 1 | Parallel build workers (auto-merge) |
+| `--no-dict` | off | Disable shared dictionary training |
+| `--ref-dict` | off | Use first genome in each shard as reference content dictionary |
+| `--delta` | off | Compress non-reference blobs against first genome via zstd prefix |
+| `--mem-delta` | off | k=31 k-mer seeded exact-match encoding for highly similar shard groups |
+| `--2bit` | off | Pack nucleotides to 2 bits/base before zstd (~1.5–2× extra compression) |
+| `--no-cidx` | off | Skip CIDX contig index (recommended for >1M genomes) |
+| `--kmer-sort` / `--no-kmer-sort` | on | Sort genomes within each shard by kmer4 NN chain |
+| `--taxon-group` / `--no-taxon-group` | on | Group genomes into per-taxon shards (requires taxonomy column) |
+| `--taxon-rank` | `g` | Rank for grouping (`g` = genus, `f` = family) |
+| `--sketch` / `--no-sketch` | on | Compute OPH sketches |
+| `--sketch-kmer` | 16 | OPH sketch k-mer size |
+| `--sketch-kmers` | unset | Comma list (e.g. `16,21,31`) → multi-k SKCH v2 in one pass |
+| `--sketch-size` | 10000 | Number of OPH bins |
+| `--sketch-syncmer` | 0 | Open syncmer prefilter `s` (0 disables) |
+| `--coordinator` | unset | NFS manifest coordinator: `manifest_dir:/output.gpk` |
+| `-v / --verbose` | off | Verbose progress |
 
 ---
 
 ## Archive statistics
 
 ```bash
-genopack stat mydb.gpk
+genopack stat mydb.gpk             # text
+genopack stat mydb.gpk --json      # JSON
 ```
 
-Output includes: generation, shard count, genome count, total bp, compression ratio, section inventory.
+`stat` works on a single archive directory or on a directory containing `part_*.gpk` (multipart set). Output: generation, shard count, genome count (total + live), total bp, compression ratio.
+
+## Inspect SKCH layout
+
+```bash
+genopack inspect mydb.gpk
+genopack inspect parts_dir/        # iterate all part_*.gpk
+genopack inspect mydb.gpk --json
+```
+
+Reports per-archive sketch size, mask words, available k-mer sizes, bytes per genome, and total preload-cost estimate. Useful when planning memory budgets for downstream consumers (e.g. geodesic).
 
 ---
 
@@ -68,46 +95,67 @@ genopack extract mydb.gpk --min-completeness 95 --max-contamination 5 -o filtere
 
 ## Taxonomy
 
+`genopack taxonomy` is a subcommand group:
+
 ```bash
-# Lookup one genome
-genopack taxonomy mydb.gpk --accession GCA_000008085.1
+# Look up one genome
+genopack taxonomy show mydb.gpk --accession GCA_000008085.1
+genopack taxonomy show mydb.gpk --json
 
-# Export as NCBI taxdump (Kraken/Kaiju compatible)
-genopack taxdump mydb.gpk -f taxdump -o ./taxdump/
+# Normalize an input TSV against an NCBI taxdump
+genopack taxonomy normalize -i raw.tsv -o normalized.tsv --ncbi-taxdump taxdump/
 
-# Export columnar binary (fast offline lookup)
-genopack taxdump mydb.gpk -f columnar -o ./taxonomy/
+# Partition a normalized TSV into N balanced parts for distributed build
+genopack taxonomy partition -i normalized.tsv -n 8 -o parts/ -r f
+
+# Assign stable taxids to a normalized TSV
+genopack taxonomy assign-taxids -i normalized.tsv -o registry.tsv
+
+# Diff against a new GTDB release
+genopack taxonomy diff --current normalized.tsv --gtdb new_*.tsv -o diff/
+
+# Apply a curated taxonomy patch
+genopack taxonomy patch --patch patch.tsv --archive mydb.gpk
+```
+
+Export the archive's taxonomy as NCBI taxdump or columnar binary:
+
+```bash
+genopack taxdump mydb.gpk -f taxdump -o ./taxdump/      # Kraken/Kaiju compatible
+genopack taxdump mydb.gpk -f columnar -o ./taxonomy/    # fast offline lookup
 ```
 
 The columnar binary export produces four files:
 
 | File | Description |
 |------|-------------|
-| `acc2taxid.bin` | Sorted `(FNV-1a-64(acc), taxid)` pairs - O(log n) binary search |
-| `taxnodes.bin` | Sorted node records + name pool - O(log n) taxid lookup |
-| `acc2taxid.tsv` | `accession\ttaxid` - pandas/polars/R compatible |
+| `acc2taxid.bin` | Sorted `(FNV-1a-64(acc), taxid)` pairs — O(log n) binary search |
+| `taxnodes.bin` | Sorted node records + name pool — O(log n) taxid lookup |
+| `acc2taxid.tsv` | `accession\ttaxid` — pandas/polars/R compatible |
 | `taxonomy.tsv` | `taxid\tparent_taxid\trank\tname\tis_synthetic` |
 
 ---
 
-## Find similar genomes
+## Similarity (library only)
 
-```bash
-genopack similar mydb.gpk GCA_000008085.1 -k 20 --min-sim 0.90
+There is no `genopack similar` CLI. KMRX k=4 cosine similarity and the optional HNSW ANN index are exposed through the C++ API:
+
+```cpp
+genopack::ArchiveReader reader; reader.open("mydb.gpk");
+const float* p = reader.kmer_profile_by_accession("GCA_000008085.1");
+auto hits = reader.find_similar_by_accession("GCA_000008085.1", 20);
 ```
 
-Uses HNSW approximate nearest-neighbour on KMRX k=4 tetranucleotide profiles. Results are sorted by cosine similarity descending.
+`find_similar` uses the HNSW section if present; otherwise it falls back to a linear KMRX scan. HNSW is not built by default — use the C++ `ArchiveBuilder` API to opt in.
 
 ---
 
-## Contig accession lookup
+## Contig accession lookup (library only)
 
-```bash
-# Single contig → genome_id
-genopack cidx mydb.gpk --accession NZ_JAVJIU010000001.1
+There is no `genopack cidx` CLI. CIDX is exposed via `ArchiveReader::find_contig_genome_id` / `batch_find_contig_genome_ids`:
 
-# Batch (one contig per line)
-genopack cidx mydb.gpk --accessions-file contigs.txt --threads 8
+```cpp
+uint32_t gid = reader.find_contig_genome_id("NZ_JAVJIU010000001.1");
 ```
 
 ---
@@ -159,20 +207,64 @@ Soft-deletes (tombstones) genomes. Physical space is not reclaimed; use `genopac
 
 For collections too large for a single node:
 
+## Distributed build
+
+For collections too large for a single node, use the NFS manifest coordinator:
+
 ```bash
-.scripts/gpk-build-distributed.sh genomes.tsv output.gpk \
-    -t 24 -z 3 \
-    node1 node2 node3 node4
+# Coordinator: allocates write offsets, assembles final TOC
+genopack coordinator -o /nfs/output.gpk --nfs-dir /nfs/manifest/ --workers 4 \
+    --ntdb /path/to/ncbi_taxdump/
+
+# Workers: build to local scratch, transfer sections via NFS manifest
+genopack build -i part_N.tsv -o /scratch/part_N.gpk -t 24 -z 6 \
+    --coordinator /nfs/manifest/:/nfs/output.gpk
 ```
 
-Each node builds its slice to local NVMe (`/scratch`), rsyncs the part back, then a parallel merge (`pwrite` one thread per part) assembles the final archive. NFS readahead efficiency is maintained by reading each part archive sequentially.
+`--ntdb` makes the coordinator embed the NCBI tree as an NTDB section in the final archive.
+
+Alternatively, build parts independently and merge:
+
+```bash
+for i in 0 1 2 3; do
+    genopack build -i part_$i.tsv -o parts/part_$i.gpk -t 24 -z 6
+done
+genopack merge -l <(ls parts/*.gpk) -o merged.gpk
+```
+
+Or skip the merge and keep the parts as a multipart set — `ArchiveSetReader` (and every CLI command that takes an archive path) accepts a directory containing `part_*.gpk`.
 
 ---
 
 ## Deduplication
 
 ```bash
-genopack dedup mydb.gpk -o mydb_dedup.gpk --min-ani 0.999
+genopack dedup mydb.gpk              # tombstone duplicates in place
+genopack dedup mydb.gpk --dry-run    # report duplicates without modifying the archive
 ```
 
-Removes near-identical sequences using KMRX cosine similarity as a pre-filter, then exact sequence comparison. Keeps the genome with the highest completeness.
+Detects exact-sequence duplicates (same content under different accessions). The genome with the highest completeness wins; the rest are tombstoned in a new catalog fragment. Reclaim space afterwards with `genopack repack`.
+
+---
+
+## Reindex
+
+Append or rebuild auxiliary sections on an existing archive:
+
+```bash
+# Add OPH sketches (single k or multi-k)
+genopack reindex mydb.gpk --skch --sketch-kmer 16 --skch-threads 16
+genopack reindex mydb.gpk --skch --sketch-kmers 16,21,31 --skch-threads 16
+
+# Build TXDB from existing TAXN strings
+genopack reindex mydb.gpk --txdb
+
+# Build CIDX from the original build TSV
+genopack reindex mydb.gpk --cidx genomes.tsv --cidx-threads 16
+
+# Force rebuild
+genopack reindex mydb.gpk --skch --force
+
+# Skip GIDX (when only --skch is needed and GIDX is absent/unwanted)
+genopack reindex mydb.gpk --skch --no-gidx
+```

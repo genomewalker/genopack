@@ -6,7 +6,7 @@
 genopack <command> [options]
 ```
 
-All commands accept `--help` / `-h` for option details.
+All commands accept `--help` / `-h` for option details. Wherever a flag below takes an *archive*, the path may be either a single archive directory (containing `toc.bin`) or a directory containing one or more `part_*.gpk` (multipart set).
 
 ---
 
@@ -18,16 +18,31 @@ Build a new archive from a TSV.
 genopack build -i genomes.tsv -o mydb.gpk [options]
 ```
 
+The output `mydb.gpk` is a directory containing `toc.bin` plus section files. Defaults: per-taxon shard grouping (`--taxon-group`, genus rank), kmer-NN sort within shards, OPH sketches (`--sketch`, k=16, sketch size 10 000), CIDX contig index, auto codec.
+
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-i / --input` | required | Input TSV (`accession  file_path  [completeness  contamination  taxonomy ...]`) |
-| `-o / --output` | required | Output `.gpk` path |
-| `-t / --threads` | 1 | Parallel FASTA decompression threads |
+| `-i / --input` | required | Input TSV (`accession\tfile_path\t[completeness\tcontamination\ttaxonomy\t…]`) |
+| `-o / --output` | required | Output archive directory (`.gpk`) |
+| `-t / --threads` | 16 | I/O threads (decompression + compression) |
 | `-z / --zstd-level` | 6 | zstd compression level (1–22) |
-| `--no-hnsw` | off | Skip HNSW index (recommended for > 1M genomes) |
-| `--no-cidx` | off | Skip CIDX contig index |
-| `--taxonomy-group` | off | Bucket genomes by genus before shard formation |
-| `--taxonomy-rank` | `g` | `g` = genus, `f` = family (requires `--taxonomy-group`) |
+| `-p / --parallel` | 1 | Parallel build workers (auto-merge) |
+| `--no-dict` | off | Disable shared dictionary training |
+| `--ref-dict` | off | Use first genome in each shard as reference content dictionary |
+| `--delta` | off | Compress non-reference blobs against first genome via zstd prefix |
+| `--mem-delta` | off | k=31 k-mer seeded exact-match encoding for highly similar shard groups |
+| `--2bit` | off | Pack nucleotides to 2 bits/base before zstd (~1.5–2× extra compression) |
+| `--no-cidx` | off | Skip CIDX contig index (recommended for >1M genomes) |
+| `--kmer-sort` / `--no-kmer-sort` | on | Sort genomes within each shard by kmer4 NN chain |
+| `--taxon-group` / `--no-taxon-group` | on | Group genomes into per-taxon shards (requires taxonomy column) |
+| `--taxon-rank` | `g` | Rank for grouping (`g` = genus, `f` = family) |
+| `--sketch` / `--no-sketch` | on | Compute OPH sketches |
+| `--sketch-kmer` | 16 | OPH sketch k-mer size |
+| `--sketch-kmers` | unset | Comma list (e.g. `16,21,31`) → multi-k SKCH v2 in a single pass |
+| `--sketch-size` | 10000 | Number of OPH bins |
+| `--sketch-syncmer` | 0 | Open syncmer prefilter `s` (0 disables) |
+| `--coordinator` | unset | NFS manifest coordinator: `manifest_dir:/output.gpk` |
+| `-v / --verbose` | off | Verbose progress |
 
 ---
 
@@ -54,10 +69,22 @@ genopack merge part1.gpk part2.gpk part3.gpk -o merged.gpk
 Print archive statistics.
 
 ```bash
-genopack stat mydb.gpk
+genopack stat mydb.gpk [--json]
 ```
 
-Output: generation, shard count, live/total genome count, total bp, compression ratio, per-section inventory.
+Output: generation, shard count, live/total genome count, total bp, compression ratio, per-section inventory. Accepts a single archive directory or a multipart set; multipart sets show an aggregated total plus per-part breakdown.
+
+---
+
+## `inspect`
+
+Report SKCH layout and preload memory cost.
+
+```bash
+genopack inspect mydb.gpk [--json]
+```
+
+For each archive (single or each `part_*.gpk` in a multipart directory) prints: live genome count, `sketch_size` (bins), `mask_words` (`ceil(sketch_size/64)`), the list of `kmer_sizes` stored, bytes per sketch per k, bytes per genome, and total preload size. Use this to decide whether to mmap-preload sketches or stream them frame-by-frame on memory-tight nodes. `--json` emits machine-readable output.
 
 ---
 
@@ -119,13 +146,13 @@ Marks genomes as deleted in a new catalog fragment. Physical space is not reclai
 
 ## `dedup`
 
-Remove near-identical sequences.
+Tombstone duplicate genomes (same sequence, different accession) in place.
 
 ```bash
-genopack dedup mydb.gpk -o mydb_dedup.gpk [--min-ani 0.999]
+genopack dedup mydb.gpk [--dry-run]
 ```
 
-Uses KMRX cosine similarity as pre-filter, then exact comparison. Keeps the genome with the highest completeness.
+Walks every shard, hashes each genome's canonical FASTA content, groups duplicates and tombstones all but one representative per group. Modifies the archive in place by appending a new CATL fragment with the tombstones; physical bytes are reclaimed only by `repack`. With `--dry-run`, prints the duplicate groups without writing.
 
 ---
 
@@ -157,11 +184,64 @@ genopack repack input.gpk output.gpk [options]
 
 ## `taxonomy`
 
-Query taxonomy for one genome.
+Group of taxonomy utilities. Each operation is its own subcommand.
+
+### `taxonomy show`
 
 ```bash
-genopack taxonomy mydb.gpk --accession GCA_000008085.1
+genopack taxonomy show mydb.gpk [--accession ACC] [--json]
 ```
+
+Print the lineage for one accession (or every accession when `--accession` is omitted). With `--json`, emits one JSON object per line.
+
+### `taxonomy normalize`
+
+```bash
+genopack taxonomy normalize -i raw.tsv -o normalized.tsv [--ncbi-taxdump DIR]
+```
+
+Take an `accession\ttaxonomy\tfile_path` TSV and produce a normalized 10-rank lineage TSV. With `--ncbi-taxdump`, fills missing ranks from NCBI `nodes.dmp` + `names.dmp`.
+
+### `taxonomy partition`
+
+```bash
+genopack taxonomy partition -i normalized.tsv -n 8 -o parts/ [-r g]
+```
+
+Partition a normalized TSV into `N` balanced parts at a given rank (`g` = genus, `f` = family) for parallel/distributed builds. Writes `part_0.tsv` … `part_{N-1}.tsv` under the output directory.
+
+### `taxonomy assign-taxids`
+
+```bash
+genopack taxonomy assign-taxids -i normalized.tsv -o registry.tsv [--acc-map acc2cid.tsv]
+```
+
+Assign canonical concept IDs to lineage paths and emit `canonical_path\tconcept_id` (sorted by path). Optionally writes a per-accession `accession\tconcept_id\ttaxonomy` map.
+
+### `taxonomy diff`
+
+```bash
+genopack taxonomy diff --current current.tsv --gtdb bac120_taxonomy.tsv --gtdb ar53_taxonomy.tsv -o out/
+```
+
+Diff a current taxonomy TSV against a new GTDB release and write per-category TSVs (added, removed, reassigned) plus a `summary.txt` to `out/`. With `--write-unchanged`, also writes the (often huge) `unchanged.tsv`.
+
+### `taxonomy patch`
+
+Patch taxonomy assignments in place, either against a `.gpk` archive or a flat input TSV.
+
+```bash
+# Patch the archive directly
+genopack taxonomy patch --archive mydb.gpk --patch reassignments.tsv
+
+# Patch an input TSV before rebuilding
+genopack taxonomy patch --tsv genomes.tsv --patch reassignments.tsv [--tsv-out patched.tsv]
+
+# GTDB-Tk classify_summary input
+genopack taxonomy patch --archive mydb.gpk --patch gtdbtk.summary.tsv --gtdbtk
+```
+
+Default patch format is `accession\tnew_taxonomy`. `--gtdbtk` accepts GTDB-Tk's `classify_summary` format directly. `--no-normalize` disables 7→10 rank normalization (default: on).
 
 ---
 
@@ -181,45 +261,55 @@ genopack taxdump mydb.gpk -f columnar -o ./taxonomy/
 
 ---
 
-## `similar`
+## Similarity search and contig lookup (library-only)
 
-Find similar genomes by KMRX cosine similarity.
+There is no `genopack similar` or `genopack cidx` CLI. KMRX/HNSW similarity search and CIDX contig→genome lookup are exposed through the C++ API only:
 
-```bash
-genopack similar mydb.gpk GCA_000008085.1 -k 20 --min-sim 0.90
-```
+- `ArchiveReader::find_similar(...)` / `find_similar_by_accession(...)` — KMRX cosine similarity, HNSW-accelerated when an HNSW section is present, linear-scan fallback otherwise.
+- `ArchiveReader::find_contig_genome_id(accession)` — CIDX binary search, ~150M queries/s/core.
 
-Uses the HNSW approximate nearest-neighbour index (if present) or falls back to linear scan.
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-k / --top-k` | 10 | Number of results |
-| `--min-sim` | 0.0 | Minimum cosine similarity threshold |
-
----
-
-## `cidx`
-
-Look up genome_id from contig accession via the CIDX index.
-
-```bash
-# Single
-genopack cidx mydb.gpk --accession NZ_JAVJIU010000001.1
-
-# Batch
-genopack cidx mydb.gpk --accessions-file contigs.txt --threads 8 -o results.tsv
-```
-
-Throughput: ~150M queries/s on a single core (binary search on sorted FNV-1a-64 hash array).
+See [API → Similarity & contig lookup](api.md#similarity--contig-lookup).
 
 ---
 
 ## `reindex`
 
-Append a missing GIDX or HNSW section to an existing archive.
+Build or rebuild auxiliary index sections in place.
 
 ```bash
-genopack reindex mydb.gpk [--hnsw] [--gidx]
+genopack reindex mydb.gpk [options]
 ```
 
-Useful when an archive was built with `--no-hnsw` and the index is needed later.
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--force` | off | Rebuild indexes even if already present |
+| `--no-gidx` | off | Skip GIDX (useful when only `--skch` is needed and GIDX is absent/unwanted) |
+| `--txdb` | off | Build the taxonomy tree (TXDB) from existing TAXN lineage strings |
+| `--cidx FILE` | unset | Build the contig accession index (CIDX) from a build TSV (`accession\ttaxonomy\tfile_path`) |
+| `--cidx-threads` | 8 | Threads for parallel FASTA decompression while indexing contigs |
+| `--skch` | off | Compute OPH sketches for genomes missing from existing SKCH sections |
+| `--skch-threads` | 8 | Threads for parallel sketch computation |
+| `--sketch-kmer` | inherit / 16 | OPH k-mer size for a single-k SKCH section |
+| `--sketch-kmers` | unset | Comma list (e.g. `16,21,31`) → multi-k SKCH v2 in one pass |
+| `--sketch-size` | inherit / 10000 | OPH sketch size |
+| `--sketch-syncmer` | inherit / 0 | Open-syncmer prefilter `s` (0 disables) |
+
+Typical uses: an archive built with `--no-cidx` later wants contig lookup (`--cidx genomes.tsv`); a TAXN-only archive needs the tree (`--txdb`); SKCH layout needs to be upgraded to V4 seekable (`--skch --force`); or a multi-k variant is needed (`--skch --sketch-kmers 16,21,31 --force`).
+
+---
+
+## `coordinator`
+
+NFS-coordinated assembly mode for distributed builds. Workers run `genopack build` with `--coordinator <manifest_dir>:<output.gpk>`; the coordinator process waits for the expected number of worker manifests, then merges parts into a single archive.
+
+```bash
+genopack coordinator -o mydb.gpk --workers 64 --nfs-dir /shared/manifests/ \
+    [--ntdb /path/to/ncbi/taxdump/]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-o / --output` | required | Final merged archive path |
+| `--workers` | required | Expected number of worker manifests |
+| `--nfs-dir` | required | Shared directory where workers drop manifests |
+| `--ntdb` | unset | NCBI `nodes.dmp` + `names.dmp` directory; embeds an NTDB section for offline taxid resolution |
