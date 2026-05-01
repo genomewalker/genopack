@@ -1,0 +1,1390 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="High-performance single-file genome archive for large-scale microbial collections">
+      
+      
+      
+        <link rel="canonical" href="https://genomewalker.github.io/genopack/cli/">
+      
+      
+        <link rel="prev" href="../api/">
+      
+      
+        <link rel="next" href="../format/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.6">
+    
+    
+      
+        <title>CLI Reference - genopack</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.484c7ddc.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../stylesheets/extra.css">
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="teal" data-md-color-accent="teal">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#cli-reference" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+<header class="md-header" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="genopack" class="md-header__button md-logo" aria-label="genopack" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            genopack
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              CLI Reference
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="default" data-md-color-primary="teal" data-md-color-accent="teal"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a4 4 0 0 0-4 4 4 4 0 0 0 4 4 4 4 0 0 0 4-4 4 4 0 0 0-4-4m0 10a6 6 0 0 1-6-6 6 6 0 0 1 6-6 6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="slate" data-md-color-primary="teal" data-md-color-accent="teal"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 18c-.89 0-1.74-.2-2.5-.55C11.56 16.5 13 14.42 13 12s-1.44-4.5-3.5-5.45C10.26 6.2 11.11 6 12 6a6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/genomewalker/genopack" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    genomewalker/genopack
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+            
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href=".." class="md-tabs__link">
+        
+  
+  
+    
+  
+  Home
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../getting-started/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Getting Started
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../api/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  API Reference
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+    
+  
+  
+    <li class="md-tabs__item md-tabs__item--active">
+      <a href="./" class="md-tabs__link">
+        
+  
+  
+    
+  
+  CLI Reference
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../format/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Format
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../changelog/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Changelog
+
+      </a>
+    </li>
+  
+
+      
+    </ul>
+  </div>
+</nav>
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+  
+
+<nav class="md-nav md-nav--primary md-nav--lifted md-nav--integrated" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="genopack" class="md-nav__button md-logo" aria-label="genopack" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    genopack
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/genomewalker/genopack" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    genomewalker/genopack
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../getting-started/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting Started
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../api/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    API Reference
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CLI Reference
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CLI Reference
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#synopsis" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Synopsis
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#build" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        build
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#merge" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        merge
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#stat" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        stat
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#inspect" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        inspect
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#extract" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        extract
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#slice" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        slice
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#add" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        add
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#rm" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        rm
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#dedup" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        dedup
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#repack" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        repack
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#taxonomy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        taxonomy
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="taxonomy">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#taxonomy-show" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        taxonomy show
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#taxonomy-normalize" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        taxonomy normalize
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#taxonomy-partition" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        taxonomy partition
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#taxonomy-assign-taxids" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        taxonomy assign-taxids
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#taxonomy-diff" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        taxonomy diff
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#taxonomy-patch" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        taxonomy patch
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#taxdump" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        taxdump
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#similarity-search-and-contig-lookup-library-only" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Similarity search and contig lookup (library-only)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#reindex" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        reindex
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#coordinator" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        coordinator
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../format/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Format
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../changelog/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Changelog
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="cli-reference">CLI Reference</h1>
+<h2 id="synopsis">Synopsis</h2>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>genopack &lt;command&gt; [options]
+</code></pre></div>
+<p>All commands accept <code>--help</code> / <code>-h</code> for option details. Wherever a flag below takes an <em>archive</em>, the path may be either a single archive directory (containing <code>toc.bin</code>) or a directory containing one or more <code>part_*.gpk</code> (multipart set).</p>
+<hr />
+<h2 id="build"><code>build</code></h2>
+<p>Build a new archive from a TSV.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>genopack<span class="w"> </span>build<span class="w"> </span>-i<span class="w"> </span>genomes.tsv<span class="w"> </span>-o<span class="w"> </span>mydb.gpk<span class="w"> </span><span class="o">[</span>options<span class="o">]</span>
+</code></pre></div>
+<p>The output <code>mydb.gpk</code> is a directory containing <code>toc.bin</code> plus section files. Defaults: per-taxon shard grouping (<code>--taxon-group</code>, genus rank), kmer-NN sort within shards, OPH sketches (<code>--sketch</code>, k=16, sketch size 10 000), CIDX contig index, auto codec.</p>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>-i / --input</code></td>
+<td>required</td>
+<td>Input TSV (<code>accession\tfile_path\t[completeness\tcontamination\ttaxonomy\t…]</code>)</td>
+</tr>
+<tr>
+<td><code>-o / --output</code></td>
+<td>required</td>
+<td>Output archive directory (<code>.gpk</code>)</td>
+</tr>
+<tr>
+<td><code>-t / --threads</code></td>
+<td>16</td>
+<td>I/O threads (decompression + compression)</td>
+</tr>
+<tr>
+<td><code>-z / --zstd-level</code></td>
+<td>6</td>
+<td>zstd compression level (1–22)</td>
+</tr>
+<tr>
+<td><code>-p / --parallel</code></td>
+<td>1</td>
+<td>Parallel build workers (auto-merge)</td>
+</tr>
+<tr>
+<td><code>--no-dict</code></td>
+<td>off</td>
+<td>Disable shared dictionary training</td>
+</tr>
+<tr>
+<td><code>--ref-dict</code></td>
+<td>off</td>
+<td>Use first genome in each shard as reference content dictionary</td>
+</tr>
+<tr>
+<td><code>--delta</code></td>
+<td>off</td>
+<td>Compress non-reference blobs against first genome via zstd prefix</td>
+</tr>
+<tr>
+<td><code>--mem-delta</code></td>
+<td>off</td>
+<td>k=31 k-mer seeded exact-match encoding for highly similar shard groups</td>
+</tr>
+<tr>
+<td><code>--2bit</code></td>
+<td>off</td>
+<td>Pack nucleotides to 2 bits/base before zstd (~1.5–2× extra compression)</td>
+</tr>
+<tr>
+<td><code>--no-cidx</code></td>
+<td>off</td>
+<td>Skip CIDX contig index (recommended for &gt;1M genomes)</td>
+</tr>
+<tr>
+<td><code>--kmer-sort</code> / <code>--no-kmer-sort</code></td>
+<td>on</td>
+<td>Sort genomes within each shard by kmer4 NN chain</td>
+</tr>
+<tr>
+<td><code>--taxon-group</code> / <code>--no-taxon-group</code></td>
+<td>on</td>
+<td>Group genomes into per-taxon shards (requires taxonomy column)</td>
+</tr>
+<tr>
+<td><code>--taxon-rank</code></td>
+<td><code>g</code></td>
+<td>Rank for grouping (<code>g</code> = genus, <code>f</code> = family)</td>
+</tr>
+<tr>
+<td><code>--sketch</code> / <code>--no-sketch</code></td>
+<td>on</td>
+<td>Compute OPH sketches</td>
+</tr>
+<tr>
+<td><code>--sketch-kmer</code></td>
+<td>16</td>
+<td>OPH sketch k-mer size</td>
+</tr>
+<tr>
+<td><code>--sketch-kmers</code></td>
+<td>unset</td>
+<td>Comma list (e.g. <code>16,21,31</code>) → multi-k SKCH v2 in a single pass</td>
+</tr>
+<tr>
+<td><code>--sketch-size</code></td>
+<td>10000</td>
+<td>Number of OPH bins</td>
+</tr>
+<tr>
+<td><code>--sketch-syncmer</code></td>
+<td>0</td>
+<td>Open syncmer prefilter <code>s</code> (0 disables)</td>
+</tr>
+<tr>
+<td><code>--coordinator</code></td>
+<td>unset</td>
+<td>NFS manifest coordinator: <code>manifest_dir:/output.gpk</code></td>
+</tr>
+<tr>
+<td><code>-v / --verbose</code></td>
+<td>off</td>
+<td>Verbose progress</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="merge"><code>merge</code></h2>
+<p>Merge multiple <code>.gpk</code> archives into one. Uses parallel <code>pwrite</code> (one thread per part) for NFS efficiency.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>genopack<span class="w"> </span>merge<span class="w"> </span>-l<span class="w"> </span>parts.txt<span class="w"> </span>-o<span class="w"> </span>merged.gpk
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="c1"># or</span>
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>genopack<span class="w"> </span>merge<span class="w"> </span>part1.gpk<span class="w"> </span>part2.gpk<span class="w"> </span>part3.gpk<span class="w"> </span>-o<span class="w"> </span>merged.gpk
+</code></pre></div>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>-l / --list</code></td>
+<td></td>
+<td>Text file with one <code>.gpk</code> path per line</td>
+</tr>
+<tr>
+<td><code>-o / --output</code></td>
+<td>required</td>
+<td>Output path</td>
+</tr>
+<tr>
+<td><code>-t / --threads</code></td>
+<td>auto</td>
+<td>Merge threads (one per input part)</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="stat"><code>stat</code></h2>
+<p>Print archive statistics.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>genopack<span class="w"> </span>stat<span class="w"> </span>mydb.gpk<span class="w"> </span><span class="o">[</span>--json<span class="o">]</span>
+</code></pre></div>
+<p>Output: generation, shard count, live/total genome count, total bp, compression ratio, per-section inventory. Accepts a single archive directory or a multipart set; multipart sets show an aggregated total plus per-part breakdown.</p>
+<hr />
+<h2 id="inspect"><code>inspect</code></h2>
+<p>Report SKCH layout and preload memory cost.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>genopack<span class="w"> </span>inspect<span class="w"> </span>mydb.gpk<span class="w"> </span><span class="o">[</span>--json<span class="o">]</span>
+</code></pre></div>
+<p>For each archive (single or each <code>part_*.gpk</code> in a multipart directory) prints: live genome count, <code>sketch_size</code> (bins), <code>mask_words</code> (<code>ceil(sketch_size/64)</code>), the list of <code>kmer_sizes</code> stored, bytes per sketch per k, bytes per genome, and total preload size. Use this to decide whether to mmap-preload sketches or stream them frame-by-frame on memory-tight nodes. <code>--json</code> emits machine-readable output.</p>
+<hr />
+<h2 id="extract"><code>extract</code></h2>
+<p>Extract genomes as FASTA.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>genopack<span class="w"> </span>extract<span class="w"> </span>mydb.gpk<span class="w"> </span><span class="o">[</span>filters<span class="o">]</span><span class="w"> </span>-o<span class="w"> </span>out.fasta
+</code></pre></div>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--accession ACC</code></td>
+<td>Extract single genome</td>
+</tr>
+<tr>
+<td><code>--accessions-file FILE</code></td>
+<td>Extract list of accessions (one per line)</td>
+</tr>
+<tr>
+<td><code>--min-completeness FLOAT</code></td>
+<td>Completeness filter (0–100)</td>
+</tr>
+<tr>
+<td><code>--max-contamination FLOAT</code></td>
+<td>Contamination filter</td>
+</tr>
+<tr>
+<td><code>--min-length INT</code></td>
+<td>Minimum assembly length in bp</td>
+</tr>
+<tr>
+<td><code>--max-contigs INT</code></td>
+<td>Maximum contig count</td>
+</tr>
+<tr>
+<td><code>-o / --output</code></td>
+<td>Output FASTA (default: stdout)</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="slice"><code>slice</code></h2>
+<p>Extract a subsequence by accession and coordinates.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>genopack<span class="w"> </span>slice<span class="w"> </span>mydb.gpk<span class="w"> </span>--accession<span class="w"> </span>GCA_000008085.1<span class="w"> </span>--start<span class="w"> </span><span class="m">100000</span><span class="w"> </span>--length<span class="w"> </span><span class="m">5000</span><span class="w"> </span>-o<span class="w"> </span>region.fasta
+</code></pre></div>
+<p>Decompresses only the checkpoint blocks covering the requested region (sub-genome granularity).</p>
+<hr />
+<h2 id="add"><code>add</code></h2>
+<p>Append genomes to an existing archive (new shard generation).</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>genopack<span class="w"> </span>add<span class="w"> </span>mydb.gpk<span class="w"> </span>-i<span class="w"> </span>new_genomes.tsv<span class="w"> </span><span class="o">[</span>-t<span class="w"> </span><span class="m">16</span><span class="o">]</span>
+</code></pre></div>
+<p>Existing shards are untouched. The catalog receives a new CATL fragment. Use <code>repack</code> afterwards if taxonomy grouping is required.</p>
+<hr />
+<h2 id="rm"><code>rm</code></h2>
+<p>Soft-delete (tombstone) genomes.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>genopack<span class="w"> </span>rm<span class="w"> </span>mydb.gpk<span class="w"> </span>GCA_000001405<span class="w"> </span>GCA_000002655
+</code></pre></div>
+<p>Marks genomes as deleted in a new catalog fragment. Physical space is not reclaimed; use <code>repack</code> to compact.</p>
+<hr />
+<h2 id="dedup"><code>dedup</code></h2>
+<p>Tombstone duplicate genomes (same sequence, different accession) in place.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a>genopack<span class="w"> </span>dedup<span class="w"> </span>mydb.gpk<span class="w"> </span><span class="o">[</span>--dry-run<span class="o">]</span>
+</code></pre></div>
+<p>Walks every shard, hashes each genome's canonical FASTA content, groups duplicates and tombstones all but one representative per group. Modifies the archive in place by appending a new CATL fragment with the tombstones; physical bytes are reclaimed only by <code>repack</code>. With <code>--dry-run</code>, prints the duplicate groups without writing.</p>
+<hr />
+<h2 id="repack"><code>repack</code></h2>
+<p>Re-shard an archive by taxonomy for fast per-taxon NFS access.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a>genopack<span class="w"> </span>repack<span class="w"> </span>input.gpk<span class="w"> </span>output.gpk<span class="w"> </span><span class="o">[</span>options<span class="o">]</span>
+</code></pre></div>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>-t / --threads</code></td>
+<td>1</td>
+<td>OMP decompression threads</td>
+</tr>
+<tr>
+<td><code>-z / --zstd-level</code></td>
+<td>6</td>
+<td>Output compression level</td>
+</tr>
+<tr>
+<td><code>-m / --max-memory</code></td>
+<td>32</td>
+<td>Max buffered FASTA data in GB before eviction</td>
+</tr>
+<tr>
+<td><code>--taxonomy-rank</code></td>
+<td><code>g</code></td>
+<td><code>g</code> = genus, <code>f</code> = family</td>
+</tr>
+<tr>
+<td><code>-v / --verbose</code></td>
+<td>off</td>
+<td>Log every source shard processed</td>
+</tr>
+</tbody>
+</table>
+<p><strong>When to use:</strong> After building a large archive without <code>--taxonomy-group</code>, or after many <code>add</code> operations that scattered genomes across shards. A repacked archive allows geodesic-style tools to read only the ~1,900 shards belonging to Salmonella instead of all 24,000+ shards.</p>
+<p><strong>Algorithm:</strong> Three-phase two-pass design.</p>
+<ol>
+<li><strong>Phase 1 (fast):</strong> Reads only <code>GenomeDirEntry</code> arrays from each shard (~300 MB total for a 3.1 TB archive). Builds a full genome→taxonomy routing table in memory.</li>
+<li><strong>Phase 2:</strong> Sorts all genome records by <code>(taxonomy, oph_fingerprint)</code>.</li>
+<li><strong>Phase 3:</strong> Single sequential pass through the source archive; decompresses FASTAs with OMP parallelism; routes each genome to its pre-determined taxon writer; flushes the <em>largest</em> writer when memory cap is hit (minimises partial-shard fragmentation).</li>
+</ol>
+<hr />
+<h2 id="taxonomy"><code>taxonomy</code></h2>
+<p>Group of taxonomy utilities. Each operation is its own subcommand.</p>
+<h3 id="taxonomy-show"><code>taxonomy show</code></h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a>genopack<span class="w"> </span>taxonomy<span class="w"> </span>show<span class="w"> </span>mydb.gpk<span class="w"> </span><span class="o">[</span>--accession<span class="w"> </span>ACC<span class="o">]</span><span class="w"> </span><span class="o">[</span>--json<span class="o">]</span>
+</code></pre></div>
+<p>Print the lineage for one accession (or every accession when <code>--accession</code> is omitted). With <code>--json</code>, emits one JSON object per line.</p>
+<h3 id="taxonomy-normalize"><code>taxonomy normalize</code></h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a>genopack<span class="w"> </span>taxonomy<span class="w"> </span>normalize<span class="w"> </span>-i<span class="w"> </span>raw.tsv<span class="w"> </span>-o<span class="w"> </span>normalized.tsv<span class="w"> </span><span class="o">[</span>--ncbi-taxdump<span class="w"> </span>DIR<span class="o">]</span>
+</code></pre></div>
+<p>Take an <code>accession\ttaxonomy\tfile_path</code> TSV and produce a normalized 10-rank lineage TSV. With <code>--ncbi-taxdump</code>, fills missing ranks from NCBI <code>nodes.dmp</code> + <code>names.dmp</code>.</p>
+<h3 id="taxonomy-partition"><code>taxonomy partition</code></h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a>genopack<span class="w"> </span>taxonomy<span class="w"> </span>partition<span class="w"> </span>-i<span class="w"> </span>normalized.tsv<span class="w"> </span>-n<span class="w"> </span><span class="m">8</span><span class="w"> </span>-o<span class="w"> </span>parts/<span class="w"> </span><span class="o">[</span>-r<span class="w"> </span>g<span class="o">]</span>
+</code></pre></div>
+<p>Partition a normalized TSV into <code>N</code> balanced parts at a given rank (<code>g</code> = genus, <code>f</code> = family) for parallel/distributed builds. Writes <code>part_0.tsv</code> … <code>part_{N-1}.tsv</code> under the output directory.</p>
+<h3 id="taxonomy-assign-taxids"><code>taxonomy assign-taxids</code></h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a>genopack<span class="w"> </span>taxonomy<span class="w"> </span>assign-taxids<span class="w"> </span>-i<span class="w"> </span>normalized.tsv<span class="w"> </span>-o<span class="w"> </span>registry.tsv<span class="w"> </span><span class="o">[</span>--acc-map<span class="w"> </span>acc2cid.tsv<span class="o">]</span>
+</code></pre></div>
+<p>Assign canonical concept IDs to lineage paths and emit <code>canonical_path\tconcept_id</code> (sorted by path). Optionally writes a per-accession <code>accession\tconcept_id\ttaxonomy</code> map.</p>
+<h3 id="taxonomy-diff"><code>taxonomy diff</code></h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a>genopack<span class="w"> </span>taxonomy<span class="w"> </span>diff<span class="w"> </span>--current<span class="w"> </span>current.tsv<span class="w"> </span>--gtdb<span class="w"> </span>bac120_taxonomy.tsv<span class="w"> </span>--gtdb<span class="w"> </span>ar53_taxonomy.tsv<span class="w"> </span>-o<span class="w"> </span>out/
+</code></pre></div>
+<p>Diff a current taxonomy TSV against a new GTDB release and write per-category TSVs (added, removed, reassigned) plus a <code>summary.txt</code> to <code>out/</code>. With <code>--write-unchanged</code>, also writes the (often huge) <code>unchanged.tsv</code>.</p>
+<h3 id="taxonomy-patch"><code>taxonomy patch</code></h3>
+<p>Patch taxonomy assignments in place, either against a <code>.gpk</code> archive or a flat input TSV.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-16-1" name="__codelineno-16-1" href="#__codelineno-16-1"></a><span class="c1"># Patch the archive directly</span>
+<a id="__codelineno-16-2" name="__codelineno-16-2" href="#__codelineno-16-2"></a>genopack<span class="w"> </span>taxonomy<span class="w"> </span>patch<span class="w"> </span>--archive<span class="w"> </span>mydb.gpk<span class="w"> </span>--patch<span class="w"> </span>reassignments.tsv
+<a id="__codelineno-16-3" name="__codelineno-16-3" href="#__codelineno-16-3"></a>
+<a id="__codelineno-16-4" name="__codelineno-16-4" href="#__codelineno-16-4"></a><span class="c1"># Patch an input TSV before rebuilding</span>
+<a id="__codelineno-16-5" name="__codelineno-16-5" href="#__codelineno-16-5"></a>genopack<span class="w"> </span>taxonomy<span class="w"> </span>patch<span class="w"> </span>--tsv<span class="w"> </span>genomes.tsv<span class="w"> </span>--patch<span class="w"> </span>reassignments.tsv<span class="w"> </span><span class="o">[</span>--tsv-out<span class="w"> </span>patched.tsv<span class="o">]</span>
+<a id="__codelineno-16-6" name="__codelineno-16-6" href="#__codelineno-16-6"></a>
+<a id="__codelineno-16-7" name="__codelineno-16-7" href="#__codelineno-16-7"></a><span class="c1"># GTDB-Tk classify_summary input</span>
+<a id="__codelineno-16-8" name="__codelineno-16-8" href="#__codelineno-16-8"></a>genopack<span class="w"> </span>taxonomy<span class="w"> </span>patch<span class="w"> </span>--archive<span class="w"> </span>mydb.gpk<span class="w"> </span>--patch<span class="w"> </span>gtdbtk.summary.tsv<span class="w"> </span>--gtdbtk
+</code></pre></div>
+<p>Default patch format is <code>accession\tnew_taxonomy</code>. <code>--gtdbtk</code> accepts GTDB-Tk's <code>classify_summary</code> format directly. <code>--no-normalize</code> disables 7→10 rank normalization (default: on).</p>
+<hr />
+<h2 id="taxdump"><code>taxdump</code></h2>
+<p>Export taxonomy in NCBI or columnar binary format.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-17-1" name="__codelineno-17-1" href="#__codelineno-17-1"></a>genopack<span class="w"> </span>taxdump<span class="w"> </span>mydb.gpk<span class="w"> </span>-f<span class="w"> </span>taxdump<span class="w"> </span>-o<span class="w"> </span>./taxdump/
+<a id="__codelineno-17-2" name="__codelineno-17-2" href="#__codelineno-17-2"></a>genopack<span class="w"> </span>taxdump<span class="w"> </span>mydb.gpk<span class="w"> </span>-f<span class="w"> </span>columnar<span class="w"> </span>-o<span class="w"> </span>./taxonomy/
+</code></pre></div>
+<table>
+<thead>
+<tr>
+<th>Format</th>
+<th>Output files</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>taxdump</code></td>
+<td><code>names.dmp</code>, <code>nodes.dmp</code>, <code>acc2taxid.dmp</code></td>
+<td>NCBI taxdump - Kraken/Kaiju compatible</td>
+</tr>
+<tr>
+<td><code>columnar</code></td>
+<td><code>acc2taxid.bin</code>, <code>taxnodes.bin</code>, <code>acc2taxid.tsv</code>, <code>taxonomy.tsv</code></td>
+<td>Fast offline lookup</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="similarity-search-and-contig-lookup-library-only">Similarity search and contig lookup (library-only)</h2>
+<p>There is no <code>genopack similar</code> or <code>genopack cidx</code> CLI. KMRX/HNSW similarity search and CIDX contig→genome lookup are exposed through the C++ API only:</p>
+<ul>
+<li><code>ArchiveReader::find_similar(...)</code> / <code>find_similar_by_accession(...)</code> — KMRX cosine similarity, HNSW-accelerated when an HNSW section is present, linear-scan fallback otherwise.</li>
+<li><code>ArchiveReader::find_contig_genome_id(accession)</code> — CIDX binary search, ~150M queries/s/core.</li>
+</ul>
+<p>See <a href="../api/#similarity--contig-lookup">API → Similarity &amp; contig lookup</a>.</p>
+<hr />
+<h2 id="reindex"><code>reindex</code></h2>
+<p>Build or rebuild auxiliary index sections in place.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-18-1" name="__codelineno-18-1" href="#__codelineno-18-1"></a>genopack<span class="w"> </span>reindex<span class="w"> </span>mydb.gpk<span class="w"> </span><span class="o">[</span>options<span class="o">]</span>
+</code></pre></div>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>--force</code></td>
+<td>off</td>
+<td>Rebuild indexes even if already present</td>
+</tr>
+<tr>
+<td><code>--no-gidx</code></td>
+<td>off</td>
+<td>Skip GIDX (useful when only <code>--skch</code> is needed and GIDX is absent/unwanted)</td>
+</tr>
+<tr>
+<td><code>--txdb</code></td>
+<td>off</td>
+<td>Build the taxonomy tree (TXDB) from existing TAXN lineage strings</td>
+</tr>
+<tr>
+<td><code>--cidx FILE</code></td>
+<td>unset</td>
+<td>Build the contig accession index (CIDX) from a build TSV (<code>accession\ttaxonomy\tfile_path</code>)</td>
+</tr>
+<tr>
+<td><code>--cidx-threads</code></td>
+<td>8</td>
+<td>Threads for parallel FASTA decompression while indexing contigs</td>
+</tr>
+<tr>
+<td><code>--skch</code></td>
+<td>off</td>
+<td>Compute OPH sketches for genomes missing from existing SKCH sections</td>
+</tr>
+<tr>
+<td><code>--skch-threads</code></td>
+<td>8</td>
+<td>Threads for parallel sketch computation</td>
+</tr>
+<tr>
+<td><code>--sketch-kmer</code></td>
+<td>inherit / 16</td>
+<td>OPH k-mer size for a single-k SKCH section</td>
+</tr>
+<tr>
+<td><code>--sketch-kmers</code></td>
+<td>unset</td>
+<td>Comma list (e.g. <code>16,21,31</code>) → multi-k SKCH v2 in one pass</td>
+</tr>
+<tr>
+<td><code>--sketch-size</code></td>
+<td>inherit / 10000</td>
+<td>OPH sketch size</td>
+</tr>
+<tr>
+<td><code>--sketch-syncmer</code></td>
+<td>inherit / 0</td>
+<td>Open-syncmer prefilter <code>s</code> (0 disables)</td>
+</tr>
+</tbody>
+</table>
+<p>Typical uses: an archive built with <code>--no-cidx</code> later wants contig lookup (<code>--cidx genomes.tsv</code>); a TAXN-only archive needs the tree (<code>--txdb</code>); SKCH layout needs to be upgraded to V4 seekable (<code>--skch --force</code>); or a multi-k variant is needed (<code>--skch --sketch-kmers 16,21,31 --force</code>).</p>
+<hr />
+<h2 id="coordinator"><code>coordinator</code></h2>
+<p>NFS-coordinated assembly mode for distributed builds. Workers run <code>genopack build</code> with <code>--coordinator &lt;manifest_dir&gt;:&lt;output.gpk&gt;</code>; the coordinator process waits for the expected number of worker manifests, then merges parts into a single archive.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-19-1" name="__codelineno-19-1" href="#__codelineno-19-1"></a>genopack<span class="w"> </span>coordinator<span class="w"> </span>-o<span class="w"> </span>mydb.gpk<span class="w"> </span>--workers<span class="w"> </span><span class="m">64</span><span class="w"> </span>--nfs-dir<span class="w"> </span>/shared/manifests/<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-19-2" name="__codelineno-19-2" href="#__codelineno-19-2"></a><span class="w">    </span><span class="o">[</span>--ntdb<span class="w"> </span>/path/to/ncbi/taxdump/<span class="o">]</span>
+</code></pre></div>
+<table>
+<thead>
+<tr>
+<th>Flag</th>
+<th>Default</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>-o / --output</code></td>
+<td>required</td>
+<td>Final merged archive path</td>
+</tr>
+<tr>
+<td><code>--workers</code></td>
+<td>required</td>
+<td>Expected number of worker manifests</td>
+</tr>
+<tr>
+<td><code>--nfs-dir</code></td>
+<td>required</td>
+<td>Shared directory where workers drop manifests</td>
+</tr>
+<tr>
+<td><code>--ntdb</code></td>
+<td>unset</td>
+<td>NCBI <code>nodes.dmp</code> + <code>names.dmp</code> directory; embeds an NTDB section for offline taxid resolution</td>
+</tr>
+</tbody>
+</table>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.tabs", "navigation.sections", "navigation.top", "navigation.indexes", "content.code.copy", "toc.integrate", "search.highlight"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.79ae519e.min.js"></script>
+      
+    
+  </body>
+</html>
