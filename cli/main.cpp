@@ -219,16 +219,20 @@ static int cmd_extract(const std::string& archive_dir,
             spdlog::error("--output-dir requires --accession or --accessions-file");
             return 1;
         }
-        auto results = ar.batch_fetch_by_accessions(q.accessions);
         size_t written = 0;
-        for (size_t i = 0; i < q.accessions.size(); ++i) {
-            if (!results[i]) { spdlog::warn("Accession not found: {}", q.accessions[i]); continue; }
-            auto path = fs::path(out_dir) / (q.accessions[i] + ".fa");
-            std::ofstream of(path);
-            if (!of) { spdlog::error("Cannot write: {}", path.string()); return 1; }
-            of << results[i]->fasta;
-            ++written;
-        }
+        ar.visit_shard_batches(q.accessions, [&](ArchiveSetReader::ShardBatch& batch) {
+            for (auto& [idx, eg] : batch) {
+                if (eg.fasta.empty()) {
+                    spdlog::warn("Accession not found or deleted: {}", q.accessions[idx]);
+                    continue;
+                }
+                auto p = fs::path(out_dir) / (q.accessions[idx] + ".fa");
+                std::ofstream of(p);
+                if (!of) { spdlog::error("Cannot write: {}", p.string()); return; }
+                of << eg.fasta;
+                ++written;
+            }
+        });
         spdlog::info("Extracted {} genomes to {}", written, out_dir);
         return 0;
     }
@@ -1642,12 +1646,12 @@ int main(int argc, char** argv) {
     std::string build_input, build_output;
     int build_threads = 16, build_level = 6, build_parallel = 1;
     bool build_no_dict = false, build_ref_dict = false, build_delta = false;
-    bool build_mem_delta = false, build_verbose = false, build_no_cidx = false;
-    bool build_2bit = false, build_kmer_nn = true, build_taxon_group = true;
+    bool build_mem_delta = true, build_verbose = false, build_no_cidx = true;
+    bool build_2bit = true, build_kmer_nn = true, build_taxon_group = true;
     bool build_sketch = true;
     int build_sketch_kmer = 16, build_sketch_size = 10000, build_sketch_syncmer = 0;
     std::string build_taxon_rank = "g";
-    std::string build_sketch_kmers_str;
+    std::string build_sketch_kmers_str = "16,21,31";
     build->add_option("-i,--input",  build_input,  "Input TSV (accession, file_path, ...)")->required();
     build->add_option("-o,--output", build_output, "Output archive directory (.gpk)")->required();
     build->add_option("-t,--threads", build_threads, "I/O threads (decompression + compression)");
@@ -1656,15 +1660,15 @@ int main(int argc, char** argv) {
     build->add_flag("--no-dict",    build_no_dict,    "Disable shared dictionary training");
     build->add_flag("--ref-dict",   build_ref_dict,   "Use first genome in each shard as reference content dictionary");
     build->add_flag("--delta",      build_delta,      "Compress non-reference blobs against first genome using zstd prefix");
-    build->add_flag("--mem-delta",  build_mem_delta,  "Force MEM-delta: k=31 k-mer seeded exact-match encoding for highly similar shard groups");
-    build->add_flag("--no-cidx",    build_no_cidx,    "Skip CIDX contig index (recommended for >1M genomes)");
-    build->add_flag("--2bit",       build_2bit,       "Pack nucleotide sequence to 2 bits/base before zstd (~1.5-2x additional compression)");
+    build->add_flag("--mem-delta,!--no-mem-delta", build_mem_delta,  "MEM-delta k-mer exact-match encoding (default: on; --no-mem-delta to disable)");
+    build->add_flag("--no-cidx,!--cidx",          build_no_cidx,    "Skip CIDX contig index (default: on; --cidx to build it)");
+    build->add_flag("--2bit,!--no-2bit",          build_2bit,       "2-bit sequence packing before zstd (default: on; --no-2bit to disable)");
     build->add_flag("--kmer-sort,!--no-kmer-sort",   build_kmer_nn,    "Sort genomes within each shard by kmer4_profile NN chain (default: on; --no-kmer-sort to disable)");
     build->add_flag("--taxon-group,!--no-taxon-group",build_taxon_group,"Group genomes into per-taxon shards (default: on; --no-taxon-group to disable; requires taxonomy column)");
     build->add_option("--taxon-rank",build_taxon_rank,"Taxonomy rank for grouping: g=genus (default), f=family");
     build->add_flag("--sketch,!--no-sketch", build_sketch, "Compute OPH sketches (default: on; use --no-sketch to disable)");
     build->add_option("--sketch-kmer", build_sketch_kmer, "OPH sketch k-mer size (default: 16)");
-    build->add_option("--sketch-kmers", build_sketch_kmers_str, "Comma-separated k-mer sizes for multi-k SKCH v2 (e.g. 16,21,31)");
+    build->add_option("--sketch-kmers", build_sketch_kmers_str, "Comma-separated k-mer sizes for multi-k SKCH v2 (default: 16,21,31)");
     build->add_option("--sketch-size", build_sketch_size, "Number of OPH bins (default: 10000)");
     build->add_option("--sketch-syncmer", build_sketch_syncmer, "Open syncmer prefilter s (0=disabled)");
     build->add_flag("-v,--verbose", build_verbose, "Verbose progress");

@@ -296,4 +296,38 @@ ArchiveSetReader open_archive_auto(const fs::path& path) {
     return r;
 }
 
+
+void ArchiveSetReader::visit_shard_batches(
+    const std::vector<std::string>& accessions,
+    const std::function<void(ShardBatch&)>& cb) const
+{
+    if (impl_->parts.size() == 1) {
+        impl_->parts[0]->visit_shard_batches(accessions, cb);
+        return;
+    }
+
+    std::vector<std::vector<size_t>> by_part(impl_->parts.size());
+    for (size_t i = 0; i < accessions.size(); ++i) {
+        for (size_t pi = 0; pi < impl_->parts.size(); ++pi) {
+            if (impl_->parts[pi]->genome_meta_by_accession(accessions[i]).has_value()) {
+                by_part[pi].push_back(i);
+                break;
+            }
+        }
+    }
+
+    for (size_t pi = 0; pi < impl_->parts.size(); ++pi) {
+        const auto& orig_idx = by_part[pi];
+        if (orig_idx.empty()) continue;
+        std::vector<std::string> sub;
+        sub.reserve(orig_idx.size());
+        for (size_t k : orig_idx) sub.push_back(accessions[k]);
+        impl_->parts[pi]->visit_shard_batches(sub, [&](ArchiveReader::ShardBatch& batch) {
+            for (auto& [local_idx, eg] : batch)
+                local_idx = orig_idx[local_idx];
+            cb(batch);
+        });
+    }
+}
 } // namespace genopack
+

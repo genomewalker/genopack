@@ -70,6 +70,13 @@ public:
     std::vector<std::optional<ExtractedGenome>>
     batch_fetch_by_accessions(const std::vector<std::string>& accessions) const;
 
+    // Fast extraction path: pread + double-buffered prefetch + parallel decompression.
+    // Routes per part, calls cb per shard batch with (original_index, genome) pairs.
+    using ShardBatch = ArchiveReader::ShardBatch;
+    void visit_shard_batches(
+        const std::vector<std::string>& accessions,
+        const std::function<void(ShardBatch&)>& cb) const;
+
     std::optional<std::string>
     fetch_sequence_slice_by_accession(std::string_view accession,
                                       uint64_t start,
