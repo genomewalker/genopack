@@ -554,8 +554,24 @@ ArchiveReader::batch_fetch_by_accessions(
         by_shard[shard_id].push_back({i, gid});
     }
 
-    // Fetch all genomes from each shard, then release that shard's pages.
-    for (const auto& [shard_id, reqs] : by_shard) {
+    // Sort shards by file_offset for sequential NFS reads — avoids random seeks
+    // across the pack file and enables OS read-ahead on contiguous access.
+    std::vector<uint32_t> shard_order;
+    shard_order.reserve(by_shard.size());
+    for (const auto& [shard_id, _] : by_shard)
+        shard_order.push_back(shard_id);
+    std::sort(shard_order.begin(), shard_order.end(),
+        [&](uint32_t a, uint32_t b) {
+            auto da = impl_->shard_descs_.find(a);
+            auto db = impl_->shard_descs_.find(b);
+            if (da == impl_->shard_descs_.end()) return false;
+            if (db == impl_->shard_descs_.end()) return true;
+            return da->second->file_offset < db->second->file_offset;
+        });
+
+    // Fetch all genomes from each shard in offset order, then release that shard's pages.
+    for (uint32_t shard_id : shard_order) {
+        const auto& reqs = by_shard.at(shard_id);
         const ShardReader& shard = impl_->get_shard(shard_id);
         for (const auto& req : reqs) {
             ExtractedGenome eg;
@@ -592,7 +608,21 @@ void ArchiveReader::visit_by_shard(
         by_shard[meta_it->second->shard_id].push_back({i, gid});
     }
 
-    for (const auto& [shard_id, reqs] : by_shard) {
+    std::vector<uint32_t> shard_order;
+    shard_order.reserve(by_shard.size());
+    for (const auto& [shard_id, _] : by_shard)
+        shard_order.push_back(shard_id);
+    std::sort(shard_order.begin(), shard_order.end(),
+        [&](uint32_t a, uint32_t b) {
+            auto da = impl_->shard_descs_.find(a);
+            auto db = impl_->shard_descs_.find(b);
+            if (da == impl_->shard_descs_.end()) return false;
+            if (db == impl_->shard_descs_.end()) return true;
+            return da->second->file_offset < db->second->file_offset;
+        });
+
+    for (uint32_t shard_id : shard_order) {
+        const auto& reqs = by_shard.at(shard_id);
         const ShardReader& shard = impl_->get_shard(shard_id);
         for (const auto& req : reqs) {
             ExtractedGenome eg;
