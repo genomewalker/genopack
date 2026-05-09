@@ -1772,6 +1772,14 @@ int main(int argc, char** argv) {
             while (std::getline(ss, tok, ','))
                 if (!tok.empty()) build_sketch_kmers.push_back(std::stoi(tok));
         }
+        // Resolve --sketch-syncmer auto (-1): s = min(k)/3
+        if (build_sketch_syncmer == -1) {
+            int ref_k = build_sketch_kmers.empty()
+                ? build_sketch_kmer
+                : *std::min_element(build_sketch_kmers.begin(), build_sketch_kmers.end());
+            build_sketch_syncmer = std::max(2, ref_k / 3);
+            spdlog::info("SKCH: syncmer auto → s={} (k={})", build_sketch_syncmer, ref_k);
+        }
         if (!build_coordinator.empty()) {
             // Coordinator mode: build to temp file, then transfer via NFS manifest.
             std::string tmp_output = build_output + ".coord_tmp";
