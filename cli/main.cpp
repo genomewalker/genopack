@@ -7,6 +7,7 @@
 #include <genopack/repack.hpp>
 #include <genopack/catalog.hpp>
 #include <genopack/cidx.hpp>
+#include <genopack/checksum.hpp>
 #include <genopack/format.hpp>
 #include <genopack/gidx.hpp>
 #include <genopack/kmrx.hpp>
@@ -850,7 +851,18 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
         //    then to built-in defaults (k=16, size=10000) for a fresh archive.
         uint32_t sk_sketch_size = (skch_size    > 0) ? static_cast<uint32_t>(skch_size)    : 10000;
         uint32_t sk_kmer_size   = (skch_kmer    > 0) ? static_cast<uint32_t>(skch_kmer)    : 16;
-        uint32_t sk_syncmer_s   = (skch_syncmer > 0) ? static_cast<uint32_t>(skch_syncmer) : 0;
+        uint32_t sk_syncmer_s;
+        if (skch_syncmer > 0) {
+            sk_syncmer_s = static_cast<uint32_t>(skch_syncmer);
+        } else if (skch_syncmer == -1) {
+            // auto: s = k/3, targeting ~6-8% syncmer density
+            uint32_t ref_k = multi_k
+                ? static_cast<uint32_t>(*std::min_element(skch_kmers.begin(), skch_kmers.end()))
+                : sk_kmer_size;
+            sk_syncmer_s = std::max(2u, ref_k / 3u);
+        } else {
+            sk_syncmer_s = 0;
+        }
         uint64_t sk_seed1       = 42;
         uint64_t sk_seed2       = 43;
 
@@ -1636,6 +1648,80 @@ static int cmd_repack(const std::string& input, const std::string& output,
     return 0;
 }
 
+// ── genopack verify ──────────────────────────────────────────────────────────
+static int cmd_verify(const std::string& archive_path, bool verbose) {
+    MmapFileReader mmap;
+    mmap.open(archive_path);
+    if (mmap.size() < sizeof(TailLocator))
+        throw std::runtime_error("verify: file too small");
+
+    // Read TailLocator from end of file.
+    uint64_t tail_off = mmap.size() - sizeof(TailLocator);
+    const auto* tail = mmap.ptr_at<TailLocator>(tail_off);
+    if (tail->magic != GPKT_MAGIC)
+        throw std::runtime_error("verify: TailLocator magic mismatch");
+
+    int failures = 0;
+
+    static const uint8_t zeros16[16] = {};
+    bool toc_checksums_present = std::memcmp(tail->toc_checksum, zeros16, 16) != 0;
+
+    // --- Verify toc_checksum (covers TOC block bytes as written) ---
+    if (toc_checksums_present) {
+        const uint8_t* toc_bytes = mmap.data() + tail->toc_offset;
+        XXH128_hash_t h = XXH3_128bits(toc_bytes, tail->toc_size);
+        XXH128_canonical_t canon;
+        XXH128_canonicalFromHash(&canon, h);
+        bool ok = std::memcmp(tail->toc_checksum, canon.digest, 16) == 0;
+        if (!ok) { spdlog::error("verify: TailLocator.toc_checksum MISMATCH"); ++failures; }
+        else if (verbose) spdlog::info("verify: toc_checksum OK");
+    } else {
+        spdlog::warn("verify: TailLocator.toc_checksum is zero (pre-feature archive)");
+    }
+
+    // Read TOC to get section list.
+    Toc toc = TocReader{}.read(mmap);
+
+    // --- Verify TocHeader.checksum (covers header + SectionDescs with checksum zeroed) ---
+    if (toc_checksums_present) {
+        const uint8_t* toc_bytes = mmap.data() + tail->toc_offset;
+        bool ok = verify_checksum(toc_bytes, tail->toc_size, offsetof(TocHeader, checksum));
+        if (!ok) { spdlog::error("verify: TocHeader.checksum MISMATCH"); ++failures; }
+        else if (verbose) spdlog::info("verify: TocHeader.checksum OK");
+    }
+
+    // --- Verify each shard ---
+    auto shard_descs = toc.find_by_type(SEC_SHRD);
+    size_t n_shards = shard_descs.size();
+    size_t n_zero   = 0; // shards with zeroed checksum (written before this feature)
+
+    for (const auto* sd : shard_descs) {
+        // Skip shards with all-zero checksum — they predate this feature.
+        static const uint8_t zeros[16] = {};
+        if (std::memcmp(sd->checksum, zeros, 16) == 0) { ++n_zero; continue; }
+
+        const uint8_t* sec = mmap.data() + sd->file_offset;
+        bool ok = verify_checksum(sec, sd->compressed_size, offsetof(ShardHeader, checksum));
+        if (!ok) {
+            spdlog::error("verify: shard section_id={} MISMATCH", sd->section_id);
+            ++failures;
+        } else if (verbose) {
+            spdlog::info("verify: shard section_id={} OK", sd->section_id);
+        }
+    }
+
+    if (n_zero > 0)
+        spdlog::warn("verify: {} of {} shards have zero checksum (pre-feature, skipped)",
+                     n_zero, n_shards);
+
+    if (failures == 0)
+        spdlog::info("verify: {} shard(s) checked, all OK", n_shards - n_zero);
+    else
+        spdlog::error("verify: {} checksum failure(s)", failures);
+
+    return failures == 0 ? 0 : 1;
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 int main(int argc, char** argv) {
     CLI::App app{"genopack — genome archive"};
@@ -1649,7 +1735,7 @@ int main(int argc, char** argv) {
     bool build_mem_delta = true, build_verbose = false, build_no_cidx = true;
     bool build_2bit = true, build_kmer_nn = true, build_taxon_group = true;
     bool build_sketch = true;
-    int build_sketch_kmer = 16, build_sketch_size = 10000, build_sketch_syncmer = 0;
+    int build_sketch_kmer = 16, build_sketch_size = 10000, build_sketch_syncmer = -1;
     std::string build_taxon_rank = "g";
     std::string build_sketch_kmers_str = "16,21,31";
     build->add_option("-i,--input",  build_input,  "Input TSV (accession, file_path, ...)")->required();
@@ -1670,7 +1756,7 @@ int main(int argc, char** argv) {
     build->add_option("--sketch-kmer", build_sketch_kmer, "OPH sketch k-mer size (default: 16)");
     build->add_option("--sketch-kmers", build_sketch_kmers_str, "Comma-separated k-mer sizes for multi-k SKCH v2 (default: 16,21,31)");
     build->add_option("--sketch-size", build_sketch_size, "Number of OPH bins (default: 10000)");
-    build->add_option("--sketch-syncmer", build_sketch_syncmer, "Open syncmer prefilter s (0=disabled)");
+    build->add_option("--sketch-syncmer", build_sketch_syncmer, "Open syncmer prefilter s (0=disabled, -1=auto: s=k/3; default: auto)");
     build->add_flag("-v,--verbose", build_verbose, "Verbose progress");
     std::string build_coordinator; // "manifest_dir:output.gpk" or empty
     build->add_option("--coordinator", build_coordinator,
@@ -1945,6 +2031,7 @@ int main(int argc, char** argv) {
             fout << acc << '\t' << norm << rest << '\n';
             if (total%500'000==0) spdlog::info("  {} rows processed...", total);
         }
+        fout.close();
         spdlog::info("taxonomy normalize: {} rows → {}", total, tax_norm_output.string());
         spdlog::info("  GTDB prokaryotes:    {}", n_gtdb);
         spdlog::info("  NCBI euk/virus:      {}", n_ncbi);
@@ -2539,6 +2626,15 @@ int main(int argc, char** argv) {
                     [](size_t n) { spdlog::info("coordinator-nfs: {} sections collected", n); });
         std::exit(0);
     });
+
+    // genopack verify
+    auto* verify_cmd = app.add_subcommand("verify",
+        "Verify XXH128 checksums of all shards and TOC. Exits 0 if all pass.");
+    std::string verify_path;
+    bool verify_verbose = false;
+    verify_cmd->add_option("archive", verify_path, "Path to .gpk archive or part directory")->required();
+    verify_cmd->add_flag("-v,--verbose", verify_verbose, "Print OK lines for every shard");
+    verify_cmd->callback([&]() { std::exit(cmd_verify(verify_path, verify_verbose)); });
 
     CLI11_PARSE(app, argc, argv);
     return 0;
