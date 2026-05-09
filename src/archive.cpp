@@ -18,6 +18,9 @@
 #include <future>
 #include <mutex>
 #include <stdexcept>
+#ifdef __unix__
+#include <sys/mman.h>
+#endif
 #include <string>
 #include <unistd.h>
 #include <unordered_map>
@@ -878,9 +881,19 @@ std::optional<SketchResult> ArchiveReader::sketch_for(GenomeId genome_id) const 
 }
 
 void ArchiveReader::release_sketches() const {
-    // V4 readers don't hold decompressed buffers between calls
-    // (sketch_for / sketch_for_ids decompress on demand), so there's
-    // nothing to release. Kept for API compatibility.
+    // Advise the kernel it can evict SKCH section pages from the page cache.
+    // Without this, mmap pages touched during preload accumulate in RSS across
+    // waves — hundreds of GB on nodes with ample RAM — because the kernel has
+    // no signal to reclaim them. The preloaded KStore buffer (heap) already
+    // holds all needed sketch data, so these file-backed pages are redundant.
+    for (const auto& desc : impl_->skch_descs_) {
+#ifdef MADV_DONTNEED
+        impl_->mmap_.advise(desc.file_offset, desc.compressed_size, MADV_DONTNEED);
+#endif
+    }
+    // Also drop the in-memory id/frame index (small heap; rebuilt on next load).
+    impl_->skch_readers_.clear();
+    impl_->skch_loaded_ = false;
 }
 
 size_t ArchiveReader::sketch_memory_bytes() const {
