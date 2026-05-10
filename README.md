@@ -301,15 +301,16 @@ builder.finalize();
 // Read derep state produced by geodesic
 #include <genopack/derep_view.hpp>
 
-auto derep = genopack::DerepView::open("run.gpd");
+genopack::DerepView derep;
+derep.open("run.gpd");
 
 // Detect drift relative to the current pack
-auto level = derep.check_against(reader);   // Valid / LayoutChangedSameLiveSet / Stale… / Mismatch
+auto staleness = derep.check(reader);   // Valid / LayoutChangedSameLiveSet / Stale… / Mismatch
 
-auto status = derep.rep_status("GCA_000008085.1");
-if (status.kind == genopack::DerepView::RepStatus::Member) {
-    auto rep = derep.rep(status.rep_id);
-    const void* emb = derep.embedding(status.rep_id);   // dim × dtype bytes
+auto status = derep.status_for_accession("GCA_000008085.1");
+if (status.kind == genopack::RepStatus::Kind::Member) {
+    std::vector<float> emb(derep.stats().embedding_dim);
+    derep.embedding_for_rep(status.rep_id, emb);
 }
 ```
 

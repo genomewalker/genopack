@@ -30,9 +30,9 @@ The output `mydb.gpk` is a directory containing `toc.bin` plus section files. De
 | `--no-dict` | off | Disable shared dictionary training |
 | `--ref-dict` | off | Use first genome in each shard as reference content dictionary |
 | `--delta` | off | Compress non-reference blobs against first genome via zstd prefix |
-| `--mem-delta` | off | k=31 k-mer seeded exact-match encoding for highly similar shard groups |
-| `--2bit` | off | Pack nucleotides to 2 bits/base before zstd (~1.5–2× extra compression) |
-| `--no-cidx` | off | Skip CIDX contig index (recommended for >1M genomes) |
+| `--mem-delta` / `--no-mem-delta` | on | k=31 k-mer seeded exact-match encoding for highly similar shard groups |
+| `--2bit` / `--no-2bit` | on | Pack nucleotides to 2 bits/base before zstd (~1.5–2× extra compression) |
+| `--no-cidx` / `--cidx` | on (skip) | Skip CIDX contig index; pass `--cidx` to build it |
 | `--kmer-sort` / `--no-kmer-sort` | on | Sort genomes within each shard by kmer4 NN chain |
 | `--taxon-group` / `--no-taxon-group` | on | Group genomes into per-taxon shards (requires taxonomy column) |
 | `--taxon-rank` | `g` | Rank for grouping (`g` = genus, `f` = family) |
@@ -102,9 +102,7 @@ genopack extract mydb.gpk [filters] -o out.fasta
 | `--accessions-file FILE` | Extract list of accessions (one per line) |
 | `--min-completeness FLOAT` | Completeness filter (0–100) |
 | `--max-contamination FLOAT` | Contamination filter |
-| `--min-length INT` | Minimum assembly length in bp |
-| `--max-contigs INT` | Maximum contig count |
-| `-o / --output` | Output FASTA (default: stdout) |
+| `-o / --out` | Output FASTA (default: stdout) |
 
 ---
 
@@ -113,7 +111,7 @@ genopack extract mydb.gpk [filters] -o out.fasta
 Extract a subsequence by accession and coordinates.
 
 ```bash
-genopack slice mydb.gpk --accession GCA_000008085.1 --start 100000 --length 5000 -o region.fasta
+genopack slice mydb.gpk --accession GCA_000008085.1 --start 100000 --length 5000 --fasta
 ```
 
 Decompresses only the checkpoint blocks covering the requested region (sub-genome granularity).
@@ -295,6 +293,21 @@ genopack reindex mydb.gpk [options]
 | `--sketch-syncmer` | inherit / 0 | Open-syncmer prefilter `s` (0 disables) |
 
 Typical uses: an archive built with `--no-cidx` later wants contig lookup (`--cidx genomes.tsv`); a TAXN-only archive needs the tree (`--txdb`); SKCH layout needs to be upgraded to V4 seekable (`--skch --force`); or a multi-k variant is needed (`--skch --sketch-kmers 16,21,31 --force`).
+
+---
+
+## `verify`
+
+```bash
+genopack verify mydb.gpk [--verbose]
+```
+
+Checks archive integrity: TailLocator checksum, TocHeader checksum, and per-shard checksums. Exits 0 if all checks pass, non-zero on any failure.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `archive` | required | Archive directory to verify |
+| `--verbose` | off | Print OK lines in addition to failures |
 
 ---
 
