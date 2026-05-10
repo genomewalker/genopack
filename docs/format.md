@@ -85,13 +85,16 @@ A `.gpk` archive is a **directory of seekable section files** plus a `toc.bin` e
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
-| 0 | 4 B | `magic` | `GPK\x01` |
-| 4 | 2 B | `version_major` | Breaking format change |
-| 6 | 2 B | `version_minor` | Backward-compatible extension |
-| 8 | 16 B | `uuid` | Archive UUID (stable across generations) |
-| 24 | 8 B | `created_ts` | Unix timestamp of initial build |
-| 32 | 8 B | `generation` | Monotonically incremented on each `add`/`rm`/`repack` |
+| 0 | 4 B | `magic` | `GPK2` (`0x324B5047`) |
+| 4 | 2 B | `version_major` | Breaking format change (current: `2`) |
+| 6 | 2 B | `version_minor` | Backward-compatible extension (current: `0`) |
+| 8 | 8 B | `file_uuid_lo` | Archive UUID low 64 bits (stable across generations) |
+| 16 | 8 B | `file_uuid_hi` | Archive UUID high 64 bits |
+| 24 | 8 B | `created_at_unix` | Unix timestamp of initial build |
+| 32 | 8 B | `flags` | Reserved flags (0) |
 | 40 | 88 B | _reserved_ | Zero-padded |
+
+> **Note:** `generation` is in `TocHeader`, not `FileHeader`.
 
 ---
 
@@ -136,15 +139,22 @@ Genomes are sorted by `oph_fingerprint` within each shard. Nearby OPH values ind
 |--------|------|-------|-------------|
 | 0 | 4 B | `magic` | `SHRD` |
 | 4 | 2 B | `version` | |
-| 6 | 2 B | `codec` | Compression codec (see table below) |
-| 8 | 8 B | `shard_id` | Unique shard identifier |
-| 16 | 4 B | `n_genomes` | Number of genomes in this shard |
-| 20 | 4 B | `dict_size` | Dictionary size in bytes (0 if none) |
-| 24 | 8 B | `genome_dir_offset` | Byte offset of `GenomeDirEntry[]` from section start |
-| 32 | 8 B | `dict_offset` | Byte offset of zstd dictionary |
-| 40 | 8 B | `blob_area_offset` | Byte offset of blob area |
-| 48 | 8 B | `checkpoint_area_offset` | Byte offset of `CheckpointEntry[]` (0 if none) |
-| 56 | 72 B | _reserved_ | Zero-padded |
+| 6 | 2 B | `flags` | |
+| 8 | 4 B | `shard_id` | Unique shard identifier |
+| 12 | 4 B | `cluster_id` | Cluster this shard belongs to |
+| 16 | 4 B | `n_genomes` | Total genomes (including deleted) |
+| 20 | 4 B | `n_deleted` | Soft-deleted genome count |
+| 24 | 4 B | `codec` | Compression codec (see table below) |
+| 28 | 4 B | `dict_size` | Dictionary size in bytes (0 if none) |
+| 32 | 8 B | `genome_dir_offset` | Byte offset of `GenomeDirEntry[]` from section start |
+| 40 | 8 B | `dict_offset` | Byte offset of zstd dictionary from section start |
+| 48 | 8 B | `blob_area_offset` | Byte offset of blob area from section start |
+| 56 | 8 B | `checkpoint_area_offset` | Byte offset of `CheckpointEntry[]` from section start (0 if none) |
+| 64 | 8 B | `checkpoint_count` | Total `CheckpointEntry` records in shard |
+| 72 | 8 B | `shard_raw_bp` | Total uncompressed genome bytes |
+| 80 | 8 B | `shard_compressed_bytes` | Total compressed bytes |
+| 88 | 16 B | `checksum` | |
+| 104 | 24 B | _reserved_ | Zero-padded |
 
 ### `GenomeDirEntry` — 64 bytes each
 
@@ -153,18 +163,21 @@ Genomes are sorted by `oph_fingerprint` within each shard. Nearby OPH values ind
 | 0 | 8 B | `genome_id` | |
 | 8 | 8 B | `oph_fingerprint` | Order-preserving hash; entries sorted by this value |
 | 16 | 8 B | `blob_offset` | Byte offset of compressed blob from blob area start |
-| 24 | 8 B | `blob_len_cmp` | Compressed size in bytes |
-| 32 | 8 B | `blob_len_raw` | Uncompressed size in bytes |
-| 40 | 4 B | `checkpoint_idx` | Index into `CheckpointEntry[]` for first checkpoint |
-| 44 | 4 B | `n_checkpoints` | Number of checkpoints (0 if slice not needed) |
+| 24 | 4 B | `blob_len_cmp` | Compressed size in bytes |
+| 28 | 4 B | `blob_len_raw` | Uncompressed size in bytes |
+| 32 | 4 B | `checkpoint_idx` | Index into `CheckpointEntry[]` for first checkpoint |
+| 36 | 4 B | `n_checkpoints` | Number of checkpoints (0 if slice not needed) |
+| 40 | 4 B | `flags` | |
+| 44 | 4 B | `meta_row_id` | Row index in logical catalog |
 | 48 | 16 B | _reserved_ | |
 
 ### `CheckpointEntry` — 16 bytes each (optional)
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
-| 0 | 8 B | `symbol_offset` | Byte offset within the decompressed genome at this checkpoint |
-| 8 | 8 B | `block_offset` | Byte offset of the corresponding zstd block within the blob |
+| 0 | 8 B | `symbol_offset` | Base position (0-indexed) within the decompressed genome |
+| 8 | 4 B | `block_offset` | Byte offset of the corresponding zstd block within the blob |
+| 12 | 4 B | _pad_ | |
 
 ### Codec values
 
@@ -212,22 +225,48 @@ Multiple CATL fragments (one per generation) are merged by `MergedCatalogReader`
 | 0 | 4 B | `magic` | `CATL` |
 | 4 | 4 B | `n_rows` | Total number of `GenomeMeta` rows |
 | 8 | 4 B | `n_groups` | Number of row groups |
-| 12 | 4 B | _reserved_ | |
+| 12 | 4 B | `row_group_size` | Rows per group (default 32768) |
 | 16 | 8 B | `stats_offset` | Byte offset of `RowGroupStatsV2[]` from section start |
 | 24 | 8 B | `rows_offset` | Byte offset of `GenomeMeta[]` from section start |
+
+### `RowGroupStatsV2` — 72 bytes each
+
+| Offset | Size | Field | Description |
+|--------|------|-------|-------------|
+| 0 | 4 B | `first_row` | First row index in this group |
+| 4 | 4 B | `last_row` | Last row index (inclusive) |
+| 8 | 4 B | `live_count` | Non-deleted rows in this group |
+| 12 | 4 B | _pad_ | |
+| 16 | 8 B | `oph_min` | |
+| 24 | 8 B | `oph_max` | |
+| 32 | 8 B | `genome_length_min` | |
+| 40 | 8 B | `genome_length_max` | |
+| 48 | 2 B | `completeness_min` | Fixed-point × 10 (e.g. 987 = 98.7%) |
+| 50 | 2 B | `completeness_max` | |
+| 52 | 2 B | `contamination_min` | Fixed-point × 10 |
+| 54 | 2 B | `contamination_max` | |
+| 56 | 4 B | `flags_any` | OR of all `GenomeMeta.flags` in group |
+| 60 | 12 B | _reserved_ | |
 
 ### `GenomeMeta` — 72 bytes each
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
 | 0 | 8 B | `genome_id` | |
-| 8 | 8 B | `oph_fingerprint` | |
-| 16 | 4 B | `completeness` | CheckM completeness × 100 (fixed-point) |
-| 20 | 4 B | `contamination` | CheckM contamination × 100 |
-| 24 | 8 B | `genome_length` | Total assembly length in bp |
-| 32 | 4 B | `n_contigs` | |
-| 36 | 4 B | `shard_id` | Which shard holds this genome |
-| 40 | 32 B | _reserved_ | |
+| 8 | 4 B | `genome_type` | `GenomeType` enum (0 in legacy archives) |
+| 12 | 4 B | `shard_id` | Which shard holds this genome |
+| 16 | 8 B | `genome_length` | Total assembly length in bp |
+| 24 | 4 B | `n_contigs` | |
+| 28 | 2 B | `gc_pct_x100` | GC% × 100 (e.g. 5234 = 52.34%) |
+| 30 | 2 B | `completeness_x10` | CheckM completeness × 10 (e.g. 987 = 98.7%) |
+| 32 | 2 B | `contamination_x10` | CheckM contamination × 10 |
+| 34 | 6 B | _pad_ | Compiler-inserted alignment padding |
+| 40 | 8 B | `oph_fingerprint` | MinHash minimum (k=21); locality-sensitive sort key |
+| 48 | 8 B | `blob_offset` | |
+| 56 | 4 B | `blob_len_cmp` | |
+| 60 | 4 B | `blob_len_raw` | |
+| 64 | 4 B | `date_added` | Days since 2024-01-01 |
+| 68 | 4 B | `flags` | Bit 0: deleted; bit 1: delta-encoded blob |
 
 ---
 
@@ -279,7 +318,7 @@ struct SectionDesc {
 |-------|-------------|
 | `FileHeader.version_major` | Breaking format change |
 | `FileHeader.version_minor` | Backward-compatible extension |
-| `FileHeader.generation` | Monotonically incremented on each `add`/`rm`/`repack` |
+| `TocHeader.generation` | Monotonically incremented on each `add`/`rm`/`repack` |
 | `SectionDesc.version` | Per-section format version (e.g. shard v4 added checkpoints) |
 
 ---
