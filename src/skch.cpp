@@ -657,7 +657,7 @@ void SkchReader::sketch_for_ids(const std::vector<GenomeId>& sorted_ids,
         }
     }
 
-    #pragma omp parallel for schedule(dynamic, 1)
+    #pragma omp parallel for schedule(dynamic, 1) num_threads(omp_get_max_threads())
     for (size_t gi_idx = 0; gi_idx < groups.size(); ++gi_idx) {
         const uint32_t fi     = groups[gi_idx].fi;
         const size_t   hi_s   = groups[gi_idx].hi_start;
