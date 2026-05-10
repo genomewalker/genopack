@@ -22,6 +22,7 @@
   - `--taxonomy-rank g|f` flag (genus default, family fallback)
   - `-m / --max-memory` flag to control eviction threshold
 - OpenMP parallel decompression in repack Phase 3
+- **Fix: `MmapFileReader::advise()` page-alignment** — `madvise()` requires a page-aligned address; the raw `data_ + offset` pointer was not aligned, so every `MADV_DONTNEED` call on SKCH sections silently returned `EINVAL`. Fixed by rounding the address down to the nearest 4 KiB page boundary and extending the length accordingly. On large runs (e.g. GTDB r232, 5.2 M genomes) this caused sketch mmap pages to accumulate across waves, inflating peak RSS by ~200–300 GiB.
 
 ## 0.1.0
 
