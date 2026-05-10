@@ -38,7 +38,7 @@ The output `mydb.gpk` is a directory containing `toc.bin` plus section files. De
 | `--taxon-rank` | `g` | Rank for grouping (`g` = genus, `f` = family) |
 | `--sketch` / `--no-sketch` | on | Compute OPH sketches |
 | `--sketch-kmer` | 16 | OPH sketch k-mer size |
-| `--sketch-kmers` | unset | Comma list (e.g. `16,21,31`) → multi-k SKCH v2 in a single pass |
+| `--sketch-kmers` | unset | Comma list (e.g. `16,21,31`) → multi-k SKCH in a single pass |
 | `--sketch-size` | 10000 | Number of OPH bins |
 | `--sketch-syncmer` | 0 | Open syncmer prefilter `s` (0 disables) |
 | `--coordinator` | unset | NFS manifest coordinator: `manifest_dir:/output.gpk` |
@@ -288,7 +288,7 @@ genopack reindex mydb.gpk [options]
 | `--skch` | off | Compute OPH sketches for genomes missing from existing SKCH sections |
 | `--skch-threads` | 8 | Threads for parallel sketch computation |
 | `--sketch-kmer` | inherit / 16 | OPH k-mer size for a single-k SKCH section |
-| `--sketch-kmers` | unset | Comma list (e.g. `16,21,31`) → multi-k SKCH v2 in one pass |
+| `--sketch-kmers` | unset | Comma list (e.g. `16,21,31`) → multi-k SKCH in one pass |
 | `--sketch-size` | inherit / 10000 | OPH sketch size |
 | `--sketch-syncmer` | inherit / 0 | Open-syncmer prefilter `s` (0 disables) |
 

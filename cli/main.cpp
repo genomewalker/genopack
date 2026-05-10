@@ -1754,7 +1754,7 @@ int main(int argc, char** argv) {
     build->add_option("--taxon-rank",build_taxon_rank,"Taxonomy rank for grouping: g=genus (default), f=family");
     build->add_flag("--sketch,!--no-sketch", build_sketch, "Compute OPH sketches (default: on; use --no-sketch to disable)");
     build->add_option("--sketch-kmer", build_sketch_kmer, "OPH sketch k-mer size (default: 16)");
-    build->add_option("--sketch-kmers", build_sketch_kmers_str, "Comma-separated k-mer sizes for multi-k SKCH v2 (default: 16,21,31)");
+    build->add_option("--sketch-kmers", build_sketch_kmers_str, "Comma-separated k-mer sizes for multi-k SKCH (default: 16,21,31)");
     build->add_option("--sketch-size", build_sketch_size, "Number of OPH bins (default: 10000)");
     build->add_option("--sketch-syncmer", build_sketch_syncmer, "Open syncmer prefilter s (0=disabled, -1=auto: s=k/3; default: auto)");
     build->add_flag("-v,--verbose", build_verbose, "Verbose progress");

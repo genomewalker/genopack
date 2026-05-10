@@ -49,7 +49,7 @@ The output `mydb.gpk` is a directory containing `toc.bin` and section files. Def
 | `--taxon-rank` | `g` | Rank for grouping (`g` = genus, `f` = family) |
 | `--sketch` / `--no-sketch` | on | Compute OPH sketches |
 | `--sketch-kmer` | 16 | OPH sketch k-mer size |
-| `--sketch-kmers` | unset | Comma list (e.g. `16,21,31`) → multi-k SKCH v2 in one pass |
+| `--sketch-kmers` | unset | Comma list (e.g. `16,21,31`) → multi-k SKCH in one pass |
 | `--sketch-size` | 10000 | Number of OPH bins |
 | `--sketch-syncmer` | 0 | Open syncmer prefilter `s` (0 disables) |
 | `--coordinator` | unset | NFS manifest coordinator: `manifest_dir:/output.gpk` |
