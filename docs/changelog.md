@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.0 — 2026-05-10
 
 - **Directory archive layout**: `.gpk` is now a directory of section files plus `toc.bin`. Single-file `.gpk` archives are no longer produced; section binary structures (CATL, GIDX, ACCX, …) are unchanged.
 - **Multipart sets via `ArchiveSetReader`**: open a directory of `part_*.gpk` archives transparently. Per-accession routing across parts, aggregated stats, multipart-aware `extract` / `fetch_by_accession` / `batch_fetch` / `fetch_sequence_slice` / `taxonomy_for_accession`. `LocatedGenomeMeta` carries `(part_index, part_path)` so callers can disambiguate part-local `genome_id` values that may collide across parts.

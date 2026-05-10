@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(genopack VERSION 0.1.0 LANGUAGES CXX)
+project(genopack VERSION 1.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -24,6 +24,17 @@ pkg_check_modules(ZSTD REQUIRED libzstd)
 
 # zlib (for gzip decompression)
 find_package(ZLIB REQUIRED)
+
+# xxhash — required by derep_view (.gpd reader)
+find_path(Xxhash_INCLUDE_DIR xxhash.h
+  HINTS /usr/local/include /usr/include
+        /maps/projects/fernandezguerra/apps/opt/conda/envs/bioinfo/include
+        ENV CONDA_PREFIX
+  PATH_SUFFIXES include)
+if(NOT Xxhash_INCLUDE_DIR)
+  message(FATAL_ERROR "xxhash.h not found. Install xxhash or set Xxhash_INCLUDE_DIR.")
+endif()
+message(STATUS "xxhash include: ${Xxhash_INCLUDE_DIR}")
 
 # libdeflate (fast gzip decompression, ~3x faster than zlib)
 pkg_check_modules(LIBDEFLATE libdeflate)
@@ -63,6 +74,7 @@ add_library(genopack_lib STATIC
   src/builder.cpp
   src/archive.cpp
   src/archive_set_reader.cpp
+  src/derep_view.cpp
   src/appender.cpp
   src/mmap_file.cpp
   src/util.cpp
@@ -89,6 +101,7 @@ add_library(genopack_lib STATIC
 target_include_directories(genopack_lib PUBLIC
   include
   ${ZSTD_INCLUDE_DIRS}
+  ${Xxhash_INCLUDE_DIR}
 )
 if(SPDLOG_INCLUDE_DIR)
   target_include_directories(genopack_lib PUBLIC ${SPDLOG_INCLUDE_DIR})
@@ -143,6 +156,12 @@ add_test(NAME genopack-mem-delta COMMAND genopack_mem_delta_test)
 add_executable(genopack_skch_dual_seed_test tests/skch_dual_seed.cpp)
 target_link_libraries(genopack_skch_dual_seed_test PRIVATE genopack_lib)
 add_test(NAME genopack-skch-dual-seed COMMAND genopack_skch_dual_seed_test)
+set_tests_properties(genopack-skch-dual-seed PROPERTIES LABELS "unit")
+
+add_executable(genopack_derep_view_test tests/derep_view_test.cpp)
+target_link_libraries(genopack_derep_view_test PRIVATE genopack_lib)
+add_test(NAME genopack-derep-view COMMAND genopack_derep_view_test)
+set_tests_properties(genopack-derep-view PROPERTIES LABELS "unit")
 
 add_executable(genopack_benchmark tests/benchmark.cpp)
 target_link_libraries(genopack_benchmark PRIVATE genopack_lib)
