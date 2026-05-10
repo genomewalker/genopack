@@ -273,62 +273,83 @@ Optional. Used for QC reports; mapping pipelines ignore.
 ```cpp
 namespace genopack {
 
+// Staleness result returned by DerepView::check()
+enum class DerepStaleness {
+    Valid,
+    LayoutChangedSameLiveSet,
+    StaleNewGenomes,
+    StaleTombstones,
+    Mismatch,
+};
+
+// Per-accession classification
+struct RepStatus {
+    enum class Kind {
+        Representative,
+        Member,
+        Unclustered,
+        UnknownSinceGeneration,
+        Absent,
+        Tombstoned,
+    };
+    Kind             kind          = Kind::Absent;
+    uint32_t         rep_id        = UINT32_MAX;  // valid for Representative/Member
+    std::string_view rep_accession;               // accession of the rep for this cluster
+};
+
+// Aggregate counts
+struct DerepStats {
+    uint64_t n_genomes_indexed = 0;
+    uint32_t n_reps            = 0;
+    uint32_t n_unclustered     = 0;
+    uint32_t n_singletons      = 0;
+    uint64_t n_members         = 0;
+};
+
 class DerepView {
 public:
-    static DerepView open(const std::filesystem::path& gpd_file);
+    DerepView();
+    ~DerepView();
+    DerepView(const DerepView&)            = delete;
+    DerepView& operator=(const DerepView&) = delete;
+    DerepView(DerepView&&) noexcept;
+    DerepView& operator=(DerepView&&) noexcept;
+
+    // Open / close
+    void open(const std::filesystem::path& gpd_path);
     void close();
     bool is_open() const;
 
-    enum class StalenessLevel {
-        Valid,
-        LayoutChangedSameLiveSet,
-        StaleNewGenomes,
-        StaleTombstones,
-        Mismatch
-    };
-    StalenessLevel check_against(const ArchiveSetReader& pack) const;
+    // Compare against a live pack to detect drift
+    DerepStaleness check(const ArchiveSetReader& archive) const;
 
-    struct RepStatus {
-        enum Kind {
-            Representative, Member,
-            Unclustered, UnknownSinceGeneration, Absent, Tombstoned
-        };
-        Kind     kind;
-        uint32_t rep_id;            // valid for Rep/Member
-        uint64_t since_generation;  // valid for UnknownSinceGeneration
-    };
-    RepStatus rep_status(std::string_view accession) const;
+    // Per-accession status lookup (O(1) via ARMP, falls back to ASOF binary search)
+    RepStatus status_for_accession(std::string_view accession) const;
 
-    struct RepInfo {
-        std::string_view accession;
-        uint32_t         cluster_size;
-        uint64_t         source_locator;
-        uint16_t         sketch_kmer;
-    };
-    std::optional<RepInfo> rep(uint32_t rep_id) const;
+    // Iterate all representatives: rep_id, rep_accession, cluster_size
+    void scan_representatives(
+        const std::function<void(uint32_t rep_id,
+                                 std::string_view rep_accession,
+                                 uint32_t cluster_size)>& cb) const;
 
-    const void* embedding(uint32_t rep_id) const;
-    uint16_t    embedding_dim() const;
-    uint8_t     embedding_dtype() const;
+    // Fill caller-allocated float buffer with the embedding for rep_id.
+    // Buffer must be embedding_dim() elements. Returns false if rep_id out of range.
+    bool embedding_for_rep(uint32_t rep_id, std::span<float> out) const;
 
-    std::vector<std::string_view> members_of(uint32_t rep_id) const;
+    // Aggregate statistics
+    DerepStats stats() const;
 
-    uint32_t n_reps() const;
-    uint64_t n_genomes() const;
-    uint64_t n_unclustered() const;
-    void scan_reps(const std::function<void(uint32_t rep_id, RepInfo)>& cb) const;
+    // Embedding metadata
+    uint32_t embedding_dim() const;
 
-    // Iterate all (accession, rep_status) pairs in genome-ordinal order
-    void scan_genomes(const std::function<void(std::string_view acc, RepStatus s)>& cb) const;
-
-    // Header introspection
+    // Archive identity / version
+    uint64_t                accession_set_hash() const;
+    uint32_t                format_major() const;
+    uint32_t                format_minor() const;
     std::array<uint8_t, 16> run_id() const;
-    uint64_t created_at_unix() const;
-    std::string_view geodesic_version() const;
-    uint16_t source_n_parts() const;
+    uint64_t                created_at_unix() const;
+    uint16_t                source_n_parts() const;
 };
-
-DerepView open_derep(const std::filesystem::path& gpd_file);
 
 } // namespace genopack
 ```
