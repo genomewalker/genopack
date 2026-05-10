@@ -62,7 +62,12 @@ void MmapFileReader::close() {
 void MmapFileReader::advise(uint64_t offset, uint64_t len, int advice) const {
     if (!data_ || len == 0) return;
     if (offset + len > size_) len = size_ - offset;
-    ::madvise(data_ + offset, len, advice);
+    // madvise requires page-aligned address; round down start, extend len.
+    static constexpr uintptr_t PAGE = 4096;
+    uintptr_t addr    = reinterpret_cast<uintptr_t>(data_) + offset;
+    uintptr_t aligned = addr & ~(PAGE - 1);
+    size_t    alen    = (addr + len) - aligned;
+    ::madvise(reinterpret_cast<void*>(aligned), alen, advice);
 }
 
 // ── AppendWriter ──────────────────────────────────────────────────────────────
