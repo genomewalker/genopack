@@ -314,6 +314,48 @@ if (status.kind == genopack::RepStatus::Kind::Member) {
 }
 ```
 
+## Performance
+
+> **Provenance:** reproduce with `bench/run_codec_bench.sh <tsv>` and
+> `bench/run_check_bench.sh <pack>` against a clean build. Numbers marked TODO
+> must be regenerated from a pinned commit + scripted run before publication.
+
+### MEM-delta codec (200 × 4 MB genomes, 16 threads, same-genus 99% ANI)
+
+| Codec | Build time | Archive size | Delta rate |
+|-------|-----------|-------------|------------|
+| Plain ZSTD | 4.2 s | 191 MB | — |
+| **MEM-delta** | **4.0 s** | **76 MB** | 79–93% |
+
+MEM-delta is simultaneously faster and 2.5× smaller for same-genus genomes
+because delta-encoding small genomes produces tiny blobs that compress the ZSTD
+work rather than adding to it.
+
+### Contamination detection (bench_grid, 177k genome reference, *E. coli* host)
+
+> Reproduce: `python3 bench/bench_grid.py` after running `genopack gcov` on the
+> reference pack.
+
+| Spike condition | Actual spike | CCO | sibling\_outlier | GMM | markers |
+|----------------|-------------|-----|-----------------|-----|---------|
+| phylum (Staphylococcus) | 20.2% | 20.9% | 0.0% | 20.8% | 100%¹ |
+| class (Bacillus) | 20.4% | 21.1% | 0.0% | 21.1% | 100%¹ |
+| order (Acinetobacter) | 21.0% | 21.6% | 0.0% | 21.7% | 100%¹ |
+| **family (Klebsiella)** | 20.1% | 16.8% | **16.7%** | 20.6% | 100%¹ |
+| genus (Salmonella) | 20.8% | 1.1% | 1.1% | 21.1% | 100%¹ |
+| same-genus control | 20.5% | 0.1% | 0.0% | 38.5%² | 100%¹ |
+
+¹ Marker completeness is blind to contamination at all taxonomic levels.  
+² GMM minority-cluster has ~38–40% false-positive rate on clean samples; use CCO
+or sibling\_outlier as primary signals.
+
+**Key results:**
+- CCO (Mahalanobis T² + SPE vs genus covariance) detects order-level and above cleanly.
+- `contamination_sibling_outlier` (genus-outlier ∧ family-inlier) adds detection at family
+  level (Klebsiella in Escherichia) that CCO underestimates.
+- Same-family contamination (Salmonella) is near-undetectable by TNF alone — both TNF
+  models overlap too much at that distance.
+
 ## License
 
 MIT
