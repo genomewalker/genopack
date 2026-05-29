@@ -17,6 +17,7 @@ Per-genome metadata record. 72 bytes, 8-byte aligned.
 | Field | Type | Description |
 |-------|------|-------------|
 | `genome_id` | `uint64_t` | Stable integer identifier (1-based) |
+| `genome_type` | `uint32_t` | Genome type flags |
 | `shard_id` | `uint32_t` | Shard section this genome lives in |
 | `genome_length` | `uint64_t` | Total assembly length in bp |
 | `n_contigs` | `uint32_t` | Number of contigs |

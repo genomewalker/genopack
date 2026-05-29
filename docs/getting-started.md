@@ -41,9 +41,9 @@ The output `mydb.gpk` is a directory containing `toc.bin` and section files. Def
 | `--no-dict` | off | Disable shared dictionary training |
 | `--ref-dict` | off | Use first genome in each shard as reference content dictionary |
 | `--delta` | off | Compress non-reference blobs against first genome via zstd prefix |
-| `--mem-delta` | off | k=31 k-mer seeded exact-match encoding for highly similar shard groups |
-| `--2bit` | off | Pack nucleotides to 2 bits/base before zstd (~1.5–2× extra compression) |
-| `--no-cidx` | off | Skip CIDX contig index (recommended for >1M genomes) |
+| `--mem-delta` / `--no-mem-delta` | **on** | k=31 k-mer seeded exact-match encoding for highly similar shard groups |
+| `--2bit` / `--no-2bit` | **on** | Pack nucleotides to 2 bits/base before zstd (~1.5–2× extra compression) |
+| `--cidx` / `--no-cidx` | off (skip) | Build CIDX contig index; opt in with `--cidx` (recommended for >1M genomes needing contig lookup) |
 | `--kmer-sort` / `--no-kmer-sort` | on | Sort genomes within each shard by kmer4 NN chain |
 | `--taxon-group` / `--no-taxon-group` | on | Group genomes into per-taxon shards (requires taxonomy column) |
 | `--taxon-rank` | `g` | Rank for grouping (`g` = genus, `f` = family) |
