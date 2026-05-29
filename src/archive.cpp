@@ -1,7 +1,11 @@
 #include <genopack/archive.hpp>
 #include <genopack/cidx.hpp>
 #include <genopack/format.hpp>
+#include <genopack/meta.hpp>
 #include <genopack/gidx.hpp>
+#include <genopack/gcov.hpp>
+#include <genopack/gstx.hpp>
+#include <genopack/qual.hpp>
 #include <genopack/kmrx.hpp>
 #include <genopack/skch.hpp>
 #include <genopack/mmap_file.hpp>
@@ -11,6 +15,8 @@
 #include <genopack/txdb.hpp>
 #include <genopack/tombstone.hpp>
 #include <spdlog/spdlog.h>
+#include <unistd.h>
+#include <sys/mman.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -22,6 +28,7 @@
 #include <sys/mman.h>
 #endif
 #include <string>
+#include <fcntl.h>
 #include <unistd.h>
 #include <unordered_map>
 #include <utility>
@@ -77,14 +84,16 @@ struct ArchiveReader::Impl {
     std::unordered_map<uint64_t, uint32_t> shard_section_to_id_;
     mutable std::mutex shard_open_mx_;
 
-    // accession <-> genome_id maps built from all ACCX sections
-    std::unordered_map<std::string, GenomeId> accession_map_;
-    std::unordered_map<GenomeId, std::string> genome_accession_map_;
+    // ACCX readers kept alive so accession lookups are zero-copy into the mmap.
+    // genome_accession_map_ stores const char* into the ACCX string area (valid
+    // while mmap_ is open) — avoids duplicating 2.3M accession strings on heap.
+    std::vector<AccessionIndexReader>         accx_readers_;
+    std::unordered_map<GenomeId, const char*> genome_accession_map_;
     std::unordered_map<GenomeId, const GenomeMeta*> genome_meta_map_;
 
-    // accession -> taxonomy string (loaded lazily on first taxonomy query)
-    mutable std::unordered_map<std::string, std::string> taxonomy_map_;
-    void ensure_taxonomy_loaded() const;
+    // TAXN readers kept alive — open() just sets pointers into the mmap, O(1),
+    // zero heap allocation. Replaces the old lazy taxonomy_map_ copy (~900 MB).
+    std::vector<TaxonomyIndexReader> taxn_readers_;
 
     // TXDB section descriptors (section_id -> SectionDesc pointer into toc_.sections)
     std::unordered_map<uint64_t, const SectionDesc*> txdb_descs_;
@@ -96,6 +105,30 @@ struct ArchiveReader::Impl {
     // GIDX reader for O(1) genome_id -> shard position lookup
     GidxReader gidx_;
     bool       has_gidx_ = false;
+
+    // GSTX reader: genus sketch stats (consensus + p90 + TNF centroid)
+    std::vector<uint8_t> gstx_buf_;  // pread heap buffer — avoids NFS mmap page faults
+    GstxReader gstx_;
+    bool       has_gstx_ = false;
+
+    // GCOV reader: per-genus biological covariance eigenbasis + calibrated quantiles
+    std::vector<uint8_t> gcov_buf_;
+    GcovReader gcov_;
+    bool       has_gcov_ = false;
+
+    // FCOV reader: per-family biological covariance (same layout as GCOV)
+    std::vector<uint8_t> fcov_buf_;
+    GcovReader fcov_;
+    bool       has_fcov_ = false;
+
+    // FMHR reader: per-genus FracMinHash reference sketches (k=21, c=125)
+    FmhrReader fmhr_;
+    bool       has_fmhr_ = false;
+
+    // QUAL reader: per-genome quality scores
+    std::vector<uint8_t> qual_buf_;  // pread heap buffer — avoids NFS mmap page faults
+    QualReader qual_;
+    bool       has_qual_ = false;
 
     // CIDX reader for contig accession -> genome_id lookup
     MergedCidxReader cidx_;
@@ -124,6 +157,15 @@ struct ArchiveReader::Impl {
     uint64_t generation_  = 0;
     uint32_t n_shards_    = 0;
 
+    // O(1) accession → GenomeId lookup across all ACCX readers (mmap'd hash tables).
+    std::optional<GenomeId> find_accession(std::string_view acc) const {
+        for (const auto& r : accx_readers_) {
+            auto gid = r.find(acc);
+            if (gid) return gid;
+        }
+        return std::nullopt;
+    }
+
     // ── taxonomy tree (lazy) ──────────────────────────────────────────────────
 
     std::optional<TaxonomyTree> get_tree() const {
@@ -149,14 +191,63 @@ struct ArchiveReader::Impl {
         return std::nullopt;
     }
 
+    // pread a section into a fresh heap buffer — one NFS bulk transfer,
+    // no mmap page-fault storm. Returns the buffer; throws on short read.
+    static std::vector<uint8_t> pread_section(int fd, uint64_t offset, uint64_t size) {
+        std::vector<uint8_t> buf(size);
+        uint8_t* p = buf.data();
+        uint64_t remaining = size;
+        while (remaining > 0) {
+            ssize_t n = ::pread(fd, p, remaining, static_cast<off_t>(offset));
+            if (n <= 0) throw std::runtime_error("pread_section: short read at offset "
+                                                  + std::to_string(offset));
+            p         += n;
+            offset    += static_cast<uint64_t>(n);
+            remaining -= static_cast<uint64_t>(n);
+        }
+        return buf;
+    }
+
     void open_gpk(const std::filesystem::path& path) {
         mmap_.open(path);
 
+        // Read FileHeader from mmap offset 0 — always a warm page, no fault.
         auto* fh = mmap_.ptr_at<FileHeader>(0);
         if (fh->magic != GPK2_MAGIC)
             throw std::runtime_error("Not a .gpk file");
 
-        toc_ = TocReader::read(mmap_);
+        // pread TailLocator from EOF — avoids mmap page-fault at multi-TB offset.
+        TailLocator tail{};
+        {
+            const uint64_t tail_off = mmap_.size() - sizeof(TailLocator);
+            const ssize_t n = ::pread(mmap_.fd(), &tail, sizeof(tail),
+                                      static_cast<off_t>(tail_off));
+            if (n != static_cast<ssize_t>(sizeof(tail)) || tail.magic != GPKT_MAGIC)
+                throw std::runtime_error("Not a .gpk file or TailLocator corrupt");
+        }
+
+        // If MetaBundle is present: one more pread gives the full section directory.
+        // This is the fast path for any archive written by genopack >= this version.
+        const uint64_t mb_off  = tail.meta_bundle_offset();
+        const uint64_t mb_size = tail.meta_bundle_size();
+        MetaBundleReader meta;
+        if (mb_off != 0 && mb_size != 0 && meta.open(mmap_.fd(), mb_off, mb_size)) {
+            toc_ = meta.to_toc();
+            spdlog::debug("genopack: MetaBundle fast-open ({} sections)", toc_.sections.size());
+        } else {
+            // Legacy archive (MetaBundle absent): fall back to pread-based TOC read.
+            // Slower on NFS (page-faults at multi-TB offset) but correct.
+            spdlog::info("genopack: legacy archive (no MetaBundle), reading TOC via pread — "
+                         "run 'genopack reindex' to add MetaBundle for fast open");
+            const uint64_t toc_off  = tail.toc_offset;
+            const uint64_t toc_size = tail.toc_size;
+            std::vector<uint8_t> toc_buf(toc_size);
+            const ssize_t nr = ::pread(mmap_.fd(), toc_buf.data(), toc_size,
+                                       static_cast<off_t>(toc_off));
+            if (nr != static_cast<ssize_t>(toc_size))
+                throw std::runtime_error("genopack: legacy archive TOC pread failed");
+            toc_ = TocReader::read_at(toc_buf.data(), 0, toc_size);
+        }
 
         // Load catalog fragments (all CATL sections)
         for (auto* sd : toc_.find_by_type(SEC_CATL)) {
@@ -195,24 +286,131 @@ struct ArchiveReader::Impl {
             }
         }
 
+        // Load GSTX section (highest section_id wins)
+        {
+            uint64_t best_id = 0;
+            const SectionDesc* best_sd = nullptr;
+            for (auto* sd : toc_.find_by_type(SEC_GSTX)) {
+                if (sd->section_id > best_id) {
+                    best_id = sd->section_id;
+                    best_sd = sd;
+                }
+            }
+            if (best_sd) {
+                gstx_buf_ = pread_section(mmap_.fd(), best_sd->file_offset,
+                                          best_sd->compressed_size);
+                gstx_.open(gstx_buf_.data(), 0, best_sd->compressed_size);
+                has_gstx_ = true;
+                // Release mmap pages for this region — data is now in gstx_buf_.
+                mmap_.advise(best_sd->file_offset, best_sd->compressed_size, MADV_DONTNEED);
+            }
+        }
+
+        // Load GCOV section (highest section_id wins)
+        {
+            uint64_t best_id = 0;
+            const SectionDesc* best_sd = nullptr;
+            for (auto* sd : toc_.find_by_type(SEC_GCOV)) {
+                if (sd->section_id > best_id) {
+                    best_id = sd->section_id;
+                    best_sd = sd;
+                }
+            }
+            if (best_sd) {
+                try {
+                    gcov_buf_ = pread_section(mmap_.fd(), best_sd->file_offset,
+                                              best_sd->compressed_size);
+                    gcov_.open(gcov_buf_.data(), 0, best_sd->compressed_size);
+                    has_gcov_ = true;
+                    mmap_.advise(best_sd->file_offset, best_sd->compressed_size, MADV_DONTNEED);
+                } catch (const std::exception& ex) {
+                    spdlog::warn("GCOV section unreadable ({}); rebuild with 'genopack gcov'", ex.what());
+                }
+            }
+        }
+
+        // Load FCOV section (per-family covariance; highest section_id wins)
+        {
+            uint64_t best_id = 0;
+            const SectionDesc* best_sd = nullptr;
+            for (auto* sd : toc_.find_by_type(SEC_FCOV)) {
+                if (sd->section_id > best_id) { best_id = sd->section_id; best_sd = sd; }
+            }
+            if (best_sd) {
+                try {
+                    fcov_buf_ = pread_section(mmap_.fd(), best_sd->file_offset,
+                                              best_sd->compressed_size);
+                    fcov_.open(fcov_buf_.data(), 0, best_sd->compressed_size);
+                    has_fcov_ = true;
+                    mmap_.advise(best_sd->file_offset, best_sd->compressed_size, MADV_DONTNEED);
+                } catch (const std::exception& ex) {
+                    spdlog::warn("FCOV section unreadable ({}); rebuild with 'genopack gcov'", ex.what());
+                }
+            }
+        }
+
+        // Load FMHR section (highest section_id wins; zero-copy — points into mmap)
+        {
+            uint64_t best_id = 0;
+            const SectionDesc* best_sd = nullptr;
+            for (auto* sd : toc_.find_by_type(SEC_FMHR)) {
+                if (sd->section_id > best_id) { best_id = sd->section_id; best_sd = sd; }
+            }
+            if (best_sd) {
+                try {
+                    fmhr_.open(mmap_.data(), best_sd->file_offset, best_sd->compressed_size);
+                    has_fmhr_ = true;
+                } catch (const std::exception& ex) {
+                    spdlog::warn("FMHR section unreadable ({}); rebuild with 'genopack gcov'", ex.what());
+                }
+            }
+        }
+
+        // Load QUAL section (highest section_id wins)
+        {
+            uint64_t best_id = 0;
+            const SectionDesc* best_sd = nullptr;
+            for (auto* sd : toc_.find_by_type(SEC_QUAL)) {
+                if (sd->section_id > best_id) {
+                    best_id = sd->section_id;
+                    best_sd = sd;
+                }
+            }
+            if (best_sd) {
+                try {
+                    qual_buf_ = pread_section(mmap_.fd(), best_sd->file_offset,
+                                              best_sd->compressed_size);
+                    qual_.open(qual_buf_.data(), 0, best_sd->compressed_size);
+                    has_qual_ = true;
+                    mmap_.advise(best_sd->file_offset, best_sd->compressed_size, MADV_DONTNEED);
+                } catch (const std::exception& e) {
+                    spdlog::warn("QUAL section unreadable ({}); rebuild with reindex", e.what());
+                }
+            }
+        }
+
         // Load CIDX sections (contig accession → genome_id)
         for (auto* sd : toc_.find_by_type(SEC_CIDX))
             cidx_.add_section(mmap_.data(), sd->file_offset, sd->compressed_size);
 
-        // Load accession index from all ACCX sections
+        // Load accession index from all ACCX sections.
+        // Keep readers alive so lookups use the mmap directly (no string copies).
+        // genome_accession_map_ stores const char* into the mmap string area.
         for (auto* sd : toc_.find_by_type(SEC_ACCX)) {
-            AccessionIndexReader reader;
-            reader.open(mmap_.data(), sd->file_offset, sd->compressed_size);
-            reader.scan([&](std::string_view acc, GenomeId gid) {
-                accession_map_[std::string(acc)] = gid;
-                genome_accession_map_[gid]       = std::string(acc);
+            accx_readers_.emplace_back();
+            accx_readers_.back().open(mmap_.data(), sd->file_offset, sd->compressed_size);
+            accx_readers_.back().scan([&](std::string_view acc, GenomeId gid) {
+                genome_accession_map_[gid] = acc.data(); // points into mmap string area
             });
         }
 
-        // Defer taxonomy loading — only loaded on first taxonomy_for_accession() call.
-        // 4.7M × ~150-char taxonomy strings cause significant heap pressure when loaded
-        // eagerly alongside DuckDB; lazy loading avoids fragmentation-induced corruption.
-        // (Genome fetch, KMRX, and HNSW access do not need taxonomy_map_.)
+        // Open TAXN readers eagerly — each open() sets 5 pointers into the existing mmap,
+        // O(1) work, zero heap allocation. Replaces the old lazy ~900 MB taxonomy_map_ copy.
+
+        for (auto* sd : toc_.find_by_type(SEC_TAXN)) {
+            taxn_readers_.emplace_back();
+            taxn_readers_.back().open(mmap_.data(), sd->file_offset, sd->compressed_size);
+        }
 
         // Index TXDB sections by section_id
         for (auto* sd : toc_.find_by_type(SEC_TXDB)) {
@@ -269,13 +467,25 @@ struct ArchiveReader::Impl {
             shard_descs_.clear();
             shards_.clear();
             shard_section_to_id_.clear();
-            accession_map_.clear();
+            accx_readers_.clear();
             genome_accession_map_.clear();
             genome_meta_map_.clear();
-            taxonomy_map_.clear();
+            taxn_readers_.clear();
             txdb_descs_.clear();
             gidx_                 = GidxReader{};
             has_gidx_             = false;
+            gstx_                 = GstxReader{};
+            has_gstx_             = false;
+            gcov_                 = GcovReader{};
+            has_gcov_             = false;
+            gcov_buf_.clear();
+            fcov_                 = GcovReader{};
+            has_fcov_             = false;
+            fcov_buf_.clear();
+            fmhr_                 = FmhrReader{};
+            has_fmhr_             = false;
+            qual_                 = QualReader{};
+            has_qual_             = false;
             kmrx_readers_.clear();
             has_kmrx_             = false;
             cidx_                 = MergedCidxReader{};
@@ -358,7 +568,7 @@ struct ArchiveReader::Impl {
 
         auto acc_it = genome_accession_map_.find(id);
         if (acc_it != genome_accession_map_.end())
-            eg.accession = acc_it->second;
+            eg.accession = std::string(acc_it->second);
 
         return eg;
     }
@@ -424,7 +634,7 @@ struct ArchiveReader::Impl {
                     }
                     auto acc_it = genome_accession_map_.find(im.meta->genome_id);
                     if (acc_it != genome_accession_map_.end())
-                        eg.accession = acc_it->second;
+                        eg.accession = std::string(acc_it->second);
                     out.push_back(std::move(eg));
                 }
             }
@@ -443,7 +653,7 @@ struct ArchiveReader::Impl {
                     eg.fasta = shard.fetch_genome(m->genome_id);
                     auto acc_it = genome_accession_map_.find(m->genome_id);
                     if (acc_it != genome_accession_map_.end())
-                        eg.accession = acc_it->second;
+                        eg.accession = std::string(acc_it->second);
                     out.push_back(std::move(eg));
                 }
             }
@@ -466,13 +676,23 @@ void ArchiveReader::close() {
     impl_->shard_descs_.clear();
     impl_->shards_.clear();
     impl_->shard_section_to_id_.clear();
-    impl_->accession_map_.clear();
+    impl_->accx_readers_.clear();
     impl_->genome_accession_map_.clear();
     impl_->genome_meta_map_.clear();
-    impl_->taxonomy_map_.clear();
+    impl_->taxn_readers_.clear();
     impl_->txdb_descs_.clear();
     impl_->gidx_                 = GidxReader{};
     impl_->has_gidx_             = false;
+    impl_->gstx_                 = GstxReader{};
+    impl_->has_gstx_             = false;
+    impl_->gcov_                 = GcovReader{};
+    impl_->has_gcov_             = false;
+    impl_->gcov_buf_.clear();
+    impl_->fcov_                 = GcovReader{};
+    impl_->has_fcov_             = false;
+    impl_->fcov_buf_.clear();
+    impl_->qual_                 = QualReader{};
+    impl_->has_qual_             = false;
     impl_->kmrx_readers_.clear();
     impl_->has_kmrx_             = false;
     impl_->cidx_                 = MergedCidxReader{};
@@ -520,9 +740,9 @@ std::optional<std::string> ArchiveReader::fetch_sequence_slice(GenomeId id,
 std::optional<GenomeMeta> ArchiveReader::genome_meta_by_accession(
     std::string_view accession) const
 {
-    auto it = impl_->accession_map_.find(std::string(accession));
-    if (it == impl_->accession_map_.end()) return std::nullopt;
-    auto meta_it = impl_->genome_meta_map_.find(it->second);
+    auto gid = impl_->find_accession(accession);
+    if (!gid) return std::nullopt;
+    auto meta_it = impl_->genome_meta_map_.find(*gid);
     if (meta_it == impl_->genome_meta_map_.end()) return std::nullopt;
     return *meta_it->second;
 }
@@ -530,9 +750,9 @@ std::optional<GenomeMeta> ArchiveReader::genome_meta_by_accession(
 std::optional<ExtractedGenome> ArchiveReader::fetch_by_accession(
     std::string_view accession) const
 {
-    auto it = impl_->accession_map_.find(std::string(accession));
-    if (it == impl_->accession_map_.end()) return std::nullopt;
-    return fetch_genome(it->second);
+    auto gid = impl_->find_accession(accession);
+    if (!gid) return std::nullopt;
+    return fetch_genome(*gid);
 }
 
 std::vector<std::optional<ExtractedGenome>>
@@ -548,13 +768,11 @@ ArchiveReader::batch_fetch_by_accessions(
     by_shard.reserve(n);
 
     for (size_t i = 0; i < n; ++i) {
-        auto it = impl_->accession_map_.find(accessions[i]);
-        if (it == impl_->accession_map_.end()) continue;
-        GenomeId gid = it->second;
-        auto meta_it = impl_->genome_meta_map_.find(gid);
+        auto gid = impl_->find_accession(accessions[i]);
+        if (!gid) continue;
+        auto meta_it = impl_->genome_meta_map_.find(*gid);
         if (meta_it == impl_->genome_meta_map_.end()) continue;
-        uint32_t shard_id = meta_it->second->shard_id;
-        by_shard[shard_id].push_back({i, gid});
+        by_shard[meta_it->second->shard_id].push_back({i, *gid});
     }
 
     // Sort shards by file_offset for sequential NFS reads — avoids random seeks
@@ -582,7 +800,7 @@ ArchiveReader::batch_fetch_by_accessions(
             eg.fasta = shard.fetch_genome(req.gid);
             auto acc_it = impl_->genome_accession_map_.find(req.gid);
             if (acc_it != impl_->genome_accession_map_.end())
-                eg.accession = acc_it->second;
+                eg.accession = std::string(acc_it->second);
             results[req.out_idx] = std::move(eg);
         }
         // Release this shard's mmap pages now that all genomes are extracted.
@@ -603,12 +821,11 @@ void ArchiveReader::visit_by_shard(
     by_shard.reserve(accessions.size());
 
     for (size_t i = 0; i < accessions.size(); ++i) {
-        auto it = impl_->accession_map_.find(accessions[i]);
-        if (it == impl_->accession_map_.end()) continue;
-        GenomeId gid = it->second;
-        auto meta_it = impl_->genome_meta_map_.find(gid);
+        auto gid = impl_->find_accession(accessions[i]);
+        if (!gid) continue;
+        auto meta_it = impl_->genome_meta_map_.find(*gid);
         if (meta_it == impl_->genome_meta_map_.end()) continue;
-        by_shard[meta_it->second->shard_id].push_back({i, gid});
+        by_shard[meta_it->second->shard_id].push_back({i, *gid});
     }
 
     std::vector<uint32_t> shard_order;
@@ -633,7 +850,7 @@ void ArchiveReader::visit_by_shard(
             eg.fasta = shard.fetch_genome(req.gid);
             auto acc_it = impl_->genome_accession_map_.find(req.gid);
             if (acc_it != impl_->genome_accession_map_.end())
-                eg.accession = acc_it->second;
+                eg.accession = std::string(acc_it->second);
             cb(req.out_idx, std::move(eg));
         }
         shard.release_pages();
@@ -649,12 +866,11 @@ void ArchiveReader::visit_shard_batches(
     by_shard.reserve(accessions.size() / 200 + 1);
 
     for (size_t i = 0; i < accessions.size(); ++i) {
-        auto it = impl_->accession_map_.find(accessions[i]);
-        if (it == impl_->accession_map_.end()) continue;
-        GenomeId gid = it->second;
-        auto meta_it = impl_->genome_meta_map_.find(gid);
+        auto gid = impl_->find_accession(accessions[i]);
+        if (!gid) continue;
+        auto meta_it = impl_->genome_meta_map_.find(*gid);
         if (meta_it == impl_->genome_meta_map_.end()) continue;
-        by_shard[meta_it->second->shard_id].push_back({i, gid});
+        by_shard[meta_it->second->shard_id].push_back({i, *gid});
     }
 
     // Build shard list sorted by file_offset for sequential NFS access.
@@ -755,7 +971,7 @@ void ArchiveReader::visit_shard_batches(
             }
             auto acc_it = impl_->genome_accession_map_.find(req.gid);
             if (acc_it != impl_->genome_accession_map_.end())
-                eg.accession = acc_it->second;
+                eg.accession = std::string(acc_it->second);
             batch[static_cast<size_t>(j)] = {req.out_idx, std::move(eg)};
         }
         cb(batch);
@@ -766,12 +982,154 @@ void ArchiveReader::visit_shard_batches(
     if (bg.valid()) bg.get();
 }
 
+void ArchiveReader::visit_shard_batches_parallel(
+    const std::vector<std::string>& accessions,
+    int n_readers,
+    const std::function<void(ShardBatch&)>& cb) const
+{
+    if (n_readers <= 1) { visit_shard_batches(accessions, cb); return; }
+
+    struct Req { size_t out_idx; GenomeId gid; };
+    std::unordered_map<uint32_t, std::vector<Req>> by_shard;
+    by_shard.reserve(accessions.size() / 200 + 1);
+
+    for (size_t i = 0; i < accessions.size(); ++i) {
+        auto gid = impl_->find_accession(accessions[i]);
+        if (!gid) continue;
+        auto meta_it = impl_->genome_meta_map_.find(*gid);
+        if (meta_it == impl_->genome_meta_map_.end()) continue;
+        by_shard[meta_it->second->shard_id].push_back({i, *gid});
+    }
+
+    std::vector<uint32_t> shard_order;
+    shard_order.reserve(by_shard.size());
+    for (const auto& [shard_id, _] : by_shard)
+        shard_order.push_back(shard_id);
+    std::sort(shard_order.begin(), shard_order.end(),
+        [&](uint32_t a, uint32_t b) {
+            auto da = impl_->shard_descs_.find(a);
+            auto db = impl_->shard_descs_.find(b);
+            if (da == impl_->shard_descs_.end()) return false;
+            if (db == impl_->shard_descs_.end()) return true;
+            return da->second->file_offset < db->second->file_offset;
+        });
+
+    const int src_fd = impl_->mmap_.fd();
+    const int n = static_cast<int>(shard_order.size());
+    n_readers = std::min(n_readers, std::max(1, n));
+
+    std::exception_ptr first_error;
+    std::mutex err_mtx;
+    std::vector<std::thread> workers;
+    workers.reserve(static_cast<size_t>(n_readers));
+
+    for (int t = 0; t < n_readers; ++t) {
+        const int band_start = (t * n) / n_readers;
+        const int band_end   = ((t + 1) * n) / n_readers;
+        if (band_start >= band_end) continue;
+
+        const int tfd = ::dup(src_fd);
+        if (tfd < 0) throw std::runtime_error("visit_shard_batches_parallel: dup failed");
+        ::posix_fadvise(tfd, 0, 0, POSIX_FADV_SEQUENTIAL);
+
+        workers.emplace_back([&, band_start, band_end, tfd]() {
+            try {
+                auto do_pread = [tfd](uint64_t offset, uint64_t size, std::vector<uint8_t>& out) {
+                    out.resize(size);
+                    uint8_t* p   = out.data();
+                    off_t    pos = static_cast<off_t>(offset);
+                    size_t   rem = size;
+                    while (rem > 0) {
+                        ssize_t r = ::pread(tfd, p, rem, pos);
+                        if (r < 0) {
+                            if (errno == EINTR) continue;
+                            throw std::runtime_error("genopack pread failed: " + std::string(strerror(errno)));
+                        }
+                        if (r == 0)
+                            throw std::runtime_error("genopack pread: unexpected EOF");
+                        p   += static_cast<size_t>(r);
+                        pos += static_cast<off_t>(r);
+                        rem -= static_cast<size_t>(r);
+                    }
+                };
+
+                std::array<std::vector<uint8_t>, 2> bufs;
+                std::array<ShardBox, 2> boxes;
+                int cur = 0;
+                std::future<void> bg;
+
+                {
+                    auto d = impl_->shard_descs_.find(shard_order[static_cast<size_t>(band_start)]);
+                    if (d != impl_->shard_descs_.end()) {
+                        do_pread(d->second->file_offset, d->second->compressed_size, bufs[0]);
+                        boxes[0].open(bufs[0].data(), 0, bufs[0].size());
+                    }
+                }
+
+                ShardBatch batch;
+                for (int s = band_start; s < band_end; ++s) {
+                    if (s > band_start && bg.valid()) {
+                        bg.get();
+                        boxes[cur].open(bufs[cur].data(), 0, bufs[cur].size());
+                    }
+
+                    const int nxt = 1 - cur;
+                    if (s + 1 < band_end) {
+                        auto d_nxt = impl_->shard_descs_.find(shard_order[static_cast<size_t>(s + 1)]);
+                        if (d_nxt != impl_->shard_descs_.end()) {
+                            const uint64_t off = d_nxt->second->file_offset;
+                            const uint64_t sz  = d_nxt->second->compressed_size;
+                            bg = std::async(std::launch::async,
+                                [&bufs, nxt, off, sz, &do_pread]() { do_pread(off, sz, bufs[nxt]); });
+                        }
+                    }
+
+                    uint32_t shard_id     = shard_order[static_cast<size_t>(s)];
+                    const auto& reqs      = by_shard.at(shard_id);
+                    const ShardReader& shard = boxes[cur].reader();
+                    const int n_reqs      = static_cast<int>(reqs.size());
+
+                    batch.clear();
+                    batch.resize(static_cast<size_t>(n_reqs));
+
+                    #pragma omp parallel for schedule(dynamic, 1) num_threads(std::min(n_reqs, 8))
+                    for (int j = 0; j < n_reqs; ++j) {
+                        const auto& req = reqs[static_cast<size_t>(j)];
+                        ExtractedGenome eg;
+                        eg.meta = *impl_->genome_meta_map_.at(req.gid);
+                        try {
+                            eg.fasta = shard.fetch_genome(req.gid);
+                        } catch (const std::exception&) {
+                            eg.fasta.clear();
+                        }
+                        auto acc_it = impl_->genome_accession_map_.find(req.gid);
+                        if (acc_it != impl_->genome_accession_map_.end())
+                            eg.accession = std::string(acc_it->second);
+                        batch[static_cast<size_t>(j)] = {req.out_idx, std::move(eg)};
+                    }
+                    cb(batch);
+
+                    cur = nxt;
+                }
+                if (bg.valid()) bg.get();
+            } catch (...) {
+                std::lock_guard<std::mutex> lk(err_mtx);
+                if (!first_error) first_error = std::current_exception();
+            }
+            ::close(tfd);
+        });
+    }
+
+    for (auto& w : workers) w.join();
+    if (first_error) std::rethrow_exception(first_error);
+}
+
 std::optional<std::string> ArchiveReader::fetch_sequence_slice_by_accession(
     std::string_view accession, uint64_t start, uint64_t length) const
 {
-    auto it = impl_->accession_map_.find(std::string(accession));
-    if (it == impl_->accession_map_.end()) return std::nullopt;
-    return fetch_sequence_slice(it->second, start, length);
+    auto gid = impl_->find_accession(accession);
+    if (!gid) return std::nullopt;
+    return fetch_sequence_slice(*gid, start, length);
 }
 
 uint32_t ArchiveReader::find_contig_genome_id(std::string_view contig_acc) const {
@@ -785,47 +1143,33 @@ void ArchiveReader::batch_find_contig_genome_ids(const std::string_view* accs,
     impl_->cidx_.batch_find(accs, out_genome_ids, n, n_threads);
 }
 
-// Lazily populate taxonomy_map_ from TAXN sections on first use.
-void ArchiveReader::Impl::ensure_taxonomy_loaded() const {
-    if (!taxonomy_map_.empty()) return;
-    std::unique_lock<std::mutex> lk(shard_open_mx_);
-    if (!taxonomy_map_.empty()) return;
-    for (auto* sd : toc_.find_by_type(SEC_TAXN)) {
-        TaxonomyIndexReader tir;
-        tir.open(mmap_.data(), sd->file_offset, sd->compressed_size);
-        tir.scan([&](std::string_view acc, std::string_view tax) {
-            taxonomy_map_[std::string(acc)] = std::string(tax);
-        });
-    }
-}
-
 std::optional<std::string> ArchiveReader::taxonomy_for_accession(
     std::string_view accession) const
 {
-    impl_->ensure_taxonomy_loaded();
-    auto it = impl_->taxonomy_map_.find(std::string(accession));
-    if (it == impl_->taxonomy_map_.end()) return std::nullopt;
-    return it->second;
+    for (const auto& tir : impl_->taxn_readers_) {
+        auto t = tir.find(accession);
+        if (t) return std::string(*t);
+    }
+    return std::nullopt;
 }
 
 void ArchiveReader::scan_taxonomy(
     const std::function<void(std::string_view, std::string_view)>& cb) const
 {
-    impl_->ensure_taxonomy_loaded();
-    for (const auto& [acc, tax] : impl_->taxonomy_map_)
-        cb(acc, tax);
+    for (const auto& tir : impl_->taxn_readers_)
+        tir.scan(cb);
 }
 
 std::string ArchiveReader::accession_for_genome_id(GenomeId id) const {
     auto it = impl_->genome_accession_map_.find(id);
     if (it == impl_->genome_accession_map_.end()) return {};
-    return it->second;
+    return std::string(it->second);
 }
 
 void ArchiveReader::scan_genome_accessions(
     const std::function<void(std::string_view, GenomeId)>& cb) const {
-    for (const auto& [acc, gid] : impl_->accession_map_)
-        cb(acc, gid);
+    for (const auto& r : impl_->accx_readers_)
+        r.scan(cb);
 }
 
 std::optional<TaxonomyTree> ArchiveReader::taxonomy_tree() const {
@@ -847,13 +1191,71 @@ const float* ArchiveReader::kmer_profile(GenomeId genome_id) const {
 
 const float* ArchiveReader::kmer_profile_by_accession(std::string_view accession) const {
     if (!impl_->has_kmrx_) return nullptr;
-    auto it = impl_->accession_map_.find(std::string(accession));
-    if (it == impl_->accession_map_.end()) return nullptr;
-    return kmer_profile(it->second);
+    auto gid = impl_->find_accession(accession);
+    if (!gid) return nullptr;
+    return kmer_profile(*gid);
 }
 
 bool ArchiveReader::has_sketches() const {
     return !impl_->skch_descs_.empty();
+}
+
+bool ArchiveReader::has_gstx() const { return impl_->has_gstx_; }
+
+const GstxEntry* ArchiveReader::gstx_for_genus(std::string_view genus) const {
+    if (!impl_->has_gstx_) return nullptr;
+    return impl_->gstx_.lookup(genus);
+}
+
+std::vector<uint32_t> ArchiveReader::gstx_kmer_sizes() const {
+    if (!impl_->has_gstx_) return {};
+    std::vector<uint32_t> ks;
+    for (uint32_t ki = 0; ki < impl_->gstx_.n_k(); ++ki)
+        ks.push_back(impl_->gstx_.kmer_size(ki));
+    return ks;
+}
+
+const GstxReader* ArchiveReader::gstx_reader() const {
+    return impl_->has_gstx_ ? &impl_->gstx_ : nullptr;
+}
+
+bool ArchiveReader::has_gcov() const { return impl_->has_gcov_; }
+
+const GcovEntry* ArchiveReader::gcov_for_genus(std::string_view genus) const {
+    if (!impl_->has_gcov_) return nullptr;
+    return impl_->gcov_.lookup(GcovWriter::hash_genus(genus));
+}
+
+const GcovReader* ArchiveReader::gcov_reader() const {
+    return impl_->has_gcov_ ? &impl_->gcov_ : nullptr;
+}
+
+bool ArchiveReader::has_fcov() const { return impl_->has_fcov_; }
+
+const GcovEntry* ArchiveReader::fcov_for_family(std::string_view family) const {
+    if (!impl_->has_fcov_) return nullptr;
+    return impl_->fcov_.lookup(GcovWriter::hash_genus(family));
+}
+
+const GcovReader* ArchiveReader::fcov_reader() const {
+    return impl_->has_fcov_ ? &impl_->fcov_ : nullptr;
+}
+
+bool ArchiveReader::has_fmhr() const { return impl_->has_fmhr_; }
+
+FmhrView ArchiveReader::fmhr_for_genus(std::string_view genus) const {
+    if (!impl_->has_fmhr_) return {};
+    return impl_->fmhr_.lookup(GcovWriter::hash_genus(genus));
+}
+
+const FmhrReader* ArchiveReader::fmhr_reader() const {
+    return impl_->has_fmhr_ ? &impl_->fmhr_ : nullptr;
+}
+
+bool ArchiveReader::has_qual() const { return impl_->has_qual_; }
+
+void ArchiveReader::scan_qual(const std::function<void(const QualRecord&)>& cb) const {
+    if (impl_->has_qual_) impl_->qual_.scan(cb);
 }
 
 std::optional<SketchResult> ArchiveReader::sketch_for(GenomeId genome_id) const {
@@ -940,7 +1342,8 @@ std::optional<SketchResult> ArchiveReader::sketch_for(GenomeId genome_id,
 
 void ArchiveReader::sketch_for_ids(const std::vector<GenomeId>& sorted_ids,
                                     uint32_t k, uint32_t sz,
-                                    const SketchCallback& cb) const
+                                    const SketchCallback& cb,
+                                    int num_threads) const
 {
     if (sorted_ids.empty() || impl_->skch_descs_.empty()) return;
 
@@ -957,10 +1360,48 @@ void ArchiveReader::sketch_for_ids(const std::vector<GenomeId>& sorted_ids,
         }
     }
 
+    // Hint sequential access so NFS/kernel prefetches frames in order.
+    // Only effective when num_threads==1 (frames read sequentially).
+    if (num_threads == 1) {
+        for (const auto& desc : impl_->skch_descs_)
+            impl_->mmap_.advise(desc.file_offset, desc.compressed_size, MADV_SEQUENTIAL);
+    }
+
     for (const auto& r : impl_->skch_readers_) {
         if (k > 0 && !r.has_kmer_size(k)) continue;
         if (sz > 0 && r.sketch_size() < sz) continue;
-        r.sketch_for_ids(sorted_ids, k, sz, cb);
+        r.sketch_for_ids(sorted_ids, k, sz, cb, num_threads);
+    }
+}
+
+void ArchiveReader::sketch_for_ids_multi_k(const std::vector<GenomeId>& sorted_ids,
+                                            uint32_t sz,
+                                            const SketchCallbackMultiK& cb,
+                                            int num_threads) const
+{
+    if (sorted_ids.empty() || impl_->skch_descs_.empty()) return;
+
+    if (!impl_->skch_loaded_) {
+        std::lock_guard<std::mutex> lk(impl_->shard_open_mx_);
+        if (!impl_->skch_loaded_) {
+            impl_->skch_readers_.reserve(impl_->skch_descs_.size());
+            for (const auto& desc : impl_->skch_descs_) {
+                impl_->skch_readers_.emplace_back();
+                impl_->skch_readers_.back().open(impl_->mmap_.data(),
+                                                 desc.file_offset, desc.compressed_size);
+            }
+            impl_->skch_loaded_ = true;
+        }
+    }
+
+    if (num_threads == 1) {
+        for (const auto& desc : impl_->skch_descs_)
+            impl_->mmap_.advise(desc.file_offset, desc.compressed_size, MADV_SEQUENTIAL);
+    }
+
+    for (const auto& r : impl_->skch_readers_) {
+        if (sz > 0 && r.sketch_size() < sz) continue;
+        r.sketch_for_ids_multi_k(sorted_ids, sz, cb, num_threads);
     }
 }
 

@@ -4,6 +4,12 @@
 #include <genopack/skch.hpp>
 #include <genopack/cidx.hpp>
 #include <genopack/gidx.hpp>
+#include <genopack/gstx.hpp>
+#include <genopack/build_genus_stats.hpp>
+#include <genopack/skani.hpp>
+#include <genopack/markers.hpp>
+#include <genopack/metamer.hpp>
+#include <genopack/qual.hpp>
 #include <genopack/kmrx.hpp>
 #include <genopack/taxn.hpp>
 #include <genopack/txdb.hpp>
@@ -269,7 +275,9 @@ struct ArchiveBuilder::Impl {
         std::vector<GidxInfo> gidx_infos;
         gidx_infos.reserve(total_records);
         std::unordered_map<ShardId, uint64_t> shard_id_to_section_id;
-        CidxWriter cidx_writer;
+        CidxWriter  cidx_writer;
+        GstxWriter  gstx_writer;
+        QualWriter  qual_writer;
 
         // ── Try resume ───────────────────────────────────────────────────────
         bool     resuming      = false;
@@ -302,7 +310,8 @@ struct ArchiveBuilder::Impl {
             parsed_ok = (parsed_fields == 5);
 
             // Read .ckpt_meta.bin and restore all in-memory state
-            if (parsed_ok && ck_genome_count > 0 && ck_genome_count < total_records) {
+            // ck_genome_count == total_records is valid: all SHRDs written, finalization interrupted
+            if (parsed_ok && ck_genome_count > 0 && ck_genome_count <= total_records) {
                 FILE* mf = std::fopen(ckpt_meta_path.c_str(), "rb");
                 bool meta_ok = (mf != nullptr);
                 size_t genomes_restored = 0;
@@ -644,6 +653,33 @@ struct ArchiveBuilder::Impl {
 
         const size_t total = total_records;
 
+        // Sort pending by genus so same-genus genomes arrive consecutively at
+        // the drain loop. Without this, random input order causes the 16 GB
+        // global cap to fire while genus buckets are still sparse, fragmenting
+        // each genus across many tiny shards and making sketch I/O expensive.
+        if (cfg.taxonomy_group) {
+            const char rank = cfg.taxonomy_rank.empty() ? 'g' : cfg.taxonomy_rank[0];
+            auto genus_key = [&](const BuildRecord& r) {
+                for (const auto& [k, v] : r.extra_fields)
+                    if (k == "taxonomy") return extract_taxonomy_bucket(v, rank);
+                return std::string("__unclassified__");
+            };
+            std::vector<size_t> idx(pending.size());
+            std::iota(idx.begin(), idx.end(), 0);
+            std::stable_sort(idx.begin(), idx.end(),
+                [&](size_t a, size_t b){ return genus_key(pending[a]) < genus_key(pending[b]); });
+            std::vector<BuildRecord> sp;
+            std::vector<uint64_t>    sr;
+            sp.reserve(pending.size());
+            sr.reserve(pending_input_rows.size());
+            for (size_t i : idx) {
+                sp.push_back(std::move(pending[i]));
+                sr.push_back(pending_input_rows[i]);
+            }
+            pending = std::move(sp);
+            pending_input_rows = std::move(sr);
+        }
+
         // Streaming producer: feeds tasks lazily to cap queue at 4*n_workers entries
         const size_t task_q_max = n_workers * 4;
 
@@ -744,6 +780,31 @@ struct ArchiveBuilder::Impl {
         staging_buffer.reserve(sort_buf * 4);
         uint64_t staging_raw_bytes = 0;
 
+        // In-memory GCOV/FCOV/FMHR writers populated during flush_staging_buf (one-pass).
+        GcovWriter build_gcov_w, build_fcov_w;
+        FmhrWriter build_fmhr_w;
+        static constexpr float  kGcovOutlierPct = 0.99f;
+        static constexpr int    kFmhK           = 21, kFmhC = 125;
+        static constexpr uint32_t kFmhMinBp     = 1000;
+
+        // Marker scoring at build time — same FASTA pass as GCOV/FMH.
+        std::unique_ptr<MarkerReader> build_mrk_rd;
+        uint64_t build_mrk_frac_max = UINT64_MAX;
+        if (!cfg.markers_path.empty()) {
+            build_mrk_rd = std::make_unique<MarkerReader>();
+            try {
+                build_mrk_rd->open(cfg.markers_path);
+                build_mrk_rd->build_merged_pool();   // copies pools to owned vectors
+                build_mrk_frac_max = build_mrk_rd->frac_max_hash();
+                spdlog::info("build: marker panel {} bac + {} arc, {} lineages",
+                             build_mrk_rd->n_bac(), build_mrk_rd->n_arc(),
+                             build_mrk_rd->n_lineages());
+            } catch (const std::exception& ex) {
+                spdlog::warn("build: cannot open markers ({}); skipping", ex.what());
+                build_mrk_rd.reset();
+            }
+        }
+
         auto flush_staging_buf = [&](std::vector<ChunkItem>& buf) {
             if (buf.empty()) return;
             // Sort by kmer NN chain (if enabled) or oph_fingerprint
@@ -791,8 +852,8 @@ struct ArchiveBuilder::Impl {
                             std::vector<uint16_t> sig1_16(n);
                             std::vector<uint16_t> sig2_16(n);
                             for (size_t si = 0; si < n; ++si) {
-                                sig1_16[si] = static_cast<uint16_t>(sk.signature1[si] >> 16);
-                                sig2_16[si] = static_cast<uint16_t>(sk.signature2[si] >> 16);
+                                sig1_16[si] = static_cast<uint16_t>(sk.signature1[si] & 0xFFFF);
+                                sig2_16[si] = static_cast<uint16_t>(sk.signature2[si] & 0xFFFF);
                             }
                             sigs1_per_k.push_back(std::move(sig1_16));
                             sigs2_per_k.push_back(std::move(sig2_16));
@@ -808,8 +869,8 @@ struct ArchiveBuilder::Impl {
                         std::vector<uint16_t> sig1_16(n);
                         std::vector<uint16_t> sig2_16(n);
                         for (size_t si = 0; si < n; ++si) {
-                            sig1_16[si] = static_cast<uint16_t>(sk.signature1[si] >> 16);
-                            sig2_16[si] = static_cast<uint16_t>(sk.signature2[si] >> 16);
+                            sig1_16[si] = static_cast<uint16_t>(sk.signature1[si] & 0xFFFF);
+                            sig2_16[si] = static_cast<uint16_t>(sk.signature2[si] & 0xFFFF);
                         }
                         skch_writer->add(item.genome_id, sig1_16, sig2_16,
                                          sk.n_real_bins, sk.genome_length,
@@ -825,6 +886,374 @@ struct ArchiveBuilder::Impl {
                 for (const auto& [k, v] : item.record.extra_fields) meta_out << "\t" << v;
                 meta_out << "\n";
             }
+            // GSTX: accumulate genus sketch stats while all genus members are in memory.
+            // Requires taxonomy_group (genus-bounded shards) + multi-k sketches.
+            // Skip for combined micro-genus shards (mixed genera).
+            const bool genus_homogeneous = [&] {
+                if (buf.size() < 2) return true;
+                std::string g0;
+                for (const auto& [k, v] : buf[0].record.extra_fields)
+                    if (k == "taxonomy") { g0 = extract_taxonomy_bucket(v, 'g'); break; }
+                for (size_t gi = 1; gi < buf.size(); ++gi)
+                    for (const auto& [k, v] : buf[gi].record.extra_fields)
+                        if (k == "taxonomy") {
+                            if (extract_taxonomy_bucket(v, 'g') != g0) return false;
+                            break;
+                        }
+                return true;
+            }();
+            if (cfg.build_gstx && cfg.taxonomy_group && multi_k_sketch && buf.size() >= 2
+                && genus_homogeneous) {
+                std::string genus_key;
+                for (const auto& [k, v] : buf[0].record.extra_fields)
+                    if (k == "taxonomy") { genus_key = extract_taxonomy_bucket(v, 'g'); break; }
+
+                const int nk   = std::min((int)buf[0].sketches_mk.size(), (int)GSTX_MAX_K);
+                const int bins = cfg.sketch_size;
+
+                if (nk > 0 && !genus_key.empty() && genus_key != "__unclassified__"
+                    && bins == static_cast<int>(GSTX_BINS)) {
+
+                    // Pass 1: Boyer-Moore majority vote → consensus signature per k
+                    std::vector<std::vector<uint16_t>> cand(nk, std::vector<uint16_t>(bins, 0));
+                    std::vector<std::vector<int32_t>>  vote(nk, std::vector<int32_t>(bins, 0));
+                    for (const auto& item : buf) {
+                        for (int ki = 0; ki < nk && ki < (int)item.sketches_mk.size(); ++ki) {
+                            const auto& sk = item.sketches_mk[ki];
+                            for (int b = 0; b < bins; ++b) {
+                                uint16_t v = static_cast<uint16_t>(sk.signature1[b] & 0xFFFF);
+                                if      (vote[ki][b] == 0) { cand[ki][b] = v; vote[ki][b] = 1; }
+                                else if (v == cand[ki][b]) { ++vote[ki][b]; }
+                                else                       { --vote[ki][b]; }
+                            }
+                        }
+                    }
+
+                    // Pass 2: containment vs consensus → exact p90 (all data in RAM)
+                    float p90[GSTX_MAX_K] = {};
+                    for (int ki = 0; ki < nk; ++ki) {
+                        std::vector<float> c;
+                        c.reserve(buf.size());
+                        for (const auto& item : buf) {
+                            if (ki >= (int)item.sketches_mk.size()) continue;
+                            const auto& sk = item.sketches_mk[ki];
+                            int match = 0;
+                            for (int b = 0; b < bins; ++b)
+                                if (static_cast<uint16_t>(sk.signature1[b] & 0xFFFF) == cand[ki][b]) ++match;
+                            c.push_back(static_cast<float>(match) / bins);
+                        }
+                        if (!c.empty()) {
+                            size_t idx = static_cast<size_t>(0.9f * c.size());
+                            if (idx >= c.size()) idx = c.size() - 1;
+                            std::nth_element(c.begin(), c.begin() + idx, c.end());
+                            p90[ki] = c[idx];
+                        }
+                    }
+
+                    // TNF centroid
+                    float tnf_mu[136] = {};
+                    for (const auto& item : buf)
+                        for (int d = 0; d < 136; ++d) tnf_mu[d] += item.stats.kmer4_profile[d];
+                    const bool has_tnf = buf.size() >= 2;
+                    if (has_tnf)
+                        for (int d = 0; d < 136; ++d) tnf_mu[d] /= static_cast<float>(buf.size());
+
+                    uint32_t ksizes[GSTX_MAX_K] = {};
+                    for (int ki = 0; ki < nk; ++ki)
+                        ksizes[ki] = static_cast<uint32_t>(cfg.sketch_kmer_sizes[ki]);
+
+                    gstx_writer.add_genus(genus_key,
+                                          static_cast<uint32_t>(buf.size()),
+                                          static_cast<uint32_t>(nk),
+                                          cand, p90,
+                                          has_tnf ? tnf_mu : nullptr,
+                                          ksizes);
+
+                    // Per-genome quality: apply genus stats to each member while in RAM.
+                    // contamination_leakage: power-law residual of sketch vs consensus.
+                    // completeness_cluster_relative: containment@k[0] / p90[0].
+                    // Absolute k values for slope-only OLS log-linear fit (α=1 forced).
+                    const float k0 = nk >= 1 ? static_cast<float>(cfg.sketch_kmer_sizes[0]) : 0.0f;
+                    const float k1 = nk >= 2 ? static_cast<float>(cfg.sketch_kmer_sizes[1]) : 0.0f;
+                    const float k2 = nk >= 3 ? static_cast<float>(cfg.sketch_kmer_sizes[2]) : 0.0f;
+
+                    // Deferred qual records + long-contig profiles for one-pass GCOV scoring.
+                    std::vector<QualRecord>                  pending_qrs;
+                    std::vector<std::vector<ContigProfile>>  all_profiles;
+                    pending_qrs.reserve(buf.size());
+                    all_profiles.reserve(buf.size());
+
+                    for (const auto& item : buf) {
+                        auto qr               = QualRecord::make_empty(item.genome_id);
+                        qr.support_tier       = 0; // GenusSaturated
+                        qr.interval_width     = 0.05f;
+                        qr.chromosome_skew_closure    = item.stats.gc_skew_closure;
+                        qr.completeness_fragmentation =
+                            item.stats.n_contigs <= 1 ? 1.0f
+                            : 1.0f / (1.0f + 0.333f * std::log2f(
+                                static_cast<float>(item.stats.n_contigs)));
+
+                        // Containment at each k vs genus consensus
+                        float cont[GSTX_MAX_K] = {};
+                        for (int ki = 0; ki < nk && ki < (int)item.sketches_mk.size(); ++ki) {
+                            const auto& sk = item.sketches_mk[ki];
+                            int match = 0;
+                            for (int b = 0; b < bins; ++b)
+                                if (static_cast<uint16_t>(sk.signature1[b] & 0xFFFF) == cand[ki][b])
+                                    ++match;
+                            cont[ki] = static_cast<float>(match) / bins;
+                        }
+
+                        if (p90[0] > 0.01f)
+                            qr.completeness_cluster_relative =
+                                std::clamp(cont[0] / p90[0], 0.0f, 1.5f);
+
+                        // Slope-only OLS: log(C_k) = k * β, no free intercept (α=1).
+                        // β = Σ(k_i * log(c_i)) / Σ(k_i^2); leakage = over-prediction at k2.
+                        // leakage_residual = per-DoF RMSE of the fit.
+                        if (nk >= 3 && cont[0] >= 0.01f && cont[1] >= 0.01f && cont[2] >= 0.01f) {
+                            const float lc0 = std::log(cont[0]), lc1 = std::log(cont[1]), lc2 = std::log(cont[2]);
+                            const float beta = (k0*lc0 + k1*lc1 + k2*lc2) / (k0*k0 + k1*k1 + k2*k2);
+                            const float c2_pred = std::exp(beta * k2);
+                            qr.contamination_leakage =
+                                std::max(0.0f, c2_pred - cont[2]) / std::max(c2_pred, 0.01f);
+                            const float r0=lc0-beta*k0, r1=lc1-beta*k1, r2=lc2-beta*k2;
+                            qr.leakage_residual = std::sqrt((r0*r0 + r1*r1 + r2*r2) / 2.0f);
+                            // sketch_breadth field repurposed → fmh_minority_u8/marker_completeness_u8 (check-time only)
+                        } else if (nk >= 2 && cont[0] >= 0.01f && cont[1] >= 0.01f) {
+                            const float beta = (k0*std::log(cont[0]) + k1*std::log(cont[1])) / (k0*k0 + k1*k1);
+                            const float c1_pred = std::exp(beta * k1);
+                            qr.contamination_leakage =
+                                std::max(0.0f, c1_pred - cont[1]) / std::max(c1_pred, 0.01f);
+                        }
+
+                        // TNF: simple L2 distance to centroid (normalised by centroid norm)
+                        if (has_tnf) {
+                            float d2 = 0.0f, norm2 = 0.0f;
+                            for (int di = 0; di < 136; ++di) {
+                                float diff = item.stats.kmer4_profile[di] - tnf_mu[di];
+                                d2    += diff * diff;
+                                norm2 += tnf_mu[di] * tnf_mu[di];
+                            }
+                            const float dist = std::sqrt(d2);
+                            const float ref  = std::sqrt(norm2);
+                            if (ref > 1e-6f)
+                                qr.contamination_tnf_excess = std::max(0.0f, dist / ref - 1.0f);
+
+                            qr.completeness_post_decontam =
+                                compute_completeness_post_decontam(item.fasta, tnf_mu);
+                        }
+
+                        {
+                            AllSignals sig = compute_all_signals(item.fasta);
+                            qr.self_coherence        = sig.self_coherence;
+                            qr.chargaff_parity        = sig.chargaff_parity;
+                            qr.spectral_gap           = sig.spectral_gap;
+                            qr.scale_kink             = sig.scale_kink;
+                            qr.contamination_mixture  = sig.contamination_mixture;
+                            qr.mixture_sources        = static_cast<int16_t>(sig.mixture_sources);
+                            qr.n_mix_windows          = sig.n_mix_windows;
+                            qr.fiedler_u16            = static_cast<uint16_t>(
+                                std::min(1.0f, std::isnan(sig.fiedler_value) ? 0.0f : sig.fiedler_value) * 65535.0f);
+                            if (sig.mix_no_data)
+                                qr.qual_flags |= QualRecord::QUAL_FLAG_MIX_NO_DATA;
+                            qr.qual_flags |= QualRecord::QUAL_FLAG_BUILD_SIGNALS;
+                        }
+
+                        // Collect long-contig profiles for GCOV (same FASTA already in RAM).
+                        all_profiles.push_back(
+                            compute_long_contig_profiles(item.fasta, GCOV_MIN_LONG_BP));
+                        pending_qrs.push_back(std::move(qr));
+                    }
+
+                    // ── One-pass GCOV/FCOV/FMHR ────────────────────────────────
+                    if (cfg.build_gcov && genus_homogeneous) {
+                        // Extract family from first genome taxonomy.
+                        std::string family_key;
+                        for (const auto& [k, v] : buf[0].record.extra_fields)
+                            if (k == "taxonomy") {
+                                auto fp = v.find("f__");
+                                if (fp != std::string::npos) {
+                                    auto fe = v.find(';', fp + 3);
+                                    family_key = v.substr(fp, fe == std::string::npos
+                                                               ? v.size() - fp : fe - fp);
+                                    if (family_key == "f__") family_key.clear();
+                                }
+                                break;
+                            }
+
+                        GenusAccum genus_acc, family_acc;
+                        std::vector<uint64_t> fmh_all;
+                        const int c_vals[1] = {kFmhC};
+                        // Per-genome metamer accumulators for marker scoring (one per genome).
+                        const bool do_markers = build_mrk_rd && build_mrk_rd->has_merged_pool();
+                        std::vector<std::vector<uint64_t>> genome_qmers(do_markers ? buf.size() : 0);
+
+                        for (size_t ii = 0; ii < buf.size(); ++ii) {
+                            const auto& fasta = buf[ii].fasta;
+                            genus_acc.add_genome(all_profiles[ii]);
+                            if (!family_key.empty()) family_acc.add_genome(all_profiles[ii]);
+
+                            // Single FASTA walk: FMH hashes (≥kFmhMinBp) + marker metamers (all contigs).
+                            const char* p = fasta.data(), *end = p + fasta.size();
+                            while (p < end) {
+                                while (p < end && *p != '>') ++p;
+                                if (p >= end) break;
+                                while (p < end && *p != '\n') ++p;
+                                if (p < end) ++p;
+                                const char* ss = p;
+                                size_t slen = 0;
+                                while (p < end && *p != '>') {
+                                    while (p < end && *p != '\n' && *p != '\r') { ++slen; ++p; }
+                                    while (p < end && (*p == '\n' || *p == '\r')) ++p;
+                                }
+                                // De-wrap contig if needed for FMH or markers.
+                                if (slen == 0) continue;
+                                const bool need_fmh = (slen >= kFmhMinBp);
+                                if (!need_fmh && !do_markers) continue;
+                                std::string seq; seq.reserve(slen);
+                                for (const char* sp = ss; sp < p; ++sp)
+                                    if (*sp != '\n' && *sp != '\r') seq.push_back(*sp);
+                                if (need_fmh) {
+                                    auto vecs = fmh_multi_c(seq, kFmhK, c_vals, 1);
+                                    if (!vecs.empty())
+                                        fmh_all.insert(fmh_all.end(), vecs[0].begin(), vecs[0].end());
+                                }
+                                if (do_markers)
+                                    extract_metamers_dna_into(seq, METAMER_K, 8,
+                                                              build_mrk_frac_max, genome_qmers[ii]);
+                            }
+                            if (do_markers) {
+                                auto& q = genome_qmers[ii];
+                                std::sort(q.begin(), q.end());
+                                q.erase(std::unique(q.begin(), q.end()), q.end());
+                            }
+                        }
+
+                        const uint32_t n_mem = static_cast<uint32_t>(buf.size());
+                        GcovEntry ge = finalize_and_add_genus(genus_key, n_mem, genus_acc, build_gcov_w);
+                        GcovEntry fe{};
+                        const bool fcov_ok = !family_key.empty() &&
+                            (fe = finalize_and_add_genus(family_key, n_mem, family_acc, build_fcov_w),
+                             (fe.flags & GCOV_FLAG_VALID) != 0);
+
+                        if (!fmh_all.empty()) {
+                            std::sort(fmh_all.begin(), fmh_all.end());
+                            fmh_all.erase(std::unique(fmh_all.begin(), fmh_all.end()), fmh_all.end());
+                            build_fmhr_w.add(GcovWriter::hash_genus(genus_key), std::move(fmh_all));
+                        }
+
+                        // Score contigs and populate outlier fields.
+                        const bool genus_ok = (ge.flags & GCOV_FLAG_VALID) != 0;
+                        for (size_t ii = 0; ii < pending_qrs.size(); ++ii) {
+                            auto& qr        = pending_qrs[ii];
+                            const auto& cps = all_profiles[ii];
+                            qr.qual_flags  |= QualRecord::QUAL_FLAG_GCOV_SCORED;
+                            if (!genus_ok || cps.empty()) continue;
+
+                            uint32_t cco_bp=0, spe_bp=0, rho_bp=0, sib_bp=0, scored_bp=0;
+                            for (const auto& cp : cps) {
+                                scored_bp += cp.bp;
+                                float xmu[136];
+                                for (int d=0;d<136;++d) xmu[d] = cp.p[d] - ge.mu[d];
+                                const float pct  = gcov_percentile(ge, gcov_mahalanobis(ge, xmu));
+                                const float spct = gcov_spe_percentile(ge, gcov_spe(ge, xmu));
+                                const bool t2  = pct  >= kGcovOutlierPct;
+                                const bool spe = spct >= kGcovOutlierPct;
+                                if (t2 || spe) cco_bp += cp.bp;
+                                if (spe)       spe_bp += cp.bp;
+                                float rhod[16];
+                                for (int i=0;i<16;++i) rhod[i] = cp.rho[i] - ge.rho_mean[i];
+                                if (gcov_rho_percentile(ge, gcov_rho_distance(ge, rhod)) >= kGcovOutlierPct)
+                                    rho_bp += cp.bp;
+                                if ((t2||spe) && fcov_ok) {
+                                    float xmuf[136];
+                                    for (int d=0;d<136;++d) xmuf[d] = cp.p[d] - fe.mu[d];
+                                    const float fp  = gcov_percentile(fe, gcov_mahalanobis(fe, xmuf));
+                                    const float fsp = gcov_spe_percentile(fe, gcov_spe(fe, xmuf));
+                                    if (!(fp >= kGcovOutlierPct || fsp >= kGcovOutlierPct))
+                                        sib_bp += cp.bp;
+                                }
+                            }
+                            if (scored_bp > 0) {
+                                auto enc = [&](uint32_t bp) {
+                                    return static_cast<uint8_t>(
+                                        std::min(255u, (bp * 255u) / scored_bp));
+                                };
+                                qr.contig_outlier_u8  = enc(cco_bp);
+                                qr.spe_outlier_u8     = enc(spe_bp);
+                                qr.rho_outlier_u8     = enc(rho_bp);
+                                qr.sibling_outlier_u8 = enc(sib_bp);
+                            }
+                        }
+
+                        // Marker completeness — reuse metamers collected in FMH loop.
+                        if (do_markers) {
+                            const uint64_t gh = GcovWriter::hash_genus(genus_key);
+                            auto calib = build_mrk_rd->lookup_lineage(gh);
+                            if (calib.valid()) {
+                                const bool is_arc = (calib.header->domain == MRKR_DOMAIN_ARC);
+                                auto mh  = is_arc ? build_mrk_rd->merged_hashes_arc()
+                                                  : build_mrk_rd->merged_hashes_bac();
+                                auto mid = is_arc ? build_mrk_rd->merged_ids_arc()
+                                                  : build_mrk_rd->merged_ids_bac();
+                                const uint8_t n_markers = calib.header->n_markers;
+                                for (size_t ii = 0; ii < pending_qrs.size(); ++ii) {
+                                    const auto& qv = genome_qmers[ii];
+                                    if (qv.empty()) continue;
+                                    uint32_t hits[173] = {};
+                                    const uint64_t *qp=qv.data(), *qpe=qp+qv.size();
+                                    const uint64_t *mhp=mh.data(), *mhe=mhp+mh.size();
+                                    const uint8_t  *mip=mid.data();
+                                    while (qp!=qpe && mhp!=mhe) {
+                                        if      (*qp < *mhp) ++qp;
+                                        else if (*mhp < *qp) { ++mhp; ++mip; }
+                                        else                 { hits[*mip]++; ++qp; ++mhp; ++mip; }
+                                    }
+                                    int n_present=0, n_expected=0;
+                                    float redun_sum=0.0f; int redun_n=0;
+                                    for (uint8_t mi=0; mi<n_markers; ++mi) {
+                                        if (!calib.marker_expected(mi)) continue;
+                                        ++n_expected;
+                                        const uint32_t thr = static_cast<uint32_t>(
+                                            calib.slots[mi].null_floor_u16)
+                                            + static_cast<uint32_t>(cfg.marker_min_hits);
+                                        if (hits[mi] >= thr) {
+                                            ++n_present;
+                                            const uint8_t pool_mi = is_arc
+                                                ? static_cast<uint8_t>(build_mrk_rd->n_bac()+mi)
+                                                : mi;
+                                            const uint32_t psz = build_mrk_rd->pool_n_hashes(pool_mi);
+                                            if (psz > 0) {
+                                                redun_sum += static_cast<float>(hits[mi])
+                                                           / static_cast<float>(psz);
+                                                ++redun_n;
+                                            }
+                                        }
+                                    }
+                                    auto& qr = pending_qrs[ii];
+                                    if (n_expected > 0) {
+                                        const float comp = static_cast<float>(n_present)
+                                                         / static_cast<float>(n_expected);
+                                        qr.marker_completeness_u8 = static_cast<uint8_t>(
+                                            std::clamp(comp, 0.0f, 1.0f) * 254.0f + 1.0f);
+                                    }
+                                    if (redun_n > 0) {
+                                        const float redun = redun_sum / static_cast<float>(redun_n);
+                                        const float clamped = std::min(0.09999f, redun);
+                                        qr.marker_redundancy_u16 = static_cast<uint16_t>(
+                                            clamped / 0.1f * 65534.0f);
+                                        qr.qual_flags |= QualRecord::QUAL_FLAG_MARKER_SCORED;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    for (auto& qr : pending_qrs) qual_writer.add(qr);
+                }
+            }
+
             launch_shard_freeze();
             buf.clear();
             staging_raw_bytes = 0;
@@ -881,10 +1310,45 @@ struct ArchiveBuilder::Impl {
                              100.0 * n_done / std::max<size_t>(size_t(1), original_total_records),
                              current_shard_id, n_failed);
         }
-        // Final flush: remaining items in all buffers
+        // Final flush: remaining items in all buffers.
+        // Micro-genera (below threshold) are bin-packed together to avoid
+        // thousands of tiny shards from singleton-genus inputs.
         if (cfg.taxonomy_group) {
-            for (auto& [key, bucket] : taxon_buckets)
-                if (!bucket.items.empty()) { taxon_total_bytes -= bucket.raw_bytes; flush_staging_buf(bucket.items); bucket.raw_bytes = 0; }
+            const uint32_t micro_genome_threshold = 32;
+
+            std::vector<std::pair<std::string, std::vector<ChunkItem>>> micro_queue;
+            for (auto& [key, bucket] : taxon_buckets) {
+                if (bucket.items.empty()) continue;
+                if (static_cast<uint32_t>(bucket.items.size()) < micro_genome_threshold) {
+                    micro_queue.push_back({key, std::move(bucket.items)});
+                } else {
+                    taxon_total_bytes -= bucket.raw_bytes;
+                    flush_staging_buf(bucket.items);
+                    bucket.raw_bytes = 0;
+                }
+            }
+
+            // Deterministic ordering → reproducible packing across builds
+            std::sort(micro_queue.begin(), micro_queue.end(),
+                [](const auto& a, const auto& b) { return a.first < b.first; });
+
+            // Greedy first-fit: pack micro-genera until shard size target reached
+            std::vector<ChunkItem> combined;
+            uint64_t combined_bytes = 0;
+            for (auto& [key, items] : micro_queue) {
+                uint64_t genus_bytes = 0;
+                for (const auto& item : items) genus_bytes += item.fasta.size();
+                if (!combined.empty() && combined_bytes + genus_bytes >= cfg.shard_cfg.max_shard_size_bytes) {
+                    flush_staging_buf(combined);
+                    combined_bytes = 0;
+                }
+                for (auto& item : items) combined.push_back(std::move(item));
+                combined_bytes += genus_bytes;
+            }
+            if (!combined.empty()) flush_staging_buf(combined);
+
+            if (!micro_queue.empty())
+                spdlog::info("Packed {} micro-genera into combined shards", micro_queue.size());
         } else {
             if (!staging_buffer.empty()) flush_staging_buf(staging_buffer);
         }
@@ -1035,6 +1499,22 @@ struct ArchiveBuilder::Impl {
             }
         }
 
+        // Write GSTX section (genus sketch stats — enables O(1) check queries)
+        if (cfg.build_gstx && cfg.taxonomy_group && multi_k_sketch
+            && gstx_writer.n_genera() > 0) {
+            spdlog::info("Writing GSTX: {} genera", gstx_writer.n_genera());
+            SectionDesc gstx_sd = gstx_writer.finalize(mw, next_section_id++);
+            toc.add_section(gstx_sd);
+        }
+
+        // Write QUAL section (per-genome quality scores computed during flush_staging_buf)
+        if (cfg.build_gstx && cfg.taxonomy_group && multi_k_sketch
+            && qual_writer.size() > 0) {
+            spdlog::info("Writing QUAL: {} genomes", qual_writer.size());
+            SectionDesc qual_sd = qual_writer.finalize(mw, next_section_id++);
+            toc.add_section(qual_sd);
+        }
+
         // Write TOC + TailLocator to local file
         toc.finalize(mw,
                      /*generation=*/1,
@@ -1092,6 +1572,57 @@ struct ArchiveBuilder::Impl {
             ::close(nfs_fd);
         }
         ::unlink(bld_meta_tmp.data());
+
+        // Write GCOV/FCOV/FMHR sections from in-memory writers (populated during flush_staging_buf).
+        // No second FASTA pass needed — all profiles were computed alongside AllSignals.
+        if (cfg.build_gcov && cfg.build_gstx && cfg.taxonomy_group) {
+            // Re-usable helper: read TOC, open append writer, write section, update TOC.
+            auto append_gcov_like = [&](auto& writer, uint32_t type, const char* label) {
+                if (writer.n_genera() == 0) return;
+                MmapFileReader mm; mm.open(gpk_path_);
+                auto toc_r = TocReader::read(mm);
+                const auto* tail = mm.ptr_at<TailLocator>(mm.size() - sizeof(TailLocator));
+                const uint64_t prev_toc = tail->toc_offset, gen = toc_r.header.generation + 1;
+                mm.close();
+                AppendWriter aw; aw.open_append(gpk_path_);
+                SectionDesc sd = writer.finalize(aw, toc_r.next_section_id(), type);
+                TocWriter tw;
+                for (const auto& s : toc_r.sections)
+                    if (s.type != type) tw.add_section(s);
+                tw.add_section(sd);
+                tw.finalize(aw, gen,
+                            toc_r.header.live_genome_count, toc_r.header.total_genome_count,
+                            prev_toc,
+                            toc_r.header.catalog_root_section_id,
+                            toc_r.header.accession_root_section_id,
+                            toc_r.header.tombstone_root_section_id);
+                spdlog::info("{}: {} entries written to {}", label, writer.n_genera(), gpk_path_.string());
+            };
+            auto append_fmhr = [&](FmhrWriter& writer) {
+                if (writer.n_genera() == 0) return;
+                MmapFileReader mm; mm.open(gpk_path_);
+                auto toc_r = TocReader::read(mm);
+                const auto* tail = mm.ptr_at<TailLocator>(mm.size() - sizeof(TailLocator));
+                const uint64_t prev_toc = tail->toc_offset, gen = toc_r.header.generation + 1;
+                mm.close();
+                AppendWriter aw; aw.open_append(gpk_path_);
+                SectionDesc sd = writer.finalize(aw, toc_r.next_section_id());
+                TocWriter tw;
+                for (const auto& s : toc_r.sections)
+                    if (s.type != SEC_FMHR) tw.add_section(s);
+                tw.add_section(sd);
+                tw.finalize(aw, gen,
+                            toc_r.header.live_genome_count, toc_r.header.total_genome_count,
+                            prev_toc,
+                            toc_r.header.catalog_root_section_id,
+                            toc_r.header.accession_root_section_id,
+                            toc_r.header.tombstone_root_section_id);
+                spdlog::info("FMHR: {} genera written to {}", writer.n_genera(), gpk_path_.string());
+            };
+            append_gcov_like(build_gcov_w, SEC_GCOV, "GCOV");
+            append_gcov_like(build_fcov_w, SEC_FCOV, "FCOV");
+            append_fmhr(build_fmhr_w);
+        }
 
         // Remove checkpoint files — build completed successfully
         std::error_code ec;

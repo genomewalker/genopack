@@ -25,7 +25,9 @@ class TocWriter {
 public:
     void add_section(SectionDesc desc);
 
-    // Writes TocHeader + all SectionDescs to writer, then appends a TailLocator.
+    // Writes [MetaBundle][TocHeader+SectionDescs][TailLocator] to writer.
+    // MetaBundle is embedded unconditionally; TailLocator.reserved records its
+    // offset+size so the reader can do one pread and skip the mmap page-fault at EOF.
     // Returns the offset where the TocHeader was written.
     uint64_t finalize(AppendWriter& writer,
                       uint64_t generation,
@@ -34,7 +36,9 @@ public:
                       uint64_t prev_toc_offset,
                       uint64_t catalog_root_id,
                       uint64_t accession_root_id,
-                      uint64_t tombstone_root_id);
+                      uint64_t tombstone_root_id,
+                      uint64_t gpk_uuid_lo = 0,
+                      uint64_t gpk_uuid_hi = 0);
 
 private:
     std::vector<SectionDesc> sections_;

@@ -67,10 +67,12 @@ static_assert(sizeof(MemDeltaChunkDesc) == 16);
 // 3-5× faster than unordered_map for the lookup-heavy MEM finding phase
 // because the key/value arrays are dense and cache-prefetch-friendly.
 
+struct KV { uint64_t key; uint32_t val; };   // 16 bytes due to alignment — do NOT pack
+
 struct AnchorIndex {
-    std::vector<uint64_t> keys; // UINT64_MAX = empty slot
-    std::vector<uint32_t> vals;
-    uint64_t              mask; // capacity - 1
+    std::vector<uint8_t>  ctrl; // 0x80=empty; [0x00,0x7F]=H2(key) — 1/12 the size of keys, stays in L3
+    std::vector<KV>       kv;
+    uint64_t              mask; // capacity - 1 (capacity is power-of-2, multiple of 16)
 
     AnchorIndex() : mask(0) {}
     explicit AnchorIndex(size_t n_entries);
@@ -84,6 +86,10 @@ FastaComponents extract_fasta_components(const char* fasta, size_t len);
 
 // Build a step-16 k=31 anchor k-mer index over the reference sequence.
 AnchorIndex build_anchor_index(const std::string& seq);
+
+// Sample ~8 evenly-spaced query k-mers; returns fraction that hit the panel index.
+// Cheap probe (~microseconds) used to skip encode_mem_delta for clear losers.
+double sample_anchor_hit_rate(const std::string& query, const AnchorIndex& idx);
 
 // Encode query relative to anchor. Returns chunked MEM-delta bytes.
 std::vector<uint8_t> encode_mem_delta(const FastaComponents& anchor,

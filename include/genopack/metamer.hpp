@@ -1,0 +1,288 @@
+#pragma once
+#include <algorithm>
+#include <cstdint>
+#include <functional>
+#include <string_view>
+#include <vector>
+
+namespace genopack {
+
+// Amino acid k=8 metamer primitives for SCG completeness/contamination estimation.
+// Build side: protein input from GTDB-Tk MSA (extract_metamers_aa).
+// Check side: DNA input via 6-frame translation (extract_metamers_dna / translate_6frame).
+// Hash encoding is identical on both sides — required for membership lookup to work.
+
+static constexpr int METAMER_K = 8;
+
+// ── Encoding tables ───────────────────────────────────────────────────────────
+
+// AA index: alphabetical single-letter order (A=0,C=1,D=2,E=3,F=4,G=5,H=6,I=7,
+//   K=8,L=9,M=10,N=11,P=12,Q=13,R=14,S=15,T=16,V=17,W=18,Y=19). 0xFF = stop/invalid.
+static constexpr uint8_t AA_STOP = 0xFF;
+static constexpr uint8_t AA_COUNT = 20;
+
+// Char → AA index (handles upper and lower case, '-', '*', 'X').
+// clang-format off
+alignas(64) static constexpr uint8_t AA_ENC[256] = {
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF, // 0x00
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF, // 0x10
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF, // 0x20  '-'=0xFF
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF, // 0x30
+    0xFF,   0,0xFF,   1,   2,   3,   4,   5,   6,   7,0xFF,   8,   9,  10,  11,0xFF, // A..O
+       12,  13,  14,  15,  16,   1,  17,  18,0xFF,  19,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF, // P..Z  U→C
+    0xFF,   0,0xFF,   1,   2,   3,   4,   5,   6,   7,0xFF,   8,   9,  10,  11,0xFF, // a..o
+       12,  13,  14,  15,  16,   1,  17,  18,0xFF,  19,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF, // p..z
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+};
+// clang-format on
+
+// DNA base encoding: A=0, C=1, G=2, T/U=3, ambiguous/other=0xFF.
+// clang-format off
+alignas(64) static constexpr uint8_t DNA_ENC[256] = {
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,   0,0xFF,   1,0xFF,0xFF,0xFF,   2,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF, // A C G
+    0xFF,0xFF,0xFF,0xFF,   3,   3,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF, // T U
+    0xFF,   0,0xFF,   1,0xFF,0xFF,0xFF,   2,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF, // a c g
+    0xFF,0xFF,0xFF,0xFF,   3,   3,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF, // t u
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,
+};
+// clang-format on
+
+// Complement of encoded base: A↔T (0↔3), C↔G (1↔2).
+static constexpr uint8_t BASE_COMP[4] = { 3, 2, 1, 0 };
+
+// ── Codon table ───────────────────────────────────────────────────────────────
+
+// Genetic code 11 (bacteria/archaea). Index = first_base*16 + second_base*4 + third_base.
+// A=0,C=1,G=2,T=3. AA values per earlier encoding.
+// clang-format off
+static constexpr uint8_t CODON11[64] = {
+    // b0=A (indices 0-15): AAA=K,AAC=N,AAG=K,AAT=N, ACA=T,ACC=T,ACG=T,ACT=T,
+    //                       AGA=R,AGC=S,AGG=R,AGT=S, ATA=I,ATC=I,ATG=M,ATT=I
+     8, 11,  8, 11,   16, 16, 16, 16,   14, 15, 14, 15,    7,  7, 10,  7,
+    // b0=C (indices 16-31): CAA=Q,CAC=H,CAG=Q,CAT=H, CCA=P,CCC=P,CCG=P,CCT=P,
+    //                        CGA=R,CGC=R,CGG=R,CGT=R, CTA=L,CTC=L,CTG=L,CTT=L
+    13,  6, 13,  6,   12, 12, 12, 12,   14, 14, 14, 14,    9,  9,  9,  9,
+    // b0=G (indices 32-47): GAA=E,GAC=D,GAG=E,GAT=D, GCA=A,GCC=A,GCG=A,GCT=A,
+    //                        GGA=G,GGC=G,GGG=G,GGT=G, GTA=V,GTC=V,GTG=V,GTT=V
+     3,  2,  3,  2,    0,  0,  0,  0,    5,  5,  5,  5,   17, 17, 17, 17,
+    // b0=T (indices 48-63): TAA=*,TAC=Y,TAG=*,TAT=Y, TCA=S,TCC=S,TCG=S,TCT=S,
+    //                        TGA=*,TGC=C,TGG=W,TGT=C, TTA=L,TTC=F,TTG=L,TTT=F
+    0xFF,19,0xFF,19,   15, 15, 15, 15, 0xFF,  1, 18,  1,    9,  4,  9,  4,
+};
+// clang-format on
+
+// ── Hash ─────────────────────────────────────────────────────────────────────
+
+// Hash one k=8 amino acid k-mer (aa[0..7] in 0-19 encoding).
+// Packs 8 AAs at 5 bits each (40 bits total) then applies splitmix64 mixing.
+// Must be called with identical encoding on build side and check side.
+[[nodiscard]] inline uint64_t metamer_hash(const uint8_t* aa) noexcept {
+    uint64_t v =  (uint64_t)aa[0]
+               | ((uint64_t)aa[1] <<  5)
+               | ((uint64_t)aa[2] << 10)
+               | ((uint64_t)aa[3] << 15)
+               | ((uint64_t)aa[4] << 20)
+               | ((uint64_t)aa[5] << 25)
+               | ((uint64_t)aa[6] << 30)
+               | ((uint64_t)aa[7] << 35);
+    v ^= v >> 30;
+    v *= 0xbf58476d1ce4e5b9ULL;
+    v ^= v >> 27;
+    v *= 0x94d049bb133111ebULL;
+    v ^= v >> 31;
+    return v;
+}
+
+// Returns true if the k-mer contains a run of >= (k+1)/2 identical amino acids.
+[[nodiscard]] inline bool metamer_is_low_complexity(const uint8_t* aa, int k) noexcept {
+    int run = 1, max_run = 1;
+    for (int i = 1; i < k; ++i) {
+        run = (aa[i] == aa[i-1]) ? run + 1 : 1;
+        if (run > max_run) max_run = run;
+    }
+    return max_run >= (k + 1) / 2;
+}
+
+// Append all k-mers from one inter-stop AA segment to `out`, skipping low-complexity.
+inline void emit_metamers(const uint8_t* seg, int len, int k,
+                          std::vector<uint64_t>& out) {
+    for (int i = 0; i + k <= len; ++i) {
+        if (!metamer_is_low_complexity(seg + i, k))
+            out.push_back(metamer_hash(seg + i));
+    }
+}
+
+// ── 6-frame translation ───────────────────────────────────────────────────────
+
+// For each inter-stop AA segment of length >= min_aa_len in all 6 reading frames,
+// calls cb(frame, aa_ptr, aa_len). Frame 0-2 = forward, 3-5 = reverse complement.
+// aa_ptr is valid only for the duration of the call (points into a local buffer).
+// Ambiguous bases (N etc.) break the reading frame like a stop codon.
+// Genetic code 11 (standard bacterial/archaeal).
+template <typename Cb>
+inline void translate_6frame(std::string_view seq, int min_aa_len, Cb&& cb) {
+    const int n = static_cast<int>(seq.size());
+    const char* s = seq.data();
+
+    // Forward frames 0-2
+    for (int frame = 0; frame < 3; ++frame) {
+        std::vector<uint8_t> seg;
+        seg.reserve(n / 3 + 2);
+        for (int i = frame; i + 2 < n; i += 3) {
+            const uint8_t b0 = DNA_ENC[(uint8_t)s[i]];
+            const uint8_t b1 = DNA_ENC[(uint8_t)s[i+1]];
+            const uint8_t b2 = DNA_ENC[(uint8_t)s[i+2]];
+            if (b0 == 0xFF || b1 == 0xFF || b2 == 0xFF) {
+                if ((int)seg.size() >= min_aa_len)
+                    cb(frame, seg.data(), (int)seg.size());
+                seg.clear();
+                continue;
+            }
+            const uint8_t aa = CODON11[b0 * 16 + b1 * 4 + b2];
+            if (aa == AA_STOP) {
+                if ((int)seg.size() >= min_aa_len)
+                    cb(frame, seg.data(), (int)seg.size());
+                seg.clear();
+            } else {
+                seg.push_back(aa);
+            }
+        }
+        if ((int)seg.size() >= min_aa_len)
+            cb(frame, seg.data(), (int)seg.size());
+    }
+
+    // Reverse complement frames 3-5.
+    // RC frame `frame` reads backward from position (n-1-frame), complementing each base.
+    for (int frame = 0; frame < 3; ++frame) {
+        std::vector<uint8_t> seg;
+        seg.reserve(n / 3 + 2);
+        const int start = n - 1 - frame;
+        for (int pos = start; pos - 2 >= 0; pos -= 3) {
+            const uint8_t e0 = DNA_ENC[(uint8_t)s[pos]];
+            const uint8_t e1 = DNA_ENC[(uint8_t)s[pos-1]];
+            const uint8_t e2 = DNA_ENC[(uint8_t)s[pos-2]];
+            if (e0 == 0xFF || e1 == 0xFF || e2 == 0xFF) {
+                if ((int)seg.size() >= min_aa_len)
+                    cb(3 + frame, seg.data(), (int)seg.size());
+                seg.clear();
+                continue;
+            }
+            const uint8_t b0 = BASE_COMP[e0];
+            const uint8_t b1 = BASE_COMP[e1];
+            const uint8_t b2 = BASE_COMP[e2];
+            const uint8_t aa = CODON11[b0 * 16 + b1 * 4 + b2];
+            if (aa == AA_STOP) {
+                if ((int)seg.size() >= min_aa_len)
+                    cb(3 + frame, seg.data(), (int)seg.size());
+                seg.clear();
+            } else {
+                seg.push_back(aa);
+            }
+        }
+        if ((int)seg.size() >= min_aa_len)
+            cb(3 + frame, seg.data(), (int)seg.size());
+    }
+}
+
+// ── Convenience extractors ────────────────────────────────────────────────────
+
+// Extract sorted, deduplicated metamer hashes from a DNA sequence (6-frame translation).
+// min_seg_aa: minimum inter-stop segment length to emit k-mers from (default = k).
+[[nodiscard]] inline std::vector<uint64_t>
+extract_metamers_dna(std::string_view seq, int k = METAMER_K, int min_seg_aa = METAMER_K) {
+    std::vector<uint64_t> hashes;
+    hashes.reserve(seq.size() / 4);
+    translate_6frame(seq, min_seg_aa, [&](int /*frame*/, const uint8_t* seg, int len) {
+        emit_metamers(seg, len, k, hashes);
+    });
+    std::sort(hashes.begin(), hashes.end());
+    hashes.erase(std::unique(hashes.begin(), hashes.end()), hashes.end());
+    return hashes;
+}
+
+// FracMinHash variant: keep only hashes ≤ max_hash during extraction.
+[[nodiscard]] inline std::vector<uint64_t>
+extract_metamers_dna(std::string_view seq, int k, int min_seg_aa, uint64_t max_hash) {
+    std::vector<uint64_t> hashes;
+    hashes.reserve(seq.size() / (4 * 32));
+    translate_6frame(seq, min_seg_aa, [&](int, const uint8_t* seg, int len) {
+        for (int i = 0; i + k <= len; ++i) {
+            if (!metamer_is_low_complexity(seg + i, k)) {
+                uint64_t h = metamer_hash(seg + i);
+                if (h <= max_hash) hashes.push_back(h);
+            }
+        }
+    });
+    std::sort(hashes.begin(), hashes.end());
+    hashes.erase(std::unique(hashes.begin(), hashes.end()), hashes.end());
+    return hashes;
+}
+
+// In-place append variant: appends unsorted hashes to an existing vector (caller sorts/deduplicates).
+// Use with a thread_local buffer to avoid per-call allocation.
+inline void
+extract_metamers_dna_into(std::string_view seq, int k, int min_seg_aa, uint64_t max_hash,
+                          std::vector<uint64_t>& out) {
+    translate_6frame(seq, min_seg_aa, [&](int, const uint8_t* seg, int len) {
+        for (int i = 0; i + k <= len; ++i) {
+            if (!metamer_is_low_complexity(seg + i, k)) {
+                uint64_t h = metamer_hash(seg + i);
+                if (h <= max_hash) out.push_back(h);
+            }
+        }
+    });
+}
+
+// Extract sorted, deduplicated metamer hashes from a protein sequence.
+// Handles uppercase/lowercase, '-' gaps (skip), '*' stops, 'X'/'B'/'Z' (break).
+// Used for building the marker panel from GTDB-Tk MSA sequences.
+[[nodiscard]] inline std::vector<uint64_t>
+extract_metamers_aa(std::string_view protein, int k = METAMER_K) {
+    std::vector<uint64_t> hashes;
+    hashes.reserve(protein.size());
+
+    std::vector<uint8_t> seg;
+    seg.reserve(protein.size());
+
+    auto flush = [&] {
+        if ((int)seg.size() >= k) {
+            emit_metamers(seg.data(), (int)seg.size(), k, hashes);
+        }
+        seg.clear();
+    };
+
+    for (unsigned char c : protein) {
+        if (c == '-') continue;          // MSA gap — skip without breaking segment
+        const uint8_t aa = AA_ENC[c];
+        if (aa == AA_STOP) {
+            flush();
+        } else {
+            seg.push_back(aa);
+        }
+    }
+    flush();
+
+    std::sort(hashes.begin(), hashes.end());
+    hashes.erase(std::unique(hashes.begin(), hashes.end()), hashes.end());
+    return hashes;
+}
+
+} // namespace genopack

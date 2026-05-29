@@ -1,4 +1,5 @@
 #include <genopack/shard.hpp>
+#include <genopack/checksum.hpp>
 #include <genopack/mem_delta.hpp>
 #include <zstd.h>
 #include <zdict.h>
@@ -11,6 +12,7 @@
 #include <fstream>
 #include <future>
 #include <limits>
+#include <memory>
 #include <numeric>
 #include <random>
 #include <stdexcept>
@@ -506,9 +508,16 @@ FrozenShard ShardWriter::freeze() {
             if (!is_panel[i]) order.push_back(i);
 
         auto compress_plain_blob = [&](const Impl::PendingGenome& pg, CompressedBlob& out) {
-            ZSTD_CCtx* cctx = ZSTD_createCCtx();
+            // Thread-local CCtx: reused across calls, ~10μs cheaper than create/free per blob.
+            static thread_local std::unique_ptr<ZSTD_CCtx, decltype(&ZSTD_freeCCtx)>
+                tl_cctx(ZSTD_createCCtx(), &ZSTD_freeCCtx);
+            ZSTD_CCtx* cctx = tl_cctx.get();
             if (!cctx) throw std::runtime_error("ZSTD_createCCtx failed");
-            ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, impl_->cfg.zstd_level);
+            ZSTD_CCtx_reset(cctx, ZSTD_reset_session_and_parameters);
+            // L1: 2-bit packed DNA has minimal remaining entropy — L3 compresses no better
+            // and costs 2× more CPU. Keep cfg.zstd_level for non-default configurations.
+            const int plain_level = std::min(impl_->cfg.zstd_level, 1);
+            ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, plain_level);
             if (impl_->cfg.use_long_match) {
                 ZSTD_CCtx_setParameter(cctx, ZSTD_c_enableLongDistanceMatching, 1);
                 ZSTD_CCtx_setParameter(cctx, ZSTD_c_windowLog, impl_->cfg.zstd_wlog);
@@ -536,7 +545,6 @@ FrozenShard ShardWriter::freeze() {
                                               blob_layout.seq.data() + range.byte_start,
                                               range.byte_len);
                 if (ZSTD_isError(csize)) {
-                    ZSTD_freeCCtx(cctx);
                     throw std::runtime_error(std::string("ZSTD_compress2: ") +
                                              ZSTD_getErrorName(csize));
                 }
@@ -548,22 +556,30 @@ FrozenShard ShardWriter::freeze() {
                 });
                 block_offset += static_cast<uint32_t>(csize);
             }
-
-            ZSTD_freeCCtx(cctx);
         };
 
-        for (size_t i = 0; i < n_ref; ++i) {
-            const auto& pg = impl_->pending[order[i]];
-            compress_plain_blob(pg, blobs[i]);
-        }
-
+        // Build panel sequence first (raw, fast) — needed for anchor index.
         FastaComponents panel_fc;
         for (size_t i = 0; i < n_ref; ++i) {
             const auto& pg = impl_->pending[order[i]];
             auto fc = extract_fasta_components(impl_->raw_buffer.data() + pg.raw_offset, pg.raw_len);
             panel_fc.seq += fc.seq;
         }
-        AnchorIndex anchor_idx = build_anchor_index(panel_fc.seq);
+
+        // Launch panel plain compression asynchronously — overlaps with anchor index build.
+        std::vector<std::future<void>> panel_futs;
+        panel_futs.reserve(n_ref);
+        for (size_t i = 0; i < n_ref; ++i) {
+            panel_futs.push_back(std::async(std::launch::async, [&, i]() {
+                const auto& pg = impl_->pending[order[i]];
+                compress_plain_blob(pg, blobs[i]);
+            }));
+        }
+
+        AnchorIndex anchor_idx = build_anchor_index(panel_fc.seq);  // runs while panel compresses
+
+        // Wait for panel compression (likely done by now since anchor build takes ~100ms).
+        for (auto& f : panel_futs) f.get();
 
         const size_t n_delta   = n - n_ref;
         const size_t n_threads = impl_->cfg.compress_threads > 0
@@ -580,6 +596,17 @@ FrozenShard ShardWriter::freeze() {
                 const auto& pg = impl_->pending[order[out_idx]];
                 const char* src = impl_->raw_buffer.data() + pg.raw_offset;
                 FastaComponents qfc = extract_fasta_components(src, pg.raw_len);
+
+                // Hit-rate gate with 512 probes (ANI^K/INDEX_STEP statistics):
+                // - same-genus winners (ANI≥97%): ~12 hits → hit_rate ≈ 0.024
+                // - same-genus losers (ANI≈92%):  ~2.4 hits → hit_rate ≈ 0.005
+                // Threshold 0.007 passes winners, rejects losers, saves 6ms/genome for ~77%.
+                const double hit_rate = sample_anchor_hit_rate(qfc.seq, anchor_idx);
+                if (hit_rate < 0.007) {
+                    compress_plain_blob(pg, blobs[out_idx]);
+                    blobs[out_idx].use_mem_delta = false;
+                    continue;
+                }
 
                 auto delta = encode_mem_delta(panel_fc, anchor_idx, qfc, impl_->cfg.checkpoint_bases);
 
@@ -693,6 +720,7 @@ FrozenShard ShardWriter::freeze() {
             push_bytes(checkpoint_entries.data(),
                        checkpoint_entries.size() * sizeof(CheckpointEntry));
 
+        compute_checksum(frozen.bytes.data(), frozen.bytes.size(), offsetof(ShardHeader, checksum));
         spdlog::info("ShardWriter shard {} (MEM-delta): {} genomes ({} ref panel), raw {}B, mem-delta {}, plain {}, bytes {}B",
                      impl_->shard_id, n, n_ref, impl_->total_raw_bytes,
                      mem_delta_count, plain_count, total_compressed);
@@ -1100,6 +1128,7 @@ FrozenShard ShardWriter::freeze() {
         push_bytes(checkpoint_entries.data(),
                    checkpoint_entries.size() * sizeof(CheckpointEntry));
 
+    compute_checksum(frozen.bytes.data(), frozen.bytes.size(), offsetof(ShardHeader, checksum));
     spdlog::info("ShardWriter shard {}: wrote {} genomes, raw {}B, compressed {}B",
                  impl_->shard_id, n, impl_->total_raw_bytes, total_compressed);
     return frozen;
@@ -1637,6 +1666,15 @@ struct ShardReader::Impl {
             auto parsed = parse_sequence_blob(src, src_size);
             if (start >= parsed.hdr.seq_len) return {};
             uint64_t clamped_end = std::min<uint64_t>(parsed.hdr.seq_len, end);
+
+            // 2-bit packed blobs: symbol_offset is in packed-byte space, not base space,
+            // so the checkpoint binary search would compare incompatible units.
+            // Decompress the full sequence (which handles 2-bit unpacking) and slice.
+            if (parsed.hdr.flags & SEQB_FLAG_PACKED_2BIT) {
+                std::string unpacked = decompress_sequence_blob(e);
+                return unpacked.substr(static_cast<size_t>(start),
+                                       static_cast<size_t>(clamped_end - start));
+            }
 
             const CheckpointEntry* cps = checkpoints_for(e);
             if (!cps || e.n_checkpoints == 0) {

@@ -5,7 +5,7 @@
 
 namespace genopack {
 
-SectionDesc GcovWriter::finalize(AppendWriter& w, uint64_t section_id) {
+SectionDesc GcovWriter::finalize(AppendWriter& w, uint64_t section_id, uint32_t section_type) {
     const uint32_t n = static_cast<uint32_t>(entries_.size());
     const uint32_t min_buckets = (n == 0) ? 1
         : static_cast<uint32_t>(static_cast<double>(n) / 0.7 + 1.0);
@@ -27,7 +27,7 @@ SectionDesc GcovWriter::finalize(AppendWriter& w, uint64_t section_id) {
     const uint64_t buckets_off = entries_off + static_cast<uint64_t>(n) * sizeof(GcovEntry);
 
     GcovHeader hdr{};
-    hdr.magic          = SEC_GCOV;
+    hdr.magic          = section_type;
     hdr.n_genera       = n;
     hdr.n_buckets      = n_buckets;
     hdr.n_eigvecs      = GCOV_N_EIGVECS;
@@ -47,7 +47,7 @@ SectionDesc GcovWriter::finalize(AppendWriter& w, uint64_t section_id) {
     const uint64_t section_end = w.current_offset();
 
     SectionDesc sd{};
-    sd.type              = SEC_GCOV;
+    sd.type              = section_type;
     sd.version           = 1;
     sd.flags             = 0;
     sd.section_id        = section_id;
@@ -143,6 +143,21 @@ float gcov_spe(const GcovEntry& e, const float* x_minus_mu) noexcept {
     float spe = 0.0f;
     for (int d = 0; d < 136; ++d) spe += resid[d] * resid[d];
     return spe;
+}
+
+float gcov_rho_distance(const GcovEntry& e, const float* rho_minus_mean) noexcept {
+    static constexpr int R = static_cast<int>(GCOV_RHO_DIM);
+    // d² = z^T P z, P stored as lower triangle: P[i][j] = rho_prec_lower[i*(i+1)/2+j] for i>=j
+    float d2 = 0.0f;
+    for (int i = 0; i < R; ++i) {
+        float row = 0.0f;
+        for (int j = 0; j <= i; ++j)
+            row += e.rho_prec_lower[i*(i+1)/2 + j] * rho_minus_mean[j];
+        for (int j = i+1; j < R; ++j)
+            row += e.rho_prec_lower[j*(j+1)/2 + i] * rho_minus_mean[j];
+        d2 += rho_minus_mean[i] * row;
+    }
+    return std::sqrt(d2 > 0.f ? d2 : 0.f);
 }
 
 } // namespace genopack

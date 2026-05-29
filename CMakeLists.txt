@@ -69,6 +69,7 @@ endif()
 # ── Library ───────────────────────────────────────────────────────────────────
 
 add_library(genopack_lib STATIC
+  src/score_bin.cpp
   src/catalog.cpp
   src/shard.cpp
   src/builder.cpp
@@ -89,13 +90,22 @@ add_library(genopack_lib STATIC
   src/kmrx.cpp
   src/skch.cpp
   src/gidx.cpp
+  src/gstx.cpp
+  src/gcov.cpp
+  src/fmhr.cpp
+  src/markers.cpp
+  src/markers_build.cpp
+  src/build_genus_stats.cpp
+  src/meta.cpp
   src/oph_sketch.cpp
+  src/skani.cpp
   src/scan_engine.cpp
   src/mem_delta.cpp
   src/ncbi_taxdb.cpp
   src/coordinator.cpp
   src/ntdb.cpp
   src/gtax.cpp
+  src/calibrate/calibrate.cpp
 )
 
 target_include_directories(genopack_lib PUBLIC
@@ -103,6 +113,7 @@ target_include_directories(genopack_lib PUBLIC
   ${ZSTD_INCLUDE_DIRS}
   ${Xxhash_INCLUDE_DIR}
 )
+target_include_directories(genopack_lib PRIVATE src)
 if(SPDLOG_INCLUDE_DIR)
   target_include_directories(genopack_lib PUBLIC ${SPDLOG_INCLUDE_DIR})
 endif()
@@ -128,10 +139,42 @@ if(TARGET spdlog::spdlog)
   target_link_libraries(genopack_lib PUBLIC spdlog::spdlog)
 endif()
 
+# Eigen3 for check module (TNF/GC-skew contig scoring)
+find_package(Eigen3 3.3 QUIET NO_MODULE)
+if(NOT Eigen3_FOUND)
+  FetchContent_Declare(Eigen3
+    GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
+    GIT_TAG        3.4.0
+    GIT_SHALLOW    TRUE)
+  set(EIGEN_BUILD_DOC OFF CACHE BOOL "" FORCE)
+  set(BUILD_TESTING   OFF CACHE BOOL "" FORCE)
+  FetchContent_MakeAvailable(Eigen3)
+endif()
+
+# Eigen3 is also needed by genopack_lib (transition-operator eigendecomposition in util.cpp)
+if(TARGET Eigen3::Eigen)
+  target_link_libraries(genopack_lib PUBLIC Eigen3::Eigen)
+elseif(DEFINED eigen3_SOURCE_DIR)
+  target_include_directories(genopack_lib PUBLIC "${eigen3_SOURCE_DIR}")
+endif()
+
 # ── CLI binary ────────────────────────────────────────────────────────────────
 
-add_executable(genopack cli/main.cpp)
+add_executable(genopack
+  cli/main.cpp
+  src/check/pass_a.cpp
+  src/check/pass_b.cpp
+  src/check/run_check.cpp
+  src/bench/bench_grid.cpp
+  src/calibrate/calibrate.cpp
+)
+target_include_directories(genopack PRIVATE src)
 target_link_libraries(genopack PRIVATE genopack_lib)
+if(TARGET Eigen3::Eigen)
+  target_link_libraries(genopack PRIVATE Eigen3::Eigen)
+elseif(DEFINED eigen3_SOURCE_DIR)
+  target_include_directories(genopack PRIVATE "${eigen3_SOURCE_DIR}")
+endif()
 if(CLI11_INCLUDE_DIR)
   target_include_directories(genopack PRIVATE ${CLI11_INCLUDE_DIR})
 endif()
@@ -167,7 +210,35 @@ add_executable(genopack_benchmark tests/benchmark.cpp)
 target_link_libraries(genopack_benchmark PRIVATE genopack_lib)
 target_compile_definitions(genopack_benchmark PRIVATE GENOPACK_BIN="$<TARGET_FILE:genopack>")
 
+# ── Shared library (.so) ──────────────────────────────────────────────────────
+# All symbols pulled from genopack_lib via --whole-archive; stub provides the
+# required translation unit for CMake.
+set_target_properties(genopack_lib PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+add_library(genopack_shared SHARED src/genopack_so_stub.cpp)
+set_target_properties(genopack_shared PROPERTIES OUTPUT_NAME "genopack")
+target_include_directories(genopack_shared PUBLIC include)
+target_link_options(genopack_shared PRIVATE
+    -Wl,--whole-archive $<TARGET_FILE:genopack_lib> -Wl,--no-whole-archive)
+add_dependencies(genopack_shared genopack_lib)
+target_link_libraries(genopack_shared PUBLIC
+    ${ZSTD_LIBRARIES} ZLIB::ZLIB pthread)
+if(OpenMP_CXX_FOUND)
+  target_link_libraries(genopack_shared PUBLIC OpenMP::OpenMP_CXX)
+endif()
+if(TARGET spdlog::spdlog)
+  target_link_libraries(genopack_shared PUBLIC spdlog::spdlog)
+endif()
+if(TARGET Eigen3::Eigen)
+  target_link_libraries(genopack_shared PUBLIC Eigen3::Eigen)
+elseif(DEFINED eigen3_SOURCE_DIR)
+  target_include_directories(genopack_shared PUBLIC "${eigen3_SOURCE_DIR}")
+endif()
+if(LIBDEFLATE_FOUND)
+  target_link_libraries(genopack_shared PUBLIC ${LIBDEFLATE_LIBRARIES})
+endif()
+
 # ── Install ───────────────────────────────────────────────────────────────────
 install(TARGETS genopack DESTINATION bin)
-install(TARGETS genopack_lib DESTINATION lib)
+install(TARGETS genopack_lib genopack_shared DESTINATION lib)
 install(DIRECTORY include/genopack DESTINATION include)

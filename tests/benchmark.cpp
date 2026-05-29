@@ -129,10 +129,10 @@ int main(int argc, char** argv) {
         std::string flags;
     };
     const std::vector<Mode> modes = {
-        {"auto", "--no-hnsw"},
-        {"plain", "--no-dict --no-hnsw"},
-        {"delta", "--delta --no-hnsw"},
-        {"mem_delta", "--mem-delta --no-hnsw"},
+        {"auto", "--no-sketch"},
+        {"plain", "--no-dict --no-sketch"},
+        {"delta", "--delta --no-sketch"},
+        {"mem_delta", "--mem-delta --no-sketch"},
     };
     std::vector<Mode> active_modes;
     if (selected_modes.empty()) {
@@ -222,7 +222,7 @@ int main(int argc, char** argv) {
     {
         auto cidx_out = tmp.path / "cidx_bench.gpk";
         run_checked(shell_quote(bin) + " build -i " + shell_quote(input_tsv.string()) +
-                    " -o " + shell_quote(cidx_out.string()) + " --no-hnsw");
+                    " -o " + shell_quote(cidx_out.string()) + " --no-sketch");
 
         ArchiveReader ar;
         ar.open(cidx_out);

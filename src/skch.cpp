@@ -619,7 +619,8 @@ std::optional<SketchResult> SkchReader::sketch_for(GenomeId genome_id,
 
 void SkchReader::sketch_for_ids(const std::vector<GenomeId>& sorted_ids,
                                  uint32_t k, uint32_t sz,
-                                 const SketchCallback& cb) const
+                                 const SketchCallback& cb,
+                                 int num_threads) const
 {
     if (sorted_ids.empty()) return;
 
@@ -657,7 +658,8 @@ void SkchReader::sketch_for_ids(const std::vector<GenomeId>& sorted_ids,
         }
     }
 
-    #pragma omp parallel for schedule(dynamic, 1) num_threads(omp_get_max_threads())
+    const int nthreads = (num_threads > 0) ? num_threads : omp_get_max_threads();
+    #pragma omp parallel for schedule(dynamic, 1) num_threads(nthreads)
     for (size_t gi_idx = 0; gi_idx < groups.size(); ++gi_idx) {
         const uint32_t fi     = groups[gi_idx].fi;
         const size_t   hi_s   = groups[gi_idx].hi_start;
@@ -706,6 +708,87 @@ void SkchReader::sketch_for_ids(const std::vector<GenomeId>& sorted_ids,
             r.kmer_size     = k;
             auto sliced = apply_slice(r, sz, mask_words_);
             if (sliced) cb(hits[hi].orig_idx, *sliced);
+        }
+    }
+}
+
+void SkchReader::sketch_for_ids_multi_k(const std::vector<GenomeId>& sorted_ids,
+                                         uint32_t sz,
+                                         const SketchCallbackMultiK& cb,
+                                         int num_threads) const
+{
+    if (sorted_ids.empty() || n_kmer_sizes_ == 0) return;
+    if (sz == 0 || sz > sketch_size_) sz = sketch_size_;
+
+    struct Hit { uint32_t frame_idx; uint32_t local_row; size_t orig_idx; };
+    std::vector<Hit> hits;
+    hits.reserve(sorted_ids.size());
+    for (size_t i = 0; i < sorted_ids.size(); ++i) {
+        uint32_t pos = find_genome_pos(id_index_, sorted_ids[i]);
+        if (pos == UINT32_MAX) continue;
+        hits.push_back({pos / frame_sz_, pos % frame_sz_, i});
+    }
+
+    struct FrameGroup { uint32_t fi; size_t hi_start; size_t hi_end; };
+    std::vector<FrameGroup> groups;
+    groups.reserve(frames_.size());
+    {
+        size_t s = 0;
+        while (s < hits.size()) {
+            const uint32_t fi = hits[s].frame_idx;
+            size_t e = s;
+            while (e < hits.size() && hits[e].frame_idx == fi) ++e;
+            groups.push_back({fi, s, e});
+            s = e;
+        }
+    }
+
+    const int nthreads = (num_threads > 0) ? num_threads : omp_get_max_threads();
+    #pragma omp parallel for schedule(dynamic, 1) num_threads(nthreads)
+    for (size_t gi_idx = 0; gi_idx < groups.size(); ++gi_idx) {
+        const uint32_t fi    = groups[gi_idx].fi;
+        const size_t   hi_s  = groups[gi_idx].hi_start;
+        const size_t   hi_e  = groups[gi_idx].hi_end;
+
+        const SkchFrameDesc& fd = frames_[fi];
+        const uint32_t frame_n  = fd.n_genomes;
+        const uint8_t* csrc     = section_base_ + fd.data_offset;
+
+        unsigned long long raw_sz = ZSTD_getFrameContentSize(csrc, fd.compressed_size);
+        if (raw_sz == ZSTD_CONTENTSIZE_ERROR || raw_sz == ZSTD_CONTENTSIZE_UNKNOWN)
+            continue;
+        std::vector<uint8_t> fbuf(static_cast<size_t>(raw_sz));
+        if (ZSTD_isError(ZSTD_decompress(fbuf.data(), fbuf.size(), csrc, fd.compressed_size)))
+            continue;
+
+        const uint32_t nk     = n_kmer_sizes_;
+        const uint32_t* nrb   = reinterpret_cast<const uint32_t*>(fbuf.data());
+        const uint16_t* sigs1 = reinterpret_cast<const uint16_t*>(
+            fbuf.data() + sizeof(uint32_t) * nk * frame_n);
+        const uint16_t* sigs2 = reinterpret_cast<const uint16_t*>(
+            fbuf.data() + sizeof(uint32_t) * nk * frame_n
+                        + sizeof(uint16_t) * nk * frame_n * sketch_size_);
+        const uint64_t* msks  = reinterpret_cast<const uint64_t*>(
+            fbuf.data() + sizeof(uint32_t) * nk * frame_n
+                        + 2 * sizeof(uint16_t) * nk * frame_n * sketch_size_);
+
+        for (size_t hi = hi_s; hi < hi_e; ++hi) {
+            const uint32_t lr         = hits[hi].local_row;
+            const uint32_t global_pos = fi * frame_sz_ + lr;
+            for (uint32_t ki = 0; ki < nk; ++ki) {
+                const size_t gj = static_cast<size_t>(ki) * frame_n + lr;
+                SketchResult r{};
+                r.sig           = sigs1 + gj * sketch_size_;
+                r.sig2          = sigs2 + gj * sketch_size_;
+                r.mask          = msks  + gj * mask_words_;
+                r.n_real_bins   = nrb[gj];
+                r.mask_words    = mask_words_;
+                r.genome_length = genome_lengths_[global_pos];
+                r.sketch_size   = sketch_size_;
+                r.kmer_size     = kmer_sizes_[ki];
+                auto sliced = apply_slice(r, sz, mask_words_);
+                if (sliced) cb(hits[hi].orig_idx, ki, *sliced);
+            }
         }
     }
 }

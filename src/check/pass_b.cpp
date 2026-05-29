@@ -1,4 +1,8 @@
 #include "pass_b.hpp"
+#include "tnf.hpp"
+#include <genopack/markers.hpp>
+#include <genopack/metamer.hpp>
+#include <genopack/score_bin.hpp>
 #include <genopack/gcov.hpp>
 #include <genopack/qual.hpp>
 #include <genopack/util.hpp>
@@ -9,6 +13,7 @@
 #include <omp.h>
 #include <spdlog/spdlog.h>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 namespace genopack::check {
@@ -75,17 +80,15 @@ struct TnfTables {
 };
 static const TnfTables kTnfTables;
 
-bool compute_tnf(std::string_view seq, Eigen::VectorXf& out) {
+// Stack-array overload: writes 136 normalized floats into caller-provided storage.
+bool compute_tnf(std::string_view seq, float out[136]) {
     if (seq.size() < 5000) return false;
-    out = Eigen::VectorXf::Zero(136);
+    std::fill(out, out + 136, 0.0f);
 
     const uint8_t* b2b = kTnfTables.base2bit.data();
     uint32_t counts[256] = {};
 
-    // Rolling 2-bit index: one lookup + shift/or/mask per base instead of 4 lookups.
-    // Reset window on any N/ambiguous base.
-    uint32_t idx   = 0;
-    uint32_t valid = 0; // consecutive valid bases in current window
+    uint32_t idx = 0, valid = 0;
     for (size_t i = 0; i < seq.size(); ++i) {
         uint8_t bits = b2b[static_cast<uint8_t>(seq[i])];
         if (bits == 0xFF) { valid = 0; idx = 0; continue; }
@@ -98,9 +101,11 @@ bool compute_tnf(std::string_view seq, Eigen::VectorXf& out) {
     for (int i = 0; i < 256; ++i)
         out[canon[i]] += static_cast<float>(counts[i]);
 
-    float norm = out.norm();
+    float norm_sq = 0.0f;
+    for (int i = 0; i < 136; ++i) norm_sq += out[i] * out[i];
+    const float norm = std::sqrt(norm_sq);
     if (norm < 1e-8f) return false;
-    out /= norm;
+    for (int i = 0; i < 136; ++i) out[i] /= norm;
     return true;
 }
 
@@ -113,21 +118,30 @@ void run_pass_b(ICheckReader& pack,
                 int threads,
                 const std::unordered_map<uint64_t, QualRecord>* qual_cache)
 {
+    // needs_full_analysis: completeness or leakage triggered — run mixture+Fiedler window model.
+    // tnf-only flagged genomes skip the expensive PCA/GMM pass (skip_mixture=true).
     std::vector<std::string> flagged;
+    std::unordered_set<std::string> needs_full_set;
     flagged.reserve(pass_a.accessions.size() / 10);
     for (const auto& acc : pass_a.accessions) {
         auto it = quality.find(acc);
         if (it == quality.end()) continue;
         const auto& q = it->second;
-        bool needs_b = (q.contamination_leakage > cfg.contamination_flag_threshold) ||
-                       (q.contamination_tnf_excess  > cfg.tnf_flag_threshold)        ||
-                       (!std::isnan(q.completeness_cluster_relative) &&
-                        q.completeness_cluster_relative < cfg.completeness_flag_threshold);
-        if (needs_b) flagged.push_back(acc);
+        const bool by_leakage     = q.contamination_leakage > cfg.contamination_flag_threshold;
+        const bool by_tnf         = q.contamination_tnf_excess > cfg.tnf_flag_threshold;
+        const bool by_completeness = !std::isnan(q.completeness_cluster_relative) &&
+                                     q.completeness_cluster_relative < cfg.completeness_flag_threshold;
+        if (by_leakage || by_tnf || by_completeness) {
+            flagged.push_back(acc);
+            if (by_leakage || by_completeness)
+                needs_full_set.insert(acc);
+        }
     }
 
     if (flagged.empty()) return;
     spdlog::info("check pass-B: {} genomes flagged for FASTA-level analysis", flagged.size());
+
+    const FmhrReader* fmhr_rd = pack.fmhr_reader();
 
     // Serve from QUAL cache where both skew and post-decontam scores are precomputed.
     std::vector<std::string> to_scan;
@@ -139,14 +153,29 @@ void run_pass_b(ICheckReader& pack,
             auto it = qual_cache->find(meta->genome_id);
             if (it == qual_cache->end()) { to_scan.push_back(acc); continue; }
             const QualRecord& r = it->second;
+            const bool has_build_signals = (r.qual_flags & QualRecord::QUAL_FLAG_BUILD_SIGNALS) != 0;
+            const bool has_gcov_scored   = (r.qual_flags & QualRecord::QUAL_FLAG_GCOV_SCORED)   != 0;
             if (std::isnan(r.chromosome_skew_closure) || std::isnan(r.completeness_post_decontam) ||
-                r.self_coherence == 0.0f) {
+                (!has_build_signals && r.self_coherence == 0.0f) ||
+                (fmhr_rd && r.fmh_minority_u8 == 0 && !std::isnan(r.chromosome_skew_closure)) ||
+                (!cfg.markers_path.empty() && r.marker_completeness_u8 == 0) ||
+                !has_gcov_scored) {
                 to_scan.push_back(acc); continue;
             }
             auto& q = quality.at(acc);
             q.chromosome_skew_closure    = r.chromosome_skew_closure;
             q.completeness_post_decontam = r.completeness_post_decontam;
             q.self_coherence             = r.self_coherence;
+            q.chargaff_parity            = r.chargaff_parity;
+            q.spectral_gap               = r.spectral_gap;
+            q.scale_kink                 = r.scale_kink;
+            q.fmh_minority_fraction      = r.fmh_minority_u8 / 255.0f;
+            if (r.marker_completeness_u8 > 0)
+                q.marker_completeness = (r.marker_completeness_u8 - 1) / 254.0f;
+            q.contamination_contig_outlier  = r.contig_outlier_u8  / 255.0f;
+            q.contamination_spe             = r.spe_outlier_u8     / 255.0f;
+            q.contamination_sibling_outlier = r.sibling_outlier_u8 / 255.0f;
+            q.contamination_rho_outlier     = r.rho_outlier_u8     / 255.0f;
         }
         if (to_scan.empty()) {
             spdlog::info("check pass-B: complete — all scores from QUAL cache");
@@ -158,19 +187,20 @@ void run_pass_b(ICheckReader& pack,
         to_scan = std::move(flagged);
     }
 
+    // Build acc→genus map once; reused for centroid accumulation and per-genome lookup.
+    std::unordered_map<std::string, std::string> flagged_genus;
+    for (const auto& [genus, members] : pass_a.genus_members)
+        for (const auto& acc : members)
+            flagged_genus[acc] = genus;
+
     std::unordered_map<std::string, Eigen::VectorXf> genus_centroid;
     {
-        std::unordered_map<std::string, std::string> acc_to_genus;
-        for (const auto& [genus, members] : pass_a.genus_members)
-            for (const auto& acc : members)
-                acc_to_genus[acc] = genus;
-
         std::unordered_map<std::string, std::pair<Eigen::VectorXf, int>> sums;
         for (const auto& acc : pass_a.accessions) {
             const float* p = pack.kmer_profile_by_accession(acc);
             if (!p) continue;
-            auto git = acc_to_genus.find(acc);
-            if (git == acc_to_genus.end()) continue;
+            auto git = flagged_genus.find(acc);
+            if (git == flagged_genus.end()) continue;
             const std::string& genus = git->second;
             auto& [sum, cnt] = sums[genus];
             if (cnt == 0) sum = Eigen::VectorXf::Zero(136);
@@ -185,10 +215,67 @@ void run_pass_b(ICheckReader& pack,
         }
     }
 
-    std::unordered_map<std::string, std::string> flagged_genus;
-    for (const auto& [genus, members] : pass_a.genus_members)
+    std::unordered_map<std::string, std::string> flagged_family;
+    for (const auto& [family, members] : pass_a.family_members)
         for (const auto& acc : members)
-            flagged_genus[acc] = genus;
+            flagged_family[acc] = family;
+
+    // Pre-build family → GSTX candidate entries for containment split.
+    const GstxReader* gstx_rd = pack.gstx_reader();
+    std::unordered_map<std::string, std::vector<const GstxEntry*>> family_gstx_candidates;
+    if (gstx_rd) {
+        for (const auto& [family, genera] : pass_a.family_to_genera) {
+            auto& candidates = family_gstx_candidates[family];
+            for (const auto& genus_name : genera) {
+                const GstxEntry* ge = pack.gstx_for_genus(genus_name);
+                if (ge && ge->genus_hash != 0 && ge->n_k_stored > 0)
+                    candidates.push_back(ge);
+            }
+        }
+    }
+
+    // Pre-cache FmhrView for each unique genus (zero-copy pointers into mmap'd FMHR section).
+    // Also cache candidate refs per family = all genera in that family with valid FMHR entries.
+    std::unordered_map<std::string, FmhrView> fmhr_host_cache;
+    std::unordered_map<std::string, std::vector<FmhrView>> fmhr_family_candidates;
+    if (fmhr_rd) {
+        for (const auto& [acc, genus] : flagged_genus) {
+            if (fmhr_host_cache.count(genus)) continue;
+            auto v = pack.fmhr_for_genus(genus);
+            if (v.valid()) fmhr_host_cache[genus] = v;
+        }
+        for (const auto& [family, genera] : pass_a.family_to_genera) {
+            auto& cands = fmhr_family_candidates[family];
+            for (const auto& g : genera) {
+                auto v = pack.fmhr_for_genus(g);
+                if (v.valid()) cands.push_back(v);
+            }
+        }
+        spdlog::info("check pass-B: FMHR cache: {} host genera, {} families with candidates",
+                     fmhr_host_cache.size(), fmhr_family_candidates.size());
+    }
+
+    // Open marker panel (read-only, mmap — safe for concurrent reads across all threads).
+    std::unique_ptr<MarkerReader> mrk_rd;
+    if (!cfg.markers_path.empty()) {
+        mrk_rd = std::make_unique<MarkerReader>();
+        try {
+            mrk_rd->open(cfg.markers_path);
+            spdlog::info("check pass-B: marker panel: {} bac + {} arc, {} lineages",
+                         mrk_rd->n_bac(), mrk_rd->n_arc(), mrk_rd->n_lineages());
+        } catch (const std::exception& ex) {
+            spdlog::warn("check pass-B: cannot open markers ({}); skipping marker scoring", ex.what());
+            mrk_rd.reset();
+        }
+    }
+    if (mrk_rd && mrk_rd->is_open()) {
+        mrk_rd->build_merged_pool();
+        spdlog::info("check pass-B: merged pool: {} M bac + {} M arc hashes",
+                     mrk_rd->merged_hashes_bac().size() / 1'000'000,
+                     mrk_rd->merged_hashes_arc().size() / 1'000'000);
+    }
+
+    const uint64_t mrk_frac_max = mrk_rd ? mrk_rd->frac_max_hash() : UINT64_MAX;
 
     // N parallel reader threads each own an independent fd and sequential shard band.
     // Callback is invoked concurrently; quality_mtx guards shared state.
@@ -244,6 +331,14 @@ void run_pass_b(ICheckReader& pack,
                     if (ge && (ge->flags & GCOV_FLAG_VALID)) gcov_entry = ge;
                 }
 
+                const GcovReader* fcov_rd    = pack.fcov_reader();
+                const GcovEntry*  fcov_entry = nullptr;
+                auto fit = flagged_family.find(acc);
+                if (fit != flagged_family.end() && fcov_rd) {
+                    const GcovEntry* fe = pack.fcov_for_family(fit->second);
+                    if (fe && (fe->flags & GCOV_FLAG_VALID)) fcov_entry = fe;
+                }
+
                 std::vector<ContigFlag> flags;
                 uint32_t byte_offset    = 0;
                 uint32_t clean_len      = 0;
@@ -251,6 +346,18 @@ void run_pass_b(ICheckReader& pack,
                 uint32_t gcov_out_bp    = 0;
                 uint32_t gcov_scored_bp = 0;
                 uint32_t spe_out_bp     = 0;
+                uint32_t sibling_out_bp = 0;
+                uint32_t rho_out_bp     = 0;
+
+                // Per-genome TNF cache: keeps computed TNF alive for compute_all_signals overload.
+                // Thread-local to avoid per-genome allocation.
+                thread_local std::vector<std::array<float,136>> tnf_cache;
+                tnf_cache.clear();
+                tnf_cache.reserve(contigs.size());
+                // Build ContigAccum for fused compute_all_signals (eliminates raw FASTA re-scan).
+                thread_local std::vector<ContigAccum> accum_contigs;
+                accum_contigs.clear();
+                accum_contigs.reserve(contigs.size());
 
                 // When no genus centroid is available, all tnf_scores are NaN →
                 // every contig counts as clean → completeness_post_decontam = 1.0.
@@ -262,8 +369,11 @@ void run_pass_b(ICheckReader& pack,
                         byte_offset += clen;
                         clean_len   += clen;
                         total_len   += clen;
+                        accum_contigs.push_back({contig.seq, nullptr, clen});
                     }
                 } else {
+                    // Hoist centroid norm — constant across all contigs for this genome.
+                    const float norm_c = centroid->norm();
                     flags.reserve(contigs.size());
                     for (const auto& contig : contigs) {
                         ContigFlag cf;
@@ -273,11 +383,19 @@ void run_pass_b(ICheckReader& pack,
                         total_len   += cf.contig_length;
 
                         if (contig.seq.size() >= 5000) {
-                            Eigen::VectorXf tnf;
+                            // Stack-allocated TNF stored in per-genome cache for compute_all_signals.
+                            tnf_cache.push_back({});
+                            float* tnf = tnf_cache.back().data();
                             if (compute_tnf(contig.seq, tnf)) {
-                                Eigen::VectorXf d = tnf - *centroid;
-                                float norm_c = centroid->norm();
-                                cf.tnf_score = (norm_c > 1e-8f) ? d.norm() / norm_c : NAN;
+                                accum_contigs.push_back({contig.seq, tnf, cf.contig_length});
+                                // Inline d.norm() — avoids Eigen heap vector for d = tnf - centroid.
+                                float d_norm_sq = 0.0f;
+                                for (int di = 0; di < 136; ++di) {
+                                    float diff = tnf[di] - (*centroid)[di];
+                                    d_norm_sq += diff * diff;
+                                }
+                                cf.tnf_score = (norm_c > 1e-8f)
+                                    ? std::sqrt(d_norm_sq) / norm_c : NAN;
 
                                 if (gcov_entry && gcov_rd && cf.contig_length >= gcov_rd->min_long_bp()) {
                                     float xmu[136];
@@ -291,7 +409,37 @@ void run_pass_b(ICheckReader& pack,
                                     if (t2_out || spe_flag) gcov_out_bp += cf.contig_length;
                                     if (spe_flag)           spe_out_bp  += cf.contig_length;
                                     gcov_scored_bp += cf.contig_length;
+
+                                    // ρ* outlier (independent of TNF covariance model)
+                                    float rho_q[16];
+                                    if (compute_rho(contig.seq, rho_q)) {
+                                        float rho_z[16];
+                                        for (int di2=0;di2<16;++di2) rho_z[di2]=rho_q[di2]-gcov_entry->rho_mean[di2];
+                                        const float rd  = gcov_rho_distance(*gcov_entry, rho_z);
+                                        const float rpc = gcov_rd->rho_percentile(*gcov_entry, rd);
+                                        if (rpc >= cfg.gcov_outlier_percentile) rho_out_bp += cf.contig_length;
+                                    }
+
+                                    // Sibling contamination: genus-outlier but family-inlier
+                                    if ((t2_out || spe_flag) && fcov_entry && fcov_rd) {
+                                        float xmu_fam[136];
+                                        for (int di = 0; di < 136; ++di)
+                                            xmu_fam[di] = tnf[di] - fcov_entry->mu[di];
+                                        const float f_dist = gcov_mahalanobis(*fcov_entry, xmu_fam);
+                                        const float f_pct  = fcov_rd->percentile(*fcov_entry, f_dist);
+                                        const float f_spe  = gcov_spe(*fcov_entry, xmu_fam);
+                                        const float f_spct = fcov_rd->spe_percentile(*fcov_entry, f_spe);
+                                        const bool family_outlier =
+                                            (f_pct  >= cfg.gcov_outlier_percentile) ||
+                                            (f_spct >= cfg.gcov_outlier_percentile);
+                                        if (!family_outlier) sibling_out_bp += cf.contig_length;
+                                    }
                                 }
+                            } else {
+                                // TNF compute failed (degenerate contig) — still include in
+                                // accum_contigs so transitions/chargaff walk sees the sequence.
+                                tnf_cache.pop_back();
+                                accum_contigs.push_back({contig.seq, nullptr, cf.contig_length});
                             }
                         }
 
@@ -311,13 +459,20 @@ void run_pass_b(ICheckReader& pack,
                 // Per-contig outlier detection.
                 // Primary: GCOV archive-calibrated percentile (no self-reference).
                 // Fallback: within-genome median/MAD z-score (when no GCOV entry).
-                float contamination_contig_outlier = NAN;
-                float contamination_spe            = NAN;
+                float contamination_contig_outlier  = NAN;
+                float contamination_spe             = NAN;
+                float contamination_sibling_outlier = NAN;
+                float contamination_rho_outlier     = NAN;
                 if (gcov_entry && gcov_rd && gcov_scored_bp > 0) {
                     contamination_contig_outlier =
                         static_cast<float>(gcov_out_bp) / static_cast<float>(gcov_scored_bp);
                     contamination_spe =
                         static_cast<float>(spe_out_bp) / static_cast<float>(gcov_scored_bp);
+                    contamination_rho_outlier =
+                        static_cast<float>(rho_out_bp) / static_cast<float>(gcov_scored_bp);
+                    if (fcov_entry)
+                        contamination_sibling_outlier =
+                            static_cast<float>(sibling_out_bp) / static_cast<float>(gcov_scored_bp);
                 } else if (centroid) {
                     std::vector<std::pair<float,uint32_t>> scored;
                     for (const auto& cf : flags) {
@@ -349,8 +504,144 @@ void run_pass_b(ICheckReader& pack,
                     }
                 }
 
+                // ── Marker-panel completeness ─────────────────────────────────────────────
+                float marker_completeness = NAN;
+                float marker_redundancy   = NAN;
+                int   marker_n_present = -1, marker_n_expected = -1;
+                if (mrk_rd && mrk_rd->has_merged_pool() && git != flagged_genus.end()) {
+                    const uint64_t genus_hash = GcovWriter::hash_genus(git->second);
+                    auto calib = mrk_rd->lookup_lineage(genus_hash);
+                    if (calib.valid()) {
+                        // Thread-local buffer: one allocation per thread lifetime, no per-genome alloc.
+                        thread_local std::vector<uint64_t> qmers;
+                        qmers.clear();
+                        for (const auto& contig : contigs)
+                            extract_metamers_dna_into(contig.seq, METAMER_K, 8, mrk_frac_max, qmers);
+                        std::sort(qmers.begin(), qmers.end());
+                        qmers.erase(std::unique(qmers.begin(), qmers.end()), qmers.end());
+
+                        const bool is_arc = (calib.header->domain == MRKR_DOMAIN_ARC);
+                        auto mh  = is_arc ? mrk_rd->merged_hashes_arc() : mrk_rd->merged_hashes_bac();
+                        auto mid = is_arc ? mrk_rd->merged_ids_arc()    : mrk_rd->merged_ids_bac();
+                        const uint8_t n_markers = calib.header->n_markers;
+
+                        uint32_t hits[173] = {};
+                        const uint64_t* qp  = qmers.data();
+                        const uint64_t* qpe = qp + qmers.size();
+                        const uint64_t* mhp = mh.data();
+                        const uint8_t*  mip = mid.data();
+                        const uint64_t* mhe = mhp + mh.size();
+                        while (qp != qpe && mhp != mhe) {
+                            if      (*qp < *mhp) ++qp;
+                            else if (*mhp < *qp) { ++mhp; ++mip; }
+                            else                 { hits[*mip]++; ++qp; ++mhp; ++mip; }
+                        }
+
+                        marker_n_present  = 0;
+                        marker_n_expected = 0;
+                        float marker_redundancy_sum = 0.0f;
+                        int   marker_redundancy_n   = 0;
+                        for (uint8_t mi = 0; mi < n_markers; ++mi) {
+                            if (!calib.marker_expected(mi)) continue;
+                            ++marker_n_expected;
+                            const uint32_t thr = static_cast<uint32_t>(calib.slots[mi].null_floor_u16)
+                                               + static_cast<uint32_t>(cfg.marker_min_hits);
+                            if (hits[mi] >= thr) {
+                                ++marker_n_present;
+                                const uint8_t pool_mi = is_arc
+                                    ? static_cast<uint8_t>(mrk_rd->n_bac() + mi)
+                                    : mi;
+                                const uint32_t psz = mrk_rd->pool_n_hashes(pool_mi);
+                                if (psz > 0) {
+                                    marker_redundancy_sum += static_cast<float>(hits[mi])
+                                                           / static_cast<float>(psz);
+                                    ++marker_redundancy_n;
+                                }
+                            }
+                        }
+                        if (marker_n_expected > 0)
+                            marker_completeness = static_cast<float>(marker_n_present)
+                                               / static_cast<float>(marker_n_expected);
+                        if (marker_redundancy_n > 0)
+                            marker_redundancy = marker_redundancy_sum
+                                              / static_cast<float>(marker_redundancy_n);
+                    }
+                }
+
+                // Z-score marker_redundancy against per-genus calibration.
+                float marker_redundancy_z = NAN;
+                if (!std::isnan(marker_redundancy) && mrk_rd && git != flagged_genus.end()) {
+                    const uint64_t genus_hash = GcovWriter::hash_genus(git->second);
+                    const auto* ce = mrk_rd->lookup_redun_calib(genus_hash);
+                    marker_redundancy_z = MarkerReader::redun_zscore(marker_redundancy, ce);
+                }
+
+                // Per-contig containment split against GSTX family-member consensus sketches.
+                float contamination_contig_split = NAN;
+                float contamination_self_outlier = NAN;
+                float fiedler_oph_val            = NAN;
+                float fiedler_tnf_bimod_val      = NAN;
+                float fiedler_tnf_gap_val        = NAN;
+                if (gstx_rd) {
+                    // Gather family candidates (may be empty; minority_fraction needs ≥2).
+                    const std::vector<const GstxEntry*>* candidates_ptr = nullptr;
+                    auto ffit2 = flagged_family.find(acc);
+                    if (ffit2 != flagged_family.end()) {
+                        auto cit = family_gstx_candidates.find(ffit2->second);
+                        if (cit != family_gstx_candidates.end())
+                            candidates_ptr = &cit->second;
+                    }
+                    // Always run for reference-free metrics (self_outlier, Fiedler).
+                    // minority_fraction / contig_split are set only when ≥2 candidates
+                    // (enforced inside score_bin_containment section 1).
+                    {
+                        static const std::vector<const GstxEntry*> empty_cands;
+                        const auto& cands = candidates_ptr ? *candidates_ptr : empty_cands;
+                        std::vector<std::string_view> seqs;
+                        seqs.reserve(contigs.size());
+                        for (const auto& c : contigs) seqs.push_back(c.seq);
+                        uint64_t pgh = 0;
+                        if (git != flagged_genus.end())
+                            pgh = GcovWriter::hash_genus(git->second);
+                        auto csr = score_bin_containment(seqs, pgh, cands, *gstx_rd);
+                        contamination_contig_split = csr.minority_fraction;
+                        contamination_self_outlier = csr.self_outlier_fraction;
+                        fiedler_oph_val            = csr.fiedler_oph;
+                        fiedler_tnf_bimod_val      = csr.fiedler_tnf_bimod;
+                        fiedler_tnf_gap_val        = csr.fiedler_tnf_gap;
+                    }
+                }
+
+                // FMH minority fraction: zero-copy mmap'd FMHR refs.
+                float fmh_minority = NAN;
+                if (fmhr_rd && git != flagged_genus.end()) {
+                    auto hit = fmhr_host_cache.find(git->second);
+                    if (hit != fmhr_host_cache.end()) {
+                        std::vector<FmhrView> refs;
+                        refs.push_back(hit->second);
+                        auto ffit3 = flagged_family.find(acc);
+                        if (ffit3 != flagged_family.end()) {
+                            auto cit = fmhr_family_candidates.find(ffit3->second);
+                            if (cit != fmhr_family_candidates.end()) {
+                                for (const auto& v : cit->second)
+                                    if (v.genus_hash != hit->second.genus_hash)
+                                        refs.push_back(v);
+                            }
+                        }
+                        if (refs.size() >= 2) {
+                            std::vector<std::string_view> seqs;
+                            seqs.reserve(contigs.size());
+                            for (const auto& c : contigs) seqs.push_back(c.seq);
+                            fmh_minority = score_bin_fmh_containment(
+                                seqs, hit->second.genus_hash, refs, 21, 125);
+                        }
+                    }
+                }
+
                 {
-                    AllSignals sig = compute_all_signals(eg.fasta, 5000, 16384, 5);
+                    const bool skip_mix = (needs_full_set.find(acc) == needs_full_set.end());
+                    AllSignals sig = compute_all_signals(
+                        std::span<const ContigAccum>(accum_contigs), 5000, 16384, 5, skip_mix);
 
                     std::lock_guard<std::mutex> lk(quality_mtx);
                     auto& q = quality.at(acc);
@@ -366,6 +657,19 @@ void run_pass_b(ICheckReader& pack,
                     q.fiedler_value                   = sig.fiedler_value;
                     q.contamination_contig_outlier    = contamination_contig_outlier;
                     q.contamination_spe               = contamination_spe;
+                    q.contamination_sibling_outlier   = contamination_sibling_outlier;
+                    q.contamination_rho_outlier       = contamination_rho_outlier;
+                    q.contamination_contig_split      = contamination_contig_split;
+                    q.contamination_self_outlier      = contamination_self_outlier;
+                    q.fiedler_oph_split               = fiedler_oph_val;
+                    q.fiedler_tnf_bimod               = fiedler_tnf_bimod_val;
+                    q.fiedler_tnf_gap                 = fiedler_tnf_gap_val;
+                    q.fmh_minority_fraction           = fmh_minority;
+                    q.marker_completeness             = marker_completeness;
+                    q.marker_redundancy               = marker_redundancy;
+                    q.marker_redundancy_z             = marker_redundancy_z;
+                    q.marker_n_present                = marker_n_present;
+                    q.marker_n_expected               = marker_n_expected;
 
                     if (sig.mix_no_data)
                         q.qual_flags |= QualRecord::QUAL_FLAG_MIX_NO_DATA;

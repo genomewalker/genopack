@@ -10,7 +10,7 @@ using namespace genopack;
 int main() {
     using namespace genopack_test;
 
-    const std::string anchor_seq = make_sequence("ACGTTGCA", 220000);
+    const std::string anchor_seq = make_random_sequence(0xdeadbeef, 220000);
     const std::string query_seq  = mutate_every(anchor_seq, 101);
 
     FastaComponents anchor_fc;
@@ -50,20 +50,22 @@ int main() {
     write_fasta(tmp.path / "r5.fa", "r5", related_tail);
     write_fasta(tmp.path / "mem.fa", "mem", mem_delta_candidate);
     write_fasta(tmp.path / "plain.fa", "plain", fallback_candidate);
+    // Panel selection picks indices {0,1,3,5,7} for n=8,n_ref=5.
+    // ACC_MEM must land at a non-panel position (2, 4, or 6) to be delta-encoded.
     write_tsv(tmp.path / "input.tsv", {
-        {"ACC_R0", tmp.path / "r0.fa"},
-        {"ACC_R1", tmp.path / "r1.fa"},
-        {"ACC_R2", tmp.path / "r2.fa"},
-        {"ACC_R3", tmp.path / "r3.fa"},
-        {"ACC_R4", tmp.path / "r4.fa"},
-        {"ACC_MEM", tmp.path / "mem.fa"},
-        {"ACC_PLAIN", tmp.path / "plain.fa"},
-        {"ACC_R5", tmp.path / "r5.fa"},
+        {"ACC_R0",    tmp.path / "r0.fa"},      // 0 (panel)
+        {"ACC_R1",    tmp.path / "r1.fa"},      // 1 (panel)
+        {"ACC_MEM",   tmp.path / "mem.fa"},     // 2 (non-panel → MEM-delta)
+        {"ACC_R2",    tmp.path / "r2.fa"},      // 3 (panel)
+        {"ACC_PLAIN", tmp.path / "plain.fa"},   // 4 (non-panel)
+        {"ACC_R3",    tmp.path / "r3.fa"},      // 5 (panel)
+        {"ACC_R4",    tmp.path / "r4.fa"},      // 6 (non-panel)
+        {"ACC_R5",    tmp.path / "r5.fa"},      // 7 (panel)
     });
 
     const std::string bin = GENOPACK_BIN;
     run_checked(shell_quote(bin) + " build -i " + shell_quote((tmp.path / "input.tsv").string()) +
-                " -o " + shell_quote((tmp.path / "db.gpk").string()) + " --mem-delta --no-hnsw");
+                " -o " + shell_quote((tmp.path / "db.gpk").string()) + " --mem-delta --no-sketch");
 
     ArchiveReader ar;
     ar.open(tmp.path / "db.gpk");

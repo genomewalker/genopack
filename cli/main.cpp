@@ -1,3 +1,13 @@
+#include "check/run_check.hpp"
+#include "bench/bench_grid.hpp"
+#include <genopack/markers_build.hpp>
+#include <genopack/markers.hpp>
+#include <genopack/metamer.hpp>
+#include <genopack/gcov.hpp>
+#include <fstream>
+#include <limits>
+#include "calibrate/calibrate.hpp"
+#include <genopack/build_genus_stats.hpp>
 #include <genopack/accx.hpp>
 #include <genopack/archive.hpp>
 #include <genopack/archive_set_reader.hpp>
@@ -10,6 +20,7 @@
 #include <genopack/checksum.hpp>
 #include <genopack/format.hpp>
 #include <genopack/gidx.hpp>
+#include <genopack/qual.hpp>
 #include <genopack/kmrx.hpp>
 #include <genopack/merger.hpp>
 #include <genopack/mmap_file.hpp>
@@ -48,13 +59,16 @@ static int cmd_build(const std::string& input_tsv, const std::string& output_dir
                      bool no_cidx, bool use_2bit, bool kmer_nn_sort,
                      bool taxonomy_group, const std::string& taxonomy_rank,
                      bool sketch, int sketch_kmer, int sketch_size, int sketch_syncmer,
-                     std::vector<int> sketch_kmers = {}) {
+                     std::vector<int> sketch_kmers = {},
+                     bool no_gstx = false,
+                     std::string markers_path = {}) {
     ArchiveBuilder::Config cfg;
     const bool explicit_codec = no_dict || ref_dict || delta || mem_delta;
     cfg.io_threads                        = static_cast<size_t>(std::max(1, threads));
     cfg.shard_cfg.compress_threads        = static_cast<size_t>(std::max(1, threads));
     cfg.verbose                           = verbose;
     cfg.build_cidx                        = !no_cidx;
+    cfg.build_gstx                        = !no_gstx;
     cfg.shard_cfg.zstd_level              = zstd_level;
     cfg.shard_cfg.auto_codec              = !explicit_codec;
     cfg.shard_cfg.train_dict              = false;
@@ -75,6 +89,7 @@ static int cmd_build(const std::string& input_tsv, const std::string& output_dir
         cfg.sketch_kmer_sizes = sketch_kmers;
         cfg.sketch_kmer_size  = sketch_kmers[0];
     }
+    cfg.markers_path = markers_path;
 
     if (n_parallel <= 1) {
         // Single-process build
@@ -590,7 +605,9 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
                        int skch_kmer, int skch_size, int skch_syncmer,
                        std::vector<int> skch_kmers = {},
                        bool skip_gidx = false,
-                       int repack_threads = 16) {
+                       int repack_threads = 16,
+                       bool build_gstx = false,
+                       bool build_qual = true) {
     (void)repack_threads;
     // Resolve .gpk path
     std::filesystem::path gpk = archive_path;
@@ -628,13 +645,23 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
     bool need_cidx = !cidx_tsv.empty() && (!has_cidx || force);
     bool need_skch = build_skch;
 
-    if (!need_gidx && !need_txdb && !need_cidx && !need_skch) {
+    bool has_gstx_sec = !toc.find_by_type(SEC_GSTX).empty();
+    bool need_gstx_check = build_gstx && (!has_gstx_sec || force);
+    bool has_qual_sec = !toc.find_by_type(SEC_QUAL).empty();
+    bool need_qual_check = build_qual && build_gstx && (!has_qual_sec || force);
+    bool need_metabundle = (tail->meta_bundle_offset() == 0);
+
+    if (!need_gidx && !need_txdb && !need_cidx && !need_skch && !need_gstx_check && !need_qual_check && !need_metabundle) {
         spdlog::info("GIDX: already present (use --force to rebuild)");
         if (build_txdb) spdlog::info("TXDB: already present (use --force to rebuild)");
         if (!cidx_tsv.empty()) spdlog::info("CIDX: already present (use --force to rebuild)");
+        if (build_gstx) spdlog::info("GSTX: already present (use --force to rebuild)");
+        if (build_qual) spdlog::info("QUAL: already present (use --force to rebuild)");
         spdlog::info("Nothing to do");
         return 0;
     }
+    if (need_metabundle)
+        spdlog::info("MetaBundle: missing — will inject after reindex");
 
     // ── Build GIDX ──────────────────────────────────────────────────────────
 
@@ -1056,12 +1083,295 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
         }
     }
 
+    // ── Build GSTX (genus sketch stats) + QUAL (per-genome quality) ─────────────
+    GstxWriter gstx_writer_new;
+    QualWriter qual_writer_new;
+    bool need_gstx = false;
+    bool need_qual = false;
+    if (need_gstx_check || need_qual_check) {
+        if (toc.find_by_type(SEC_SKCH).empty()) {
+            spdlog::warn("GSTX: no SKCH section — run reindex --skch first");
+        } else if (toc.find_by_type(SEC_TAXN).empty()) {
+            spdlog::warn("GSTX: no TAXN section found");
+        } else {
+            // Open a fresh ArchiveReader (its own mmap; the existing mmap above stays open)
+            ArchiveReader ar;
+            ar.open(gpk);
+
+            const std::vector<uint32_t> avail_k = ar.available_sketch_kmer_sizes();
+            const uint32_t sk_sz = ar.sketch_sketch_size();
+            const int nk = static_cast<int>(avail_k.size());
+
+            if (nk == 0 || sk_sz == 0 || sk_sz != GSTX_BINS) {
+                spdlog::warn("GSTX: sketch_size={} != GSTX_BINS={} — skipping", sk_sz, GSTX_BINS);
+            } else {
+                // acc→gid
+                std::unordered_map<std::string, GenomeId> acc_to_gid;
+                ar.scan_genome_accessions([&](std::string_view acc, GenomeId gid) {
+                    acc_to_gid.emplace(acc, gid);
+                });
+
+                // genus→members
+                struct GMember { GenomeId gid; std::string acc; };
+                std::vector<std::string>                      genus_keys;
+                std::unordered_map<std::string, size_t>       genus_idx_map;
+                std::vector<std::vector<GMember>>             genus_members;
+                genus_keys.reserve(65536);
+                genus_members.reserve(65536);
+
+                ar.scan_taxonomy([&](std::string_view acc, std::string_view tax) {
+                    constexpr std::string_view needle = ";g__";
+                    std::string_view gsv;
+                    auto pos = tax.find(needle);
+                    if (pos != std::string_view::npos) {
+                        auto s = pos + 1;
+                        auto e = tax.find(';', s);
+                        gsv = tax.substr(s, e == std::string_view::npos ? e : e - s);
+                    } else if (tax.starts_with("g__")) {
+                        auto e = tax.find(';', 3);
+                        gsv = tax.substr(0, e);
+                    }
+                    if (gsv.empty() || gsv == "g__") return;
+                    auto it = acc_to_gid.find(std::string(acc));
+                    if (it == acc_to_gid.end() || it->second == 0) return;
+                    std::string gkey(gsv);
+                    auto git = genus_idx_map.find(gkey);
+                    if (git == genus_idx_map.end()) {
+                        size_t idx = genus_keys.size();
+                        genus_idx_map[gkey] = idx;
+                        genus_keys.push_back(gkey);
+                        genus_members.emplace_back();
+                        git = genus_idx_map.find(gkey);
+                    }
+                    genus_members[git->second].push_back({it->second, std::string(acc)});
+                });
+
+                const size_t n_genera = genus_keys.size();
+                spdlog::info("GSTX: {} genera, k=[{}], sketch_sz={}",
+                             n_genera, [&]{ std::string s; for (size_t i=0;i<avail_k.size();++i){if(i)s+=',';s+=std::to_string(avail_k[i]);}return s;}(), sk_sz);
+
+                // Sort each genus by gid for sequential SKCH access
+                for (auto& members : genus_members)
+                    std::sort(members.begin(), members.end(),
+                              [](const GMember& a, const GMember& b) { return a.gid < b.gid; });
+
+                // Dense re-index: only genera with ≥2 members get cand/vcnt/conts slots.
+                // Singletons are skipped in GSTX/QUAL output anyway; allocating for them
+                // was the source of the 100+ GB peak RSS.
+                std::vector<size_t> multi_gi; // genus_members indices with size ≥ 2
+                multi_gi.reserve(n_genera / 4);
+                for (size_t gi = 0; gi < n_genera; ++gi)
+                    if (genus_members[gi].size() >= 2) multi_gi.push_back(gi);
+                const size_t n_multi = multi_gi.size();
+
+                // gid → dense multi-genus index (singletons absent → ignored in callbacks)
+                std::unordered_map<GenomeId, size_t> gid_to_gi;
+                gid_to_gi.reserve(acc_to_gid.size());
+                for (size_t mgi = 0; mgi < n_multi; ++mgi)
+                    for (const auto& m : genus_members[multi_gi[mgi]])
+                        gid_to_gi[m.gid] = mgi;
+
+                // Only feed multi-genus gids to sketch_for_ids (saves I/O + memory)
+                std::vector<GenomeId> all_sorted_gids;
+                all_sorted_gids.reserve(gid_to_gi.size());
+                for (const auto& [gid, mgi] : gid_to_gi) all_sorted_gids.push_back(gid);
+                std::sort(all_sorted_gids.begin(), all_sorted_gids.end());
+
+                // cand/vcnt only for multi-member genera.
+                // vcnt uses int8_t: BM voting only needs sign, not magnitude (4× smaller).
+                std::vector<std::vector<std::vector<uint16_t>>> cand(
+                    n_multi, std::vector<std::vector<uint16_t>>(nk, std::vector<uint16_t>(sk_sz, 0)));
+                std::vector<std::vector<std::vector<int8_t>>> vcnt(
+                    n_multi, std::vector<std::vector<int8_t>>(nk, std::vector<int8_t>(sk_sz, 0)));
+
+                // Pass 1: Boyer-Moore consensus — fused multi-k, one sequential scan
+                ar.sketch_for_ids_multi_k(all_sorted_gids, sk_sz,
+                    [&](size_t bidx, uint32_t ki, const SketchResult& sk) {
+                        auto it = gid_to_gi.find(all_sorted_gids[bidx]);
+                        if (it == gid_to_gi.end()) return;
+                        const size_t mgi = it->second;
+                        auto& c = cand[mgi][ki];
+                        auto& v = vcnt[mgi][ki];
+                        for (uint32_t b = 0; b < sk_sz; ++b) {
+                            if (v[b] == 0)             { c[b] = sk.sig[b]; v[b] = 1; }
+                            else if (sk.sig[b]==c[b])  { if (v[b] < 127) ++v[b]; }
+                            else                       { --v[b]; }
+                        }
+                    }, 1);
+                spdlog::info("GSTX: pass-1 done ({} k values fused)", nk);
+                { decltype(vcnt) tmp; tmp.swap(vcnt); } // free vote counts — no longer needed
+
+                ar.release_sketches(); // drop pass-1 SKCH pages before pass-2
+
+                // Pass 2: containment vs consensus → p90 per multi-genus per k
+                const bool have_kmrx = ar.kmer_profile(all_sorted_gids[0]) != nullptr;
+                std::vector<std::vector<std::vector<float>>> conts(
+                    n_multi, std::vector<std::vector<float>>(nk));
+                for (size_t mgi = 0; mgi < n_multi; ++mgi)
+                    for (int ki = 0; ki < nk; ++ki)
+                        conts[mgi][ki].reserve(genus_members[multi_gi[mgi]].size());
+
+                // Pass 2: containment vs consensus — fused multi-k, one sequential scan
+                ar.sketch_for_ids_multi_k(all_sorted_gids, sk_sz,
+                    [&](size_t bidx, uint32_t ki, const SketchResult& sk) {
+                        auto it = gid_to_gi.find(all_sorted_gids[bidx]);
+                        if (it == gid_to_gi.end()) return;
+                        const size_t mgi = it->second;
+                        uint32_t matches = 0;
+                        const auto& c = cand[mgi][ki];
+                        for (uint32_t b = 0; b < sk_sz; ++b)
+                            if (sk.sig[b] == c[b]) ++matches;
+                        conts[mgi][ki].push_back(
+                            static_cast<float>(matches) / static_cast<float>(sk_sz));
+                    }, 1);
+                spdlog::info("GSTX: pass-2 done ({} k values fused)", nk);
+
+                ar.release_sketches(); // drop pass-2 SKCH pages before TNF scan
+
+                // Feed GstxWriter: p90 + TNF centroid + consensus
+                for (size_t mgi = 0; mgi < n_multi; ++mgi) {
+                    const size_t gi = multi_gi[mgi];
+                    const auto& members = genus_members[gi];
+
+                    std::vector<float> p90(nk, 0.0f);
+                    for (int ki = 0; ki < nk; ++ki) {
+                        auto cv = conts[mgi][ki];
+                        if (cv.empty()) continue;
+                        std::sort(cv.begin(), cv.end());
+                        size_t idx = static_cast<size_t>(
+                            std::ceil(0.9f * static_cast<float>(cv.size())) - 1);
+                        p90[ki] = cv[std::min(idx, cv.size() - 1)];
+                    }
+
+                    std::vector<float> tnf_sum(136, 0.0f);
+                    uint32_t tnf_cnt = 0;
+                    if (have_kmrx) {
+                        for (const auto& m : members) {
+                            const float* p = ar.kmer_profile(m.gid);
+                            if (!p) continue;
+                            for (int d = 0; d < 136; ++d) tnf_sum[d] += p[d];
+                            ++tnf_cnt;
+                        }
+                    }
+                    std::vector<float> tnf_mu(136, 0.0f);
+                    if (tnf_cnt >= 2)
+                        for (int d = 0; d < 136; ++d) tnf_mu[d] = tnf_sum[d] / tnf_cnt;
+
+                    if (need_gstx_check)
+                        gstx_writer_new.add_genus(
+                            genus_keys[gi],
+                            static_cast<uint32_t>(members.size()),
+                            static_cast<uint32_t>(nk),
+                            cand[mgi],
+                            p90.data(),
+                            tnf_cnt >= 2 ? tnf_mu.data() : nullptr,
+                            avail_k.data());
+
+                    if (need_qual_check) {
+                        const float k0 = nk >= 1 ? static_cast<float>(avail_k[0]) : 0.0f;
+                        const float k1 = nk >= 2 ? static_cast<float>(avail_k[1]) : 0.0f;
+                        const float k2 = nk >= 3 ? static_cast<float>(avail_k[2]) : 0.0f;
+                        for (size_t mi = 0; mi < members.size(); ++mi) {
+                            auto qr           = QualRecord::make_empty(members[mi].gid);
+                            qr.support_tier   = 0;
+                            qr.interval_width = 0.05f;
+
+                            auto meta = ar.genome_meta_by_accession(members[mi].acc);
+                            uint32_t nc = meta ? meta->n_contigs : 0;
+                            qr.completeness_fragmentation =
+                                nc <= 1 ? 1.0f
+                                : 1.0f / (1.0f + 0.333f * std::log2f(static_cast<float>(nc)));
+
+                            float cont[GSTX_MAX_K] = {};
+                            for (int ki = 0; ki < nk; ++ki)
+                                if (mi < conts[mgi][ki].size())
+                                    cont[ki] = conts[mgi][ki][mi];
+
+                            if (p90[0] > 0.01f)
+                                qr.completeness_cluster_relative =
+                                    std::clamp(cont[0] / p90[0], 0.0f, 1.5f);
+
+                            if (nk >= 3 && cont[0] >= 0.01f && cont[1] >= 0.01f && cont[2] >= 0.01f) {
+                                const float lc0 = std::log(cont[0]), lc1 = std::log(cont[1]), lc2 = std::log(cont[2]);
+                                const float beta    = (k0*lc0 + k1*lc1 + k2*lc2) / (k0*k0 + k1*k1 + k2*k2);
+                                const float c2_pred = std::exp(beta * k2);
+                                qr.contamination_leakage =
+                                    std::max(0.0f, c2_pred - cont[2]) / std::max(c2_pred, 0.01f);
+                                const float r0=lc0-beta*k0, r1=lc1-beta*k1, r2=lc2-beta*k2;
+                                qr.leakage_residual = std::sqrt((r0*r0 + r1*r1 + r2*r2) / 2.0f);
+                                // sketch_breadth field repurposed → fmh_minority_u8/contig_split_u8 (check-time only)
+                            } else if (nk >= 2 && cont[0] >= 0.01f && cont[1] >= 0.01f) {
+                                const float beta    = (k0*std::log(cont[0]) + k1*std::log(cont[1])) / (k0*k0 + k1*k1);
+                                const float c1_pred = std::exp(beta * k1);
+                                qr.contamination_leakage =
+                                    std::max(0.0f, c1_pred - cont[1]) / std::max(c1_pred, 0.01f);
+                            }
+
+                            if (tnf_cnt >= 2) {
+                                const float* tp = ar.kmer_profile(members[mi].gid);
+                                if (tp) {
+                                    float d2 = 0.0f, norm2 = 0.0f;
+                                    for (int d = 0; d < 136; ++d) {
+                                        float diff = tp[d] - tnf_mu[d];
+                                        d2    += diff * diff;
+                                        norm2 += tnf_mu[d] * tnf_mu[d];
+                                    }
+                                    const float dist = std::sqrt(d2);
+                                    const float ref  = std::sqrt(norm2);
+                                    if (ref > 1e-6f)
+                                        qr.contamination_tnf_excess =
+                                            std::max(0.0f, dist / ref - 1.0f);
+                                }
+                            }
+                            qual_writer_new.add(qr);
+                        }
+                    }
+                }
+
+                { decltype(cand) tmp; tmp.swap(cand); }   // free consensus sketches
+                { decltype(conts) tmp; tmp.swap(conts); } // free containment vectors
+
+                // Singletons: no cluster → NaN for all cluster-derived fields,
+                // but completeness_fragmentation is computable from n_contigs alone.
+                if (need_qual_check) {
+                    for (size_t gi = 0; gi < n_genera; ++gi) {
+                        if (genus_members[gi].size() != 1) continue;
+                        const auto& m = genus_members[gi][0];
+                        auto qr       = QualRecord::make_empty(m.gid);
+                        qr.support_tier   = static_cast<uint8_t>(2); // Singleton
+                        qr.interval_width = 1.0f;
+                        auto meta = ar.genome_meta_by_accession(m.acc);
+                        if (meta) {
+                            uint32_t nc = meta->n_contigs;
+                            qr.completeness_fragmentation =
+                                nc <= 1 ? 1.0f
+                                : 1.0f / (1.0f + 0.333f * std::log2f(static_cast<float>(nc)));
+                        }
+                        qual_writer_new.add(qr);
+                    }
+                }
+
+                if (need_gstx_check) {
+                    need_gstx = true;
+                    spdlog::info("GSTX: {} genera computed", gstx_writer_new.n_genera());
+                }
+                if (need_qual_check && qual_writer_new.size() > 0) {
+                    need_qual = true;
+                    spdlog::info("QUAL: {} genomes computed", qual_writer_new.size());
+                }
+                ar.close(); // drop all mmap pages (KMRX + residual) before write phase
+            }
+        }
+    }
+
     // Copy existing sections into new TocWriter (excluding rebuilt types if --force)
     TocWriter new_toc;
     for (const auto& s : toc.sections) {
         if (force && s.type == SEC_GIDX) continue;
         if (force && need_txdb && s.type == SEC_TXDB) continue;
         if (force && need_cidx && s.type == SEC_CIDX) continue;
+        if (force && need_gstx && s.type == SEC_GSTX) continue;
+        if (force && need_qual && s.type == SEC_QUAL) continue;
         new_toc.add_section(s);
     }
 
@@ -1104,6 +1414,20 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
         new_toc.add_section(skch_sd);
         spdlog::info("SKCH(multi-k): written at offset {}, {} bytes ({} sketches)",
                      skch_sd.file_offset, skch_sd.compressed_size, skch_sd.item_count);
+    }
+
+    if (need_gstx && gstx_writer_new.n_genera() > 0) {
+        SectionDesc gstx_sd = gstx_writer_new.finalize(writer, next_section_id++);
+        new_toc.add_section(gstx_sd);
+        spdlog::info("GSTX: written at offset {}, {} bytes ({} genera)",
+                     gstx_sd.file_offset, gstx_sd.compressed_size, gstx_sd.item_count);
+    }
+
+    if (need_qual && qual_writer_new.size() > 0) {
+        SectionDesc qual_sd = qual_writer_new.finalize(writer, next_section_id++);
+        new_toc.add_section(qual_sd);
+        spdlog::info("QUAL: written at offset {}, {} bytes ({} genomes)",
+                     qual_sd.file_offset, qual_sd.compressed_size, qual_sd.item_count);
     }
 
     // Write new TOC + TailLocator
@@ -1748,6 +2072,8 @@ int main(int argc, char** argv) {
     build->add_flag("--delta",      build_delta,      "Compress non-reference blobs against first genome using zstd prefix");
     build->add_flag("--mem-delta,!--no-mem-delta", build_mem_delta,  "MEM-delta k-mer exact-match encoding (default: on; --no-mem-delta to disable)");
     build->add_flag("--no-cidx,!--cidx",          build_no_cidx,    "Skip CIDX contig index (default: on; --cidx to build it)");
+    bool build_no_gstx = false;
+    build->add_flag("--no-gstx,!--gstx",         build_no_gstx,    "Skip GSTX genus-stats index (default: on; --no-gstx to disable)");
     build->add_flag("--2bit,!--no-2bit",          build_2bit,       "2-bit sequence packing before zstd (default: on; --no-2bit to disable)");
     build->add_flag("--kmer-sort,!--no-kmer-sort",   build_kmer_nn,    "Sort genomes within each shard by kmer4_profile NN chain (default: on; --no-kmer-sort to disable)");
     build->add_flag("--taxon-group,!--no-taxon-group",build_taxon_group,"Group genomes into per-taxon shards (default: on; --no-taxon-group to disable; requires taxonomy column)");
@@ -1758,6 +2084,9 @@ int main(int argc, char** argv) {
     build->add_option("--sketch-size", build_sketch_size, "Number of OPH bins (default: 10000)");
     build->add_option("--sketch-syncmer", build_sketch_syncmer, "Open syncmer prefilter s (0=disabled, -1=auto: s=k/3; default: auto)");
     build->add_flag("-v,--verbose", build_verbose, "Verbose progress");
+    std::string build_markers;
+    build->add_option("--markers", build_markers,
+        "Path to markers.mrk; enables build-time marker completeness scoring (no check re-scan)");
     std::string build_coordinator; // "manifest_dir:output.gpk" or empty
     build->add_option("--coordinator", build_coordinator,
         "NFS manifest coordinator: manifest_dir:/path/to/output.gpk. "
@@ -1790,7 +2119,8 @@ int main(int argc, char** argv) {
                                 build_2bit, build_kmer_nn,
                                 build_taxon_group, build_taxon_rank,
                                 build_sketch, build_sketch_kmer, build_sketch_size,
-                                build_sketch_syncmer, build_sketch_kmers);
+                                build_sketch_syncmer, build_sketch_kmers,
+                                build_no_gstx, build_markers);
             if (rc != 0) std::exit(rc);
             std::string hostname = "worker";
             {
@@ -1818,7 +2148,8 @@ int main(int argc, char** argv) {
                              build_2bit, build_kmer_nn,
                              build_taxon_group, build_taxon_rank,
                              build_sketch, build_sketch_kmer, build_sketch_size,
-                             build_sketch_syncmer, build_sketch_kmers));
+                             build_sketch_syncmer, build_sketch_kmers,
+                             build_no_gstx, build_markers));
     });
 
     // genopack extract
@@ -2557,7 +2888,11 @@ int main(int argc, char** argv) {
     reindex_cmd->add_option("archive", reindex_archive, "Path to .gpk archive")->required();
     reindex_cmd->add_flag("--force", reindex_force, "Rebuild indexes even if already present");
     bool reindex_no_gidx = false;
-    reindex_cmd->add_flag("--no-gidx", reindex_no_gidx, "Skip GIDX build (useful when only --skch is needed and GIDX is absent/unwanted)");
+    reindex_cmd->add_flag("--no-gidx", reindex_no_gidx, "Skip GIDX build");
+    bool reindex_no_gstx = false;
+    reindex_cmd->add_flag("--no-gstx", reindex_no_gstx, "Skip GSTX genus-stats index build");
+    bool reindex_no_qual = false;
+    reindex_cmd->add_flag("--no-qual", reindex_no_qual, "Skip QUAL per-genome quality score build");
     reindex_cmd->add_flag("--txdb", reindex_txdb, "Build taxonomy tree (TXDB) from TAXN lineage strings");
     reindex_cmd->add_option("--cidx", reindex_cidx_tsv, "Build contig accession index (CIDX) from build TSV (accession<TAB>taxonomy<TAB>file_path)");
     reindex_cmd->add_option("--cidx-threads", reindex_cidx_threads, "Threads for parallel FASTA decompression (default: 8)");
@@ -2585,7 +2920,7 @@ int main(int argc, char** argv) {
                               reindex_skch, reindex_skch_threads,
                               reindex_skch_kmer, reindex_skch_size, reindex_skch_syncmer,
                               std::move(reindex_skch_kmers),
-                              reindex_no_gidx));
+                              reindex_no_gidx, 16, !reindex_no_gstx, !reindex_no_qual));
     });
 
     // genopack repack
@@ -2643,6 +2978,263 @@ int main(int argc, char** argv) {
     verify_cmd->add_option("archive", verify_path, "Path to .gpk archive or part directory")->required();
     verify_cmd->add_flag("-v,--verbose", verify_verbose, "Print OK lines for every shard");
     verify_cmd->callback([&]() { std::exit(cmd_verify(verify_path, verify_verbose)); });
+
+    // genopack check
+    auto* check_cmd = app.add_subcommand("check",
+        "Compute per-genome quality scores (completeness, contamination) and write QUAL section.");
+    std::string check_pack;
+    std::string check_genomes;
+    std::string check_output;
+    int check_threads = 8;
+    int check_min_genus_size = 3;
+    float check_leakage_threshold = 0.05f;
+    bool check_recompute = false;
+    check_cmd->add_option("pack", check_pack, "Path to .gpk archive or directory of parts")->required();
+    check_cmd->add_option("-g,--genomes", check_genomes, "Optional accession list (one per line); default: all in pack");
+    check_cmd->add_option("-o,--output", check_output, "TSV output path for quality table");
+    check_cmd->add_option("-t,--threads", check_threads, "Threads (default: 8)");
+    check_cmd->add_option("--min-genus-size", check_min_genus_size, "Min genus members for saturated tier (default: 3)");
+    check_cmd->add_option("--leakage-threshold", check_leakage_threshold, "Containment leakage threshold (default: 0.05)");
+    check_cmd->add_flag("--recompute", check_recompute, "Ignore existing QUAL section and force full rescan");
+    std::string check_markers;
+    check_cmd->add_option("--markers", check_markers, "Path to markers.mrk sidecar for SCG completeness scoring");
+    check_cmd->callback([&]() {
+        std::exit(genopack::check::cmd_check(
+            check_pack,
+            check_genomes.empty() ? std::filesystem::path{} : std::filesystem::path{check_genomes},
+            check_threads,
+            check_min_genus_size,
+            check_leakage_threshold,
+            check_output.empty() ? std::filesystem::path{} : std::filesystem::path{check_output},
+            check_recompute,
+            check_markers.empty() ? std::filesystem::path{} : std::filesystem::path{check_markers}));
+    });
+
+    // genopack gcov
+    auto* gcov_cmd = app.add_subcommand("gcov",
+        "Build (or rebuild) the GCOV per-genus covariance section in an existing .gpk archive.");
+    std::string gcov_pack;
+    int gcov_threads = 8;
+    gcov_cmd->add_option("archive", gcov_pack, "Path to .gpk archive")->required();
+    gcov_cmd->add_option("-t,--threads", gcov_threads, "Parallel shard readers (default: 8)");
+    gcov_cmd->callback([&]() {
+        using namespace genopack;
+        const std::filesystem::path gp(gcov_pack);
+
+        // Single-pass fused build: GCOV + FCOV + FMHR, one shard scan.
+        ArchiveReader ar;
+        ar.open(gp);
+        auto [gcov_w, fcov_w, fmhr_w] = build_gcov_fcov_fmhr(ar, gcov_threads);
+        ar.close();
+
+        if (gcov_w.n_genera() == 0) {
+            spdlog::warn("gcov: no genera found (archive has no TAXN section?)");
+            std::exit(1);
+        }
+
+        // Append all three sections in one open-write-close cycle.
+        MmapFileReader mmap;
+        mmap.open(gp);
+        auto toc_r = TocReader::read(mmap);
+        const auto* tail    = mmap.ptr_at<TailLocator>(mmap.size() - sizeof(TailLocator));
+        const uint64_t prev = tail->toc_offset;
+        const uint64_t gen  = toc_r.header.generation + 1;
+        mmap.close();
+
+        AppendWriter aw;
+        aw.open_append(gp);
+        uint64_t next_sid = toc_r.next_section_id();
+        SectionDesc gcov_sd = gcov_w.finalize(aw, next_sid++);
+        SectionDesc fcov_sd = fcov_w.n_genera() > 0
+            ? fcov_w.finalize(aw, next_sid, SEC_FCOV) : SectionDesc{};
+        ++next_sid;
+        SectionDesc fmhr_sd = fmhr_w.n_genera() > 0
+            ? fmhr_w.finalize(aw, next_sid) : SectionDesc{};
+
+        TocWriter new_toc;
+        for (const auto& sd : toc_r.sections)
+            if (sd.type != SEC_GCOV && sd.type != SEC_FCOV && sd.type != SEC_FMHR)
+                new_toc.add_section(sd);
+        new_toc.add_section(gcov_sd);
+        if (fcov_w.n_genera() > 0) new_toc.add_section(fcov_sd);
+        if (fmhr_w.n_genera() > 0) new_toc.add_section(fmhr_sd);
+        new_toc.finalize(aw, gen,
+                         toc_r.header.live_genome_count,
+                         toc_r.header.total_genome_count,
+                         prev,
+                         toc_r.header.catalog_root_section_id,
+                         toc_r.header.accession_root_section_id,
+                         toc_r.header.tombstone_root_section_id);
+
+        spdlog::info("gcov: {} genera, {} families, {} fmhr genera written to {}",
+                     gcov_w.n_genera(), fcov_w.n_genera(), fmhr_w.n_genera(), gcov_pack);
+        std::exit(0);
+    });
+
+    // genopack calibrate
+    auto* cal_cmd = app.add_subcommand("calibrate",
+        "Fit a completeness calibration model from a genopack archive + CheckM2 ground truth. "
+        "Writes an isotonic+OLS JSON model and prints RMSE and per-decile stats.");
+    std::string cal_archive;
+    std::string cal_checkm2;
+    std::string cal_output  = "calibration.json";
+    int         cal_threads = 8;
+    cal_cmd->add_option("archive", cal_archive,
+        "Path to .gpk archive or directory of parts")->required();
+    cal_cmd->add_option("--checkm2", cal_checkm2,
+        "CheckM2 TSV with completeness/contamination ground truth")->required();
+    cal_cmd->add_option("-o,--output", cal_output,
+        "Output JSON path for calibration model (default: calibration.json)");
+    cal_cmd->add_option("-t,--threads", cal_threads,
+        "Threads (default: 8)");
+    cal_cmd->callback([&]() {
+        std::exit(genopack::calibrate::run_calibrate(
+            cal_archive, cal_checkm2, cal_output, cal_threads));
+    });
+
+    // genopack bench-grid
+    auto* bg_cmd = app.add_subcommand("bench-grid",
+        "Heterogeneous spike-fraction × ANI-distance benchmark from a manifest TSV");
+    std::string bg_archive, bg_manifest, bg_output;
+    int bg_threads = 4, bg_reps = 5;
+    uint32_t bg_seed = 42;
+    bg_cmd->add_option("archive",        bg_archive,    "Archive path (.gpk)")->required();
+    bg_cmd->add_option("-o,--output",    bg_output,     "TSV output path")->required();
+    bg_cmd->add_option("--manifest",     bg_manifest,   "Manifest TSV (host_genus, contam_genus, ani_label, intra_offset)")->required();
+    bg_cmd->add_option("-t,--threads",   bg_threads,    "Thread count");
+    bg_cmd->add_option("-r,--reps",      bg_reps,       "Replicates per cell");
+    bg_cmd->add_option("--seed",         bg_seed,       "Random seed");
+    bg_cmd->callback([&]() {
+        std::exit(genopack::bench::cmd_bench_grid(
+            bg_archive, bg_manifest, bg_output, bg_threads, bg_reps, bg_seed));
+    });
+
+    // genopack markers
+    auto* markers_cmd = app.add_subcommand("markers",
+        "Build or manage the SCG marker metamer panel (.mrk sidecar)");
+    markers_cmd->require_subcommand(1);
+
+    auto* markers_build_cmd = markers_cmd->add_subcommand("build",
+        "Build markers.mrk from GTDB-Tk MSA files (bac120 + ar53)");
+    std::string mb_gtdbtk_db, mb_output;
+    float mb_threshold = 0.30f;
+    int mb_threads = 1;
+    markers_build_cmd->add_option("--gtdbtk-db", mb_gtdbtk_db,
+        "GTDB-Tk reference database root")->required();
+    markers_build_cmd->add_option("-o,--output", mb_output,
+        "Output .mrk file")->required();
+    markers_build_cmd->add_option("--threshold", mb_threshold,
+        "Default presence threshold (default: 0.30)");
+    markers_build_cmd->add_option("-t,--threads", mb_threads,
+        "Thread count (default: 1)");
+    int mb_scale = 1;
+    markers_build_cmd->add_option("--scale", mb_scale,
+        "FracMinHash scale factor: keep 1/N of hashes (default: 1 = keep all)");
+    markers_build_cmd->callback([&]() {
+        genopack::MarkersBuildConfig cfg;
+        cfg.gtdbtk_db         = mb_gtdbtk_db;
+        cfg.output            = mb_output;
+        cfg.default_threshold = mb_threshold;
+        cfg.threads           = mb_threads;
+        cfg.frac_scale        = static_cast<uint16_t>(mb_scale);
+        genopack::build_markers_panel(cfg);
+    });
+
+    // genopack markers score
+    auto* markers_score_cmd = markers_cmd->add_subcommand("score",
+        "Score a FASTA file for SCG marker completeness");
+    std::string ms_fasta, ms_mrk, ms_genus;
+    int ms_min_hits = 1;
+    markers_score_cmd->add_option("--fasta",   ms_fasta,  "Input FASTA file")->required();
+    markers_score_cmd->add_option("--markers", ms_mrk,    "Markers .mrk file")->required();
+    markers_score_cmd->add_option("--genus",   ms_genus,  "Target genus key (e.g. g__Escherichia)")->required();
+    markers_score_cmd->add_option("--min-hits", ms_min_hits, "Min hits per marker to call present (default: 1)");
+    markers_score_cmd->callback([&]() {
+        genopack::MarkerReader mr;
+        mr.open(ms_mrk);
+        if (!mr.is_open()) throw std::runtime_error("cannot open markers: " + ms_mrk);
+        mr.build_merged_pool();
+
+        const uint64_t gh = genopack::GcovWriter::hash_genus(ms_genus);
+        auto calib = mr.lookup_lineage(gh);
+        if (!calib.valid()) {
+            std::cout << "NA\tNA\tNA\n";
+            return;
+        }
+
+        // Read FASTA and extract metamers.
+        std::vector<uint64_t> qmers;
+        qmers.reserve(1 << 16);
+        const uint64_t frac_max = mr.frac_max_hash();
+        {
+            std::ifstream fin(ms_fasta);
+            if (!fin) throw std::runtime_error("cannot open FASTA: " + ms_fasta);
+            std::string line, seq;
+            auto flush_seq = [&]() {
+                if (!seq.empty()) {
+                    auto h = genopack::extract_metamers_dna(seq, genopack::METAMER_K, 8, frac_max);
+                    qmers.insert(qmers.end(), h.begin(), h.end());
+                    seq.clear();
+                }
+            };
+            while (std::getline(fin, line)) {
+                if (!line.empty() && line[0] == '>') flush_seq();
+                else seq += line;
+            }
+            flush_seq();
+        }
+        std::sort(qmers.begin(), qmers.end());
+        qmers.erase(std::unique(qmers.begin(), qmers.end()), qmers.end());
+
+        const bool is_arc = (calib.header->domain == genopack::MRKR_DOMAIN_ARC);
+        auto mh  = is_arc ? mr.merged_hashes_arc() : mr.merged_hashes_bac();
+        auto mid = is_arc ? mr.merged_ids_arc()    : mr.merged_ids_bac();
+        const uint8_t n_markers = calib.header->n_markers;
+
+        uint32_t hits[173] = {};
+        const uint64_t* qp  = qmers.data(),  *qpe = qp  + qmers.size();
+        const uint64_t* mhp = mh.data(),     *mhe = mhp + mh.size();
+        const uint8_t*  mip = mid.data();
+        while (qp != qpe && mhp != mhe) {
+            if      (*qp < *mhp) ++qp;
+            else if (*mhp < *qp) { ++mhp; ++mip; }
+            else                 { hits[*mip]++; ++qp; ++mhp; ++mip; }
+        }
+
+        int n_present = 0, n_expected = 0;
+        for (uint8_t mi = 0; mi < n_markers; ++mi) {
+            if (!calib.marker_expected(mi)) continue;
+            ++n_expected;
+            const uint32_t thr = static_cast<uint32_t>(calib.slots[mi].null_floor_u16)
+                               + static_cast<uint32_t>(ms_min_hits);
+            if (hits[mi] >= thr) ++n_present;
+        }
+        const float completeness = n_expected > 0
+            ? static_cast<float>(n_present) / static_cast<float>(n_expected)
+            : std::numeric_limits<float>::quiet_NaN();
+        float redundancy = std::numeric_limits<float>::quiet_NaN();
+        {
+            float rsum = 0.0f; int rn = 0;
+            for (uint8_t mi = 0; mi < n_markers; ++mi) {
+                if (!calib.marker_expected(mi)) continue;
+                const uint32_t thr = static_cast<uint32_t>(calib.slots[mi].null_floor_u16)
+                                   + static_cast<uint32_t>(ms_min_hits);
+                if (hits[mi] >= thr) {
+                    const bool is_arc2 = (calib.header->domain == genopack::MRKR_DOMAIN_ARC);
+                    const uint8_t pool_mi = is_arc2
+                        ? static_cast<uint8_t>(mr.n_bac() + mi) : mi;
+                    const uint32_t psz = mr.pool_n_hashes(pool_mi);
+                    if (psz > 0) { rsum += static_cast<float>(hits[mi]) / psz; ++rn; }
+                }
+            }
+            if (rn > 0) redundancy = rsum / rn;
+        }
+        auto fmtf = [](float v) -> std::string {
+            return std::isnan(v) ? "NA" : std::to_string(v);
+        };
+        std::cout << fmtf(completeness) << "\t" << fmtf(redundancy)
+                  << "\t" << n_present << "\t" << n_expected << "\n";
+    });
 
     CLI11_PARSE(app, argc, argv);
     return 0;

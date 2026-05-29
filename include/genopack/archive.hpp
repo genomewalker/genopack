@@ -1,6 +1,10 @@
 #pragma once
 #include "types.hpp"
 #include "catalog.hpp"
+#include "fmhr.hpp"
+#include "gcov.hpp"
+#include "gstx.hpp"
+#include "qual.hpp"
 #include "shard.hpp"
 #include "skch.hpp"
 #include "txdb.hpp"
@@ -75,6 +79,12 @@ public:
     void visit_shard_batches(
         const std::vector<std::string>& accessions,
         const std::function<void(ShardBatch&)>& cb) const;
+    // Like visit_shard_batches but uses n_readers independent fds for parallel NFS I/O.
+    // cb may be called concurrently from multiple threads; caller must be thread-safe.
+    void visit_shard_batches_parallel(
+        const std::vector<std::string>& accessions,
+        int n_readers,
+        const std::function<void(ShardBatch&)>& cb) const;
     std::optional<std::string> fetch_sequence_slice_by_accession(std::string_view accession,
                                                                  uint64_t start,
                                                                  uint64_t length) const;
@@ -133,9 +143,19 @@ public:
     // that contain the requested ids. sorted_ids must be sorted ascending.
     // cb(idx_in_sorted_ids, SketchResult) — pointers are valid only during the callback.
     using SketchCallback = SkchReader::SketchCallback;
+    // num_threads=0 → omp_get_max_threads(). Pass 1 for sequential NFS access.
     void sketch_for_ids(const std::vector<GenomeId>& sorted_ids,
                         uint32_t k, uint32_t sz,
-                        const SketchCallback& cb) const;
+                        const SketchCallback& cb,
+                        int num_threads = 0) const;
+
+    // Fused multi-k: one sequential pass yields all k values per genome.
+    // cb(row_idx, ki, result) — ki is index into available_sketch_kmer_sizes().
+    using SketchCallbackMultiK = SkchReader::SketchCallbackMultiK;
+    void sketch_for_ids_multi_k(const std::vector<GenomeId>& sorted_ids,
+                                 uint32_t sz,
+                                 const SketchCallbackMultiK& cb,
+                                 int num_threads = 0) const;
 
     // Release decompressed SKCH buffers to free memory. Sections auto-reload on next sketch_for().
     void release_sketches() const;
@@ -150,6 +170,42 @@ public:
                                               uint64_t offset,
                                               uint64_t compressed_size,
                                               uint32_t shard_id)>& cb) const;
+
+    // GSTX: genus sketch stats index (consensus sig + p90 + TNF centroid per genus).
+    // Built during archive construction; enables O(1) check queries without loading members.
+    bool has_gstx() const;
+    // Returns nullptr if genus not found or no GSTX section present.
+    const GstxEntry* gstx_for_genus(std::string_view genus) const;
+    // k-mer sizes stored in GSTX (same as sketch k-values); empty if no GSTX.
+    std::vector<uint32_t> gstx_kmer_sizes() const;
+    // Raw reader pointer (nullptr if no GSTX section); valid for archive lifetime.
+    const GstxReader* gstx_reader() const;
+
+    // GCOV: per-genus biological covariance eigenbasis + calibrated quantiles.
+    bool has_gcov() const;
+    // Returns nullptr if genus not found or no GCOV section present.
+    const GcovEntry* gcov_for_genus(std::string_view genus) const;
+    // Raw reader pointer (nullptr if no GCOV section); valid for archive lifetime.
+    const GcovReader* gcov_reader() const;
+
+    // FCOV: per-family biological covariance (same layout as GCOV, keyed by family hash).
+    bool has_fcov() const;
+    // Returns nullptr if family not found or no FCOV section present.
+    const GcovEntry* fcov_for_family(std::string_view family) const;
+    // Raw reader pointer (nullptr if no FCOV section); valid for archive lifetime.
+    const GcovReader* fcov_reader() const;
+
+    // FMHR: per-genus FracMinHash reference sketches (k=21, c=125).
+    bool has_fmhr() const;
+    // Returns invalid FmhrView (valid()==false) if genus not found or no FMHR section.
+    FmhrView fmhr_for_genus(std::string_view genus) const;
+    // Raw reader pointer (nullptr if no FMHR section); valid for archive lifetime.
+    const FmhrReader* fmhr_reader() const;
+
+    // QUAL: per-genome quality scores (completeness, contamination, consistency).
+    // Written during build; enables O(1) quality lookup without re-computing.
+    bool has_qual() const;
+    void scan_qual(const std::function<void(const QualRecord&)>& cb) const;
 
     // File descriptor for the underlying mmap (for posix_fadvise).
     int fd() const;
@@ -186,11 +242,15 @@ struct ArchiveBuilderConfig {
     bool     taxonomy_group      = true;   // bucket genomes by taxonomy before shard formation
     std::string taxonomy_rank    = "g";    // "g"=genus, "f"=family; genus with family fallback
     bool     build_sketch        = false;  // compute OPH sketches and write SKCH section
+    bool     build_gstx          = true;   // build GSTX genus-stats index (needs taxonomy_group + build_sketch)
+    bool     build_gcov          = true;   // build GCOV per-genus covariance eigenbasis (needs build_gstx)
     int      sketch_kmer_size    = 16;     // k-mer size for OPH sketching (single-k path)
     std::vector<int> sketch_kmer_sizes;   // if size > 1: write multi-k SKCH v2 (overrides sketch_kmer_size)
     int      sketch_size         = 10000;  // number of OPH bins
     int      sketch_syncmer_s    = 0;      // 0 = disabled; >0 = open syncmer prefilter
     uint64_t sketch_seed         = 42;
+    std::string markers_path;           // path to .mrk file; empty = skip build-time marker scoring
+    int         marker_min_hits  = 5;  // min pool hits to call a marker present (matches check default)
 };
 
 class ArchiveBuilder {

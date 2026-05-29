@@ -208,9 +208,20 @@ public:
     // (sig / sig2 / mask) are valid only during the cb invocation —
     // consumers must copy out before returning.
     using SketchCallback = std::function<void(size_t, const SketchResult&)>;
+    // num_threads=0 → omp_get_max_threads(). Pass 1 for sequential NFS access.
     void sketch_for_ids(const std::vector<GenomeId>& sorted_ids,
                         uint32_t k, uint32_t sz,
-                        const SketchCallback& cb) const;
+                        const SketchCallback& cb,
+                        int num_threads = 0) const;
+
+    // Fused multi-k: decompresses each frame once and calls cb for every k value.
+    // cb(row_idx, ki, result) — ki is the index into kmer_sizes[].
+    // Use instead of N separate sketch_for_ids calls to avoid re-reading frames.
+    using SketchCallbackMultiK = std::function<void(size_t, uint32_t ki, const SketchResult&)>;
+    void sketch_for_ids_multi_k(const std::vector<GenomeId>& sorted_ids,
+                                 uint32_t sz,
+                                 const SketchCallbackMultiK& cb,
+                                 int num_threads = 0) const;
 
     // Peek version and stored kmer_sizes without building id_index. Returns
     // {4, kmer_sizes} for V4; throws for anything else.

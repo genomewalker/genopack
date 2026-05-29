@@ -21,7 +21,8 @@ struct QualRecord {
     float    leakage_residual;              //  4  per-DoF RMSE of slope-only log-linear fit
     uint8_t  support_tier;                  //  1
     uint8_t  spe_outlier_u8;               //  1  contamination_spe × 255; 0=clean
-    uint8_t  _pad[2];                       //  2  reserved
+    uint8_t  sibling_outlier_u8;           //  1  contamination_sibling_outlier × 255; 0=clean
+    uint8_t  rho_outlier_u8;              //  1  contamination_rho_outlier × 255; 0=clean
     float    interval_width;                //  4
     float    self_coherence;               //  4  (NAN = not computed)
     float    contamination_mixture;         //  4  (NAN = not computed)
@@ -30,14 +31,22 @@ struct QualRecord {
     uint16_t n_mix_windows;               //  2  windows used in mixture model
     uint8_t  qual_flags;                  //  1  bitfield — see QUAL_FLAG_* constants
     uint8_t  contig_outlier_u8;          //  1  contamination_contig_outlier × 255; 0=pure
-    float    sketch_breadth;              //  4  |Q∩C|/|C| at k=sketch_kmer_sizes[2] (build-time only; NAN in check)
-    // total = 64
+    uint8_t  fmh_minority_u8;             //  1  fmh_minority_fraction × 255; 0=clean/not computed
+    uint8_t  marker_completeness_u8;     //  1  marker_completeness encoded: 0=not_scored, 1-255=(v-1)/254.0
+    uint16_t marker_redundancy_u16;      //  2  raw marker_redundancy × 65535 (0xFFFF = not scored)
+    float    chargaff_parity;            //  4  Chargaff 2nd parity score [0,1]; NAN = not computed
+    float    spectral_gap;               //  4  1 - |λ₂| from k3 Markov op; NAN = not computed
+    float    scale_kink;                 //  4  log₂(W*) dyadic-window scale; NAN = not computed
+    // total = 80 (struct has 8-byte alignment from genome_id; 76 bytes data → sizeof rounds to 80)
 
     // qual_flags bits
     static constexpr uint8_t QUAL_FLAG_MIX_NO_DATA        = 0x01; // mixture model had < min_windows
     static constexpr uint8_t QUAL_FLAG_FRAG_GATED         = 0x02; // completeness_fragmentation < 0.65
     static constexpr uint8_t QUAL_FLAG_LEAKAGE_UNRELIABLE = 0x04; // leakage_residual above threshold
     static constexpr uint8_t QUAL_FLAG_COHERENCE_GATED    = 0x08; // self_coherence < 0.80
+    static constexpr uint8_t QUAL_FLAG_MARKER_SCORED      = 0x10; // marker_redundancy_u16 is valid
+    static constexpr uint8_t QUAL_FLAG_BUILD_SIGNALS      = 0x20; // AllSignals computed at build time (chargaff/spectral/scale_kink valid)
+    static constexpr uint8_t QUAL_FLAG_GCOV_SCORED        = 0x40; // per-contig GCOV scoring cached (contig_outlier/spe/sibling/rho valid)
 
     // support_tier sentinel: no genus-level reference available (singleton genus)
     static constexpr uint8_t TIER_NO_GENUS_REF = 0xFF;
@@ -59,12 +68,19 @@ struct QualRecord {
         r.fiedler_u16                  = 0;
         r.n_mix_windows               = 0;
         r.spe_outlier_u8              = 0;
+        r.sibling_outlier_u8          = 0;
+        r.rho_outlier_u8              = 0;
+        r.marker_redundancy_u16       = 0xFFFF;
+        r.chargaff_parity             = NAN;
+        r.spectral_gap                = NAN;
+        r.scale_kink                  = NAN;
         r.qual_flags                  = 0;
-        r.sketch_breadth              = NAN;
+        r.fmh_minority_u8             = 0;
+        r.marker_completeness_u8      = 0;
         return r;
     }
 };
-static_assert(sizeof(QualRecord) == 64);
+static_assert(sizeof(QualRecord) == 80);
 
 // ── Writer ────────────────────────────────────────────────────────────────────
 
@@ -118,7 +134,8 @@ private:
 
 class QualReader {
 public:
-    static constexpr uint64_t kOldStride = 48; // pre-v2 layout without contamination_mixture
+    static constexpr uint64_t kOldStride    = 48; // pre-v2 layout without contamination_mixture
+    static constexpr uint64_t kMediumStride = 64; // pre-v3 layout without chargaff/spectral/scale_kink
 
     void open(const uint8_t* data, uint64_t offset, uint64_t size) {
         if (size < sizeof(QualHeader))
@@ -129,10 +146,11 @@ public:
             throw std::runtime_error("QUAL: bad magic");
 
         const uint64_t stride = header_->record_stride;
-        if (stride != sizeof(QualRecord) && stride != kOldStride)
+        if (stride != sizeof(QualRecord) && stride != kOldStride && stride != kMediumStride)
             throw std::runtime_error("QUAL: unknown record_stride " + std::to_string(stride)
                                      + " — rebuild required");
-        old_layout_ = (stride == kOldStride);
+        old_layout_    = (stride == kOldStride);
+        medium_layout_ = (stride == kMediumStride);
 
         const uint64_t end = header_->records_offset
             + static_cast<uint64_t>(header_->n_records) * stride;
@@ -145,27 +163,28 @@ public:
     uint32_t n_records() const { return header_ ? header_->n_records : 0; }
     bool is_old_layout() const { return old_layout_; }
 
-    // Linear scan. Old 48-byte records are upcast: new fields default to NAN/0.
+    // Linear scan. Old 48- and 64-byte records are upcast: new fields default to NAN/0.
     void scan(const std::function<void(const QualRecord&)>& cb) const {
         if (!data_) return;
         const uint64_t stride = header_->record_stride;
         for (uint32_t i = 0; i < header_->n_records; ++i) {
-            if (!old_layout_) {
+            if (!old_layout_ && !medium_layout_) {
                 cb(*reinterpret_cast<const QualRecord*>(base_ + i * stride));
             } else {
-                // Upcast 48-byte old record: copy into a zero-initialised new record.
                 QualRecord r = QualRecord::make_empty(0);
-                __builtin_memcpy(&r, base_ + i * stride, kOldStride);
+                __builtin_memcpy(&r, base_ + i * stride,
+                                 old_layout_ ? kOldStride : kMediumStride);
                 cb(r);
             }
         }
     }
 
 private:
-    const uint8_t*    data_       = nullptr;
-    const QualHeader* header_     = nullptr;
-    const uint8_t*    base_       = nullptr;
-    bool              old_layout_ = false;
+    const uint8_t*    data_          = nullptr;
+    const QualHeader* header_        = nullptr;
+    const uint8_t*    base_          = nullptr;
+    bool              old_layout_    = false;
+    bool              medium_layout_ = false;
 };
 
 } // namespace genopack

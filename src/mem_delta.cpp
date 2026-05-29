@@ -6,6 +6,9 @@
 #ifdef __AVX2__
 #  include <immintrin.h>
 #endif
+#ifdef __SSE2__
+#  include <emmintrin.h>
+#endif
 
 namespace genopack {
 
@@ -49,36 +52,94 @@ static uint64_t kmer62(const char* s) {
     return h;
 }
 
-// ── Flat open-addressing hash table ───────────────────────────────────────────
+// ── Swiss-table AnchorIndex ───────────────────────────────────────────────────
+//
+// ctrl[] is a 1-byte-per-slot metadata array: 0x80 = empty; [0x00,0x7F] = H2(key).
+// find() scans 16 ctrl bytes at a time with SSE2, touching keys[] only on tag
+// matches (rare for misses). ctrl (3.75 MB) stays warm in L3; kv[] (key+val fused, 16B/slot) is prefetched
+// on tag match. Fixes the two-miss hit path and eliminates random DRAM misses for
+// negative lookups. Right-extension uses AVX2 32-byte compares when available.
+
+static constexpr uint8_t kCtrlEmpty = 0x80u;
 
 static size_t next_pow2(size_t n) {
-    size_t p = 1;
+    size_t p = 16;       // minimum 16 so one group always exists
     while (p < n) p <<= 1;
     return p;
 }
 
+// H2: 7-bit secondary tag stored in ctrl[]. Must be in [0x00, 0x7F].
+static inline uint8_t h2_tag(uint64_t key) {
+    return static_cast<uint8_t>((key ^ (key >> 15) ^ (key >> 32)) & 0x7Fu);
+}
+
 AnchorIndex::AnchorIndex(size_t n_entries) {
-    size_t cap = next_pow2(n_entries * 3 + 1);  // ~33% load factor
-    keys.assign(cap, UINT64_MAX);
-    vals.assign(cap, 0);
+    size_t cap = next_pow2(n_entries * 3 + 16);  // ~33% load, always multiple of 16
     mask = cap - 1;
+    ctrl.assign(cap, kCtrlEmpty);
+    kv.assign(cap, {UINT64_MAX, 0});
+}
+
+static inline size_t h1_slot(uint64_t key, uint64_t mask) {
+    // Fibonacci hashing: mixes all 64 bits, breaks sequential k-mer clustering.
+    // Multiply by golden-ratio constant then mask to group-aligned slot.
+    uint64_t h = key * 0x9e3779b97f4a7c15ULL;
+    return h & (mask & ~uint64_t(15));
 }
 
 void AnchorIndex::insert(uint64_t key, uint32_t val) {
-    uint64_t slot = key & mask;
-    while (keys[slot] != UINT64_MAX) {
-        if (keys[slot] == key) return;  // duplicate: keep first position
-        slot = (slot + 1) & mask;
+    const uint8_t tag = h2_tag(key);
+    size_t slot = h1_slot(key, mask);
+
+    for (;;) {
+#ifdef __SSE2__
+        const __m128i vg  = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ctrl.data() + slot));
+        int mt = _mm_movemask_epi8(_mm_cmpeq_epi8(vg, _mm_set1_epi8(static_cast<char>(tag))));
+        int em = _mm_movemask_epi8(_mm_cmpeq_epi8(vg, _mm_set1_epi8(static_cast<char>(kCtrlEmpty))));
+        for (int tmp = mt; tmp; tmp &= tmp - 1) {
+            int i = __builtin_ctz(tmp);
+            if (kv[slot + i].key == key) return;  // duplicate
+        }
+        if (em) {
+            int i = __builtin_ctz(em);
+            ctrl[slot + i] = tag;
+            kv[slot + i] = {key, val};
+            return;
+        }
+#else
+        for (int i = 0; i < 16; ++i) {
+            uint8_t c = ctrl[slot + i];
+            if (c == kCtrlEmpty) { ctrl[slot+i]=tag; kv[slot+i]={key,val}; return; }
+            if (c == tag && kv[slot + i].key == key) return;
+        }
+#endif
+        slot = (slot + 16) & mask;
     }
-    keys[slot] = key;
-    vals[slot] = val;
 }
 
 uint32_t AnchorIndex::find(uint64_t key) const {
-    uint64_t slot = key & mask;
-    while (keys[slot] != UINT64_MAX && keys[slot] != key)
-        slot = (slot + 1) & mask;
-    return keys[slot] == key ? vals[slot] : UINT32_MAX;
+    const uint8_t tag = h2_tag(key);
+    size_t slot = h1_slot(key, mask);
+
+    for (;;) {
+#ifdef __SSE2__
+        const __m128i vg  = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ctrl.data() + slot));
+        int mt = _mm_movemask_epi8(_mm_cmpeq_epi8(vg, _mm_set1_epi8(static_cast<char>(tag))));
+        int em = _mm_movemask_epi8(_mm_cmpeq_epi8(vg, _mm_set1_epi8(static_cast<char>(kCtrlEmpty))));
+        for (int tmp = mt; tmp; tmp &= tmp - 1) {
+            int i = __builtin_ctz(tmp);
+            if (kv[slot + i].key == key) return kv[slot + i].val;
+        }
+        if (em) return UINT32_MAX;
+#else
+        for (int i = 0; i < 16; ++i) {
+            uint8_t c = ctrl[slot + i];
+            if (c == kCtrlEmpty) return UINT32_MAX;
+            if (c == tag && kv[slot + i].key == key) return kv[slot + i].val;
+        }
+#endif
+        slot = (slot + 16) & mask;
+    }
 }
 
 // ── FASTA parsing ─────────────────────────────────────────────────────────────
@@ -186,9 +247,9 @@ static std::vector<MemEntry> find_mems(const std::string& anchor,
         if (pf_qi + static_cast<uint32_t>(K) <= qlen) {
             uint64_t ph = kmer62(query.data() + pf_qi);
             if (ph != UINT64_MAX) {
-                uint64_t slot = ph & idx.mask;
-                __builtin_prefetch(idx.keys.data() + slot, 0, 1);
-                __builtin_prefetch(idx.vals.data() + slot, 0, 1);
+                size_t pf_slot = h1_slot(ph, idx.mask);
+                __builtin_prefetch(idx.ctrl.data() + pf_slot, 0, 1);
+                __builtin_prefetch(idx.kv.data()   + pf_slot, 0, 1);
             }
         }
 
@@ -208,6 +269,15 @@ static std::vector<MemEntry> find_mems(const std::string& anchor,
         }
 
         uint32_t qend = qi + K, rend = ri + K;
+#ifdef __AVX2__
+        while (qend + 32 <= qlen && rend + 32 <= alen) {
+            __m256i qv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(query.data()  + qend));
+            __m256i rv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(anchor.data() + rend));
+            uint32_t neq = static_cast<uint32_t>(~_mm256_movemask_epi8(_mm256_cmpeq_epi8(qv, rv)));
+            if (neq) { int advance = __builtin_ctz(neq); qend += advance; rend += advance; break; }
+            qend += 32; rend += 32;
+        }
+#endif
         while (qend < qlen && rend < alen && query[qend] == anchor[rend]) {
             ++qend; ++rend;
         }
@@ -257,17 +327,20 @@ static uint64_t read_varint(const uint8_t*& p, const uint8_t* end) {
     throw std::runtime_error("decode_mem_delta: malformed varint");
 }
 
-static double sample_anchor_hit_rate(const std::string& query,
-                                     const AnchorIndex& idx,
-                                     uint32_t start,
-                                     uint32_t len) {
-    if (query.size() < static_cast<size_t>(K) || len < static_cast<uint32_t>(K) || idx.keys.empty())
+static double sample_anchor_hit_rate_impl(const std::string& query,
+                                          const AnchorIndex& idx,
+                                          uint32_t start,
+                                          uint32_t len) {
+    if (query.size() < static_cast<size_t>(K) || len < static_cast<uint32_t>(K) || idx.kv.empty())
         return 0.0;
     uint32_t end = std::min<uint32_t>(static_cast<uint32_t>(query.size()), start + len);
     if (end <= start || end - start < static_cast<uint32_t>(K))
         return 0.0;
 
-    uint32_t step = std::max<uint32_t>(256u, len / 8u);
+    // 512 probes: ANI^K/INDEX_STEP ≈ 1.3% true rate for same-genus genomes.
+    // n=8 gives P(zero hits)≈0.90 (useless). n=512 gives P(zero hits)≈0.001.
+    // Each probe is one hash lookup (~ns); 512 costs ~1μs total.
+    uint32_t step = std::max<uint32_t>(1u, (end - start) / 512u);
     uint32_t hits = 0;
     uint32_t total = 0;
     for (uint32_t pos = start; pos + static_cast<uint32_t>(K) <= end; pos += step) {
@@ -277,6 +350,11 @@ static double sample_anchor_hit_rate(const std::string& query,
         ++total;
     }
     return total > 0 ? static_cast<double>(hits) / total : 0.0;
+}
+
+double sample_anchor_hit_rate(const std::string& query, const AnchorIndex& idx) {
+    return sample_anchor_hit_rate_impl(query, idx, 0,
+                                       static_cast<uint32_t>(query.size()));
 }
 
 static std::vector<std::pair<uint32_t, uint32_t>>
@@ -294,8 +372,8 @@ build_query_chunks(const std::string& query,
     uint32_t min_chunk = std::max<uint32_t>(8192u, step / 2u);
     uint32_t max_chunk = std::max<uint32_t>(step, step * 4u);
     for (uint32_t start = 0; start < query_len; ) {
-        double hit_rate = sample_anchor_hit_rate(query, idx, start,
-                                                 std::min<uint32_t>(step, query_len - start));
+        double hit_rate = sample_anchor_hit_rate_impl(query, idx, start,
+                                                      std::min<uint32_t>(step, query_len - start));
         uint32_t target = step;
         if (hit_rate >= 0.85) target = max_chunk;
         else if (hit_rate >= 0.65) target = std::min<uint32_t>(max_chunk, step * 2u);

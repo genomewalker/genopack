@@ -13,6 +13,8 @@ namespace genopack {
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 static constexpr uint32_t GCOV_N_EIGVECS    = 15;   // top eigenvectors of Σ_bio stored
+static constexpr uint32_t GCOV_RHO_DIM     = 16;   // dinucleotide pairs (A/C/G/T × A/C/G/T)
+static constexpr uint32_t GCOV_RHO_PREC_N  = GCOV_RHO_DIM*(GCOV_RHO_DIM+1)/2; // 136 lower-triangle entries
 static constexpr uint32_t GCOV_N_QUANTILES  = 128;  // percentile points of Mahalanobis dist
 static constexpr uint32_t GCOV_MIN_LONG_BP  = 20000; // min contig length for Σ_bio estimation
 static constexpr uint32_t GCOV_MIN_LONG_N   = 20;   // min long contigs per genus
@@ -55,6 +57,9 @@ struct GcovEntry {
     float    mu[136];                                 //  544  L2-normalised genus centroid (mean of long-contig profiles)
     uint32_t _pad2;                                   //    4
     float    spe_quantiles[GCOV_N_QUANTILES];         //  512  sorted SPE (‖residual‖²) values at Q percentile points
+    float    rho_mean[GCOV_RHO_DIM];                  //   64  genus mean dinucleotide ρ* vector
+    float    rho_prec_lower[GCOV_RHO_PREC_N];         //  544  precision matrix Σ_ρ⁻¹ lower triangle
+    float    rho_quantiles[GCOV_N_QUANTILES];          //  512  sorted ρ* Mahalanobis distances for percentile lookup
 };
 static_assert(sizeof(GcovEntry) ==
     8 + 4 + 4 + 4 + 4 +
@@ -62,7 +67,8 @@ static_assert(sizeof(GcovEntry) ==
     GCOV_N_EIGVECS * 136 * 4 +
     GCOV_N_QUANTILES * 4 +
     136 * 4 + 4 + 4 + 136 * 4 + 4 +
-    GCOV_N_QUANTILES * 4);  // spe_quantiles
+    GCOV_N_QUANTILES * 4 +
+    GCOV_RHO_DIM * 4 + GCOV_RHO_PREC_N * 4 + GCOV_N_QUANTILES * 4);  // rho fields
 
 static constexpr uint32_t GCOV_FLAG_VALID = 0x1u;
 
@@ -83,7 +89,10 @@ public:
              float       sigma2_resid,
              float       n_eff_alpha,
              const float mu[136],
-             const float spe_quantiles[GCOV_N_QUANTILES])
+             const float spe_quantiles[GCOV_N_QUANTILES],
+             const float rho_mean[GCOV_RHO_DIM],
+             const float rho_prec_lower[GCOV_RHO_PREC_N],
+             const float rho_quantiles[GCOV_N_QUANTILES])
     {
         GcovEntry e{};
         e.genus_hash      = genus_hash;
@@ -102,11 +111,15 @@ public:
         for (int d = 0; d < 136; ++d) e.mu[d] = mu[d];
         for (uint32_t q = 0; q < GCOV_N_QUANTILES; ++q)
             e.spe_quantiles[q] = spe_quantiles[q];
+        for (uint32_t i = 0; i < GCOV_RHO_DIM; ++i) e.rho_mean[i] = rho_mean[i];
+        for (uint32_t i = 0; i < GCOV_RHO_PREC_N; ++i) e.rho_prec_lower[i] = rho_prec_lower[i];
+        for (uint32_t q = 0; q < GCOV_N_QUANTILES; ++q) e.rho_quantiles[q] = rho_quantiles[q];
         entries_.push_back(e);
     }
 
-    SectionDesc finalize(AppendWriter& w, uint64_t section_id);
+    SectionDesc finalize(AppendWriter& w, uint64_t section_id, uint32_t section_type = SEC_GCOV);
     size_t n_genera() const { return entries_.size(); }
+    const GcovEntry& last_entry() const { return entries_.back(); }
 
     // FNV-1a 64-bit hash of genus name; 0 remapped to 1 (0 = empty sentinel).
     static uint64_t hash_genus(std::string_view s) noexcept {
@@ -134,8 +147,8 @@ public:
             throw std::runtime_error("GCOV section too small");
         data_   = data + offset;
         header_ = reinterpret_cast<const GcovHeader*>(data_);
-        if (header_->magic != SEC_GCOV)
-            throw std::runtime_error("GCOV: bad magic");
+        if (header_->magic != SEC_GCOV && header_->magic != SEC_FCOV)
+            throw std::runtime_error("GCOV/FCOV: bad magic");
         if (header_->entry_stride != sizeof(GcovEntry))
             throw std::runtime_error("GCOV: unknown entry_stride — rebuild required");
         entries_ = reinterpret_cast<const GcovEntry*>(data_ + header_->entries_offset);
@@ -183,6 +196,18 @@ public:
         return static_cast<float>(lo) / static_cast<float>(Q);
     }
 
+    // Fraction of calibration contigs with ρ* Mahalanobis distance <= d.
+    float rho_percentile(const GcovEntry& e, float d) const {
+        const uint32_t Q = header_->n_quantiles;
+        if (Q == 0) return NAN;
+        uint32_t lo = 0, hi = Q;
+        while (lo < hi) {
+            uint32_t mid = (lo + hi) / 2;
+            if (e.rho_quantiles[mid] <= d) lo = mid + 1; else hi = mid;
+        }
+        return static_cast<float>(lo) / static_cast<float>(Q);
+    }
+
     // Fraction of calibration contigs with SPE (‖residual‖²) <= spe.
     float spe_percentile(const GcovEntry& e, float spe) const {
         const uint32_t Q = header_->n_quantiles;
@@ -205,6 +230,26 @@ private:
 
 // PPCA+Δ-method distance (length-adjusted; use for statistical p-value estimation).
 // x_minus_mu = contig_tnf[136] - e.mu[136]; n_kmers = contig_bp - 3.
+// Standalone percentile lookups — no GcovReader required; use compile-time GCOV_N_QUANTILES.
+inline float gcov_percentile(const GcovEntry& e, float d) noexcept {
+    constexpr uint32_t Q = GCOV_N_QUANTILES;
+    uint32_t lo = 0, hi = Q;
+    while (lo < hi) { uint32_t mid=(lo+hi)/2; if (e.quantiles[mid]<=d) lo=mid+1; else hi=mid; }
+    return static_cast<float>(lo) / static_cast<float>(Q);
+}
+inline float gcov_spe_percentile(const GcovEntry& e, float spe) noexcept {
+    constexpr uint32_t Q = GCOV_N_QUANTILES;
+    uint32_t lo = 0, hi = Q;
+    while (lo < hi) { uint32_t mid=(lo+hi)/2; if (e.spe_quantiles[mid]<=spe) lo=mid+1; else hi=mid; }
+    return static_cast<float>(lo) / static_cast<float>(Q);
+}
+inline float gcov_rho_percentile(const GcovEntry& e, float d) noexcept {
+    constexpr uint32_t Q = GCOV_N_QUANTILES;
+    uint32_t lo = 0, hi = Q;
+    while (lo < hi) { uint32_t mid=(lo+hi)/2; if (e.rho_quantiles[mid]<=d) lo=mid+1; else hi=mid; }
+    return static_cast<float>(lo) / static_cast<float>(Q);
+}
+
 float gcov_ppca_distance(const GcovEntry& e, const float* x_minus_mu, uint32_t n_kmers) noexcept;
 
 // Pure Mahalanobis distance in top-K eigenbasis (no length correction).
@@ -213,5 +258,9 @@ float gcov_mahalanobis(const GcovEntry& e, const float* x_minus_mu) noexcept;
 // SPE (squared prediction error): ‖x_minus_mu − Σ_k proj_k v_k‖²
 // Catches contamination whose direction lies outside the top-K biological subspace.
 float gcov_spe(const GcovEntry& e, const float* x_minus_mu) noexcept;
+
+// Mahalanobis distance in 16-dim ρ* space using stored precision matrix.
+// rho_minus_mean = contig_rho[16] - e.rho_mean[16].
+float gcov_rho_distance(const GcovEntry& e, const float* rho_minus_mean) noexcept;
 
 } // namespace genopack

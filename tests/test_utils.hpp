@@ -32,6 +32,20 @@ inline std::string make_sequence(const std::string& motif, size_t n) {
     return out;
 }
 
+// LCG-based pseudorandom ACGT sequence — realistic compressibility (~3-4x ZSTD),
+// unlike repeating-motif sequences that compress to near-zero and break MEM-delta tests.
+inline std::string make_random_sequence(uint64_t seed, size_t n) {
+    static constexpr char bases[4] = {'A', 'C', 'G', 'T'};
+    std::string out;
+    out.reserve(n);
+    uint64_t s = seed;
+    for (size_t i = 0; i < n; ++i) {
+        s = s * 6364136223846793005ULL + 1442695040888963407ULL;
+        out.push_back(bases[(s >> 33) & 3]);
+    }
+    return out;
+}
+
 inline std::string mutate_every(const std::string& input, size_t step) {
     std::string out = input;
     for (size_t i = step; i < out.size(); i += step)
