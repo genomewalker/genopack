@@ -16,7 +16,7 @@ A high-performance single-file genome archive format for large-scale microbial g
 - **Taxonomy repack** — re-shard by genus/family for 10–13× faster per-taxon NFS access
 - **Distributed build** — split TSV across N nodes, build parts in parallel, merge or coordinate via NFS manifest
 - **Append and tombstone** — add genomes or mark deleted without full rebuild
-- **Quality scoring (`genopack check`)** — per-genome completeness and contamination signals (QUAL section): cluster-relative completeness, leakage, TNF excess, chromosome skew closure, Fiedler eigenvalue, contig-level Mahalanobis outlier (CCO), SPE, sibling outlier (family-vs-genus), marker-gene completeness/redundancy, GMM minority fraction, and more
+- **Quality scoring (`genopack check`)** — per-genome completeness and contamination signals (QUAL section): cluster-relative completeness, leakage, TNF excess, chromosome skew closure, Fiedler eigenvalue, contig-level Mahalanobis outlier (CCO), SPE, sibling outlier (family-vs-genus), marker-gene completeness/redundancy, FracMinHash minority fraction, and more
 - **Covariance sections (GCOV/FCOV)** — per-genus and per-family TNF covariance matrices built in one pass at build time or via `genopack gcov`; used by `check` for contamination detection
 - **`.gpd` derep archives** — read derep state produced by [geodesic](https://github.com/genomewalker/geodesic) via `DerepView`: O(1) `accession → rep_id`, O(1) `rep_id → embedding`, with staleness detection against the source pack
 

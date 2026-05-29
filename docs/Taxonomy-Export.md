@@ -83,8 +83,7 @@ struct Acc2TaxidHeader {
 
 struct Acc2TaxidEntry {
     uint64_t acc_hash;    // FNV-1a-64(accession_string)
-    uint32_t taxid;
-    uint32_t _pad;
+    uint64_t taxid;       // NCBI taxids fit in low 32 bits; GTDB concept_ids use bit 63
 };  // 16 bytes, sorted ascending by acc_hash
 ```
 
@@ -130,7 +129,7 @@ def lookup(mm, n_entries, accession: str) -> int | None:
         if entry_hash < h:   lo = mid + 1
         elif entry_hash > h: hi = mid
         else:
-            return struct.unpack_from("<I", mm, base + mid * 16 + 8)[0]
+            return struct.unpack_from("<Q", mm, base + mid * 16 + 8)[0]
     return None
 ```
 
@@ -156,13 +155,13 @@ struct TaxnodesHeader {
 };  // 32 bytes
 
 struct TaxnodeEntry {
-    uint32_t taxid;
-    uint32_t parent_taxid;    // self-referential for root
+    uint64_t taxid;           // NCBI taxids in low 32 bits; GTDB concept_ids use bit 63
+    uint64_t parent_taxid;    // self-referential for root
     uint32_t name_offset;     // byte offset into name pool
-    uint8_t  rank;            // TaxRank enum (0=no_rank … 9=species)
+    uint8_t  rank;            // TaxRank enum (see below)
     uint8_t  flags;           // bit 0: synthetic node
     uint16_t name_len;        // bytes (excluding null terminator)
-};  // 16 bytes
+};  // 24 bytes
 ```
 
 **TaxRank enum:**
@@ -171,6 +170,8 @@ struct TaxnodeEntry {
 |-------|------|
 | 0 | no_rank |
 | 1 | domain |
+| 2 | life (l__ — mOTUs extended format) |
+| 3 | kingdom (k__ — mOTUs extended format) |
 | 4 | phylum |
 | 5 | class |
 | 6 | order |
@@ -201,7 +202,7 @@ def get_node(mm, n_nodes, pool_base, taxid: int):
         if t < taxid:   lo = mid + 1
         elif t > taxid: hi = mid
         else:
-            t, p, name_off, rank, flags, name_len = struct.unpack_from("<IIIBBh", mm, base + mid * 16)
+            t, p, name_off, rank, flags, name_len = struct.unpack_from("<QQIBBh", mm, base + mid * 24)
             name = mm[pool_base + name_off: pool_base + name_off + name_len].decode()
             return {"taxid": t, "parent": p, "rank": rank, "name": name, "synthetic": bool(flags & 1)}
     return None

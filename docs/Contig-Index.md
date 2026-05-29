@@ -31,7 +31,7 @@ struct CidxEntry {
 
 ## Build integration
 
-CIDX is built automatically during `genopack build`. For each genome, the builder parses every `>header` line in the FASTA and records the first whitespace-delimited token as the contig accession:
+CIDX is built when `--cidx` is passed to `genopack build` (off by default; use `--cidx` to opt in). For each genome, the builder parses every `>header` line in the FASTA and records the first whitespace-delimited token as the contig accession:
 
 ```
 >NZ_JAVJIU010000001.1 Christiangramia sp. SM2212 ...

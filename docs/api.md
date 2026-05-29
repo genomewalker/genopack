@@ -344,10 +344,9 @@ struct ArchiveBuilderConfig {
     bool   verbose              = false;
     size_t batch_size           = 1000;  // genomes buffered before shard flush
     GenomeId starting_genome_id = 1;
-    bool   build_hnsw           = true;  // disable with --no-hnsw for > 1M genomes
     bool   build_cidx           = true;  // disable with --no-cidx for large archives
-    bool   kmer_nn_sort         = false; // sort within shards by kmer NN chain
-    bool   taxonomy_group       = false; // bucket by taxonomy before shard formation
+    bool   kmer_nn_sort         = true;  // sort within shards by kmer NN chain
+    bool   taxonomy_group       = true;  // bucket by taxonomy before shard formation
     std::string taxonomy_rank   = "g";   // "g" = genus, "f" = family
 };
 ```

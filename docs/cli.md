@@ -38,9 +38,9 @@ The output `mydb.gpk` is a directory containing `toc.bin` plus section files. De
 | `--taxon-rank` | `g` | Rank for grouping (`g` = genus, `f` = family) |
 | `--sketch` / `--no-sketch` | on | Compute OPH sketches |
 | `--sketch-kmer` | 16 | OPH sketch k-mer size |
-| `--sketch-kmers` | unset | Comma list (e.g. `16,21,31`) → multi-k SKCH in a single pass |
+| `--sketch-kmers` | `16,21,31` | Comma list (e.g. `16,21,31`) → multi-k SKCH in a single pass |
 | `--sketch-size` | 10000 | Number of OPH bins |
-| `--sketch-syncmer` | 0 | Open syncmer prefilter `s` (0 disables) |
+| `--sketch-syncmer` | `-1` (auto: `s=k/3`) | Open syncmer prefilter `s` (0 disables) |
 | `--coordinator` | unset | NFS manifest coordinator: `manifest_dir:/output.gpk` |
 | `-v / --verbose` | off | Verbose progress |
 
@@ -60,7 +60,7 @@ genopack merge part1.gpk part2.gpk part3.gpk -o merged.gpk
 |------|---------|-------------|
 | `-l / --list` | | Text file with one `.gpk` path per line |
 | `-o / --output` | required | Output path |
-| `-t / --threads` | auto | Merge threads (one per input part) |
+| *(no thread option)* | — | Merge is single-threaded; parallelism comes from having parts pre-built |
 
 ---
 
@@ -98,7 +98,7 @@ genopack extract mydb.gpk [filters] -o out.fasta
 
 | Flag | Description |
 |------|-------------|
-| `--accession ACC` | Extract single genome |
+| `--accession ACC` | Extract genome(s) by accession (repeatable: `--accession A --accession B`) |
 | `--accessions-file FILE` | Extract list of accessions (one per line) |
 | `--min-completeness FLOAT` | Completeness filter (0–100) |
 | `--max-contamination FLOAT` | Contamination filter |
@@ -123,7 +123,7 @@ Decompresses only the checkpoint blocks covering the requested region (sub-genom
 Append genomes to an existing archive (new shard generation).
 
 ```bash
-genopack add mydb.gpk -i new_genomes.tsv [-t 16]
+genopack add mydb.gpk -i new_genomes.tsv
 ```
 
 Existing shards are untouched. The catalog receives a new CATL fragment. Use `repack` afterwards if taxonomy grouping is required.
@@ -288,9 +288,9 @@ genopack reindex mydb.gpk [options]
 | `--skch` | off | Compute OPH sketches for genomes missing from existing SKCH sections |
 | `--skch-threads` | 8 | Threads for parallel sketch computation |
 | `--sketch-kmer` | inherit / 16 | OPH k-mer size for a single-k SKCH section |
-| `--sketch-kmers` | unset | Comma list (e.g. `16,21,31`) → multi-k SKCH in one pass |
+| `--sketch-kmers` | `16,21,31` | Comma list (e.g. `16,21,31`) → multi-k SKCH in one pass |
 | `--sketch-size` | inherit / 10000 | OPH sketch size |
-| `--sketch-syncmer` | inherit / 0 | Open-syncmer prefilter `s` (0 disables) |
+| `--sketch-syncmer` | `-1` (auto: `s=k/3`) | Open-syncmer prefilter `s` (0 disables) |
 
 Typical uses: an archive built with `--no-cidx` later wants contig lookup (`--cidx genomes.tsv`); a TAXN-only archive needs the tree (`--txdb`); SKCH layout needs to be upgraded to V4 seekable (`--skch --force`); or a multi-k variant is needed (`--skch --sketch-kmers 16,21,31 --force`).
 

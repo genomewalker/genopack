@@ -52,7 +52,7 @@ A `.gpk` archive is a **directory of seekable section files** plus a `toc.bin` e
     <span class="fmt-name">TOMB<span class="fmt-sub">tombstone records for soft-deleted genomes</span></span>
   </div>
   <div class="fmt-row divider">
-    <span class="fmt-name">TOC<span class="fmt-sub">zstd-compressed SectionDesc[] — one record per section</span></span>
+    <span class="fmt-name">TOC<span class="fmt-sub">SectionDesc[] (raw, uncompressed) — one record per section</span></span>
   </div>
   <div class="fmt-row">
     <span class="fmt-name">TailLocator<span class="fmt-sub">fixed footer at EOF, points to TOC offset</span></span>
@@ -176,7 +176,7 @@ Genomes are sorted by `oph_fingerprint` within each shard. Nearby OPH values ind
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
 | 0 | 8 B | `symbol_offset` | Base position (0-indexed) within the decompressed genome |
-| 8 | 4 B | `block_offset` | Byte offset of the corresponding zstd block within the blob |
+| 8 | 4 B | `block_offset` | Byte offset within the **decompressed** blob where this checkpoint's content starts |
 | 12 | 4 B | _pad_ | |
 
 ### Codec values
@@ -284,7 +284,7 @@ genome_id  ->  (section_id, dir_index, catl_row_index)
 
 ## TOC and TailLocator
 
-The TOC is a zstd-compressed array of `SectionDesc` records.
+The TOC is an uncompressed array of `SectionDesc` records written directly after a `TocHeader`.
 
 ### `SectionDesc`
 
