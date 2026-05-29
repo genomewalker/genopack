@@ -16,6 +16,8 @@ A high-performance single-file genome archive format for large-scale microbial g
 - **Taxonomy repack** — re-shard by genus/family for 10–13× faster per-taxon NFS access
 - **Distributed build** — split TSV across N nodes, build parts in parallel, merge or coordinate via NFS manifest
 - **Append and tombstone** — add genomes or mark deleted without full rebuild
+- **Quality scoring (`genopack check`)** — per-genome completeness and contamination signals (QUAL section): cluster-relative completeness, leakage, TNF excess, chromosome skew closure, Fiedler eigenvalue, contig-level Mahalanobis outlier (CCO), SPE, sibling outlier (family-vs-genus), marker-gene completeness/redundancy, GMM minority fraction, and more
+- **Covariance sections (GCOV/FCOV)** — per-genus and per-family TNF covariance matrices built in one pass at build time or via `genopack gcov`; used by `check` for contamination detection
 - **`.gpd` derep archives** — read derep state produced by [geodesic](https://github.com/genomewalker/geodesic) via `DerepView`: O(1) `accession → rep_id`, O(1) `rep_id → embedding`, with staleness detection against the source pack
 
 ## Format overview
@@ -33,6 +35,11 @@ SKCH × N            - OPH sketches: dual-seed sigs + occupancy masks, seekable 
 KMRX (optional)     - float[n × 136] L2-normalised k=4 tetranucleotide profiles
 HNSW (optional)     - hnswlib serialised blob for cosine ANN over KMRX (library only)
 NTDB (optional)     - embedded NCBI nodes.dmp/names.dmp tree (set by `coordinator --ntdb`)
+GSTX (optional)     - per-genus sketch stats: TNF centroid, p90 completeness, OPH consensus
+GCOV (optional)     - per-genus biological covariance (Ledoit-Wolf TNF, eigenvectors, SPE thresholds)
+FCOV (optional)     - per-family biological covariance (same layout as GCOV, keyed by family hash)
+FMHR (optional)     - per-genus FracMinHash reference sketches (k=21, c=125)
+QUAL (optional)     - per-genome quality records (80 B each): completeness, contamination, flags
 TOMB                - tombstones for soft-deleted genomes
 TailLocator (64 B)  - fixed footer at end of toc.bin pointing to the TOC offset
 ```
@@ -245,8 +252,57 @@ For workflows that prefer reading parts directly without a final merge, every CL
 | `repack` | Re-shard by taxonomy for fast per-taxon NFS access |
 | `reindex` | Append or rebuild GIDX / TXDB / CIDX / SKCH sections |
 | `coordinator` | NFS manifest coordinator for distributed build |
+| `verify` | Verify XXH128 checksums for all sections |
+| `check` | Compute per-genome quality scores; writes QUAL section and TSV |
+| `gcov` | Build or rebuild GCOV + FCOV + FMHR covariance sections (one pass) |
+| `calibrate` | Fit isotonic+OLS completeness calibration model vs CheckM2 |
+| `markers build` | Build a `.mrk` single-copy marker panel from a GTDB-Tk database |
+| `markers score` | Score a FASTA against a `.mrk` panel (completeness + redundancy) |
+| `bench-grid` | Spike-fraction × taxonomic-distance contamination benchmark |
 
 Full option reference: [CLI Reference](https://genomewalker.github.io/genopack/cli/).
+
+## Quality scoring and contamination detection
+
+`genopack check` computes per-genome quality and contamination signals and writes them
+back to the archive as a QUAL section, and to a TSV for downstream use.
+
+```bash
+# Score all genomes in an archive
+genopack check mydb.gpk -o quality.tsv -t 16
+
+# With single-copy marker genes for completeness
+genopack check mydb.gpk -o quality.tsv --markers markers_r232.mrk -t 16
+
+# Force rescore even if QUAL section already exists
+genopack check mydb.gpk -o quality.tsv --recompute -t 16
+```
+
+The GCOV and FCOV covariance sections must be present for contig-level outlier
+scoring (CCO, SPE, sibling outlier). Build them with:
+
+```bash
+genopack gcov mydb.gpk -t 16
+```
+
+`gcov` runs a single shard-scan building GCOV (per-genus), FCOV (per-family),
+and FMHR (per-genus FracMinHash references) simultaneously.
+
+### Key quality metrics (TSV columns)
+
+| Column | Description |
+|--------|-------------|
+| `quality_tier` | `HQ` / `MQ` / `LQ` (completeness + contamination thresholds) |
+| `completeness_effective` | max(marker_completeness, completeness_cluster_relative) |
+| `completeness_cluster_relative` | OPH-sketch cluster-relative completeness |
+| `contamination_leakage` | Minimizer mass leakage outside expected genus range |
+| `contamination_tnf_excess` | TNF Mahalanobis distance from genus centroid |
+| `contamination_contig_outlier` | Fraction bp where T² or SPE > 95th percentile (requires GCOV) |
+| `contamination_spe` | SPE-based contig outlier fraction (requires GCOV) |
+| `contamination_sibling_outlier` | Genus-outlier AND family-inlier fraction (requires GCOV+FCOV) |
+| `fiedler_value` | Spectral bimodality score (high = two-component TNF distribution) |
+| `marker_completeness` | Single-copy marker gene completeness (requires `--markers`) |
+| `marker_redundancy` | Single-copy marker gene redundancy (requires `--markers`) |
 
 ## Library usage
 
@@ -313,48 +369,6 @@ if (status.kind == genopack::RepStatus::Kind::Member) {
     derep.embedding_for_rep(status.rep_id, emb);
 }
 ```
-
-## Performance
-
-> **Provenance:** reproduce with `bench/run_codec_bench.sh <tsv>` and
-> `bench/run_check_bench.sh <pack>` against a clean build. Numbers marked TODO
-> must be regenerated from a pinned commit + scripted run before publication.
-
-### MEM-delta codec (200 × 4 MB genomes, 16 threads, same-genus 99% ANI)
-
-| Codec | Build time | Archive size | Delta rate |
-|-------|-----------|-------------|------------|
-| Plain ZSTD | 4.2 s | 191 MB | — |
-| **MEM-delta** | **4.0 s** | **76 MB** | 79–93% |
-
-MEM-delta is simultaneously faster and 2.5× smaller for same-genus genomes
-because delta-encoding small genomes produces tiny blobs that compress the ZSTD
-work rather than adding to it.
-
-### Contamination detection (bench_grid, 177k genome reference, *E. coli* host)
-
-> Reproduce: `python3 bench/bench_grid.py` after running `genopack gcov` on the
-> reference pack.
-
-| Spike condition | Actual spike | CCO | sibling\_outlier | GMM | markers |
-|----------------|-------------|-----|-----------------|-----|---------|
-| phylum (Staphylococcus) | 20.2% | 20.9% | 0.0% | 20.8% | 100%¹ |
-| class (Bacillus) | 20.4% | 21.1% | 0.0% | 21.1% | 100%¹ |
-| order (Acinetobacter) | 21.0% | 21.6% | 0.0% | 21.7% | 100%¹ |
-| **family (Klebsiella)** | 20.1% | 16.8% | **16.7%** | 20.6% | 100%¹ |
-| genus (Salmonella) | 20.8% | 1.1% | 1.1% | 21.1% | 100%¹ |
-| same-genus control | 20.5% | 0.1% | 0.0% | 38.5%² | 100%¹ |
-
-¹ Marker completeness is blind to contamination at all taxonomic levels.  
-² GMM minority-cluster has ~38–40% false-positive rate on clean samples; use CCO
-or sibling\_outlier as primary signals.
-
-**Key results:**
-- CCO (Mahalanobis T² + SPE vs genus covariance) detects order-level and above cleanly.
-- `contamination_sibling_outlier` (genus-outlier ∧ family-inlier) adds detection at family
-  level (Klebsiella in Escherichia) that CCO underestimates.
-- Same-family contamination (Salmonella) is near-undetectable by TNF alone — both TNF
-  models overlap too much at that distance.
 
 ## License
 
