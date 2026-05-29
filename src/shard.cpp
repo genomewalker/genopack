@@ -598,13 +598,14 @@ FrozenShard ShardWriter::freeze() {
                 FastaComponents qfc = extract_fasta_components(src, pg.raw_len);
 
                 // Hit-rate gate with 512 probes (ANI^K/INDEX_STEP statistics):
-                // - same-genus winners (ANI≥97%): ~12 hits → hit_rate ≈ 0.024
-                // - same-genus losers (ANI≈92%):  ~2.4 hits → hit_rate ≈ 0.005
-                // Threshold 0.007 passes winners, rejects losers, saves 6ms/genome for ~77%.
+                // Threshold 0.001 → cuts at ANI ≈ 87.5% (cross-family/order); same-genus
+                // pairs (ANI ≥ 90%) have hit_rate ≥ 0.002 and always pass.
                 const double hit_rate = sample_anchor_hit_rate(qfc.seq, anchor_idx);
-                if (hit_rate < 0.007) {
-                    compress_plain_blob(pg, blobs[out_idx]);
-                    blobs[out_idx].use_mem_delta = false;
+                if (hit_rate < 0.001) {
+                    CompressedBlob local;
+                    compress_plain_blob(pg, local);
+                    local.use_mem_delta = false;
+                    blobs[out_idx] = std::move(local);
                     continue;
                 }
 
