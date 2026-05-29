@@ -37,7 +37,9 @@ struct QualRecord {
     float    chargaff_parity;            //  4  Chargaff 2nd parity score [0,1]; NAN = not computed
     float    spectral_gap;               //  4  1 - |λ₂| from k3 Markov op; NAN = not computed
     float    scale_kink;                 //  4  log₂(W*) dyadic-window scale; NAN = not computed
-    // total = 80 (struct has 8-byte alignment from genome_id; 76 bytes data → sizeof rounds to 80)
+    uint8_t  cross_genus_u8;             //  1  contamination_cross_genus × 255; 0=clean (uses tail padding)
+    uint8_t  _pad[3];                    //  3  padding to reach 80 bytes
+    // total = 80
 
     // qual_flags bits
     static constexpr uint8_t QUAL_FLAG_MIX_NO_DATA        = 0x01; // mixture model had < min_windows
@@ -70,6 +72,7 @@ struct QualRecord {
         r.spe_outlier_u8              = 0;
         r.sibling_outlier_u8          = 0;
         r.rho_outlier_u8              = 0;
+        r.cross_genus_u8              = 0;
         r.marker_redundancy_u16       = 0xFFFF;
         r.chargaff_parity             = NAN;
         r.spectral_gap                = NAN;

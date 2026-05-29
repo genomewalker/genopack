@@ -176,6 +176,7 @@ void run_pass_b(ICheckReader& pack,
             q.contamination_spe             = r.spe_outlier_u8     / 255.0f;
             q.contamination_sibling_outlier = r.sibling_outlier_u8 / 255.0f;
             q.contamination_rho_outlier     = r.rho_outlier_u8     / 255.0f;
+            q.contamination_cross_genus     = r.cross_genus_u8     / 255.0f;
         }
         if (to_scan.empty()) {
             spdlog::info("check pass-B: complete — all scores from QUAL cache");
@@ -348,6 +349,7 @@ void run_pass_b(ICheckReader& pack,
                 uint32_t spe_out_bp     = 0;
                 uint32_t sibling_out_bp = 0;
                 uint32_t rho_out_bp     = 0;
+                uint32_t cross_genus_bp = 0;
 
                 // Per-genome TNF cache: keeps computed TNF alive for compute_all_signals overload.
                 // Thread-local to avoid per-genome allocation.
@@ -420,6 +422,19 @@ void run_pass_b(ICheckReader& pack,
                                         if (rpc >= cfg.gcov_outlier_percentile) rho_out_bp += cf.contig_length;
                                     }
 
+                                    // Contrastive cross-genus: contig fits a foreign genus better
+                                    {
+                                        float min_foreign = std::numeric_limits<float>::max();
+                                        gcov_rd->scan([&](const GcovEntry& fe) {
+                                            if (&fe == gcov_entry || !(fe.flags & GCOV_FLAG_VALID)) return;
+                                            float xf[136];
+                                            for (int di = 0; di < 136; ++di) xf[di] = tnf[di] - fe.mu[di];
+                                            float d = gcov_mahalanobis(fe, xf);
+                                            if (d < min_foreign) min_foreign = d;
+                                        });
+                                        if (min_foreign < dist) cross_genus_bp += cf.contig_length;
+                                    }
+
                                     // Sibling contamination: genus-outlier but family-inlier
                                     if ((t2_out || spe_flag) && fcov_entry && fcov_rd) {
                                         float xmu_fam[136];
@@ -463,6 +478,7 @@ void run_pass_b(ICheckReader& pack,
                 float contamination_spe             = NAN;
                 float contamination_sibling_outlier = NAN;
                 float contamination_rho_outlier     = NAN;
+                float contamination_cross_genus     = NAN;
                 if (gcov_entry && gcov_rd && gcov_scored_bp > 0) {
                     contamination_contig_outlier =
                         static_cast<float>(gcov_out_bp) / static_cast<float>(gcov_scored_bp);
@@ -470,6 +486,8 @@ void run_pass_b(ICheckReader& pack,
                         static_cast<float>(spe_out_bp) / static_cast<float>(gcov_scored_bp);
                     contamination_rho_outlier =
                         static_cast<float>(rho_out_bp) / static_cast<float>(gcov_scored_bp);
+                    contamination_cross_genus =
+                        static_cast<float>(cross_genus_bp) / static_cast<float>(gcov_scored_bp);
                     if (fcov_entry)
                         contamination_sibling_outlier =
                             static_cast<float>(sibling_out_bp) / static_cast<float>(gcov_scored_bp);
@@ -659,6 +677,7 @@ void run_pass_b(ICheckReader& pack,
                     q.contamination_spe               = contamination_spe;
                     q.contamination_sibling_outlier   = contamination_sibling_outlier;
                     q.contamination_rho_outlier       = contamination_rho_outlier;
+                    q.contamination_cross_genus       = contamination_cross_genus;
                     q.contamination_contig_split      = contamination_contig_split;
                     q.contamination_self_outlier      = contamination_self_outlier;
                     q.fiedler_oph_split               = fiedler_oph_val;

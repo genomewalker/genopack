@@ -100,6 +100,8 @@ void write_qual_to_archive(const std::filesystem::path& gpk_path,
             std::min(1.0f, std::isnan(q.contamination_sibling_outlier) ? 0.0f : q.contamination_sibling_outlier) * 255.0f);
         r.rho_outlier_u8                = static_cast<uint8_t>(
             std::min(1.0f, std::isnan(q.contamination_rho_outlier) ? 0.0f : q.contamination_rho_outlier) * 255.0f);
+        r.cross_genus_u8                = static_cast<uint8_t>(
+            std::min(1.0f, std::isnan(q.contamination_cross_genus) ? 0.0f : q.contamination_cross_genus) * 255.0f);
         r.fmh_minority_u8               = static_cast<uint8_t>(
             std::min(1.0f, std::isnan(q.fmh_minority_fraction) ? 0.0f : q.fmh_minority_fraction) * 255.0f);
         // marker_completeness: 0=not_scored, 1-255=(value-1)/254 → range [0,1] with sentinel 0
@@ -333,7 +335,7 @@ int cmd_check(const std::filesystem::path& pack_path,
            "\tchromosome_skew_closure\tleakage_residual\tself_coherence"
            "\tchargaff_parity\tspectral_gap\tscale_kink\tcontamination_mixture\tmixture_sources"
            "\tn_mix_windows\tfiedler_value\tcontamination_contig_outlier\tcontamination_spe"
-           "\tcontamination_sibling_outlier\tcontamination_rho_outlier\tcontamination_contig_split"
+           "\tcontamination_sibling_outlier\tcontamination_rho_outlier\tcontamination_cross_genus\tcontamination_contig_split"
            "\tcontamination_self_outlier\tfiedler_oph_split"
            "\tfiedler_tnf_bimod\tfiedler_tnf_gap"
            "\tfmh_minority_fraction"
@@ -382,6 +384,7 @@ int cmd_check(const std::filesystem::path& pack_path,
             << fmt(q.contamination_spe) << '\t'
             << fmt(q.contamination_sibling_outlier) << '\t'
             << fmt(q.contamination_rho_outlier) << '\t'
+            << fmt(q.contamination_cross_genus) << '\t'
             << fmt(q.contamination_contig_split) << '\t'
             << fmt(q.contamination_self_outlier) << '\t'
             << fmt(q.fiedler_oph_split) << '\t'

@@ -59,6 +59,7 @@ struct GenomeQuality {
     float    fiedler_tnf_bimod             = NAN;  // TNF-kernel v₂ normalized max-gap bimodality
     float    fiedler_tnf_gap               = NAN;  // TNF-kernel λ₃−λ₂ eigengap
     float    fmh_minority_fraction         = NAN;  // FMH k=21,c=125 minority bp / scored_bp
+    float    contamination_cross_genus     = NAN;  // fraction bp where any foreign genus fits better than assigned
 
     // Marker-panel completeness (protein k-mer based; NAN if no .mrk file supplied)
     float    marker_completeness   = NAN;  // present / expected markers
