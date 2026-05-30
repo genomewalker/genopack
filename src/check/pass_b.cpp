@@ -359,6 +359,21 @@ void run_pass_b(ICheckReader& pack,
                 thread_local std::vector<std::array<float,136>> tnf_cache;
                 tnf_cache.clear();
                 tnf_cache.reserve(contigs.size());
+
+                // Qualifying contigs for batched cross-genus scan (genus-outer × contig-inner).
+                // At full GTDB scale (34,834 genera × ~11KB = 383MB), scanning each genus ONCE
+                // and evaluating all contigs in the inner loop reduces memory bandwidth from
+                // O(n_contigs × 383MB) to O(383MB) — loaded once into CPU cache per MAG.
+                struct QualContig {
+                    const float* tnf;
+                    float dist2, spe, host_ll;
+                    float best_foreign_ll;
+                    bool  family_inlier;
+                    uint32_t length;
+                    size_t   ci;
+                };
+                thread_local std::vector<QualContig> qual_contigs;
+                qual_contigs.clear();
                 // Build ContigAccum for fused compute_all_signals (eliminates raw FASTA re-scan).
                 thread_local std::vector<ContigAccum> accum_contigs;
                 accum_contigs.clear();
@@ -427,27 +442,11 @@ void run_pass_b(ICheckReader& pack,
                                         if (rpc >= cfg.gcov_outlier_percentile) rho_out_bp += cf.contig_length;
                                     }
 
-                                    // Contrastive cross-genus: log-LR test (calibrated for covariance breadth)
+                                    // Collect for batched cross-genus scan (executed after contig loop).
                                     {
                                         const float host_ll = gcov_log_likelihood(
                                             *gcov_entry, dist * dist, spe);
-                                        float best_foreign_ll = -std::numeric_limits<float>::max();
-                                        gcov_rd->scan([&](const GcovEntry& fe) {
-                                            if (&fe == gcov_entry || !(fe.flags & GCOV_FLAG_VALID)) return;
-                                            float xf[136];
-                                            for (int di = 0; di < 136; ++di) xf[di] = tnf[di] - fe.mu[di];
-                                            const float fd   = gcov_mahalanobis(fe, xf);
-                                            const float fspe = gcov_spe(fe, xf);
-                                            const float fll  = gcov_log_likelihood(fe, fd * fd, fspe);
-                                            if (fll > best_foreign_ll) best_foreign_ll = fll;
-                                        });
-                                        if (best_foreign_ll > host_ll + cfg.cross_genus_lr_margin) {
-                                            cross_genus_bp += cf.contig_length;
-                                            ctg_cross_genus[ci] = true;
-                                        }
-
-                                        // Sibling: family-inlier AND foreign genus fits better by log-LR
-                                        // (decoupled from host-outlier predicate — catches same-family contamination)
+                                        bool family_inlier = false;
                                         if (fcov_entry && fcov_rd) {
                                             float xmu_fam[136];
                                             for (int di = 0; di < 136; ++di)
@@ -456,13 +455,12 @@ void run_pass_b(ICheckReader& pack,
                                             const float f_pct  = fcov_rd->percentile(*fcov_entry, f_dist);
                                             const float f_spe  = gcov_spe(*fcov_entry, xmu_fam);
                                             const float f_spct = fcov_rd->spe_percentile(*fcov_entry, f_spe);
-                                            const bool family_inlier =
-                                                (f_pct  < cfg.gcov_outlier_percentile) &&
-                                                (f_spct < cfg.gcov_outlier_percentile);
-                                            if (family_inlier &&
-                                                best_foreign_ll > host_ll + cfg.cross_genus_lr_margin)
-                                                sibling_out_bp += cf.contig_length;
+                                            family_inlier = (f_pct  < cfg.gcov_outlier_percentile) &&
+                                                            (f_spct < cfg.gcov_outlier_percentile);
                                         }
+                                        qual_contigs.push_back({tnf, dist * dist, spe, host_ll,
+                                                                -std::numeric_limits<float>::max(),
+                                                                family_inlier, cf.contig_length, ci});
                                     }
                                 }
                             } else {
@@ -479,6 +477,33 @@ void run_pass_b(ICheckReader& pack,
                             clean_len += cf.contig_length;
 
                         flags.push_back(cf);
+                    }
+                }
+
+                // Batched cross-genus scan: genus-outer × contig-inner.
+                // Each GcovEntry's eigvecs (8KB+) is loaded once and reused across all
+                // qualifying contigs in this MAG, rather than once per contig.
+                // At full GTDB scale: O(383MB) total loads vs O(n_contigs × 383MB).
+                if (!qual_contigs.empty() && gcov_rd) {
+                    gcov_rd->scan([&](const GcovEntry& fe) {
+                        if (&fe == gcov_entry || !(fe.flags & GCOV_FLAG_VALID)) return;
+                        for (auto& qc : qual_contigs) {
+                            float xf[136];
+                            for (int di = 0; di < 136; ++di) xf[di] = qc.tnf[di] - fe.mu[di];
+                            const float fd  = gcov_mahalanobis(fe, xf);
+                            const float fsp = gcov_spe(fe, xf);
+                            const float fll = gcov_log_likelihood(fe, fd * fd, fsp);
+                            if (fll > qc.best_foreign_ll) qc.best_foreign_ll = fll;
+                        }
+                    });
+                    for (const auto& qc : qual_contigs) {
+                        if (qc.best_foreign_ll > qc.host_ll + cfg.cross_genus_lr_margin) {
+                            cross_genus_bp += qc.length;
+                            ctg_cross_genus[qc.ci] = true;
+                        }
+                        if (qc.family_inlier &&
+                            qc.best_foreign_ll > qc.host_ll + cfg.cross_genus_lr_margin)
+                            sibling_out_bp += qc.length;
                     }
                 }
 

@@ -46,8 +46,8 @@ struct GcovEntry {
     uint64_t genus_hash;                              //  8
     uint32_t n_members;                               //  4
     uint32_t n_long_contigs;                          //  4  long contigs used for Σ_bio
-    uint32_t flags;                                   //  4  bit0 = valid
-    uint32_t _pad;                                    //  4
+    uint32_t flags;                                   //  4  bit0=valid  bit1=has_log_det
+    float    log_det_cached;                          //  4  precomputed log|Σ|; valid when bit1 set
     float    eigenvalues[GCOV_N_EIGVECS];             //   60  top-K eigenvalues of LW-shrunk Σ_bio (descending)
     float    eigvecs[GCOV_N_EIGVECS][136];            // 8160  top-K eigenvectors row-major (descending)
     float    quantiles[GCOV_N_QUANTILES];             //  512  sorted Mahalanobis distances at Q equally-spaced percentile points
@@ -70,7 +70,8 @@ static_assert(sizeof(GcovEntry) ==
     GCOV_N_QUANTILES * 4 +
     GCOV_RHO_DIM * 4 + GCOV_RHO_PREC_N * 4 + GCOV_N_QUANTILES * 4);  // rho fields
 
-static constexpr uint32_t GCOV_FLAG_VALID = 0x1u;
+static constexpr uint32_t GCOV_FLAG_VALID       = 0x1u;
+static constexpr uint32_t GCOV_FLAG_HAS_LOG_DET = 0x2u;
 
 // ── Writer ────────────────────────────────────────────────────────────────────
 
@@ -114,6 +115,15 @@ public:
         for (uint32_t i = 0; i < GCOV_RHO_DIM; ++i) e.rho_mean[i] = rho_mean[i];
         for (uint32_t i = 0; i < GCOV_RHO_PREC_N; ++i) e.rho_prec_lower[i] = rho_prec_lower[i];
         for (uint32_t q = 0; q < GCOV_N_QUANTILES; ++q) e.rho_quantiles[q] = rho_quantiles[q];
+        if (flags & GCOV_FLAG_VALID) {
+            float ld = 0.0f;
+            constexpr int K = static_cast<int>(GCOV_N_EIGVECS);
+            for (int k = 0; k < K; ++k)
+                if (eigenvalues[k] >= 1e-9f) ld += std::log(eigenvalues[k]);
+            ld += (136 - K) * std::log(std::max(sigma2_resid, 1e-12f));
+            e.log_det_cached = ld;
+            e.flags |= GCOV_FLAG_HAS_LOG_DET;
+        }
         entries_.push_back(e);
     }
 
@@ -264,7 +274,9 @@ float gcov_spe(const GcovEntry& e, const float* x_minus_mu) noexcept;
 float gcov_rho_distance(const GcovEntry& e, const float* rho_minus_mean) noexcept;
 
 // log|Σ| = Σ_k log λ_k + (D−K)·log σ²_resid  (constant per genus)
+// Returned from cache when available (bit1 of flags set at write time).
 inline float gcov_log_det(const GcovEntry& e) noexcept {
+    if (e.flags & GCOV_FLAG_HAS_LOG_DET) return e.log_det_cached;
     float ld = 0.0f;
     constexpr int K = static_cast<int>(GCOV_N_EIGVECS);
     for (int k = 0; k < K; ++k)
