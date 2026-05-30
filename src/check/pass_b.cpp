@@ -583,18 +583,7 @@ void run_pass_b(ICheckReader& pack,
                                 translate_6frame(contig.seq, min_seg,
                                     [&](int, const uint8_t* seg, int len, int, int) {
                                         orf_mers.clear();
-                                        for (int i = 0; i + METAMER_K_D6 <= len; ++i) {
-                                            uint8_t d6[METAMER_K_D6];
-                                            bool ok = true;
-                                            for (int j = 0; j < METAMER_K_D6; ++j) {
-                                                if (seg[i+j] >= 20) { ok = false; break; }
-                                                d6[j] = AA_DAYHOFF6[seg[i+j]];
-                                            }
-                                            if (!ok) continue;
-                                            if (!metamer_is_syncmer_d6(d6)) continue;
-                                            if (metamer_is_low_complexity(d6, METAMER_K_D6)) continue;
-                                            orf_mers.push_back(metamer_hash_d6(d6));
-                                        }
+                                        extract_d6_orf_syncmers(seg, len, orf_mers);
                                         if (orf_mers.empty()) return;
                                         std::sort(orf_mers.begin(), orf_mers.end());
                                         orf_mers.erase(std::unique(orf_mers.begin(), orf_mers.end()),

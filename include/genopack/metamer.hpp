@@ -454,6 +454,67 @@ inline void extract_d6_dna_into(std::string_view seq, int min_seg_aa,
     });
 }
 
+// Extract Dayhoff-6 k=12 syncmer hashes from one pre-translated ORF segment using a
+// sliding-window minimum deque — O(len) vs the per-position O(WIN) smer recomputation.
+// seg: AA_ENC-encoded values 0..19 (translate_6frame guarantees this).
+// Appends to `out` without clearing.
+inline void extract_d6_orf_syncmers(const uint8_t* seg, int len,
+                                     std::vector<uint64_t>& out) {
+    constexpr int K = METAMER_K_D6;
+    constexpr int S = METAMER_S_D6;
+    constexpr int W = K - S + 1;  // 9: number of s-mers per k-mer window
+    if (len < K) return;
+
+    thread_local std::vector<uint8_t>  d6;
+    thread_local std::vector<uint16_t> sv;
+    d6.resize(len);
+    for (int i = 0; i < len; ++i) {
+        if (seg[i] >= 20) return;  // ambiguous AA — skip ORF
+        d6[i] = AA_DAYHOFF6[seg[i]];
+    }
+    const int nsm = len - S + 1;
+    sv.resize(nsm);
+    for (int i = 0; i < nsm; ++i)
+        sv[i] = static_cast<uint16_t>(d6[i] | (d6[i+1]<<3) | (d6[i+2]<<6) | (d6[i+3]<<9));
+
+    // Monotonic deque for sliding-window minimum (window = [i, i+W-1]).
+    // Fixed-capacity 16 (> W=9). Stores s-mer indices; back >= sv comparison keeps
+    // invariant that sv[dq[head]] is the minimum in the current window.
+    struct Deque {
+        int buf[16]; int h = 0, t = 0;
+        bool empty()     const { return h == t; }
+        int  front()     const { return buf[h & 15]; }
+        int  back()      const { return buf[(t-1) & 15]; }
+        void push(int v)       { buf[t++ & 15] = v; }
+        void pop_front()       { ++h; }
+        void pop_back()        { --t; }
+    } dq;
+
+    // Seed deque with first window [0, W-1].
+    for (int j = 0; j < W && j < nsm; ++j) {
+        while (!dq.empty() && sv[dq.back()] >= sv[j]) dq.pop_back();
+        dq.push(j);
+    }
+
+    const int nk = len - K + 1;
+    for (int i = 0; i < nk; ++i) {
+        // Expire front if it left the window.
+        while (!dq.empty() && dq.front() < i) dq.pop_front();
+
+        // Closed syncmer t=0: emit if window minimum is at left edge i.
+        if (!dq.empty() && dq.front() == i)
+            if (!metamer_is_low_complexity(d6.data() + i, K))
+                out.push_back(metamer_hash_d6(d6.data() + i));
+
+        // Enqueue next s-mer (right edge of next window).
+        const int nx = i + W;
+        if (nx < nsm) {
+            while (!dq.empty() && sv[dq.back()] >= sv[nx]) dq.pop_back();
+            dq.push(nx);
+        }
+    }
+}
+
 // Dayhoff-6 variant of extract_metamers_aa: for pool building from MSA protein strings.
 // Gaps ('-') skip without breaking the segment (same as extract_metamers_aa).
 // Only emits syncmer k-mers to keep pool sparse and density-consistent.

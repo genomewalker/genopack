@@ -3197,18 +3197,7 @@ int main(int argc, char** argv) {
                     genopack::translate_6frame(seq, min_seg,
                         [&](int, const uint8_t* seg, int len, int, int) {
                             orf_mers.clear();
-                            for (int i = 0; i + genopack::METAMER_K_D6 <= len; ++i) {
-                                uint8_t d6[genopack::METAMER_K_D6];
-                                bool ok = true;
-                                for (int j = 0; j < genopack::METAMER_K_D6; ++j) {
-                                    if (seg[i+j] >= 20) { ok = false; break; }
-                                    d6[j] = genopack::AA_DAYHOFF6[seg[i+j]];
-                                }
-                                if (!ok) continue;
-                                if (!genopack::metamer_is_syncmer_d6(d6)) continue;
-                                if (genopack::metamer_is_low_complexity(d6, genopack::METAMER_K_D6)) continue;
-                                orf_mers.push_back(genopack::metamer_hash_d6(d6));
-                            }
+                            genopack::extract_d6_orf_syncmers(seg, len, orf_mers);
                             if (orf_mers.empty()) return;
                             std::sort(orf_mers.begin(), orf_mers.end());
                             orf_mers.erase(std::unique(orf_mers.begin(), orf_mers.end()), orf_mers.end());
