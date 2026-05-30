@@ -3170,73 +3170,108 @@ int main(int argc, char** argv) {
             return;
         }
 
-        // Read FASTA and extract metamers.
-        std::vector<uint64_t> qmers;
-        qmers.reserve(1 << 16);
+        // Per-contig voting: each contig votes independently for each marker.
+        // Dispatches to Dayhoff-6 k=12 syncmers or full-AA k=8 FracMinHash.
+        const bool is_d6      = mr.is_dayhoff6();
         const uint64_t frac_max = mr.frac_max_hash();
-        {
-            std::ifstream fin(ms_fasta);
-            if (!fin) throw std::runtime_error("cannot open FASTA: " + ms_fasta);
-            std::string line, seq;
-            auto flush_seq = [&]() {
-                if (!seq.empty()) {
-                    auto h = genopack::extract_metamers_dna(seq, genopack::METAMER_K, 8, frac_max);
-                    qmers.insert(qmers.end(), h.begin(), h.end());
-                    seq.clear();
-                }
-            };
-            while (std::getline(fin, line)) {
-                if (!line.empty() && line[0] == '>') flush_seq();
-                else seq += line;
-            }
-            flush_seq();
-        }
-        std::sort(qmers.begin(), qmers.end());
-        qmers.erase(std::unique(qmers.begin(), qmers.end()), qmers.end());
+        const int min_seg     = is_d6 ? genopack::METAMER_K_D6 : genopack::METAMER_K;
+        const uint32_t min_hits = static_cast<uint32_t>(ms_min_hits);
 
         const bool is_arc = (calib.header->domain == genopack::MRKR_DOMAIN_ARC);
         auto mh  = is_arc ? mr.merged_hashes_arc() : mr.merged_hashes_bac();
         auto mid = is_arc ? mr.merged_ids_arc()    : mr.merged_ids_bac();
         const uint8_t n_markers = calib.header->n_markers;
 
-        uint32_t hits[173] = {};
-        const uint64_t* qp  = qmers.data(),  *qpe = qp  + qmers.size();
-        const uint64_t* mhp = mh.data(),     *mhe = mhp + mh.size();
-        const uint8_t*  mip = mid.data();
-        while (qp != qpe && mhp != mhe) {
-            if      (*qp < *mhp) ++qp;
-            else if (*mhp < *qp) { ++mhp; ++mip; }
-            else                 { hits[*mip]++; ++qp; ++mhp; ++mip; }
+        uint32_t contig_votes[173] = {};
+        {
+            std::ifstream fin(ms_fasta);
+            if (!fin) throw std::runtime_error("cannot open FASTA: " + ms_fasta);
+            std::string line, seq;
+            std::vector<uint64_t> orf_mers;
+            auto score_contig = [&]() {
+                if (seq.empty()) return;
+                uint32_t best[173] = {};
+                if (is_d6) {
+                    genopack::translate_6frame(seq, min_seg,
+                        [&](int, const uint8_t* seg, int len, int, int) {
+                            orf_mers.clear();
+                            for (int i = 0; i + genopack::METAMER_K_D6 <= len; ++i) {
+                                uint8_t d6[genopack::METAMER_K_D6];
+                                bool ok = true;
+                                for (int j = 0; j < genopack::METAMER_K_D6; ++j) {
+                                    if (seg[i+j] >= 20) { ok = false; break; }
+                                    d6[j] = genopack::AA_DAYHOFF6[seg[i+j]];
+                                }
+                                if (!ok) continue;
+                                if (!genopack::metamer_is_syncmer_d6(d6)) continue;
+                                if (genopack::metamer_is_low_complexity(d6, genopack::METAMER_K_D6)) continue;
+                                orf_mers.push_back(genopack::metamer_hash_d6(d6));
+                            }
+                            if (orf_mers.empty()) return;
+                            std::sort(orf_mers.begin(), orf_mers.end());
+                            orf_mers.erase(std::unique(orf_mers.begin(), orf_mers.end()), orf_mers.end());
+                            uint32_t local[173] = {};
+                            const uint64_t* mhp = mh.data(), *mhe = mhp + mh.size();
+                            const uint8_t* mip = mid.data();
+                            for (uint64_t h : orf_mers) {
+                                auto it = std::lower_bound(mhp, mhe, h);
+                                if (it != mhe && *it == h)
+                                    local[mip[it - mhp]]++;
+                            }
+                            const uint32_t q_sz = static_cast<uint32_t>(orf_mers.size());
+                            const uint32_t thr = std::max(min_hits, std::max(1u, q_sz / 20u));
+                            for (uint8_t mi = 0; mi < n_markers; ++mi)
+                                if (local[mi] >= thr && local[mi] > best[mi])
+                                    best[mi] = local[mi];
+                        });
+                } else {
+                    orf_mers.clear();
+                    genopack::extract_metamers_dna_into(seq, genopack::METAMER_K, min_seg,
+                                                        frac_max, orf_mers);
+                    if (!orf_mers.empty()) {
+                        std::sort(orf_mers.begin(), orf_mers.end());
+                        orf_mers.erase(std::unique(orf_mers.begin(), orf_mers.end()), orf_mers.end());
+                        uint32_t hits[173] = {};
+                        const uint64_t* qp = orf_mers.data(), *qpe = qp + orf_mers.size();
+                        const uint64_t* mhp = mh.data(), *mhe = mhp + mh.size();
+                        const uint8_t* mip = mid.data();
+                        while (qp != qpe && mhp != mhe) {
+                            if (*qp < *mhp) ++qp;
+                            else if (*mhp < *qp) { ++mhp; ++mip; }
+                            else { hits[*mip]++; ++qp; ++mhp; ++mip; }
+                        }
+                        const uint32_t q_sz = static_cast<uint32_t>(orf_mers.size());
+                        const uint32_t thr = std::max(min_hits, std::max(1u, q_sz / 20u));
+                        for (uint8_t mi = 0; mi < n_markers; ++mi)
+                            if (hits[mi] >= thr && hits[mi] > best[mi])
+                                best[mi] = hits[mi];
+                    }
+                }
+                for (uint8_t mi = 0; mi < n_markers; ++mi)
+                    if (best[mi] > 0) contig_votes[mi]++;
+                seq.clear();
+            };
+            while (std::getline(fin, line)) {
+                if (!line.empty() && line[0] == '>') score_contig();
+                else seq += line;
+            }
+            score_contig();
         }
 
-        int n_present = 0, n_expected = 0;
+        int n_present = 0, n_expected = 0, n_redundant = 0;
         for (uint8_t mi = 0; mi < n_markers; ++mi) {
             if (!calib.marker_expected(mi)) continue;
             ++n_expected;
-            const uint32_t thr = static_cast<uint32_t>(calib.slots[mi].null_floor_u16)
-                               + static_cast<uint32_t>(ms_min_hits);
-            if (hits[mi] >= thr) ++n_present;
+            if (contig_votes[mi] >= 1) ++n_present;
+            if (contig_votes[mi] >= 2) ++n_redundant;
         }
         const float completeness = n_expected > 0
             ? static_cast<float>(n_present) / static_cast<float>(n_expected)
             : std::numeric_limits<float>::quiet_NaN();
-        float redundancy = std::numeric_limits<float>::quiet_NaN();
-        {
-            float rsum = 0.0f; int rn = 0;
-            for (uint8_t mi = 0; mi < n_markers; ++mi) {
-                if (!calib.marker_expected(mi)) continue;
-                const uint32_t thr = static_cast<uint32_t>(calib.slots[mi].null_floor_u16)
-                                   + static_cast<uint32_t>(ms_min_hits);
-                if (hits[mi] >= thr) {
-                    const bool is_arc2 = (calib.header->domain == genopack::MRKR_DOMAIN_ARC);
-                    const uint8_t pool_mi = is_arc2
-                        ? static_cast<uint8_t>(mr.n_bac() + mi) : mi;
-                    const uint32_t psz = mr.pool_n_hashes(pool_mi);
-                    if (psz > 0) { rsum += static_cast<float>(hits[mi]) / psz; ++rn; }
-                }
-            }
-            if (rn > 0) redundancy = rsum / rn;
-        }
+        float redundancy = n_expected > 0
+            ? static_cast<float>(n_redundant) / static_cast<float>(n_expected)
+            : std::numeric_limits<float>::quiet_NaN();
+
         auto fmtf = [](float v) -> std::string {
             return std::isnan(v) ? "NA" : std::to_string(v);
         };

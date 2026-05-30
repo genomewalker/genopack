@@ -556,42 +556,77 @@ void run_pass_b(ICheckReader& pack,
 
                         thread_local std::vector<uint64_t> orf_mers;
                         for (const auto& contig : contigs) {
-                            // Per-marker best hit count across all ORFs in this contig.
                             uint32_t best[173] = {};
-                            orf_mers.clear();
 
                             if (is_d6) {
-                                extract_d6_dna_into(contig.seq, min_seg, orf_mers);
+                                // Dayhoff-6: per-ORF scoring — threshold normalised to each
+                                // individual ORF's syncmer count, not the whole contig.
+                                // A 300AA ORF has ~32 syncmers; threshold = max(min_hits, 32/20)=2.
+                                translate_6frame(contig.seq, min_seg,
+                                    [&](int, const uint8_t* seg, int len, int, int) {
+                                        orf_mers.clear();
+                                        for (int i = 0; i + METAMER_K_D6 <= len; ++i) {
+                                            uint8_t d6[METAMER_K_D6];
+                                            bool ok = true;
+                                            for (int j = 0; j < METAMER_K_D6; ++j) {
+                                                if (seg[i+j] >= 20) { ok = false; break; }
+                                                d6[j] = AA_DAYHOFF6[seg[i+j]];
+                                            }
+                                            if (!ok) continue;
+                                            if (!metamer_is_syncmer_d6(d6)) continue;
+                                            if (metamer_is_low_complexity(d6, METAMER_K_D6)) continue;
+                                            orf_mers.push_back(metamer_hash_d6(d6));
+                                        }
+                                        if (orf_mers.empty()) return;
+                                        std::sort(orf_mers.begin(), orf_mers.end());
+                                        orf_mers.erase(std::unique(orf_mers.begin(), orf_mers.end()),
+                                                       orf_mers.end());
+
+                                        uint32_t local[173] = {};
+                                        // Binary search: O(q×log(pool)) vs O(pool) for tiny ORF queries
+                                        const uint64_t* mhp = mh.data();
+                                        const uint64_t* mhe = mhp + mh.size();
+                                        const uint8_t*  mip = mid.data();
+                                        for (uint64_t h : orf_mers) {
+                                            auto it = std::lower_bound(mhp, mhe, h);
+                                            if (it != mhe && *it == h)
+                                                local[mip[it - mhp]]++;
+                                        }
+                                        const uint32_t q_sz = static_cast<uint32_t>(orf_mers.size());
+                                        const uint32_t thr  = std::max(min_hits,
+                                                                        std::max(1u, q_sz / 20u));
+                                        for (uint8_t mi = 0; mi < n_markers; ++mi)
+                                            if (local[mi] >= thr && local[mi] > best[mi])
+                                                best[mi] = local[mi];
+                                    });
                             } else {
+                                // Full-AA k=8: whole-contig accumulation (legacy).
+                                orf_mers.clear();
                                 extract_metamers_dna_into(contig.seq, METAMER_K, min_seg,
                                                          mrk_frac_max, orf_mers);
+                                if (!orf_mers.empty()) {
+                                    std::sort(orf_mers.begin(), orf_mers.end());
+                                    orf_mers.erase(std::unique(orf_mers.begin(), orf_mers.end()),
+                                                   orf_mers.end());
+                                    uint32_t hits[173] = {};
+                                    const uint64_t* qp  = orf_mers.data();
+                                    const uint64_t* qpe = qp + orf_mers.size();
+                                    const uint64_t* mhp = mh.data();
+                                    const uint64_t* mhe = mhp + mh.size();
+                                    const uint8_t*  mip = mid.data();
+                                    while (qp != qpe && mhp != mhe) {
+                                        if      (*qp < *mhp) ++qp;
+                                        else if (*mhp < *qp) { ++mhp; ++mip; }
+                                        else { hits[*mip]++; ++qp; ++mhp; ++mip; }
+                                    }
+                                    const uint32_t q_sz = static_cast<uint32_t>(orf_mers.size());
+                                    const uint32_t thr  = std::max(min_hits,
+                                                                    std::max(1u, q_sz / 20u));
+                                    for (uint8_t mi = 0; mi < n_markers; ++mi)
+                                        if (hits[mi] >= thr && hits[mi] > best[mi])
+                                            best[mi] = hits[mi];
+                                }
                             }
-                            if (orf_mers.empty()) continue;
-                            std::sort(orf_mers.begin(), orf_mers.end());
-                            orf_mers.erase(std::unique(orf_mers.begin(), orf_mers.end()),
-                                           orf_mers.end());
-
-                            // Two-pointer merge against pool → hits per marker.
-                            uint32_t hits[173] = {};
-                            const uint64_t* qp  = orf_mers.data();
-                            const uint64_t* qpe = qp + orf_mers.size();
-                            const uint64_t* mhp = mh.data();
-                            const uint64_t* mhe = mhp + mh.size();
-                            const uint8_t*  mip = mid.data();
-                            while (qp != qpe && mhp != mhe) {
-                                if      (*qp < *mhp) ++qp;
-                                else if (*mhp < *qp) { ++mhp; ++mip; }
-                                else                 { hits[*mip]++; ++qp; ++mhp; ++mip; }
-                            }
-
-                            // Threshold: min_hits OR min containment fraction of ORF sketch.
-                            // Query-normalised containment stabilises threshold for short ORFs.
-                            const uint32_t q_sz   = static_cast<uint32_t>(orf_mers.size());
-                            const uint32_t frac_t = std::max(1u, q_sz / 20u); // 5% of sketch
-                            const uint32_t thr    = std::max(min_hits, frac_t);
-                            for (uint8_t mi = 0; mi < n_markers; ++mi)
-                                if (hits[mi] >= thr && hits[mi] > best[mi])
-                                    best[mi] = hits[mi];
 
                             for (uint8_t mi = 0; mi < n_markers; ++mi)
                                 if (best[mi] > 0) contig_votes[mi]++;
