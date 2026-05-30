@@ -71,11 +71,47 @@ void MarkerWriter::finalize(const std::filesystem::path& path,
         pool_bytes += nh * sizeof(uint64_t);
     }
 
-    // Redundancy calibration section (sorted by genus_hash, after pool).
+    // Pre-merged pool section: k-way merge done at build time so loading is O(1).
+    // Layout: [N_bac uint64 hashes][N_bac uint8 ids] then [N_arc uint64][N_arc uint8]
+    // Aligned to 8 bytes. Stored after pool hash arrays.
     const uint64_t pool_end = static_cast<uint64_t>(pool_off) + pool_bytes;
-    const uint32_t redun_calib_off = (redun_calib_.empty()) ? 0
-                                   : static_cast<uint32_t>(pool_end);
-    const uint32_t redun_calib_n   = static_cast<uint32_t>(redun_calib_.size());
+    // Align merged section to 8 bytes.
+    const uint64_t merged_bac_off_u64 = (pool_end + 7) & ~uint64_t{7};
+
+    // Build merged bac pool (k-way merge of the per-marker arrays).
+    auto build_merged_section = [&](uint8_t base, uint8_t count)
+        -> std::pair<std::vector<uint64_t>, std::vector<uint8_t>> {
+        std::vector<std::pair<uint64_t,uint8_t>> pairs;
+        size_t total = 0;
+        for (uint8_t i = 0; i < count; ++i)
+            if (base + i < pool_.size()) total += pool_[base + i].size();
+        pairs.reserve(total);
+        for (uint8_t i = 0; i < count; ++i) {
+            if (base + i >= pool_.size()) continue;
+            for (uint64_t h : pool_[base + i]) pairs.emplace_back(h, i);
+        }
+        std::stable_sort(pairs.begin(), pairs.end(),
+                         [](const auto& a, const auto& b) { return a.first < b.first; });
+        std::vector<uint64_t> hashes(pairs.size());
+        std::vector<uint8_t>  ids(pairs.size());
+        for (size_t i = 0; i < pairs.size(); ++i) {
+            hashes[i] = pairs[i].first;
+            ids[i]    = pairs[i].second;
+        }
+        return {std::move(hashes), std::move(ids)};
+    };
+
+    auto [merged_bac_h, merged_bac_id] = build_merged_section(0,     n_bac);
+    auto [merged_arc_h, merged_arc_id] = build_merged_section(n_bac, n_arc);
+
+    // Merged arc section follows immediately after bac.
+    const uint64_t bac_section_bytes = merged_bac_h.size() * 8 + merged_bac_h.size();
+    const uint64_t bac_section_padded = (bac_section_bytes + 7) & ~uint64_t{7};
+    const uint64_t merged_arc_off_u64 = merged_arc_h.empty() ? 0
+                                       : merged_bac_off_u64 + bac_section_padded;
+
+    const uint32_t merged_bac_off = static_cast<uint32_t>(merged_bac_off_u64);
+    const uint32_t merged_arc_off = static_cast<uint32_t>(merged_arc_off_u64);
 
     // ── Pass 2: write ─────────────────────────────────────────────────────────
 
@@ -98,9 +134,9 @@ void MarkerWriter::finalize(const std::filesystem::path& path,
     hdr.pool_idx_off  = pool_idx_off;
     hdr.calib_off     = calib_off;
     hdr.pool_off      = pool_off;
-    hdr.frac_scale       = frac_scale;
-    hdr.redun_calib_off  = redun_calib_off;
-    hdr.redun_calib_n    = redun_calib_n;
+    hdr.frac_scale      = frac_scale;
+    hdr.merged_bac_off  = merged_bac_off;
+    hdr.merged_arc_off  = merged_arc_off;
     write(&hdr, sizeof(hdr));
 
     // Sorted lookup table.
@@ -129,9 +165,23 @@ void MarkerWriter::finalize(const std::filesystem::path& path,
             write(pool_[mi].data(), pool_[mi].size() * sizeof(uint64_t));
     }
 
-    // Redundancy calibration array (sorted by genus_hash).
-    if (!redun_calib_.empty())
-        write(redun_calib_.data(), redun_calib_.size() * sizeof(RedunCalibEntry));
+    // Pre-merged pool (bac then arc): enables O(1) loading via mmap pointer.
+    // Align to 8 bytes.
+    {
+        const uint64_t cur = static_cast<uint64_t>(f.tellp());
+        const uint64_t pad = (merged_bac_off_u64 > cur) ? merged_bac_off_u64 - cur : 0;
+        if (pad) { const std::vector<uint8_t> zeros(pad, 0); write(zeros.data(), pad); }
+    }
+    write(merged_bac_h.data(),  merged_bac_h.size()  * sizeof(uint64_t));
+    write(merged_bac_id.data(), merged_bac_id.size());
+    if (!merged_arc_h.empty()) {
+        // Pad to 8-byte alignment between bac and arc sections.
+        const uint64_t cur = static_cast<uint64_t>(f.tellp());
+        const uint64_t pad = (merged_arc_off_u64 > cur) ? merged_arc_off_u64 - cur : 0;
+        if (pad) { const std::vector<uint8_t> zeros(pad, 0); write(zeros.data(), pad); }
+        write(merged_arc_h.data(),  merged_arc_h.size()  * sizeof(uint64_t));
+        write(merged_arc_id.data(), merged_arc_id.size());
+    }
 
     if (!f) throw std::runtime_error("markers: write failed: " + path.string());
 }

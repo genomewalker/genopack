@@ -551,12 +551,17 @@ void run_pass_b(ICheckReader& pack,
                     const uint64_t genus_hash = GcovWriter::hash_genus(git->second);
                     auto calib = mrk_rd->lookup_lineage(genus_hash);
                     if (calib.valid()) {
-                        const bool is_arc     = (calib.header->domain == MRKR_DOMAIN_ARC);
-                        const bool is_d6      = mrk_rd->is_dayhoff6();
-                        auto mh  = is_arc ? mrk_rd->merged_hashes_arc() : mrk_rd->merged_hashes_bac();
-                        auto mid = is_arc ? mrk_rd->merged_ids_arc()    : mrk_rd->merged_ids_bac();
+                        const bool is_arc      = (calib.header->domain == MRKR_DOMAIN_ARC);
+                        const bool is_d6       = mrk_rd->is_dayhoff6();
+                        auto mh   = is_arc ? mrk_rd->merged_hashes_arc() : mrk_rd->merged_hashes_bac();
+                        auto mid  = is_arc ? mrk_rd->merged_ids_arc()    : mrk_rd->merged_ids_bac();
+                        const BlockedBloom& bloom =
+                            is_arc ? mrk_rd->merged_bloom_arc() : mrk_rd->merged_bloom_bac();
                         const uint8_t  n_markers = calib.header->n_markers;
-                        const int      min_seg   = is_d6 ? METAMER_K_D6 : METAMER_K;
+                        // min_seg=50 for Dayhoff-6: ORFs <50 AA can never accumulate
+                        // min_hits=5 syncmer hits (max ~5 syncmers at 11% rate → needs 100% hit
+                        // rate at any divergence — impossible). Skip them with zero sensitivity loss.
+                        const int min_seg = is_d6 ? 50 : METAMER_K;
                         const uint32_t min_hits  = static_cast<uint32_t>(cfg.marker_min_hits);
 
                         // contig_votes_native[mi]  = host-origin contigs voting for marker mi.
@@ -596,11 +601,11 @@ void run_pass_b(ICheckReader& pack,
                                                        orf_mers.end());
 
                                         uint32_t local[173] = {};
-                                        // Binary search: O(q×log(pool)) vs O(pool) for tiny ORF queries
                                         const uint64_t* mhp = mh.data();
                                         const uint64_t* mhe = mhp + mh.size();
                                         const uint8_t*  mip = mid.data();
                                         for (uint64_t h : orf_mers) {
+                                            if (!bloom.might_contain(h)) continue;
                                             auto it = std::lower_bound(mhp, mhe, h);
                                             if (it != mhe && *it == h)
                                                 local[mip[it - mhp]]++;
@@ -622,15 +627,13 @@ void run_pass_b(ICheckReader& pack,
                                     orf_mers.erase(std::unique(orf_mers.begin(), orf_mers.end()),
                                                    orf_mers.end());
                                     uint32_t hits[173] = {};
-                                    const uint64_t* qp  = orf_mers.data();
-                                    const uint64_t* qpe = qp + orf_mers.size();
                                     const uint64_t* mhp = mh.data();
                                     const uint64_t* mhe = mhp + mh.size();
                                     const uint8_t*  mip = mid.data();
-                                    while (qp != qpe && mhp != mhe) {
-                                        if      (*qp < *mhp) ++qp;
-                                        else if (*mhp < *qp) { ++mhp; ++mip; }
-                                        else { hits[*mip]++; ++qp; ++mhp; ++mip; }
+                                    for (uint64_t h : orf_mers) {
+                                        if (!bloom.might_contain(h)) continue;
+                                        auto it = std::lower_bound(mhp, mhe, h);
+                                        if (it != mhe && *it == h) hits[mip[it - mhp]]++;
                                     }
                                     const uint32_t q_sz = static_cast<uint32_t>(orf_mers.size());
                                     const uint32_t thr  = std::max(min_hits,

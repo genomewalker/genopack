@@ -33,11 +33,11 @@ static constexpr uint8_t  MRKR_ALPHABET_DAYHOFF6  = 2; // Dayhoff-6 groups, k=12
 
 // ── On-disk structs (little-endian POD) ──────────────────────────────────────
 
-struct MarkerHeader {         // 40 bytes (v2+; v1 was 32 bytes without redun_calib fields)
+struct MarkerHeader {         // 40 bytes (v2+; v1 was 32 bytes)
     uint32_t magic;           // MRKR_MAGIC
     uint16_t version;         // MRKR_VERSION
-    uint8_t  k;               // metamer k (= METAMER_K = 8)
-    uint8_t  alphabet;        // MRKR_ALPHABET_FULL_AA = 0
+    uint8_t  k;               // metamer k
+    uint8_t  alphabet;        // MRKR_ALPHABET_*
     uint32_t n_lineages;      // entries in lookup table
     uint8_t  n_bac_markers;   // 120 for GTDB bac120
     uint8_t  n_arc_markers;   // 53 for GTDB ar53
@@ -46,8 +46,12 @@ struct MarkerHeader {         // 40 bytes (v2+; v1 was 32 bytes without redun_ca
     uint32_t pool_idx_off;    // byte offset → MarkerPoolEntry[n_bac+n_arc]
     uint32_t calib_off;       // byte offset → packed CalibEntry data
     uint32_t pool_off;        // byte offset → concatenated sorted uint64 hash arrays
-    uint32_t redun_calib_off; // byte offset → RedunCalibEntry[redun_calib_n] (0 if absent)
-    uint32_t redun_calib_n;   // number of RedunCalibEntry rows (0 if absent)
+    // Merged-pool fast-path: pre-sorted (hash,id) pairs written at build time.
+    // If non-zero, build_merged_pool() uses mmap pointers instead of k-way merge.
+    // Layout: N_bac uint64 hashes | N_bac uint8 ids | (arc equivalent at merged_arc_off).
+    // N_bac/N_arc are the respective sums of per-marker pool sizes.
+    uint32_t merged_bac_off;  // byte offset → pre-merged bac pool (0 if absent)
+    uint32_t merged_arc_off;  // byte offset → pre-merged arc pool (0 if absent)
 };
 static_assert(sizeof(MarkerHeader) == 40);
 
@@ -153,10 +157,16 @@ struct BlockedBloom {
         if (map.empty()) return;
         n_blocks = std::max(1u, (uint32_t)(map.count * bits_per_elem / BITS_PER_BLOCK));
         data.assign((size_t)n_blocks * 8, 0);
-        // Iterate all valid entries in the flat map
-        for (size_t i = 0; i < map.keys.size(); ++i) {
+        for (size_t i = 0; i < map.keys.size(); ++i)
             if (map.keys[i] != FlatHitMap::EMPTY) insert(map.keys[i]);
-        }
+    }
+
+    // Build directly from a sorted/unsorted hash array — no FlatHitMap needed.
+    void build_from_hashes(const uint64_t* hashes, size_t n, float bits_per_elem = 10.0f) {
+        if (n == 0) return;
+        n_blocks = std::max(1u, (uint32_t)(n * bits_per_elem / BITS_PER_BLOCK));
+        data.assign((size_t)n_blocks * 8, 0);
+        for (size_t i = 0; i < n; ++i) insert(hashes[i]);
     }
 
     void insert(uint64_t h) noexcept {
@@ -341,8 +351,33 @@ public:
         if (!hdr_) return;
         const uint8_t n_bac = hdr_->n_bac_markers;
         const uint8_t n_arc = hdr_->n_arc_markers;
-        build_merged(0,     n_bac, merged_hashes_bac_, merged_ids_bac_);
-        build_merged(n_bac, n_arc, merged_hashes_arc_, merged_ids_arc_);
+
+        if (hdr_->merged_bac_off != 0) {
+            // Fast path: pre-merged pool stored in file — just mmap pointers, no copy/merge.
+            const auto load_pre = [&](uint32_t sec_off, uint8_t base, uint8_t count,
+                                      std::vector<uint64_t>& out_h,
+                                      std::vector<uint8_t>&  out_id) {
+                size_t total = 0;
+                for (uint8_t i = 0; i < count; ++i) total += pool_idx_[base + i].n_hashes;
+                if (total == 0) return;
+                const auto* h_ptr  = reinterpret_cast<const uint64_t*>(data_ + sec_off);
+                const auto* id_ptr = reinterpret_cast<const uint8_t*>(h_ptr + total);
+                out_h.assign(h_ptr,  h_ptr  + total);
+                out_id.assign(id_ptr, id_ptr + total);
+            };
+            load_pre(hdr_->merged_bac_off, 0,     n_bac, merged_hashes_bac_, merged_ids_bac_);
+            if (hdr_->merged_arc_off != 0)
+                load_pre(hdr_->merged_arc_off, n_bac, n_arc, merged_hashes_arc_, merged_ids_arc_);
+        } else {
+            // Fallback: k-way merge for old pools without pre-merged section.
+            build_merged(0,     n_bac, merged_hashes_bac_, merged_ids_bac_);
+            build_merged(n_bac, n_arc, merged_hashes_arc_, merged_ids_arc_);
+        }
+
+        merged_bloom_bac_.build_from_hashes(merged_hashes_bac_.data(),
+                                            merged_hashes_bac_.size());
+        merged_bloom_arc_.build_from_hashes(merged_hashes_arc_.data(),
+                                            merged_hashes_arc_.size());
     }
 
     bool has_merged_pool() const { return !merged_hashes_bac_.empty(); }
@@ -351,18 +386,10 @@ public:
     }
 
 
-    bool has_redun_calib() const { return redun_calib_ != nullptr && hdr_->redun_calib_n > 0; }
+    bool has_redun_calib() const { return false; }
 
-    // O(log n) lookup of per-genus redundancy calibration. Returns nullptr if absent.
-    const RedunCalibEntry* lookup_redun_calib(uint64_t genus_hash) const {
-        if (!has_redun_calib()) return nullptr;
-        const auto* lo = redun_calib_;
-        const auto* hi = lo + hdr_->redun_calib_n;
-        auto it = std::lower_bound(lo, hi, genus_hash,
-            [](const RedunCalibEntry& e, uint64_t h) { return e.genus_hash < h; });
-        if (it == hi || it->genus_hash != genus_hash) return nullptr;
-        return it;
-    }
+    // Redundancy calibration removed — always returns nullptr.
+    const RedunCalibEntry* lookup_redun_calib(uint64_t) const { return nullptr; }
 
     // Compute z-score for observed redundancy given a calibration entry.
     // Returns NaN if calibration is absent or invalid.
@@ -372,10 +399,12 @@ public:
         return (observed - ce->median) / (1.4826f * mad_eff);
     }
 
-    std::span<const uint64_t> merged_hashes_bac() const { return merged_hashes_bac_; }
-    std::span<const uint8_t>  merged_ids_bac()    const { return merged_ids_bac_; }
-    std::span<const uint64_t> merged_hashes_arc() const { return merged_hashes_arc_; }
-    std::span<const uint8_t>  merged_ids_arc()    const { return merged_ids_arc_; }
+    std::span<const uint64_t>  merged_hashes_bac() const { return merged_hashes_bac_; }
+    std::span<const uint8_t>   merged_ids_bac()    const { return merged_ids_bac_; }
+    std::span<const uint64_t>  merged_hashes_arc() const { return merged_hashes_arc_; }
+    std::span<const uint8_t>   merged_ids_arc()    const { return merged_ids_arc_; }
+    const BlockedBloom& merged_bloom_bac()          const { return merged_bloom_bac_; }
+    const BlockedBloom& merged_bloom_arc()          const { return merged_bloom_arc_; }
 
 private:
     MmapFileReader           mmap_;
@@ -389,6 +418,8 @@ private:
     std::vector<uint8_t>  merged_ids_bac_;
     std::vector<uint64_t> merged_hashes_arc_;
     std::vector<uint8_t>  merged_ids_arc_;
+    BlockedBloom          merged_bloom_bac_;
+    BlockedBloom          merged_bloom_arc_;
 
     void build_merged(uint8_t base, uint8_t count,
                       std::vector<uint64_t>& out_hashes,
@@ -438,8 +469,7 @@ private:
             throw std::runtime_error("markers.mrk: k mismatch — rebuild required");
         lookup_   = reinterpret_cast<const MarkerLookupEntry*>(data + hdr_->lookup_off);
         pool_idx_ = reinterpret_cast<const MarkerPoolEntry*>(data + hdr_->pool_idx_off);
-        if (hdr_->version >= 2 && hdr_->redun_calib_n > 0)
-            redun_calib_ = reinterpret_cast<const RedunCalibEntry*>(data + hdr_->redun_calib_off);
+        // redun_calib_ always null — field repurposed for merged_bac/arc_off in v2+
     }
 
     CalibView calib_view_at(uint32_t off) const {
