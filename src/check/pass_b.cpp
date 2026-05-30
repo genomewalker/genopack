@@ -422,32 +422,40 @@ void run_pass_b(ICheckReader& pack,
                                         if (rpc >= cfg.gcov_outlier_percentile) rho_out_bp += cf.contig_length;
                                     }
 
-                                    // Contrastive cross-genus: contig fits a foreign genus better
+                                    // Contrastive cross-genus: log-LR test (calibrated for covariance breadth)
                                     {
-                                        float min_foreign = std::numeric_limits<float>::max();
+                                        const float host_ll = gcov_log_likelihood(
+                                            *gcov_entry, dist * dist, spe);
+                                        float best_foreign_ll = -std::numeric_limits<float>::max();
                                         gcov_rd->scan([&](const GcovEntry& fe) {
                                             if (&fe == gcov_entry || !(fe.flags & GCOV_FLAG_VALID)) return;
                                             float xf[136];
                                             for (int di = 0; di < 136; ++di) xf[di] = tnf[di] - fe.mu[di];
-                                            float d = gcov_mahalanobis(fe, xf);
-                                            if (d < min_foreign) min_foreign = d;
+                                            const float fd   = gcov_mahalanobis(fe, xf);
+                                            const float fspe = gcov_spe(fe, xf);
+                                            const float fll  = gcov_log_likelihood(fe, fd * fd, fspe);
+                                            if (fll > best_foreign_ll) best_foreign_ll = fll;
                                         });
-                                        if (min_foreign < dist) cross_genus_bp += cf.contig_length;
-                                    }
+                                        if (best_foreign_ll > host_ll + cfg.cross_genus_lr_margin)
+                                            cross_genus_bp += cf.contig_length;
 
-                                    // Sibling contamination: genus-outlier but family-inlier
-                                    if ((t2_out || spe_flag) && fcov_entry && fcov_rd) {
-                                        float xmu_fam[136];
-                                        for (int di = 0; di < 136; ++di)
-                                            xmu_fam[di] = tnf[di] - fcov_entry->mu[di];
-                                        const float f_dist = gcov_mahalanobis(*fcov_entry, xmu_fam);
-                                        const float f_pct  = fcov_rd->percentile(*fcov_entry, f_dist);
-                                        const float f_spe  = gcov_spe(*fcov_entry, xmu_fam);
-                                        const float f_spct = fcov_rd->spe_percentile(*fcov_entry, f_spe);
-                                        const bool family_outlier =
-                                            (f_pct  >= cfg.gcov_outlier_percentile) ||
-                                            (f_spct >= cfg.gcov_outlier_percentile);
-                                        if (!family_outlier) sibling_out_bp += cf.contig_length;
+                                        // Sibling: family-inlier AND foreign genus fits better by log-LR
+                                        // (decoupled from host-outlier predicate — catches same-family contamination)
+                                        if (fcov_entry && fcov_rd) {
+                                            float xmu_fam[136];
+                                            for (int di = 0; di < 136; ++di)
+                                                xmu_fam[di] = tnf[di] - fcov_entry->mu[di];
+                                            const float f_dist = gcov_mahalanobis(*fcov_entry, xmu_fam);
+                                            const float f_pct  = fcov_rd->percentile(*fcov_entry, f_dist);
+                                            const float f_spe  = gcov_spe(*fcov_entry, xmu_fam);
+                                            const float f_spct = fcov_rd->spe_percentile(*fcov_entry, f_spe);
+                                            const bool family_inlier =
+                                                (f_pct  < cfg.gcov_outlier_percentile) &&
+                                                (f_spct < cfg.gcov_outlier_percentile);
+                                            if (family_inlier &&
+                                                best_foreign_ll > host_ll + cfg.cross_genus_lr_margin)
+                                                sibling_out_bp += cf.contig_length;
+                                        }
                                     }
                                 }
                             } else {
@@ -523,6 +531,9 @@ void run_pass_b(ICheckReader& pack,
                 }
 
                 // ── Marker-panel completeness ─────────────────────────────────────────────
+                // Whole-genome accumulation: collect all DNA k-mers from all contigs,
+                // then sorted two-pointer merge against the merged pool.
+                // Matches the `markers score` subcommand algorithm exactly.
                 float marker_completeness = NAN;
                 float marker_redundancy   = NAN;
                 int   marker_n_present = -1, marker_n_expected = -1;
@@ -530,7 +541,6 @@ void run_pass_b(ICheckReader& pack,
                     const uint64_t genus_hash = GcovWriter::hash_genus(git->second);
                     auto calib = mrk_rd->lookup_lineage(genus_hash);
                     if (calib.valid()) {
-                        // Thread-local buffer: one allocation per thread lifetime, no per-genome alloc.
                         thread_local std::vector<uint64_t> qmers;
                         qmers.clear();
                         for (const auto& contig : contigs)
@@ -544,11 +554,9 @@ void run_pass_b(ICheckReader& pack,
                         const uint8_t n_markers = calib.header->n_markers;
 
                         uint32_t hits[173] = {};
-                        const uint64_t* qp  = qmers.data();
-                        const uint64_t* qpe = qp + qmers.size();
-                        const uint64_t* mhp = mh.data();
+                        const uint64_t* qp  = qmers.data(), *qpe = qp  + qmers.size();
+                        const uint64_t* mhp = mh.data(),    *mhe = mhp + mh.size();
                         const uint8_t*  mip = mid.data();
-                        const uint64_t* mhe = mhp + mh.size();
                         while (qp != qpe && mhp != mhe) {
                             if      (*qp < *mhp) ++qp;
                             else if (*mhp < *qp) { ++mhp; ++mip; }
@@ -557,32 +565,32 @@ void run_pass_b(ICheckReader& pack,
 
                         marker_n_present  = 0;
                         marker_n_expected = 0;
-                        float marker_redundancy_sum = 0.0f;
-                        int   marker_redundancy_n   = 0;
+                        float redundancy_sum = 0.0f;
+                        int   redundancy_n   = 0;
+                        const uint32_t min_hits = static_cast<uint32_t>(cfg.marker_min_hits);
                         for (uint8_t mi = 0; mi < n_markers; ++mi) {
                             if (!calib.marker_expected(mi)) continue;
                             ++marker_n_expected;
                             const uint32_t thr = static_cast<uint32_t>(calib.slots[mi].null_floor_u16)
-                                               + static_cast<uint32_t>(cfg.marker_min_hits);
+                                               + min_hits;
                             if (hits[mi] >= thr) {
                                 ++marker_n_present;
                                 const uint8_t pool_mi = is_arc
-                                    ? static_cast<uint8_t>(mrk_rd->n_bac() + mi)
-                                    : mi;
+                                    ? static_cast<uint8_t>(mrk_rd->n_bac() + mi) : mi;
                                 const uint32_t psz = mrk_rd->pool_n_hashes(pool_mi);
                                 if (psz > 0) {
-                                    marker_redundancy_sum += static_cast<float>(hits[mi])
-                                                           / static_cast<float>(psz);
-                                    ++marker_redundancy_n;
+                                    redundancy_sum += static_cast<float>(hits[mi])
+                                                    / static_cast<float>(psz);
+                                    ++redundancy_n;
                                 }
                             }
                         }
                         if (marker_n_expected > 0)
                             marker_completeness = static_cast<float>(marker_n_present)
                                                / static_cast<float>(marker_n_expected);
-                        if (marker_redundancy_n > 0)
-                            marker_redundancy = marker_redundancy_sum
-                                              / static_cast<float>(marker_redundancy_n);
+                        if (redundancy_n > 0)
+                            marker_redundancy = redundancy_sum
+                                             / static_cast<float>(redundancy_n);
                     }
                 }
 

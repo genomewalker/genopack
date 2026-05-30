@@ -89,6 +89,15 @@ static constexpr uint8_t CODON11[64] = {
 };
 // clang-format on
 
+// ── Reduced alphabets ────────────────────────────────────────────────────────
+
+// Murphy 10-class reduction (index = AA_ENC value, result = class 0..9).
+// Groups: {LVIM}=0  {C}=1  {A}=2  {G}=3  {ST}=4  {P}=5  {FYW}=6  {EDNQ}=7  {KR}=8  {H}=9
+// 10^8 = 100M k-mer space (vs 6^8=1.7M for Dayhoff6) — survives cross-family filter.
+static constexpr uint8_t AA_MURPHY10[20] = {
+    2, 1, 7, 7, 6, 3, 9, 0, 8, 0, 0, 7, 5, 7, 8, 4, 4, 0, 6, 6
+};
+
 // ── Hash ─────────────────────────────────────────────────────────────────────
 
 // Hash one k=8 amino acid k-mer (aa[0..7] in 0-19 encoding).
@@ -103,6 +112,25 @@ static constexpr uint8_t CODON11[64] = {
                | ((uint64_t)aa[5] << 25)
                | ((uint64_t)aa[6] << 30)
                | ((uint64_t)aa[7] << 35);
+    v ^= v >> 30;
+    v *= 0xbf58476d1ce4e5b9ULL;
+    v ^= v >> 27;
+    v *= 0x94d049bb133111ebULL;
+    v ^= v >> 31;
+    return v;
+}
+
+// Murphy 10-class variant: 10 classes × 4 bits = 32-bit packed input, then splitmix64.
+// 10^8 = 100M k-mer space — large enough to survive without cross-family filtering.
+[[nodiscard]] inline uint64_t metamer_hash_murphy10(const uint8_t* aa) noexcept {
+    uint64_t v =  (uint64_t)AA_MURPHY10[aa[0]]
+               | ((uint64_t)AA_MURPHY10[aa[1]] <<  4)
+               | ((uint64_t)AA_MURPHY10[aa[2]] <<  8)
+               | ((uint64_t)AA_MURPHY10[aa[3]] << 12)
+               | ((uint64_t)AA_MURPHY10[aa[4]] << 16)
+               | ((uint64_t)AA_MURPHY10[aa[5]] << 20)
+               | ((uint64_t)AA_MURPHY10[aa[6]] << 24)
+               | ((uint64_t)AA_MURPHY10[aa[7]] << 28);
     v ^= v >> 30;
     v *= 0xbf58476d1ce4e5b9ULL;
     v ^= v >> 27;
@@ -133,7 +161,9 @@ inline void emit_metamers(const uint8_t* seg, int len, int k,
 // ── 6-frame translation ───────────────────────────────────────────────────────
 
 // For each inter-stop AA segment of length >= min_aa_len in all 6 reading frames,
-// calls cb(frame, aa_ptr, aa_len). Frame 0-2 = forward, 3-5 = reverse complement.
+// calls cb(frame, aa_ptr, aa_len, nt_start, nt_end) where [nt_start, nt_end) is the
+// half-open interval on the FORWARD strand (reverse-strand ORFs are complemented back).
+// Frame 0-2 = forward, 3-5 = reverse complement.
 // aa_ptr is valid only for the duration of the call (points into a local buffer).
 // Ambiguous bases (N etc.) break the reading frame like a stop codon.
 // Genetic code 11 (standard bacterial/archaeal).
@@ -146,43 +176,49 @@ inline void translate_6frame(std::string_view seq, int min_aa_len, Cb&& cb) {
     for (int frame = 0; frame < 3; ++frame) {
         std::vector<uint8_t> seg;
         seg.reserve(n / 3 + 2);
+        int seg_nt_start = frame;
         for (int i = frame; i + 2 < n; i += 3) {
             const uint8_t b0 = DNA_ENC[(uint8_t)s[i]];
             const uint8_t b1 = DNA_ENC[(uint8_t)s[i+1]];
             const uint8_t b2 = DNA_ENC[(uint8_t)s[i+2]];
             if (b0 == 0xFF || b1 == 0xFF || b2 == 0xFF) {
                 if ((int)seg.size() >= min_aa_len)
-                    cb(frame, seg.data(), (int)seg.size());
+                    cb(frame, seg.data(), (int)seg.size(), seg_nt_start, i);
                 seg.clear();
+                seg_nt_start = i + 3;
                 continue;
             }
             const uint8_t aa = CODON11[b0 * 16 + b1 * 4 + b2];
             if (aa == AA_STOP) {
                 if ((int)seg.size() >= min_aa_len)
-                    cb(frame, seg.data(), (int)seg.size());
+                    cb(frame, seg.data(), (int)seg.size(), seg_nt_start, i);
                 seg.clear();
+                seg_nt_start = i + 3;
             } else {
                 seg.push_back(aa);
             }
         }
         if ((int)seg.size() >= min_aa_len)
-            cb(frame, seg.data(), (int)seg.size());
+            cb(frame, seg.data(), (int)seg.size(), seg_nt_start, n);
     }
 
     // Reverse complement frames 3-5.
-    // RC frame `frame` reads backward from position (n-1-frame), complementing each base.
+    // RC frame `frame` reads backward from position (n-1-frame).
+    // nt_start/nt_end reported on the forward strand: nt_start = n - pos - 1, nt_end = n - seg_rc_end.
     for (int frame = 0; frame < 3; ++frame) {
         std::vector<uint8_t> seg;
         seg.reserve(n / 3 + 2);
-        const int start = n - 1 - frame;
-        for (int pos = start; pos - 2 >= 0; pos -= 3) {
+        const int rc_start = n - 1 - frame;
+        int seg_rc_end = rc_start + 1; // exclusive RC end (= fwd nt_start = n - seg_rc_end)
+        for (int pos = rc_start; pos - 2 >= 0; pos -= 3) {
             const uint8_t e0 = DNA_ENC[(uint8_t)s[pos]];
             const uint8_t e1 = DNA_ENC[(uint8_t)s[pos-1]];
             const uint8_t e2 = DNA_ENC[(uint8_t)s[pos-2]];
             if (e0 == 0xFF || e1 == 0xFF || e2 == 0xFF) {
                 if ((int)seg.size() >= min_aa_len)
-                    cb(3 + frame, seg.data(), (int)seg.size());
+                    cb(3+frame, seg.data(), (int)seg.size(), n - seg_rc_end, n - (pos - 2));
                 seg.clear();
+                seg_rc_end = pos - 2;
                 continue;
             }
             const uint8_t b0 = BASE_COMP[e0];
@@ -191,14 +227,53 @@ inline void translate_6frame(std::string_view seq, int min_aa_len, Cb&& cb) {
             const uint8_t aa = CODON11[b0 * 16 + b1 * 4 + b2];
             if (aa == AA_STOP) {
                 if ((int)seg.size() >= min_aa_len)
-                    cb(3 + frame, seg.data(), (int)seg.size());
+                    cb(3+frame, seg.data(), (int)seg.size(), n - seg_rc_end, n - (pos - 2));
                 seg.clear();
+                seg_rc_end = pos - 2;
             } else {
                 seg.push_back(aa);
             }
         }
         if ((int)seg.size() >= min_aa_len)
-            cb(3 + frame, seg.data(), (int)seg.size());
+            cb(3+frame, seg.data(), (int)seg.size(), n - seg_rc_end, n);
+    }
+}
+
+// Forward-only 3-frame translation (frames 0-2). Identical to the forward half of
+// translate_6frame, but skips the reverse-complement frames 3-5 entirely.
+// Used by marker scoring, which only needs forward ORFs and pays no RC overhead.
+template <typename Cb>
+inline void translate_3frame_fwd(std::string_view seq, int min_aa_len, Cb&& cb) {
+    const int n = static_cast<int>(seq.size());
+    const char* s = seq.data();
+
+    for (int frame = 0; frame < 3; ++frame) {
+        std::vector<uint8_t> seg;
+        seg.reserve(n / 3 + 2);
+        int seg_nt_start = frame;
+        for (int i = frame; i + 2 < n; i += 3) {
+            const uint8_t b0 = DNA_ENC[(uint8_t)s[i]];
+            const uint8_t b1 = DNA_ENC[(uint8_t)s[i+1]];
+            const uint8_t b2 = DNA_ENC[(uint8_t)s[i+2]];
+            if (b0 == 0xFF || b1 == 0xFF || b2 == 0xFF) {
+                if ((int)seg.size() >= min_aa_len)
+                    cb(frame, seg.data(), (int)seg.size(), seg_nt_start, i);
+                seg.clear();
+                seg_nt_start = i + 3;
+                continue;
+            }
+            const uint8_t aa = CODON11[b0 * 16 + b1 * 4 + b2];
+            if (aa == AA_STOP) {
+                if ((int)seg.size() >= min_aa_len)
+                    cb(frame, seg.data(), (int)seg.size(), seg_nt_start, i);
+                seg.clear();
+                seg_nt_start = i + 3;
+            } else {
+                seg.push_back(aa);
+            }
+        }
+        if ((int)seg.size() >= min_aa_len)
+            cb(frame, seg.data(), (int)seg.size(), seg_nt_start, n);
     }
 }
 
@@ -210,7 +285,7 @@ inline void translate_6frame(std::string_view seq, int min_aa_len, Cb&& cb) {
 extract_metamers_dna(std::string_view seq, int k = METAMER_K, int min_seg_aa = METAMER_K) {
     std::vector<uint64_t> hashes;
     hashes.reserve(seq.size() / 4);
-    translate_6frame(seq, min_seg_aa, [&](int /*frame*/, const uint8_t* seg, int len) {
+    translate_6frame(seq, min_seg_aa, [&](int, const uint8_t* seg, int len, int, int) {
         emit_metamers(seg, len, k, hashes);
     });
     std::sort(hashes.begin(), hashes.end());
@@ -223,7 +298,7 @@ extract_metamers_dna(std::string_view seq, int k = METAMER_K, int min_seg_aa = M
 extract_metamers_dna(std::string_view seq, int k, int min_seg_aa, uint64_t max_hash) {
     std::vector<uint64_t> hashes;
     hashes.reserve(seq.size() / (4 * 32));
-    translate_6frame(seq, min_seg_aa, [&](int, const uint8_t* seg, int len) {
+    translate_6frame(seq, min_seg_aa, [&](int, const uint8_t* seg, int len, int, int) {
         for (int i = 0; i + k <= len; ++i) {
             if (!metamer_is_low_complexity(seg + i, k)) {
                 uint64_t h = metamer_hash(seg + i);
@@ -241,7 +316,7 @@ extract_metamers_dna(std::string_view seq, int k, int min_seg_aa, uint64_t max_h
 inline void
 extract_metamers_dna_into(std::string_view seq, int k, int min_seg_aa, uint64_t max_hash,
                           std::vector<uint64_t>& out) {
-    translate_6frame(seq, min_seg_aa, [&](int, const uint8_t* seg, int len) {
+    translate_6frame(seq, min_seg_aa, [&](int, const uint8_t* seg, int len, int, int) {
         for (int i = 0; i + k <= len; ++i) {
             if (!metamer_is_low_complexity(seg + i, k)) {
                 uint64_t h = metamer_hash(seg + i);
@@ -249,6 +324,35 @@ extract_metamers_dna_into(std::string_view seq, int k, int min_seg_aa, uint64_t 
             }
         }
     });
+}
+
+// Murphy10 variant of extract_metamers_aa: same extraction but uses metamer_hash_murphy10.
+// Used for building and querying reduced-alphabet marker pools.
+[[nodiscard]] inline std::vector<uint64_t>
+extract_metamers_aa_murphy10(std::string_view protein, int k = METAMER_K) {
+    std::vector<uint64_t> hashes;
+    hashes.reserve(protein.size());
+    std::vector<uint8_t> seg;
+    seg.reserve(protein.size());
+    auto flush = [&] {
+        if ((int)seg.size() >= k) {
+            for (int i = 0; i + k <= (int)seg.size(); ++i) {
+                if (!metamer_is_low_complexity(seg.data() + i, k))
+                    hashes.push_back(metamer_hash_murphy10(seg.data() + i));
+            }
+        }
+        seg.clear();
+    };
+    for (unsigned char c : protein) {
+        if (c == '-') continue;
+        const uint8_t aa = AA_ENC[c];
+        if (aa == AA_STOP) flush();
+        else seg.push_back(aa);
+    }
+    flush();
+    std::sort(hashes.begin(), hashes.end());
+    hashes.erase(std::unique(hashes.begin(), hashes.end()), hashes.end());
+    return hashes;
 }
 
 // Extract sorted, deduplicated metamer hashes from a protein sequence.

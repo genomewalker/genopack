@@ -263,4 +263,21 @@ float gcov_spe(const GcovEntry& e, const float* x_minus_mu) noexcept;
 // rho_minus_mean = contig_rho[16] - e.rho_mean[16].
 float gcov_rho_distance(const GcovEntry& e, const float* rho_minus_mean) noexcept;
 
+// log|Σ| = Σ_k log λ_k + (D−K)·log σ²_resid  (constant per genus)
+inline float gcov_log_det(const GcovEntry& e) noexcept {
+    float ld = 0.0f;
+    constexpr int K = static_cast<int>(GCOV_N_EIGVECS);
+    for (int k = 0; k < K; ++k)
+        if (e.eigenvalues[k] >= 1e-9f) ld += std::log(e.eigenvalues[k]);
+    ld += (136 - K) * std::log(std::max(e.sigma2_resid, 1e-12f));
+    return ld;
+}
+
+// PPCA log-likelihood (up to constant −½D·log 2π, which cancels in ratios).
+// d2_top  = gcov_mahalanobis()²
+// spe_val = gcov_spe()
+inline float gcov_log_likelihood(const GcovEntry& e, float d2_top, float spe_val) noexcept {
+    return -0.5f * (d2_top + spe_val / std::max(e.sigma2_resid, 1e-12f) + gcov_log_det(e));
+}
+
 } // namespace genopack

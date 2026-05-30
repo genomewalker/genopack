@@ -11,11 +11,12 @@ namespace genopack::check {
 
 struct PassBConfig {
     float contamination_flag_threshold = 0.02f;
-    float tnf_flag_threshold           = 0.10f;
+    float tnf_flag_threshold           = 0.02f;  // lowered from 0.10 — fires at ~2% phylum spike
     float completeness_flag_threshold  = 0.70f;
     float contig_tnf_threshold         = 3.0f;
     float contig_leakage_threshold     = 0.20f;
     float gcov_outlier_percentile      = 0.99f; // GCOV-based outlier threshold (percentile of calibration dist)
+    float cross_genus_lr_margin        = 0.0f;  // log-LR margin for cross_genus/sibling; 0 = flag if any foreign LL > host LL
 
     // Marker panel scoring (protein k-mer completeness via .mrk sidecar)
     std::string markers_path;       // path to markers.mrk; empty = disabled

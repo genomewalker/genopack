@@ -27,7 +27,8 @@ static constexpr uint8_t  MRKR_VERSION     = 2;
 static constexpr uint8_t  MRKR_VERSION_MIN = 1; // lowest readable version
 static constexpr uint8_t  MRKR_DOMAIN_BAC = 0;
 static constexpr uint8_t  MRKR_DOMAIN_ARC = 1;
-static constexpr uint8_t  MRKR_ALPHABET_FULL_AA = 0;
+static constexpr uint8_t  MRKR_ALPHABET_FULL_AA   = 0;
+static constexpr uint8_t  MRKR_ALPHABET_MURPHY10  = 1; // Murphy 10-class reduced alphabet
 
 // ── On-disk structs (little-endian POD) ──────────────────────────────────────
 
@@ -98,6 +99,86 @@ struct RedunCalibEntry {      // 24 bytes
 };
 static_assert(sizeof(RedunCalibEntry) == 24);
 
+// ── In-RAM acceleration structures ────────────────────────────────────────────
+
+// Flat open-addressing hash map: uint64 hash → uint8 marker_id.
+// ~220k entries per genus, L2/L3-resident. Much faster than the 12M merged pool.
+struct FlatHitMap {
+    static constexpr uint64_t EMPTY = UINT64_MAX;
+    std::vector<uint64_t> keys;
+    std::vector<uint8_t>  vals;
+    uint32_t              mask = 0;
+    uint32_t              count = 0;
+
+    void build(const std::vector<std::pair<uint64_t,uint8_t>>& entries) {
+        uint32_t cap = 1;
+        while (cap < entries.size() * 2) cap <<= 1;
+        keys.assign(cap, EMPTY);
+        vals.resize(cap, 0);
+        mask = cap - 1;
+        count = 0;
+        for (auto& [k, v] : entries) {
+            uint32_t i = (uint32_t)(k * 0x9e3779b97f4a7c15ULL >> 32) & mask;
+            while (keys[i] != EMPTY) i = (i + 1) & mask;
+            keys[i] = k; vals[i] = v; ++count;
+        }
+    }
+
+    // Returns UINT8_MAX if not found.
+    uint8_t lookup(uint64_t k) const noexcept {
+        if (keys.empty()) return UINT8_MAX;
+        uint32_t i = (uint32_t)(k * 0x9e3779b97f4a7c15ULL >> 32) & mask;
+        while (keys[i] != EMPTY) {
+            if (keys[i] == k) return vals[i];
+            i = (i + 1) & mask;
+        }
+        return UINT8_MAX;
+    }
+
+    bool empty() const { return count == 0; }
+    size_t memory_bytes() const { return keys.size() * 9; }
+};
+
+// Blocked Bloom filter: one 64-byte cache-line block per bucket.
+// k=4 independent bit probes per element. ~1% FP at 10 bits/element.
+struct BlockedBloom {
+    static constexpr int BITS_PER_BLOCK = 512; // 64 bytes
+    static constexpr int K = 4;
+
+    std::vector<uint64_t> data; // n_blocks * 8 uint64s
+    uint32_t n_blocks = 0;
+
+    void build(const FlatHitMap& map, float bits_per_elem = 10.0f) {
+        if (map.empty()) return;
+        n_blocks = std::max(1u, (uint32_t)(map.count * bits_per_elem / BITS_PER_BLOCK));
+        data.assign((size_t)n_blocks * 8, 0);
+        // Iterate all valid entries in the flat map
+        for (size_t i = 0; i < map.keys.size(); ++i) {
+            if (map.keys[i] != FlatHitMap::EMPTY) insert(map.keys[i]);
+        }
+    }
+
+    void insert(uint64_t h) noexcept {
+        const uint32_t b = (uint32_t)(h % n_blocks) * 8;
+        uint64_t mix = h;
+        for (int i = 0; i < K; ++i) {
+            mix = mix * 0x9e3779b97f4a7c15ULL ^ (mix >> 32);
+            data[b + ((mix >> 9) & 7)] |= (uint64_t)1 << (mix & 63);
+        }
+    }
+
+    bool might_contain(uint64_t h) const noexcept {
+        if (data.empty()) return true;
+        const uint32_t b = (uint32_t)(h % n_blocks) * 8;
+        uint64_t mix = h;
+        for (int i = 0; i < K; ++i) {
+            mix = mix * 0x9e3779b97f4a7c15ULL ^ (mix >> 32);
+            if (!((data[b + ((mix >> 9) & 7)] >> (mix & 63)) & 1)) return false;
+        }
+        return true;
+    }
+};
+
 // ── Writer ────────────────────────────────────────────────────────────────────
 
 class MarkerWriter {
@@ -166,6 +247,8 @@ public:
     uint8_t  n_bac()      const { return hdr_ ? hdr_->n_bac_markers : 0; }
     uint8_t  n_arc()      const { return hdr_ ? hdr_->n_arc_markers : 0; }
     uint8_t  k()          const { return hdr_ ? hdr_->k : 0; }
+    uint8_t  alphabet()   const { return hdr_ ? hdr_->alphabet : MRKR_ALPHABET_FULL_AA; }
+    bool     is_murphy10() const { return alphabet() == MRKR_ALPHABET_MURPHY10; }
     uint16_t frac_scale() const { return hdr_ ? (hdr_->frac_scale ? hdr_->frac_scale : 1) : 1; }
     uint64_t frac_max_hash() const {
         const uint32_t s = frac_scale();
@@ -228,6 +311,24 @@ public:
         return map;
     }
 
+    // Build a per-genus FlatHitMap from the expected markers of one lineage.
+    // Caller should cache this and reuse across all genomes of the same genus.
+    FlatHitMap build_flat_hit_map(const CalibView& calib) const {
+        FlatHitMap fm;
+        if (!calib.valid() || !hdr_) return fm;
+        const uint8_t n  = calib.header->n_markers;
+        const uint8_t base_id = (calib.header->domain == MRKR_DOMAIN_ARC) ? hdr_->n_bac_markers : 0;
+        std::vector<std::pair<uint64_t,uint8_t>> entries;
+        entries.reserve(static_cast<size_t>(n) * 600); // ~500 hashes/marker average
+        for (uint8_t i = 0; i < n; ++i) {
+            if (!calib.marker_expected(i)) continue;
+            auto hashes = pool_hashes(base_id + i);
+            for (uint64_t h : hashes) entries.emplace_back(h, i);
+        }
+        fm.build(entries);
+        return fm;
+    }
+
     // Build merged sorted pools (bac and arc separately) for fast single-pass scoring.
     // k-way merge of all per-marker pools — call once after open().
     // After this, merged_hashes_bac/arc() return contiguous sorted arrays where
@@ -245,6 +346,7 @@ public:
     uint32_t pool_n_hashes(uint8_t mi) const {
         return pool_idx_ ? pool_idx_[mi].n_hashes : 0;
     }
+
 
     bool has_redun_calib() const { return redun_calib_ != nullptr && hdr_->redun_calib_n > 0; }
 
@@ -343,6 +445,19 @@ private:
         v.expected = p + sizeof(CalibEntryHeader) + n * sizeof(CalibSlot);
         return v;
     }
+};
+
+// Combined per-genus marker acceleration index: flat hit map + bloom prefilter.
+// Built once per genus and cached (see GenusIndexCache); reused across all genomes.
+struct GenusMarkerIndex {
+    FlatHitMap    map;
+    BlockedBloom  bloom;
+
+    void build(const MarkerReader& mrk_rd, const MarkerReader::CalibView& calib) {
+        map = mrk_rd.build_flat_hit_map(calib);
+        bloom.build(map);
+    }
+    size_t memory_bytes() const { return map.memory_bytes() + bloom.data.size() * 8; }
 };
 
 } // namespace genopack

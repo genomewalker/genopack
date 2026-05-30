@@ -622,7 +622,9 @@ void build_markers_panel(const MarkersBuildConfig& cfg) {
     auto arc = scan_panel(db / "msa/gtdb_r232_ar53.faa",
                           arc_tax, k_ar53_ranges, 53, MRKR_DOMAIN_ARC, cfg.threads);
 
-    // Cross-family filter within each panel.
+    // Cross-family filter: removes k-mers shared across ≥2 marker families.
+    // Essential for Murphy10 — without it, first-writer collision in FlatHitMap
+    // makes most markers undetectable. Murphy10 (100M space) survives better than Dayhoff6.
     spdlog::info("markers: cross-family filter (bac120)");
     cross_family_filter(bac.pool_hashes, cfg.threads);
     spdlog::info("markers: cross-family filter (ar53)");
@@ -646,31 +648,10 @@ void build_markers_panel(const MarkersBuildConfig& cfg) {
     spdlog::info("markers: ar53 pool: {} total hashes across {} markers",
                  arc_total, arc.pool_hashes.size());
 
-    // Per-genus redundancy calibration (second pass over reference sequences).
-    const uint64_t max_hash = (cfg.frac_scale > 1)
-                            ? UINT64_MAX / static_cast<uint64_t>(cfg.frac_scale)
-                            : UINT64_MAX;
-    spdlog::info("markers: computing bac120 redundancy calibration ({} genomes)",
-                 bac.ginfo.size());
-    auto bac_calib = compute_redun_calib(bac, k_bac120_ranges, 120, max_hash, bac_tax);
-    spdlog::info("markers: bac120 calibration: {} genera", bac_calib.size());
-
-    spdlog::info("markers: computing ar53 redundancy calibration ({} genomes)",
-                 arc.ginfo.size());
-    auto arc_calib = compute_redun_calib(arc, k_ar53_ranges, 53, max_hash, arc_tax);
-    spdlog::info("markers: ar53 calibration: {} genera", arc_calib.size());
-
-    // Merge bac+arc calibration (both sorted by genus_hash; merge them).
+    // Redundancy calibration skipped: per-ORF argmax scoring gives ~0 baseline
+    // redundancy on clean genomes by construction, so z-score normalization adds nothing.
     std::vector<RedunCalibEntry> all_calib;
-    all_calib.reserve(bac_calib.size() + arc_calib.size());
-    std::merge(bac_calib.begin(), bac_calib.end(),
-               arc_calib.begin(), arc_calib.end(),
-               std::back_inserter(all_calib),
-               [](const RedunCalibEntry& a, const RedunCalibEntry& b) {
-                   return a.genus_hash < b.genus_hash;
-               });
 
-    // Free seqbuf memory now that calibration is done.
     bac.seqbuf.clear(); bac.seqbuf.shrink_to_fit();
     arc.seqbuf.clear(); arc.seqbuf.shrink_to_fit();
     bac.ginfo.clear();  bac.ginfo.shrink_to_fit();
