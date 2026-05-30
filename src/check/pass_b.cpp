@@ -341,6 +341,9 @@ void run_pass_b(ICheckReader& pack,
                 }
 
                 std::vector<ContigFlag> flags;
+                // ctg_cross_genus[i] = true if contigs[i] was flagged by cross_genus log-LR test.
+                // Used below for the joint marker+GCOV contamination signal.
+                std::vector<bool> ctg_cross_genus(contigs.size(), false);
                 uint32_t byte_offset    = 0;
                 uint32_t clean_len      = 0;
                 uint32_t total_len      = 0;
@@ -377,7 +380,9 @@ void run_pass_b(ICheckReader& pack,
                     // Hoist centroid norm — constant across all contigs for this genome.
                     const float norm_c = centroid->norm();
                     flags.reserve(contigs.size());
+                    size_t contig_ci = 0;
                     for (const auto& contig : contigs) {
+                        const size_t ci = contig_ci++;
                         ContigFlag cf;
                         cf.contig_offset = byte_offset;
                         cf.contig_length = static_cast<uint32_t>(contig.seq.size());
@@ -436,8 +441,10 @@ void run_pass_b(ICheckReader& pack,
                                             const float fll  = gcov_log_likelihood(fe, fd * fd, fspe);
                                             if (fll > best_foreign_ll) best_foreign_ll = fll;
                                         });
-                                        if (best_foreign_ll > host_ll + cfg.cross_genus_lr_margin)
+                                        if (best_foreign_ll > host_ll + cfg.cross_genus_lr_margin) {
                                             cross_genus_bp += cf.contig_length;
+                                            ctg_cross_genus[ci] = true;
+                                        }
 
                                         // Sibling: family-inlier AND foreign genus fits better by log-LR
                                         // (decoupled from host-outlier predicate — catches same-family contamination)
@@ -536,8 +543,9 @@ void run_pass_b(ICheckReader& pack,
                 // clears the containment threshold. Redundancy = markers with ≥2 votes
                 // (two separate genomic loci → contamination signal).
                 // Works for both full-AA k=8 (legacy) and Dayhoff-6 k=12 syncmer pools.
-                float marker_completeness = NAN;
-                float marker_redundancy   = NAN;
+                float marker_completeness        = NAN;
+                float marker_redundancy          = NAN;
+                float marker_joint_contamination = NAN;
                 int   marker_n_present = -1, marker_n_expected = -1;
                 if (mrk_rd && mrk_rd->has_merged_pool() && git != flagged_genus.end()) {
                     const uint64_t genus_hash = GcovWriter::hash_genus(git->second);
@@ -551,11 +559,16 @@ void run_pass_b(ICheckReader& pack,
                         const int      min_seg   = is_d6 ? METAMER_K_D6 : METAMER_K;
                         const uint32_t min_hits  = static_cast<uint32_t>(cfg.marker_min_hits);
 
-                        // contig_votes[mi] = number of contigs with a confirmed ORF for marker mi.
-                        uint32_t contig_votes[173] = {};
+                        // contig_votes_native[mi]  = host-origin contigs voting for marker mi.
+                        // contig_votes_foreign[mi] = cross_genus-flagged contigs voting for marker mi.
+                        // Joint signal: both vote → marker present in two different organisms.
+                        uint32_t contig_votes_native[173]  = {};
+                        uint32_t contig_votes_foreign[173] = {};
 
                         thread_local std::vector<uint64_t> orf_mers;
-                        for (const auto& contig : contigs) {
+                        for (size_t ci2 = 0; ci2 < contigs.size(); ++ci2) {
+                            const auto& contig = contigs[ci2];
+                            const bool is_foreign = (ci2 < ctg_cross_genus.size()) && ctg_cross_genus[ci2];
                             uint32_t best[173] = {};
 
                             if (is_d6) {
@@ -628,27 +641,37 @@ void run_pass_b(ICheckReader& pack,
                                 }
                             }
 
-                            for (uint8_t mi = 0; mi < n_markers; ++mi)
-                                if (best[mi] > 0) contig_votes[mi]++;
+                            for (uint8_t mi = 0; mi < n_markers; ++mi) {
+                                if (best[mi] > 0) {
+                                    if (is_foreign) contig_votes_foreign[mi]++;
+                                    else            contig_votes_native[mi]++;
+                                }
+                            }
                         }
 
                         marker_n_present  = 0;
                         marker_n_expected = 0;
-                        int redundant_n   = 0;
+                        int redundant_n = 0, joint_n = 0;
                         for (uint8_t mi = 0; mi < n_markers; ++mi) {
                             if (!calib.marker_expected(mi)) continue;
                             ++marker_n_expected;
-                            if (contig_votes[mi] >= 1) ++marker_n_present;
-                            if (contig_votes[mi] >= 2) ++redundant_n;
+                            const uint32_t tot = contig_votes_native[mi] + contig_votes_foreign[mi];
+                            if (tot >= 1) ++marker_n_present;
+                            if (tot >= 2) ++redundant_n;
+                            // Joint: confirmed duplication across organisms (native + foreign vote)
+                            if (contig_votes_native[mi] >= 1 && contig_votes_foreign[mi] >= 1)
+                                ++joint_n;
                         }
                         if (marker_n_expected > 0) {
-                            marker_completeness = static_cast<float>(marker_n_present)
-                                               / static_cast<float>(marker_n_expected);
-                            marker_redundancy   = static_cast<float>(redundant_n)
-                                               / static_cast<float>(marker_n_expected);
+                            const float ne = static_cast<float>(marker_n_expected);
+                            marker_completeness        = static_cast<float>(marker_n_present) / ne;
+                            marker_redundancy          = static_cast<float>(redundant_n) / ne;
+                            marker_joint_contamination = static_cast<float>(joint_n) / ne;
                         }
                     }
                 }
+
+                // Joint: marker_joint_contamination already assigned inside scoring block above.
 
                 // Z-score marker_redundancy against per-genus calibration.
                 float marker_redundancy_z = NAN;
@@ -751,6 +774,7 @@ void run_pass_b(ICheckReader& pack,
                     q.marker_completeness             = marker_completeness;
                     q.marker_redundancy               = marker_redundancy;
                     q.marker_redundancy_z             = marker_redundancy_z;
+                    q.marker_joint_contamination      = marker_joint_contamination;
                     q.marker_n_present                = marker_n_present;
                     q.marker_n_expected               = marker_n_expected;
 

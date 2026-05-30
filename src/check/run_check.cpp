@@ -339,7 +339,7 @@ int cmd_check(const std::filesystem::path& pack_path,
            "\tcontamination_self_outlier\tfiedler_oph_split"
            "\tfiedler_tnf_bimod\tfiedler_tnf_gap"
            "\tfmh_minority_fraction"
-           "\tmarker_completeness\tmarker_redundancy\tmarker_redundancy_z\tmarker_n_present\tmarker_n_expected"
+           "\tmarker_completeness\tmarker_redundancy\tmarker_redundancy_z\tmarker_joint_contamination\tmarker_n_present\tmarker_n_expected"
            "\tqual_flags\tsupport_tier\tinterval_width\n";
 
     auto tier_str = [](SupportTier t) -> const char* {
@@ -394,6 +394,7 @@ int cmd_check(const std::filesystem::path& pack_path,
             << fmt(q.marker_completeness) << '\t'
             << fmt(q.marker_redundancy) << '\t'
             << fmt(q.marker_redundancy_z) << '\t'
+            << fmt(q.marker_joint_contamination) << '\t'
             << q.marker_n_present << '\t'
             << q.marker_n_expected << '\t'
             << static_cast<int>(q.qual_flags) << '\t'

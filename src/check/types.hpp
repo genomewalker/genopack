@@ -62,10 +62,11 @@ struct GenomeQuality {
     float    contamination_cross_genus     = NAN;  // fraction bp where any foreign genus fits better than assigned
 
     // Marker-panel completeness (protein k-mer based; NAN if no .mrk file supplied)
-    float    marker_completeness   = NAN;  // present / expected markers
-    float    marker_redundancy     = NAN;  // mean(hits[mi]/pool_size[mi])
-    float    marker_redundancy_z   = NAN;  // (observed - genus_median) / (1.4826 * MAD_eff)
-    int      marker_n_present      = -1;   // raw present count
+    float    marker_completeness         = NAN;  // present / expected markers
+    float    marker_redundancy           = NAN;  // markers with ≥2 contig votes / expected
+    float    marker_redundancy_z         = NAN;  // (observed - genus_median) / (1.4826 * MAD_eff)
+    float    marker_joint_contamination  = NAN;  // markers with both native+cross_genus votes / expected
+    int      marker_n_present            = -1;   // raw present count
     int      marker_n_expected     = -1;   // expected marker count for this lineage
 
     uint8_t  qual_flags           = 0;

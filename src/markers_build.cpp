@@ -449,27 +449,40 @@ static PanelResult scan_panel_d6(
         const int col_start = ranges[mi].col_start;
         const int col_len   = ranges[mi].col_end - col_start;
 
-        // Per-column IC: fraction of max information content in Dayhoff-6 space.
+        // Per-column IC using one representative per genus (phylogenetically de-biased).
+        // Raw frequency counting over 189K genomes overweights dense clades (e.g. many
+        // Escherichia strains dominate → "conserved" means conserved in Proteobacteria).
+        // Using one genome per genus gives ~35K near-independent samples and makes IC
+        // reflect cross-clade conservation rather than within-clade redundancy.
         std::vector<float> col_ic(col_len, 0.0f);
-        for (int j = 0; j < col_len; ++j) {
-            int cnt[6] = {};
-            int n_obs  = 0;
-            for (const auto& g : ginfo) {
-                if (g.seq_offset == UINT32_MAX) continue;
-                const uint8_t aa = AA_ENC[static_cast<unsigned char>(
-                    seqbuf[g.seq_offset + col_start + j])];
-                if (aa >= 20) continue;          // gap or ambiguous
-                cnt[AA_DAYHOFF6[aa]]++;
-                ++n_obs;
+        {
+            // Collect one representative genome index per genus.
+            std::unordered_map<uint64_t, uint32_t> genus_rep; // genus_hash → ginfo index
+            genus_rep.reserve(res.lineages.size());
+            for (uint32_t gi = 0; gi < static_cast<uint32_t>(ginfo.size()); ++gi) {
+                if (ginfo[gi].seq_offset != UINT32_MAX)
+                    genus_rep.emplace(ginfo[gi].genus_hash, gi); // first-seen wins
             }
-            if (n_obs == 0) continue;
-            float H = 0.0f;
-            for (int g = 0; g < 6; ++g) {
-                if (!cnt[g]) continue;
-                const float p = static_cast<float>(cnt[g]) / n_obs;
-                H -= p * std::log(p);
+
+            for (int j = 0; j < col_len; ++j) {
+                int cnt[6] = {};
+                int n_obs  = 0;
+                for (const auto& [gh, gi] : genus_rep) {
+                    const uint8_t aa = AA_ENC[static_cast<unsigned char>(
+                        seqbuf[ginfo[gi].seq_offset + col_start + j])];
+                    if (aa >= 20) continue;
+                    cnt[AA_DAYHOFF6[aa]]++;
+                    ++n_obs;
+                }
+                if (n_obs == 0) continue;
+                float H = 0.0f;
+                for (int g = 0; g < 6; ++g) {
+                    if (!cnt[g]) continue;
+                    const float p = static_cast<float>(cnt[g]) / n_obs;
+                    H -= p * std::log(p);
+                }
+                col_ic[j] = std::max(0.0f, (std::log(6.0f) - H) / std::log(6.0f));
             }
-            col_ic[j] = std::max(0.0f, (std::log(6.0f) - H) / std::log(6.0f));
         }
 
         // Extract k=12 syncmer k-mers: recode → IC filter → dedup.
