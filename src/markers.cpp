@@ -10,7 +10,7 @@ namespace genopack {
 
 void MarkerWriter::finalize(const std::filesystem::path& path,
                             uint8_t n_bac, uint8_t n_arc, uint8_t k,
-                            uint16_t frac_scale) const {
+                            uint16_t frac_scale, uint8_t alphabet) const {
     // Sort lineages by hash for binary search at read time.
     std::vector<size_t> order(lineages_.size());
     std::iota(order.begin(), order.end(), 0);
@@ -90,7 +90,7 @@ void MarkerWriter::finalize(const std::filesystem::path& path,
     hdr.magic         = MRKR_MAGIC;
     hdr.version       = MRKR_VERSION;
     hdr.k             = k;
-    hdr.alphabet      = MRKR_ALPHABET_FULL_AA;
+    hdr.alphabet      = alphabet;
     hdr.n_lineages    = n_lin;
     hdr.n_bac_markers = n_bac;
     hdr.n_arc_markers = n_arc;

@@ -9,7 +9,9 @@ struct MarkersBuildConfig {
     std::filesystem::path output;      // output .mrk file
     int threads = 1;
     float default_threshold = 0.30f;   // min containment fraction → marker present
-    uint16_t frac_scale = 1;           // FracMinHash divisor: keep hashes ≤ UINT64_MAX/frac_scale
+    uint16_t frac_scale = 1;           // FracMinHash divisor (ignored when dayhoff6=true)
+    bool dayhoff6 = false;             // build Dayhoff-6 k=12 syncmer profile pool
+    float ic_threshold = 0.25f;        // min per-column IC (0–1) to include a k-mer position
 };
 
 // Build a markers.mrk sidecar from GTDB-Tk r232 MSA files.

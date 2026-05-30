@@ -375,6 +375,147 @@ static PanelResult scan_panel(
     return res;
 }
 
+// ── Dayhoff-6 profile pool builder ───────────────────────────────────────────
+// Builds a compact discriminative pool using Dayhoff-6 k=12 syncmers filtered
+// by per-column information content (IC). Only k-mers whose weakest MSA column
+// has IC ≥ ic_threshold are retained, giving a sparse, high-quality pool.
+// Syncmers (closed, t=0) replace FracMinHash: consistent ~11% density without
+// the Poisson empty-window variance that destabilizes per-ORF containment scores.
+
+static PanelResult scan_panel_d6(
+    const std::filesystem::path& msa_path,
+    const std::unordered_map<std::string, std::string>& taxonomy,
+    const MarkerRange* ranges,
+    int n_markers,
+    uint8_t domain,
+    float ic_threshold,
+    int threads = 1)
+{
+    // ── Pass 1: load MSA (identical to scan_panel) ────────────────────────────
+    PanelResult res;
+    res.n_markers = static_cast<uint8_t>(n_markers);
+    res.domain    = domain;
+    res.pool_hashes.resize(n_markers);
+
+    const int expected_cols = ranges[n_markers - 1].col_end;
+    std::vector<GenomeInfo>& ginfo  = res.ginfo;
+    std::vector<char>&       seqbuf = res.seqbuf;
+    ginfo.reserve(200000);
+    seqbuf.reserve((size_t)200000 * expected_cols);
+
+    std::unordered_map<uint64_t, size_t> genus_idx_map;
+    size_t n_valid = 0, n_skipped = 0;
+    {
+        std::ifstream f(msa_path);
+        if (!f) throw std::runtime_error("markers: cannot open MSA: " + msa_path.string());
+        std::string acc, seq, line;
+        auto commit = [&]() {
+            if (acc.empty()) return;
+            if ((int)seq.size() != expected_cols) { ++n_skipped; ginfo.push_back({0, 0, UINT32_MAX}); return; }
+            auto tax_it = taxonomy.find(acc);
+            if (tax_it == taxonomy.end())           { ++n_skipped; ginfo.push_back({0, 0, UINT32_MAX}); return; }
+            auto genus = extract_genus(tax_it->second);
+            if (genus.empty() || genus.size() <= 3)  { ++n_skipped; ginfo.push_back({0, 0, UINT32_MAX}); return; }
+            const uint64_t gh = GcovWriter::hash_genus(genus);
+            auto [it, inserted] = genus_idx_map.emplace(gh, res.lineages.size());
+            if (inserted) res.lineages.push_back({gh, domain, 0, std::string(genus)});
+            res.lineages[it->second].ref_count++;
+            const uint32_t off = static_cast<uint32_t>(seqbuf.size());
+            seqbuf.insert(seqbuf.end(), seq.begin(), seq.end());
+            ginfo.push_back({gh, static_cast<uint32_t>(it->second), off});
+            ++n_valid;
+        };
+        while (std::getline(f, line)) {
+            if (line.empty()) continue;
+            if (line[0] == '>') {
+                commit();
+                acc = line.substr(1);
+                if (auto sp = acc.find(' '); sp != std::string::npos) acc.resize(sp);
+                seq.clear(); seq.reserve(expected_cols + 4);
+            } else { seq += line; }
+        }
+        commit();
+    }
+    spdlog::info("markers: d6 {}: {} genomes ({} skipped), {} genera",
+                 domain == MRKR_DOMAIN_BAC ? "bac120" : "ar53",
+                 n_valid, n_skipped, res.lineages.size());
+
+    // ── Pass 2: per-marker Dayhoff-6 profile extraction with IC filter ────────
+    std::atomic<int> done_count{0};
+#ifdef _OPENMP
+#pragma omp parallel for schedule(dynamic) num_threads(threads)
+#endif
+    for (int mi = 0; mi < n_markers; ++mi) {
+        const int col_start = ranges[mi].col_start;
+        const int col_len   = ranges[mi].col_end - col_start;
+
+        // Per-column IC: fraction of max information content in Dayhoff-6 space.
+        std::vector<float> col_ic(col_len, 0.0f);
+        for (int j = 0; j < col_len; ++j) {
+            int cnt[6] = {};
+            int n_obs  = 0;
+            for (const auto& g : ginfo) {
+                if (g.seq_offset == UINT32_MAX) continue;
+                const uint8_t aa = AA_ENC[static_cast<unsigned char>(
+                    seqbuf[g.seq_offset + col_start + j])];
+                if (aa >= 20) continue;          // gap or ambiguous
+                cnt[AA_DAYHOFF6[aa]]++;
+                ++n_obs;
+            }
+            if (n_obs == 0) continue;
+            float H = 0.0f;
+            for (int g = 0; g < 6; ++g) {
+                if (!cnt[g]) continue;
+                const float p = static_cast<float>(cnt[g]) / n_obs;
+                H -= p * std::log(p);
+            }
+            col_ic[j] = std::max(0.0f, (std::log(6.0f) - H) / std::log(6.0f));
+        }
+
+        // Extract k=12 syncmer k-mers: recode → IC filter → dedup.
+        std::vector<uint64_t> raw;
+        raw.reserve(1 << 20);
+
+        for (const auto& g : ginfo) {
+            if (g.seq_offset == UINT32_MAX) continue;
+
+            // Build gap-skipped Dayhoff-6 segment + MSA column index mapping.
+            std::vector<uint8_t> d6;
+            std::vector<int>     cpos;
+            d6.reserve(col_len);
+            cpos.reserve(col_len);
+            for (int j = 0; j < col_len; ++j) {
+                const uint8_t aa = AA_ENC[static_cast<unsigned char>(
+                    seqbuf[g.seq_offset + col_start + j])];
+                if (aa >= 20) continue;
+                d6.push_back(AA_DAYHOFF6[aa]);
+                cpos.push_back(j);
+            }
+
+            for (int i = 0; i + METAMER_K_D6 <= (int)d6.size(); ++i) {
+                if (!metamer_is_syncmer_d6(d6.data() + i)) continue;
+                if (metamer_is_low_complexity(d6.data() + i, METAMER_K_D6)) continue;
+                // Weakest-link IC over the k-mer's MSA columns.
+                float min_ic = 1.0f;
+                for (int j = 0; j < METAMER_K_D6; ++j)
+                    min_ic = std::min(min_ic, col_ic[cpos[i + j]]);
+                if (min_ic < ic_threshold) continue;
+                raw.push_back(metamer_hash_d6(d6.data() + i));
+            }
+        }
+
+        std::sort(raw.begin(), raw.end());
+        raw.erase(std::unique(raw.begin(), raw.end()), raw.end());
+        res.pool_hashes[mi] = std::move(raw);
+
+        int d = ++done_count;
+        if (d % 20 == 0 || d == n_markers)
+            spdlog::info("markers: d6 {}/{} done, pool[{}]={} hashes",
+                         d, n_markers, mi, res.pool_hashes[mi].size());
+    }
+    return res;
+}
+
 // ── Cross-family filter ───────────────────────────────────────────────────────
 // Remove any hash appearing in ≥2 distinct marker families within the same panel.
 //
@@ -613,14 +754,24 @@ void build_markers_panel(const MarkersBuildConfig& cfg) {
                  bac_tax.size(), arc_tax.size());
 
     // Scan bac120 MSA.
-    spdlog::info("markers: scanning bac120 MSA ({})", (db / "msa/gtdb_r232_bac120.faa").string());
-    auto bac = scan_panel(db / "msa/gtdb_r232_bac120.faa",
-                          bac_tax, k_bac120_ranges, 120, MRKR_DOMAIN_BAC, cfg.threads);
+    spdlog::info("markers: scanning bac120 MSA ({}) [{}]",
+                 (db / "msa/gtdb_r232_bac120.faa").string(),
+                 cfg.dayhoff6 ? "dayhoff6+syncmer+IC" : "full-AA");
+    auto bac = cfg.dayhoff6
+        ? scan_panel_d6(db / "msa/gtdb_r232_bac120.faa",
+                        bac_tax, k_bac120_ranges, 120, MRKR_DOMAIN_BAC,
+                        cfg.ic_threshold, cfg.threads)
+        : scan_panel(db / "msa/gtdb_r232_bac120.faa",
+                     bac_tax, k_bac120_ranges, 120, MRKR_DOMAIN_BAC, cfg.threads);
 
     // Scan ar53 MSA.
     spdlog::info("markers: scanning ar53 MSA");
-    auto arc = scan_panel(db / "msa/gtdb_r232_ar53.faa",
-                          arc_tax, k_ar53_ranges, 53, MRKR_DOMAIN_ARC, cfg.threads);
+    auto arc = cfg.dayhoff6
+        ? scan_panel_d6(db / "msa/gtdb_r232_ar53.faa",
+                        arc_tax, k_ar53_ranges, 53, MRKR_DOMAIN_ARC,
+                        cfg.ic_threshold, cfg.threads)
+        : scan_panel(db / "msa/gtdb_r232_ar53.faa",
+                     arc_tax, k_ar53_ranges, 53, MRKR_DOMAIN_ARC, cfg.threads);
 
     // Cross-family filter: removes k-mers shared across ≥2 marker families.
     // Essential for Murphy10 — without it, first-writer collision in FlatHitMap
@@ -630,8 +781,9 @@ void build_markers_panel(const MarkersBuildConfig& cfg) {
     spdlog::info("markers: cross-family filter (ar53)");
     cross_family_filter(arc.pool_hashes, cfg.threads);
 
-    // FracMinHash: discard hashes above threshold (keep 1/frac_scale of hash space).
-    if (cfg.frac_scale > 1) {
+    // FracMinHash: discard hashes above threshold (full-AA mode only;
+    // dayhoff6 pools are already sparse via IC + syncmer filtering).
+    if (!cfg.dayhoff6 && cfg.frac_scale > 1) {
         const uint64_t max_hash = UINT64_MAX / static_cast<uint64_t>(cfg.frac_scale);
         for (auto& pool : bac.pool_hashes)
             pool.erase(std::upper_bound(pool.begin(), pool.end(), max_hash), pool.end());
@@ -690,7 +842,10 @@ void build_markers_panel(const MarkersBuildConfig& cfg) {
     spdlog::info("markers: {} bac + {} arc lineages, writing {}",
                  bac.lineages.size(), arc.lineages.size(), cfg.output.string());
 
-    writer.finalize(cfg.output, 120, 53, METAMER_K, cfg.frac_scale);
+    const uint8_t  pool_k      = cfg.dayhoff6 ? METAMER_K_D6 : METAMER_K;
+    const uint16_t pool_scale  = cfg.dayhoff6 ? 1            : cfg.frac_scale;
+    const uint8_t  pool_alpha  = cfg.dayhoff6 ? MRKR_ALPHABET_DAYHOFF6 : MRKR_ALPHABET_FULL_AA;
+    writer.finalize(cfg.output, 120, 53, pool_k, pool_scale, pool_alpha);
     spdlog::info("markers: done");
 }
 

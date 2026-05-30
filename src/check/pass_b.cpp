@@ -530,10 +530,12 @@ void run_pass_b(ICheckReader& pack,
                     }
                 }
 
-                // ── Marker-panel completeness ─────────────────────────────────────────────
-                // Whole-genome accumulation: collect all DNA k-mers from all contigs,
-                // then sorted two-pointer merge against the merged pool.
-                // Matches the `markers score` subcommand algorithm exactly.
+                // ── Marker-panel completeness + redundancy ────────────────────────────────
+                // Per-contig voting: each contig independently scores all 6-frame ORFs
+                // against the marker pool. A contig "votes" for marker M if any ORF
+                // clears the containment threshold. Redundancy = markers with ≥2 votes
+                // (two separate genomic loci → contamination signal).
+                // Works for both full-AA k=8 (legacy) and Dayhoff-6 k=12 syncmer pools.
                 float marker_completeness = NAN;
                 float marker_redundancy   = NAN;
                 int   marker_n_present = -1, marker_n_expected = -1;
@@ -541,56 +543,75 @@ void run_pass_b(ICheckReader& pack,
                     const uint64_t genus_hash = GcovWriter::hash_genus(git->second);
                     auto calib = mrk_rd->lookup_lineage(genus_hash);
                     if (calib.valid()) {
-                        thread_local std::vector<uint64_t> qmers;
-                        qmers.clear();
-                        for (const auto& contig : contigs)
-                            extract_metamers_dna_into(contig.seq, METAMER_K, 8, mrk_frac_max, qmers);
-                        std::sort(qmers.begin(), qmers.end());
-                        qmers.erase(std::unique(qmers.begin(), qmers.end()), qmers.end());
-
-                        const bool is_arc = (calib.header->domain == MRKR_DOMAIN_ARC);
+                        const bool is_arc     = (calib.header->domain == MRKR_DOMAIN_ARC);
+                        const bool is_d6      = mrk_rd->is_dayhoff6();
                         auto mh  = is_arc ? mrk_rd->merged_hashes_arc() : mrk_rd->merged_hashes_bac();
                         auto mid = is_arc ? mrk_rd->merged_ids_arc()    : mrk_rd->merged_ids_bac();
-                        const uint8_t n_markers = calib.header->n_markers;
+                        const uint8_t  n_markers = calib.header->n_markers;
+                        const int      min_seg   = is_d6 ? METAMER_K_D6 : METAMER_K;
+                        const uint32_t min_hits  = static_cast<uint32_t>(cfg.marker_min_hits);
 
-                        uint32_t hits[173] = {};
-                        const uint64_t* qp  = qmers.data(), *qpe = qp  + qmers.size();
-                        const uint64_t* mhp = mh.data(),    *mhe = mhp + mh.size();
-                        const uint8_t*  mip = mid.data();
-                        while (qp != qpe && mhp != mhe) {
-                            if      (*qp < *mhp) ++qp;
-                            else if (*mhp < *qp) { ++mhp; ++mip; }
-                            else                 { hits[*mip]++; ++qp; ++mhp; ++mip; }
+                        // contig_votes[mi] = number of contigs with a confirmed ORF for marker mi.
+                        uint32_t contig_votes[173] = {};
+
+                        thread_local std::vector<uint64_t> orf_mers;
+                        for (const auto& contig : contigs) {
+                            // Per-marker best hit count across all ORFs in this contig.
+                            uint32_t best[173] = {};
+                            orf_mers.clear();
+
+                            if (is_d6) {
+                                extract_d6_dna_into(contig.seq, min_seg, orf_mers);
+                            } else {
+                                extract_metamers_dna_into(contig.seq, METAMER_K, min_seg,
+                                                         mrk_frac_max, orf_mers);
+                            }
+                            if (orf_mers.empty()) continue;
+                            std::sort(orf_mers.begin(), orf_mers.end());
+                            orf_mers.erase(std::unique(orf_mers.begin(), orf_mers.end()),
+                                           orf_mers.end());
+
+                            // Two-pointer merge against pool → hits per marker.
+                            uint32_t hits[173] = {};
+                            const uint64_t* qp  = orf_mers.data();
+                            const uint64_t* qpe = qp + orf_mers.size();
+                            const uint64_t* mhp = mh.data();
+                            const uint64_t* mhe = mhp + mh.size();
+                            const uint8_t*  mip = mid.data();
+                            while (qp != qpe && mhp != mhe) {
+                                if      (*qp < *mhp) ++qp;
+                                else if (*mhp < *qp) { ++mhp; ++mip; }
+                                else                 { hits[*mip]++; ++qp; ++mhp; ++mip; }
+                            }
+
+                            // Threshold: min_hits OR min containment fraction of ORF sketch.
+                            // Query-normalised containment stabilises threshold for short ORFs.
+                            const uint32_t q_sz   = static_cast<uint32_t>(orf_mers.size());
+                            const uint32_t frac_t = std::max(1u, q_sz / 20u); // 5% of sketch
+                            const uint32_t thr    = std::max(min_hits, frac_t);
+                            for (uint8_t mi = 0; mi < n_markers; ++mi)
+                                if (hits[mi] >= thr && hits[mi] > best[mi])
+                                    best[mi] = hits[mi];
+
+                            for (uint8_t mi = 0; mi < n_markers; ++mi)
+                                if (best[mi] > 0) contig_votes[mi]++;
                         }
 
                         marker_n_present  = 0;
                         marker_n_expected = 0;
-                        float redundancy_sum = 0.0f;
-                        int   redundancy_n   = 0;
-                        const uint32_t min_hits = static_cast<uint32_t>(cfg.marker_min_hits);
+                        int redundant_n   = 0;
                         for (uint8_t mi = 0; mi < n_markers; ++mi) {
                             if (!calib.marker_expected(mi)) continue;
                             ++marker_n_expected;
-                            const uint32_t thr = static_cast<uint32_t>(calib.slots[mi].null_floor_u16)
-                                               + min_hits;
-                            if (hits[mi] >= thr) {
-                                ++marker_n_present;
-                                const uint8_t pool_mi = is_arc
-                                    ? static_cast<uint8_t>(mrk_rd->n_bac() + mi) : mi;
-                                const uint32_t psz = mrk_rd->pool_n_hashes(pool_mi);
-                                if (psz > 0) {
-                                    redundancy_sum += static_cast<float>(hits[mi])
-                                                    / static_cast<float>(psz);
-                                    ++redundancy_n;
-                                }
-                            }
+                            if (contig_votes[mi] >= 1) ++marker_n_present;
+                            if (contig_votes[mi] >= 2) ++redundant_n;
                         }
-                        if (marker_n_expected > 0)
+                        if (marker_n_expected > 0) {
                             marker_completeness = static_cast<float>(marker_n_present)
                                                / static_cast<float>(marker_n_expected);
-                        if (redundancy_n > 0)
-                            marker_redundancy = redundancy_sum
-                                             / static_cast<float>(redundancy_n);
+                            marker_redundancy   = static_cast<float>(redundant_n)
+                                               / static_cast<float>(marker_n_expected);
+                        }
                     }
                 }
 

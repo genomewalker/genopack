@@ -389,4 +389,103 @@ extract_metamers_aa(std::string_view protein, int k = METAMER_K) {
     return hashes;
 }
 
+// ── Dayhoff-6 reduced alphabet ────────────────────────────────────────────────
+// Groups (index into AA_ENC order ACDEFGHIKLMNPQRSTVWY → 0..19):
+//   0=C  1=AGPST  2=DENQ  3=HKR  4=ILMV  5=FWY
+static constexpr uint8_t AA_DAYHOFF6[20] = {
+    1, 0, 2, 2, 5, 1, 3, 4, 3, 4, 4, 2, 1, 2, 3, 1, 1, 4, 5, 5
+};
+
+static constexpr int METAMER_K_D6 = 12; // Dayhoff-6 k-mer length
+static constexpr int METAMER_S_D6 =  4; // syncmer inner s-mer length
+
+// Dayhoff-6 k=12 hash: pack 12 groups × 3 bits = 36 bits → splitmix64.
+// d6[0..11] must be AA_DAYHOFF6-encoded (values 0..5).
+[[nodiscard]] inline uint64_t metamer_hash_d6(const uint8_t* d6) noexcept {
+    uint64_t v = 0;
+    for (int i = 0; i < METAMER_K_D6; ++i)
+        v |= static_cast<uint64_t>(d6[i]) << (3 * i);
+    v ^= v >> 30;
+    v *= 0xbf58476d1ce4e5b9ULL;
+    v ^= v >> 27;
+    v *= 0x94d049bb133111ebULL;
+    v ^= v >> 31;
+    return v;
+}
+
+// Closed syncmer (t=0): select k-mer if the minimum s-mer (packed 3×s bits, no mixing)
+// is at position 0. Gives ~1/(k-s+1) = ~11% selection at k=12, s=4.
+// Identical criterion at pool-build and query time → consistent per-ORF sketch density.
+[[nodiscard]] inline bool metamer_is_syncmer_d6(const uint8_t* d6) noexcept {
+    // Pack each s-mer as s×3-bit integer (12 bits for s=4) — no mixing, just ordering.
+    auto smer = [&](int pos) -> uint16_t {
+        uint16_t v = 0;
+        for (int i = 0; i < METAMER_S_D6; ++i)
+            v |= static_cast<uint16_t>(d6[pos + i]) << (3 * i);
+        return v;
+    };
+    const uint16_t s0 = smer(0);
+    for (int i = 1; i <= METAMER_K_D6 - METAMER_S_D6; ++i)
+        if (smer(i) < s0) return false;
+    return true;
+}
+
+// Append Dayhoff-6 k=12 syncmer hashes from a DNA sequence (6-frame translation).
+// Only k-mers passing the closed-syncmer criterion (t=0) are emitted.
+// Low-complexity k-mers (run ≥ (k+1)/2 of same Dayhoff group) are skipped.
+// No FracMinHash subsampling: syncmers provide consistent ~11% density already.
+inline void extract_d6_dna_into(std::string_view seq, int min_seg_aa,
+                                std::vector<uint64_t>& out) {
+    constexpr int k = METAMER_K_D6;
+    translate_6frame(seq, min_seg_aa, [&](int, const uint8_t* seg, int len, int, int) {
+        for (int i = 0; i + k <= len; ++i) {
+            // Recode to Dayhoff-6 and check for invalid AA (0xFF from AA_ENC).
+            uint8_t d6[METAMER_K_D6];
+            bool valid = true;
+            for (int j = 0; j < k; ++j) {
+                if (seg[i + j] >= 20) { valid = false; break; }
+                d6[j] = AA_DAYHOFF6[seg[i + j]];
+            }
+            if (!valid) continue;
+            if (!metamer_is_syncmer_d6(d6)) continue;
+            if (metamer_is_low_complexity(d6, k)) continue;
+            out.push_back(metamer_hash_d6(d6));
+        }
+    });
+}
+
+// Dayhoff-6 variant of extract_metamers_aa: for pool building from MSA protein strings.
+// Gaps ('-') skip without breaking the segment (same as extract_metamers_aa).
+// Only emits syncmer k-mers to keep pool sparse and density-consistent.
+[[nodiscard]] inline std::vector<uint64_t>
+extract_metamers_d6_aa(std::string_view protein) {
+    std::vector<uint64_t> hashes;
+    hashes.reserve(protein.size() / 8);
+    constexpr int k = METAMER_K_D6;
+
+    std::vector<uint8_t> seg; // Dayhoff-6 encoded segment
+    seg.reserve(protein.size());
+
+    auto flush = [&] {
+        for (int i = 0; i + k <= (int)seg.size(); ++i) {
+            if (!metamer_is_syncmer_d6(seg.data() + i)) continue;
+            if (metamer_is_low_complexity(seg.data() + i, k)) continue;
+            hashes.push_back(metamer_hash_d6(seg.data() + i));
+        }
+        seg.clear();
+    };
+
+    for (unsigned char c : protein) {
+        if (c == '-') continue;
+        const uint8_t aa = AA_ENC[c];
+        if (aa == AA_STOP || aa == 0xFF) { flush(); continue; }
+        seg.push_back(AA_DAYHOFF6[aa]);
+    }
+    flush();
+
+    std::sort(hashes.begin(), hashes.end());
+    hashes.erase(std::unique(hashes.begin(), hashes.end()), hashes.end());
+    return hashes;
+}
+
 } // namespace genopack

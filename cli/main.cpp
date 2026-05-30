@@ -3129,7 +3129,13 @@ int main(int argc, char** argv) {
         "Thread count (default: 1)");
     int mb_scale = 1;
     markers_build_cmd->add_option("--scale", mb_scale,
-        "FracMinHash scale factor: keep 1/N of hashes (default: 1 = keep all)");
+        "FracMinHash scale factor: keep 1/N of hashes (default: 1 = keep all; ignored with --dayhoff6)");
+    bool mb_dayhoff6 = false;
+    markers_build_cmd->add_flag("--dayhoff6", mb_dayhoff6,
+        "Build Dayhoff-6 k=12 syncmer profile pool (recommended; compact, robust to divergence)");
+    float mb_ic_threshold = 0.25f;
+    markers_build_cmd->add_option("--ic-threshold", mb_ic_threshold,
+        "Min per-column IC fraction to include k-mer positions (default: 0.25; --dayhoff6 only)");
     markers_build_cmd->callback([&]() {
         genopack::MarkersBuildConfig cfg;
         cfg.gtdbtk_db         = mb_gtdbtk_db;
@@ -3137,6 +3143,8 @@ int main(int argc, char** argv) {
         cfg.default_threshold = mb_threshold;
         cfg.threads           = mb_threads;
         cfg.frac_scale        = static_cast<uint16_t>(mb_scale);
+        cfg.dayhoff6          = mb_dayhoff6;
+        cfg.ic_threshold      = mb_ic_threshold;
         genopack::build_markers_panel(cfg);
     });
 

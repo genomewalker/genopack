@@ -29,6 +29,7 @@ static constexpr uint8_t  MRKR_DOMAIN_BAC = 0;
 static constexpr uint8_t  MRKR_DOMAIN_ARC = 1;
 static constexpr uint8_t  MRKR_ALPHABET_FULL_AA   = 0;
 static constexpr uint8_t  MRKR_ALPHABET_MURPHY10  = 1; // Murphy 10-class reduced alphabet
+static constexpr uint8_t  MRKR_ALPHABET_DAYHOFF6  = 2; // Dayhoff-6 groups, k=12 syncmers
 
 // ── On-disk structs (little-endian POD) ──────────────────────────────────────
 
@@ -207,7 +208,8 @@ public:
     // Write the complete .mrk file. n_bac/n_arc are the schema sizes (e.g., 120, 53).
     void finalize(const std::filesystem::path& path,
                   uint8_t n_bac, uint8_t n_arc, uint8_t k = METAMER_K,
-                  uint16_t frac_scale = 1) const;
+                  uint16_t frac_scale = 1,
+                  uint8_t alphabet = MRKR_ALPHABET_FULL_AA) const;
 
     // Set the per-genus redundancy calibration table (sorted by genus_hash).
     void set_redun_calib(std::vector<RedunCalibEntry> entries) {
@@ -248,7 +250,8 @@ public:
     uint8_t  n_arc()      const { return hdr_ ? hdr_->n_arc_markers : 0; }
     uint8_t  k()          const { return hdr_ ? hdr_->k : 0; }
     uint8_t  alphabet()   const { return hdr_ ? hdr_->alphabet : MRKR_ALPHABET_FULL_AA; }
-    bool     is_murphy10() const { return alphabet() == MRKR_ALPHABET_MURPHY10; }
+    bool     is_murphy10()  const { return alphabet() == MRKR_ALPHABET_MURPHY10; }
+    bool     is_dayhoff6()  const { return alphabet() == MRKR_ALPHABET_DAYHOFF6; }
     uint16_t frac_scale() const { return hdr_ ? (hdr_->frac_scale ? hdr_->frac_scale : 1) : 1; }
     uint64_t frac_max_hash() const {
         const uint32_t s = frac_scale();
@@ -428,7 +431,10 @@ private:
             throw std::runtime_error("markers.mrk: bad magic");
         if (hdr_->version < MRKR_VERSION_MIN || hdr_->version > MRKR_VERSION)
             throw std::runtime_error("markers.mrk: unsupported version — rebuild required");
-        if (hdr_->k != METAMER_K)
+        const bool k_ok = (hdr_->k == METAMER_K) ||
+                          (hdr_->k == METAMER_K_D6 &&
+                           hdr_->alphabet == MRKR_ALPHABET_DAYHOFF6);
+        if (!k_ok)
             throw std::runtime_error("markers.mrk: k mismatch — rebuild required");
         lookup_   = reinterpret_cast<const MarkerLookupEntry*>(data + hdr_->lookup_off);
         pool_idx_ = reinterpret_cast<const MarkerPoolEntry*>(data + hdr_->pool_idx_off);
