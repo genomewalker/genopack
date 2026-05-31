@@ -422,7 +422,10 @@ static PanelResult scan_panel_d6(
             if (genus.empty() || genus.size() <= 3)  { ++n_skipped; ginfo.push_back({0, 0, UINT32_MAX}); return; }
             const uint64_t gh = GcovWriter::hash_genus(genus);
             auto [it, inserted] = genus_idx_map.emplace(gh, res.lineages.size());
-            if (inserted) res.lineages.push_back({gh, domain, 0, std::string(genus)});
+            if (inserted) {
+                res.lineages.push_back({gh, domain, 0, std::string(genus),
+                                        std::vector<uint32_t>(n_markers, 0)});
+            }
             res.lineages[it->second].ref_count++;
             const uint32_t off = static_cast<uint32_t>(seqbuf.size());
             seqbuf.insert(seqbuf.end(), seq.begin(), seq.end());
