@@ -85,12 +85,24 @@ void run_pass_marker(ICheckReader&                                   pack,
                 const BlockedBloom& bloom =
                     is_arc ? mrk_rd.merged_bloom_arc() : mrk_rd.merged_bloom_bac();
                 const uint8_t n_markers = calib.header->n_markers;
+                const uint8_t base_id   = is_arc ? mrk_rd.n_bac() : 0;
+
+                std::vector<uint32_t> pool_sizes(n_markers);
+                for (uint8_t mi = 0; mi < n_markers; ++mi)
+                    pool_sizes[mi] = static_cast<uint32_t>(
+                        mrk_rd.pool_hashes(static_cast<uint8_t>(base_id + mi)).size());
+
+                // null_floor_u16 / threshold_u16 are calibrated for complete-genome presence
+                // calls (threshold ~47% median containment). For completeness *estimation* on
+                // fragments we need high sensitivity, so we keep the original raw-count gate
+                // (>= minhit) and only use pool_sizes for future fractional scoring.
+                // TODO: apply per-ORF null_floor correction as max(0, hits - nf * q_sz) >= minhit.
 
                 std::vector<uint32_t> votes(n_markers, 0);
                 thread_local std::vector<uint64_t> orf_mers;
 
                 for (const auto& contig : contigs) {
-                    uint32_t best[173] = {};
+                    std::vector<uint32_t> best(n_markers, 0);
 
                     if (is_d6) {
                         translate_6frame(contig.seq, min_seg,
@@ -101,19 +113,19 @@ void run_pass_marker(ICheckReader&                                   pack,
                                 std::sort(orf_mers.begin(), orf_mers.end());
                                 orf_mers.erase(std::unique(orf_mers.begin(), orf_mers.end()),
                                                orf_mers.end());
-                                uint32_t local[173] = {};
+                                std::vector<uint32_t> local(n_markers, 0);
                                 const uint64_t* mhp = mh.data(), *mhe = mhp + mh.size();
                                 const uint8_t*  mip = mid.data();
                                 for (uint64_t h : orf_mers) {
                                     if (!bloom.might_contain(h)) continue;
                                     auto it2 = std::lower_bound(mhp, mhe, h);
-                                    if (it2 != mhe && *it2 == h) local[mip[it2 - mhp]]++;
+                                    if (it2 != mhe && *it2 == h) {
+                                        const uint8_t id = mip[it2 - mhp];
+                                        if (id < n_markers) local[id]++;
+                                    }
                                 }
-                                const uint32_t q_sz = static_cast<uint32_t>(orf_mers.size());
-                                const uint32_t thr  = std::max(minhit, std::max(1u, q_sz / 20u));
                                 for (uint8_t mi = 0; mi < n_markers; ++mi)
-                                    if (local[mi] >= thr && local[mi] > best[mi])
-                                        best[mi] = local[mi];
+                                    if (local[mi] > best[mi]) best[mi] = local[mi];
                             });
                     } else {
                         orf_mers.clear();
@@ -122,24 +134,24 @@ void run_pass_marker(ICheckReader&                                   pack,
                             std::sort(orf_mers.begin(), orf_mers.end());
                             orf_mers.erase(std::unique(orf_mers.begin(), orf_mers.end()),
                                            orf_mers.end());
-                            uint32_t hits[173] = {};
+                            std::vector<uint32_t> hits(n_markers, 0);
                             const uint64_t* mhp = mh.data(), *mhe = mhp + mh.size();
                             const uint8_t*  mip = mid.data();
                             for (uint64_t h : orf_mers) {
                                 if (!bloom.might_contain(h)) continue;
                                 auto it2 = std::lower_bound(mhp, mhe, h);
-                                if (it2 != mhe && *it2 == h) hits[mip[it2 - mhp]]++;
+                                if (it2 != mhe && *it2 == h) {
+                                    const uint8_t id = mip[it2 - mhp];
+                                    if (id < n_markers) hits[id]++;
+                                }
                             }
-                            const uint32_t q_sz = static_cast<uint32_t>(orf_mers.size());
-                            const uint32_t thr  = std::max(minhit, std::max(1u, q_sz / 20u));
                             for (uint8_t mi = 0; mi < n_markers; ++mi)
-                                if (hits[mi] >= thr && hits[mi] > best[mi])
-                                    best[mi] = hits[mi];
+                                if (hits[mi] > best[mi]) best[mi] = hits[mi];
                         }
                     }
 
                     for (uint8_t mi = 0; mi < n_markers; ++mi)
-                        if (best[mi] > 0) votes[mi]++;
+                        if (best[mi] >= minhit) votes[mi]++;
                 }
 
                 // Aggregate + per-SCG bitmask
