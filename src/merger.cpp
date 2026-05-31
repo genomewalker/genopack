@@ -520,54 +520,76 @@ void merge_archives(const std::vector<std::filesystem::path>& inputs,
     }
 
     // SKCH: merge OPH sketch sections from all archives.
-    // V4-only: every source archive must have SKC4 sections. Each sketch
-    // is read via SkchReader::sketch_for_ids and re-emitted carrying both
-    // sig1 and sig2. If ANY archive has a SKCH section that isn't V4 we
-    // abort — there is no sig2 to transit.
+    // V4-only: every source archive must have SKC4 sections. Preserves multi-k
+    // when all input archives share the same k-set (n_kmer_sizes > 1).
     {
-        uint32_t skch_sketch_size = 0, skch_kmer_size = 0, skch_syncmer_s = 0;
-        uint64_t skch_seed1 = 42, skch_seed2 = 43;
-        bool     skch_params_set = false;
-        size_t   total_sketches  = 0;
+        uint32_t              skch_sketch_size = 0, skch_syncmer_s = 0;
+        uint64_t              skch_seed1 = 42, skch_seed2 = 43;
+        std::vector<uint32_t> skch_kmer_sizes;
+        bool                  skch_params_set = false;
+        size_t                total_sketches  = 0;
 
         for (size_t ai = 0; ai < archives.size(); ++ai) {
             for (const auto* sd : archives[ai].toc.find_by_type(SEC_SKCH)) {
-                // peek_params throws if the section is not SKC4.
                 auto [ver, ks] = SkchReader::peek_params(
                     archives[ai].mmap.data(), sd->file_offset, sd->compressed_size);
-                if (ver != 4) {
+                if (ver != 4)
                     throw std::runtime_error(
                         "SKC4 required; source archive lacks sig2 — rebuild first");
-                }
                 SkchReader reader;
                 reader.open(archives[ai].mmap.data(), sd->file_offset, sd->compressed_size);
                 if (!skch_params_set) {
                     skch_sketch_size = reader.sketch_size();
-                    skch_kmer_size   = reader.kmer_size();
                     skch_syncmer_s   = reader.syncmer_s();
                     skch_seed1       = reader.seed1();
                     skch_seed2       = reader.seed2();
+                    for (uint32_t i = 0; i < reader.n_kmer_sizes(); ++i)
+                        skch_kmer_sizes.push_back(reader.kmer_size_at(i));
                     skch_params_set  = true;
                 } else {
+                    // Allow merging archives that have a subset of k-values (e.g.
+                    // single-k added via 'genopack add' into a multi-k archive);
+                    // keep only the k-values common to all sources.
                     if (reader.sketch_size() != skch_sketch_size ||
-                        reader.kmer_size()   != skch_kmer_size   ||
-                        reader.seed1()       != skch_seed1       ||
-                        reader.seed2()       != skch_seed2) {
+                        reader.seed1()        != skch_seed1       ||
+                        reader.seed2()        != skch_seed2)
                         throw std::runtime_error(
-                            "SKCH merge: mismatched parameters across source archives");
+                            "SKCH merge: mismatched sketch_size or seeds across archives");
+                    std::vector<uint32_t> src_ks;
+                    for (uint32_t i = 0; i < reader.n_kmer_sizes(); ++i)
+                        src_ks.push_back(reader.kmer_size_at(i));
+                    if (src_ks != skch_kmer_sizes) {
+                        // Downgrade to the intersection
+                        std::vector<uint32_t> common;
+                        for (uint32_t k : skch_kmer_sizes)
+                            if (std::find(src_ks.begin(), src_ks.end(), k) != src_ks.end())
+                                common.push_back(k);
+                        if (common.empty())
+                            throw std::runtime_error("SKCH merge: no common k-values");
+                        if (common != skch_kmer_sizes)
+                            spdlog::warn("SKCH merge: downgrading to common k-values [{}]",
+                                         common.size());
+                        skch_kmer_sizes = common;
                     }
                 }
                 total_sketches += reader.n_genomes();
             }
         }
 
-        if (total_sketches > 0) {
-            spdlog::info("Merging SKCH (V4): {} sketches from {} archives",
+        if (total_sketches > 0 && !skch_kmer_sizes.empty()) {
+            const bool multi_k = skch_kmer_sizes.size() > 1;
+            spdlog::info("Merging SKCH (V4, k=[{}] nk={}): {} sketches from {} archives",
+                         skch_kmer_sizes[0], skch_kmer_sizes.size(),
                          total_sketches, archives.size());
-            SkchWriter skch_out(skch_sketch_size, skch_kmer_size,
-                                skch_syncmer_s, skch_seed1, skch_seed2);
 
-            const uint32_t mask_words = (skch_sketch_size + 63) / 64;
+            std::unique_ptr<SkchWriter>      skch_out_1k;
+            std::unique_ptr<SkchWriterMultiK> skch_out_mk;
+            if (multi_k)
+                skch_out_mk = std::make_unique<SkchWriterMultiK>(
+                    skch_kmer_sizes, skch_sketch_size, skch_syncmer_s, skch_seed1, skch_seed2);
+            else
+                skch_out_1k = std::make_unique<SkchWriter>(
+                    skch_sketch_size, skch_kmer_sizes[0], skch_syncmer_s, skch_seed1, skch_seed2);
 
             for (size_t ai = 0; ai < archives.size(); ++ai) {
                 GenomeId gid_off = gid_offsets[ai];
@@ -575,41 +597,82 @@ void merge_archives(const std::vector<std::filesystem::path>& inputs,
                     SkchReader reader;
                     reader.open(archives[ai].mmap.data(),
                                 sd->file_offset, sd->compressed_size);
+                    const auto& src_ids = reader.genome_ids();
+                    const size_t n = src_ids.size();
+                    const uint32_t nk = static_cast<uint32_t>(skch_kmer_sizes.size());
 
-                    const auto& src_ids = reader.genome_ids(); // sorted ascending
+                    if (!multi_k) {
+                        // Single-k path (unchanged)
+                        std::vector<GenomeId>              out_ids(n);
+                        std::vector<std::vector<uint16_t>> out_sig1(n), out_sig2(n);
+                        std::vector<std::vector<uint64_t>> out_mask(n);
+                        std::vector<uint32_t>              out_nrb(n);
+                        std::vector<uint64_t>              out_glen(n);
+                        reader.sketch_for_ids(src_ids, skch_kmer_sizes[0], skch_sketch_size,
+                            [&](size_t row, const SketchResult& sr) {
+                                out_ids[row]  = static_cast<GenomeId>(src_ids[row]) + gid_off;
+                                out_sig1[row].assign(sr.sig,  sr.sig  + sr.sketch_size);
+                                out_sig2[row].assign(sr.sig2, sr.sig2 + sr.sketch_size);
+                                out_mask[row].assign(sr.mask, sr.mask + sr.mask_words);
+                                out_nrb[row]  = sr.n_real_bins;
+                                out_glen[row] = sr.genome_length;
+                            });
+                        for (size_t j = 0; j < n; ++j)
+                            if (!out_sig1[j].empty())
+                                skch_out_1k->add(out_ids[j], out_sig1[j], out_sig2[j],
+                                                 out_nrb[j], out_glen[j], out_mask[j]);
+                    } else {
+                        // Multi-k path: collect per-k data then emit per genome
+                        // sigs_per_k[ki][genome_row]
+                        std::vector<std::vector<std::vector<uint16_t>>>
+                            sigs1(nk, std::vector<std::vector<uint16_t>>(n)),
+                            sigs2(nk, std::vector<std::vector<uint16_t>>(n));
+                        std::vector<std::vector<uint32_t>>
+                            nrbs(nk, std::vector<uint32_t>(n, 0));
+                        std::vector<std::vector<uint64_t>> masks(n);
+                        std::vector<uint64_t> glens(n, 0);
 
-                    // Pre-allocate per-row remapped output since cb may fire
-                    // concurrently from multiple threads — serialise through a
-                    // mutex-protected SkchWriter::add.
-                    std::vector<GenomeId>              out_ids(src_ids.size());
-                    std::vector<std::vector<uint16_t>> out_sig1(src_ids.size());
-                    std::vector<std::vector<uint16_t>> out_sig2(src_ids.size());
-                    std::vector<std::vector<uint64_t>> out_mask(src_ids.size());
-                    std::vector<uint32_t>              out_nrb(src_ids.size());
-                    std::vector<uint64_t>              out_glen(src_ids.size());
+                        // Build map from k-value → output ki
+                        std::unordered_map<uint32_t,uint32_t> k_to_out_ki;
+                        for (uint32_t ki = 0; ki < nk; ++ki)
+                            k_to_out_ki[skch_kmer_sizes[ki]] = ki;
 
-                    reader.sketch_for_ids(src_ids, skch_kmer_size, skch_sketch_size,
-                        [&](size_t row, const SketchResult& sr) {
-                            out_ids[row]  = static_cast<GenomeId>(src_ids[row]) + gid_off;
-                            out_sig1[row].assign(sr.sig,  sr.sig  + sr.sketch_size);
-                            out_sig2[row].assign(sr.sig2, sr.sig2 + sr.sketch_size);
-                            out_mask[row].assign(sr.mask, sr.mask + sr.mask_words);
-                            out_nrb[row]  = sr.n_real_bins;
-                            out_glen[row] = sr.genome_length;
-                        });
+                        reader.sketch_for_ids_multi_k(src_ids, skch_sketch_size,
+                            [&](size_t row, uint32_t /*src_ki*/, const SketchResult& sr) {
+                                const uint32_t k  = sr.kmer_size;
+                                auto it = k_to_out_ki.find(k);
+                                if (it == k_to_out_ki.end()) return;
+                                const uint32_t oki = it->second;
+                                sigs1[oki][row].assign(sr.sig,  sr.sig  + sr.sketch_size);
+                                sigs2[oki][row].assign(sr.sig2, sr.sig2 + sr.sketch_size);
+                                nrbs[oki][row] = sr.n_real_bins;
+                                if (masks[row].empty()) {
+                                    masks[row].assign(sr.mask, sr.mask + sr.mask_words);
+                                    glens[row] = sr.genome_length;
+                                }
+                            });
 
-                    for (size_t j = 0; j < src_ids.size(); ++j) {
-                        if (out_sig1[j].empty()) continue;
-                        skch_out.add(out_ids[j],
-                                     out_sig1[j], out_sig2[j],
-                                     out_nrb[j], out_glen[j],
-                                     out_mask[j]);
+                        for (size_t j = 0; j < n; ++j) {
+                            if (sigs1[0][j].empty()) continue;
+                            GenomeId gid = static_cast<GenomeId>(src_ids[j]) + gid_off;
+                            std::vector<std::vector<uint16_t>> s1(nk), s2(nk);
+                            std::vector<uint32_t>              nrb_j(nk, 0);
+                            std::vector<std::vector<uint64_t>> mk(nk);
+                            for (uint32_t ki = 0; ki < nk; ++ki) {
+                                s1[ki]    = std::move(sigs1[ki][j]);
+                                s2[ki]    = std::move(sigs2[ki][j]);
+                                nrb_j[ki] = nrbs[ki][j];
+                                mk[ki]    = masks[j]; // shared bitmask
+                            }
+                            skch_out_mk->add(gid, glens[j], s1, s2, nrb_j, mk);
+                        }
                     }
-                    (void)mask_words;
                 }
             }
 
-            SectionDesc skch_sd = skch_out.finalize(mw, next_section_id++);
+            SectionDesc skch_sd = multi_k
+                ? skch_out_mk->finalize(mw, next_section_id++)
+                : skch_out_1k->finalize(mw, next_section_id++);
             toc_out.add_section(skch_sd);
         }
     }
