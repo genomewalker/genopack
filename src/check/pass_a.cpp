@@ -368,11 +368,9 @@ PassAResult run_pass_a(ICheckReader& pack,
         if (!gstx_targets.empty()) {
             sort_by_gid(gstx_targets);
 
-            // Per-target leakage storage: lk[target_idx * GSTX_MAX_K + ki]
-            // visit_sketch_gids delivers ki as index into available_kmer_sizes() (0,1,2…),
-            // NOT as the raw k-value — use directly as array index.
             const int n_tgt = static_cast<int>(gstx_targets.size());
-            std::vector<float> lk(static_cast<size_t>(n_tgt) * GSTX_MAX_K, NAN);
+            std::vector<float>    lk(static_cast<size_t>(n_tgt) * GSTX_MAX_K, NAN);
+            std::vector<uint32_t> nrb(static_cast<size_t>(n_tgt), 0); // n_real_bins at k=0
 
             std::vector<GenomeId> sorted_gids;
             sorted_gids.reserve(gstx_targets.size());
@@ -389,15 +387,19 @@ PassAResult run_pass_a(ICheckReader& pack,
                         if (sk.sig[b] != cons[b]) ++mismatch;
                     lk[static_cast<size_t>(bidx) * GSTX_MAX_K + ki] =
                         static_cast<float>(mismatch) / static_cast<float>(sk.sketch_size);
+                    if (ki == 0) nrb[bidx] = sk.n_real_bins;
                 });
 
             for (int tidx = 0; tidx < n_tgt; ++tidx) {
-                const GlobalTarget& gt = gstx_targets[tidx];
-                const GenusSlot&    sl = slots[gt.gi];
-                const float* tlk       = &lk[static_cast<size_t>(tidx) * GSTX_MAX_K];
-                apply_leakage_scores(genus_tq[gt.gi][gt.tq_idx].q,
-                                     tlk, n_k, avail_k.data(),
-                                     sl.gstx_e->p90_containment[0]);
+                const GlobalTarget& gt  = gstx_targets[tidx];
+                const GenusSlot&    sl  = slots[gt.gi];
+                const GstxEntry*    gst = sl.gstx_e;
+                const float* tlk        = &lk[static_cast<size_t>(tidx) * GSTX_MAX_K];
+                auto& q = genus_tq[gt.gi][gt.tq_idx].q;
+                apply_leakage_scores(q, tlk, n_k, avail_k.data(), gst->p90_containment[0]);
+                if (gst->nrb_p90 > 0.0f && nrb[tidx] > 0)
+                    q.completeness_sketch_fill = std::clamp(
+                        static_cast<float>(nrb[tidx]) / gst->nrb_p90, 0.0f, 1.5f);
             }
             spdlog::info("check pass-A: {} targets scored via single GSTX pass",
                          gstx_targets.size());
@@ -469,9 +471,9 @@ PassAResult run_pass_a(ICheckReader& pack,
                 }
                 const int n_sample = static_cast<int>(sample_gids.size());
 
-                // Leakage pass over sample
-                std::vector<float> sample_lk(
-                    static_cast<size_t>(n_sample) * GSTX_MAX_K, NAN);
+                // Leakage + n_real_bins pass over sample
+                std::vector<float>    sample_lk(static_cast<size_t>(n_sample) * GSTX_MAX_K, NAN);
+                std::vector<uint32_t> sample_nrb(static_cast<size_t>(n_sample), 0);
 
                 pack.visit_sketch_gids(sample_gids, sketch_sz,
                     [&](size_t sidx, uint32_t ki_raw, const SketchResult& sk) {
@@ -480,14 +482,23 @@ PassAResult run_pass_a(ICheckReader& pack,
                         const int ki = it->second;
                         sample_lk[sidx * GSTX_MAX_K + ki] =
                             votes[ki].leakage(sk.sig, sk.sketch_size);
+                        if (ki == 0) sample_nrb[sidx] = sk.n_real_bins;
                     });
 
-                // p90 from k=0 containment across full sample
-                std::vector<float> c0_all;
+                // p90 from k=0 containment + nrb across reference members in sample
+                // (exclude query targets from p90 computation)
+                std::unordered_set<GenomeId> tq_gids;
+                for (const auto& tqr : tq)
+                    if (tqr.m->gid) tq_gids.insert(tqr.m->gid);
+
+                std::vector<float> c0_all, nrb_ref;
                 c0_all.reserve(n_sample);
+                nrb_ref.reserve(n_sample);
                 for (int si = 0; si < n_sample; ++si) {
                     float v = sample_lk[static_cast<size_t>(si) * GSTX_MAX_K + 0];
                     if (!std::isnan(v)) c0_all.push_back(1.0f - v);
+                    if (!tq_gids.count(sample_gids[si]) && sample_nrb[si] > 0)
+                        nrb_ref.push_back(static_cast<float>(sample_nrb[si]));
                 }
                 float p90_c0 = 0.0f;
                 if (!c0_all.empty()) {
@@ -497,6 +508,16 @@ PassAResult run_pass_a(ICheckReader& pack,
                                      c0_all.begin() + static_cast<ptrdiff_t>(p90_idx),
                                      c0_all.end());
                     p90_c0 = c0_all[p90_idx];
+                }
+                float nrb_p90 = 0.0f;
+                if (!nrb_ref.empty()) {
+                    size_t p90_idx = static_cast<size_t>(
+                        0.9f * static_cast<float>(nrb_ref.size()));
+                    if (p90_idx >= nrb_ref.size()) p90_idx = nrb_ref.size() - 1;
+                    std::nth_element(nrb_ref.begin(),
+                                     nrb_ref.begin() + static_cast<ptrdiff_t>(p90_idx),
+                                     nrb_ref.end());
+                    nrb_p90 = nrb_ref[p90_idx];
                 }
 
                 // Apply scores to target genomes
@@ -510,6 +531,10 @@ PassAResult run_pass_a(ICheckReader& pack,
                     if (it == sample_pos.end()) continue;
                     const float* tlk = &sample_lk[static_cast<size_t>(it->second) * GSTX_MAX_K];
                     apply_leakage_scores(tqr.q, tlk, n_k, avail_k.data(), p90_c0);
+                    const uint32_t qnrb = sample_nrb[it->second];
+                    if (nrb_p90 > 0.0f && qnrb > 0)
+                        tqr.q.completeness_sketch_fill = std::clamp(
+                            static_cast<float>(qnrb) / nrb_p90, 0.0f, 1.5f);
                 }
             }
         }

@@ -37,8 +37,9 @@ struct QualRecord {
     float    chargaff_parity;            //  4  Chargaff 2nd parity score [0,1]; NAN = not computed
     float    spectral_gap;               //  4  1 - |λ₂| from k3 Markov op; NAN = not computed
     float    scale_kink;                 //  4  log₂(W*) dyadic-window scale; NAN = not computed
-    uint8_t  cross_genus_u8;             //  1  contamination_cross_genus × 255; 0=clean (uses tail padding)
-    uint8_t  _pad[3];                    //  3  padding to reach 80 bytes
+    uint8_t  cross_genus_u8;             //  1  contamination_cross_genus × 255; 0=clean
+    uint8_t  sketch_fill_u8;             //  1  completeness_sketch_fill × 200 (200=100%, >200 allowed up to 255)
+    uint8_t  _pad[2];                    //  2  padding to reach 80 bytes
     // total = 80
 
     // qual_flags bits
@@ -73,6 +74,7 @@ struct QualRecord {
         r.sibling_outlier_u8          = 0;
         r.rho_outlier_u8              = 0;
         r.cross_genus_u8              = 0;
+        r.sketch_fill_u8              = 0;
         r.marker_redundancy_u16       = 0xFFFF;
         r.chargaff_parity             = NAN;
         r.spectral_gap                = NAN;

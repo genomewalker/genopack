@@ -962,12 +962,29 @@ struct ArchiveBuilder::Impl {
                     for (int ki = 0; ki < nk; ++ki)
                         ksizes[ki] = static_cast<uint32_t>(cfg.sketch_kmer_sizes[ki]);
 
+                    // nrb_p90: p90 of n_real_bins at k=0 — used for sketch-fill completeness
+                    float nrb_p90_gstx = 0.0f;
+                    if (nk > 0) {
+                        std::vector<float> nrb_v;
+                        nrb_v.reserve(buf.size());
+                        for (const auto& item : buf)
+                            if (!item.sketches_mk.empty())
+                                nrb_v.push_back(static_cast<float>(item.sketches_mk[0].n_real_bins));
+                        if (!nrb_v.empty()) {
+                            size_t idx = static_cast<size_t>(0.9f * static_cast<float>(nrb_v.size()));
+                            if (idx >= nrb_v.size()) idx = nrb_v.size() - 1;
+                            std::nth_element(nrb_v.begin(), nrb_v.begin() + static_cast<ptrdiff_t>(idx), nrb_v.end());
+                            nrb_p90_gstx = nrb_v[idx];
+                        }
+                    }
+
                     gstx_writer.add_genus(genus_key,
                                           static_cast<uint32_t>(buf.size()),
                                           static_cast<uint32_t>(nk),
                                           cand, p90,
                                           has_tnf ? tnf_mu : nullptr,
-                                          ksizes);
+                                          ksizes,
+                                          nrb_p90_gstx);
 
                     // Per-genome quality: apply genus stats to each member while in RAM.
                     // contamination_leakage: power-law residual of sketch vs consensus.

@@ -105,6 +105,7 @@ add_library(genopack_lib STATIC
   src/coordinator.cpp
   src/ntdb.cpp
   src/gtax.cpp
+  src/sim.cpp
   src/calibrate/calibrate.cpp
 )
 

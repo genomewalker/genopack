@@ -1,5 +1,6 @@
 #include "check/run_check.hpp"
 #include "bench/bench_grid.hpp"
+#include <genopack/sim.hpp>
 #include <genopack/markers_build.hpp>
 #include <genopack/markers.hpp>
 #include <genopack/metamer.hpp>
@@ -3107,6 +3108,60 @@ int main(int argc, char** argv) {
     bg_cmd->callback([&]() {
         std::exit(genopack::bench::cmd_bench_grid(
             bg_archive, bg_manifest, bg_output, bg_threads, bg_reps, bg_seed));
+    });
+
+    // genopack sim
+    auto* sim_cmd = app.add_subcommand("sim",
+        "Generate synthetic fragmented/contaminated genomes for completeness/"
+        "contamination benchmarking (CheckM2-compatible 20kb chunk fragmentation).");
+    std::vector<std::string> sim_refs, sim_tax;
+    std::string sim_contam, sim_comp_str = "0.1,0.3,0.5,0.7,0.9,1.0";
+    std::string sim_cont_str = "0.0", sim_outdir, sim_out_tsv, sim_manifest_tsv;
+    int sim_reps = 3, sim_chunk = 20000, sim_min_chunk = 1000, sim_threads = 4;
+    uint64_t sim_seed = 42;
+    sim_cmd->add_option("--ref",          sim_refs,     "Reference genome FASTA (repeatable)")->required();
+    sim_cmd->add_option("--taxonomy",     sim_tax,      "GTDB taxonomy string; one per --ref in order");
+    sim_cmd->add_option("--contam",       sim_contam,   "Contamination source FASTA (default: none)");
+    sim_cmd->add_option("--completeness", sim_comp_str, "Comma-separated completeness fractions 0.0-1.0");
+    sim_cmd->add_option("--contamination",sim_cont_str, "Comma-separated contamination fractions 0.0-0.5");
+    sim_cmd->add_option("--reps",         sim_reps,     "Replicates per combination (default: 3)");
+    sim_cmd->add_option("--seed",         sim_seed,     "Base random seed (default: 42)");
+    sim_cmd->add_option("--chunk-size",   sim_chunk,    "Fragment size in bp (default: 20000)");
+    sim_cmd->add_option("--min-chunk",    sim_min_chunk,"Min chunk size to keep in bp (default: 1000)");
+    sim_cmd->add_option("--output-dir",   sim_outdir,   "Output directory for FASTA files")->required();
+    sim_cmd->add_option("--output-tsv",   sim_out_tsv,  "Ground-truth TSV (default: <output-dir>/sim_manifest.tsv)");
+    sim_cmd->add_option("--manifest-tsv", sim_manifest_tsv, "genopack-add manifest TSV (default: <output-dir>/add_manifest.tsv)");
+    sim_cmd->add_option("-t,--threads",   sim_threads,  "Parallel workers (default: 4)");
+    sim_cmd->callback([&]() {
+        auto parse_fracs = [](const std::string& s) {
+            std::vector<double> out;
+            std::istringstream ss(s);
+            std::string tok;
+            while (std::getline(ss, tok, ','))
+                if (!tok.empty()) out.push_back(std::stod(tok));
+            return out;
+        };
+        if (!sim_tax.empty() && sim_tax.size() != sim_refs.size()) {
+            spdlog::error("sim: --taxonomy count ({}) != --ref count ({})",
+                          sim_tax.size(), sim_refs.size());
+            std::exit(2);
+        }
+        genopack::SimConfig cfg;
+        cfg.refs.reserve(sim_refs.size());
+        for (size_t i = 0; i < sim_refs.size(); ++i)
+            cfg.refs.push_back({sim_refs[i], sim_tax.empty() ? std::string{} : sim_tax[i]});
+        cfg.contam        = sim_contam;
+        cfg.completeness  = parse_fracs(sim_comp_str);
+        cfg.contamination = parse_fracs(sim_cont_str);
+        cfg.reps          = sim_reps;
+        cfg.seed          = sim_seed;
+        cfg.chunk_size    = sim_chunk;
+        cfg.min_chunk     = sim_min_chunk;
+        cfg.output_dir    = sim_outdir;
+        cfg.output_tsv    = sim_out_tsv;
+        cfg.manifest_tsv  = sim_manifest_tsv;
+        cfg.threads       = sim_threads;
+        std::exit(genopack::run_sim(cfg));
     });
 
     // genopack markers

@@ -35,6 +35,7 @@ struct ContigFlag {
 
 struct GenomeQuality {
     float completeness_cluster_relative = NAN;
+    float completeness_sketch_fill      = NAN;
     float completeness_fragmentation    = NAN;
     float completeness_post_decontam    = NAN;
     float contamination_leakage    = 0.0f;

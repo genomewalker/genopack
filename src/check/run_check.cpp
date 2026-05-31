@@ -103,6 +103,9 @@ void write_qual_to_archive(const std::filesystem::path& gpk_path,
             std::min(1.0f, std::isnan(q.contamination_rho_outlier) ? 0.0f : q.contamination_rho_outlier) * 255.0f);
         r.cross_genus_u8                = static_cast<uint8_t>(
             std::min(1.0f, std::isnan(q.contamination_cross_genus) ? 0.0f : q.contamination_cross_genus) * 255.0f);
+        // sketch_fill: 0=not_scored, 1-255 = clamp(value,0,1.27)*200 (200=100%)
+        r.sketch_fill_u8 = std::isnan(q.completeness_sketch_fill) ? 0u
+            : static_cast<uint8_t>(std::clamp(q.completeness_sketch_fill, 0.0f, 1.27f) * 200.0f + 0.5f);
         r.fmh_minority_u8               = static_cast<uint8_t>(
             std::min(1.0f, std::isnan(q.fmh_minority_fraction) ? 0.0f : q.fmh_minority_fraction) * 255.0f);
         // marker_completeness: 0=not_scored, 1-255=(value-1)/254 → range [0,1] with sentinel 0
@@ -342,7 +345,7 @@ int cmd_check(const std::filesystem::path& pack_path,
     // TSV output (aggregated across all parts)
     std::ofstream tsv(output);
     if (!tsv) throw std::runtime_error("check: cannot open output: " + output.string());
-    tsv << "accession\tquality_tier\tcompleteness_effective\tcompleteness_cluster_relative\tcompleteness_fragmentation"
+    tsv << "accession\tquality_tier\tcompleteness_effective\tcompleteness_cluster_relative\tcompleteness_sketch_fill\tcompleteness_fragmentation"
            "\tcompleteness_post_decontam\tcontamination_leakage\tcontamination_tnf_excess"
            "\tchromosome_skew_closure\tleakage_residual\tself_coherence"
            "\tchargaff_parity\tspectral_gap\tscale_kink\tcontamination_mixture\tmixture_sources"
@@ -379,6 +382,7 @@ int cmd_check(const std::filesystem::path& pack_path,
             << qtier << '\t'
             << fmt(comp_eff) << '\t'
             << fmt(q.completeness_cluster_relative) << '\t'
+            << fmt(q.completeness_sketch_fill) << '\t'
             << fmt(q.completeness_fragmentation) << '\t'
             << fmt(q.completeness_post_decontam) << '\t'
             << fmt(q.contamination_leakage) << '\t'

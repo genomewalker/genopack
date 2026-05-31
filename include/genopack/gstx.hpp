@@ -43,7 +43,7 @@ struct GstxEntry {          // 60576 bytes
     uint8_t  n_k_stored;    // actual k-values in consensus[] (≤ GSTX_MAX_K)
     uint8_t  _pad0;
     float    p90_containment[GSTX_MAX_K]; // [k0,k1,k2]
-    float    _padf;                       // align tnf_mu to offset 32
+    float    nrb_p90;                     // p90 of n_real_bins at k=0 across genus members
     float    tnf_mu[136];                 // L2-normalised TNF centroid
     uint16_t consensus[GSTX_MAX_K][GSTX_BINS]; // majority-vote sig per bin
 };
@@ -67,7 +67,8 @@ public:
                    const std::vector<std::vector<uint16_t>>& consensus, // [n_k][GSTX_BINS]
                    const float*     p90,          // float[n_k]
                    const float*     tnf_mu,       // float[136] or nullptr
-                   const uint32_t*  kmer_sizes);  // uint32_t[n_k]
+                   const uint32_t*  kmer_sizes,   // uint32_t[n_k]
+                   float            nrb_p90 = 0.0f);
 
     // Write GSTX section to w; returns the SectionDesc to add to the TOC.
     SectionDesc finalize(AppendWriter& w, uint64_t section_id);

@@ -38,7 +38,8 @@ void GstxWriter::add_genus(std::string_view genus,
                             const std::vector<std::vector<uint16_t>>& consensus,
                             const float*     p90,
                             const float*     tnf_mu,
-                            const uint32_t*  kmer_sizes)
+                            const uint32_t*  kmer_sizes,
+                            float            nrb_p90)
 {
     GstxEntry e{};
     e.genus_hash  = hash_genus(genus);
@@ -54,6 +55,7 @@ void GstxWriter::add_genus(std::string_view genus,
     }
     if (tnf_mu)
         std::memcpy(e.tnf_mu, tnf_mu, 136 * sizeof(float));
+    e.nrb_p90 = nrb_p90;
 
     // Update header k-metadata (all genera in a single build have the same k-set)
     if (n_k_hdr_ == 0 && n_k > 0) {

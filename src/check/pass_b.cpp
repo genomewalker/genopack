@@ -168,6 +168,8 @@ void run_pass_b(ICheckReader& pack,
             q.contamination_sibling_outlier = r.sibling_outlier_u8 / 255.0f;
             q.contamination_rho_outlier     = r.rho_outlier_u8     / 255.0f;
             q.contamination_cross_genus     = r.cross_genus_u8     / 255.0f;
+            if (r.sketch_fill_u8 > 0)
+                q.completeness_sketch_fill = r.sketch_fill_u8 / 200.0f;
         }
         if (to_scan.empty()) {
             spdlog::info("check pass-B: complete — all scores from QUAL cache");
