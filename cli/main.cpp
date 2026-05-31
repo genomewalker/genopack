@@ -3136,15 +3136,21 @@ int main(int argc, char** argv) {
     float mb_ic_threshold = 0.25f;
     markers_build_cmd->add_option("--ic-threshold", mb_ic_threshold,
         "Min per-column IC fraction to include k-mer positions (default: 0.25; --dayhoff6 only)");
+    float mb_expected_min_frac = 0.50f;
+    markers_build_cmd->add_option("--expected-min-frac", mb_expected_min_frac,
+        "A marker is counted as expected for a genus only if it is detectable (≥1 IC-passing "
+        "syncmer) in at least this fraction of the genus's reference genomes. Mirrors CheckM2's "
+        "~97%% single-copy universality criterion. (default: 0.95)");
     markers_build_cmd->callback([&]() {
         genopack::MarkersBuildConfig cfg;
-        cfg.gtdbtk_db         = mb_gtdbtk_db;
-        cfg.output            = mb_output;
-        cfg.default_threshold = mb_threshold;
-        cfg.threads           = mb_threads;
-        cfg.frac_scale        = static_cast<uint16_t>(mb_scale);
-        cfg.dayhoff6          = mb_dayhoff6;
-        cfg.ic_threshold      = mb_ic_threshold;
+        cfg.gtdbtk_db          = mb_gtdbtk_db;
+        cfg.output             = mb_output;
+        cfg.default_threshold  = mb_threshold;
+        cfg.expected_min_frac  = mb_expected_min_frac;
+        cfg.threads            = mb_threads;
+        cfg.frac_scale         = static_cast<uint16_t>(mb_scale);
+        cfg.dayhoff6           = mb_dayhoff6;
+        cfg.ic_threshold       = mb_ic_threshold;
         genopack::build_markers_panel(cfg);
     });
 

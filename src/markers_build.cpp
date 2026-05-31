@@ -239,12 +239,13 @@ load_taxonomy(const std::filesystem::path& tsv) {
     return map;
 }
 
-// Lineage accumulator: tracks per-genus ref count.
+// Lineage accumulator: tracks per-genus ref count and per-marker detection rate.
 struct LineageAcc {
     uint64_t genus_hash;
     uint8_t  domain;
     uint32_t ref_count = 0;
     std::string genus_name;
+    std::vector<uint32_t> marker_detected; // [mi] = #ref genomes with ≥1 IC-passing syncmer
 };
 
 // ── Per-panel scan ────────────────────────────────────────────────────────────
@@ -313,7 +314,10 @@ static PanelResult scan_panel(
 
             const uint64_t gh = GcovWriter::hash_genus(genus);
             auto [it, inserted] = genus_idx_map.emplace(gh, res.lineages.size());
-            if (inserted) res.lineages.push_back({gh, domain, 0, std::string(genus)});
+            if (inserted) {
+                res.lineages.push_back({gh, domain, 0, std::string(genus),
+                                        std::vector<uint32_t>(n_markers, 0)});
+            }
             res.lineages[it->second].ref_count++;
 
             const uint32_t off = static_cast<uint32_t>(seqbuf.size());
@@ -505,6 +509,7 @@ static PanelResult scan_panel_d6(
                 cpos.push_back(j);
             }
 
+            bool any_hit = false;
             for (int i = 0; i + METAMER_K_D6 <= (int)d6.size(); ++i) {
                 if (!metamer_is_syncmer_d6(d6.data() + i)) continue;
                 if (metamer_is_low_complexity(d6.data() + i, METAMER_K_D6)) continue;
@@ -514,7 +519,11 @@ static PanelResult scan_panel_d6(
                     min_ic = std::min(min_ic, col_ic[cpos[i + j]]);
                 if (min_ic < ic_threshold) continue;
                 raw.push_back(metamer_hash_d6(d6.data() + i));
+                any_hit = true;
             }
+            // Track how many reference genomes in this lineage detected marker mi.
+            // Safe: each OpenMP thread owns a unique mi, so no data race on [mi].
+            if (any_hit) res.lineages[g.lineage_idx].marker_detected[mi]++;
         }
 
         std::sort(raw.begin(), raw.end());
@@ -833,18 +842,36 @@ void build_markers_panel(const MarkersBuildConfig& cfg) {
 
     // Add bac lineages.
     const uint16_t thresh_u16 = static_cast<uint16_t>(cfg.default_threshold * 65535.0f);
+    size_t bac_expected_set = 0, bac_expected_total = 0;
     for (const auto& lin : bac.lineages) {
         std::vector<CalibSlot> slots(120, CalibSlot{0, thresh_u16});
-        std::vector<bool> expected(120, true);
+        std::vector<bool> expected(120);
+        for (int mi = 0; mi < 120; ++mi) {
+            const bool det = lin.ref_count > 0 &&
+                static_cast<float>(lin.marker_detected[mi]) / static_cast<float>(lin.ref_count)
+                    >= cfg.expected_min_frac;
+            expected[mi] = det;
+            bac_expected_set    += det ? 1 : 0;
+            bac_expected_total  += 1;
+        }
         writer.add_lineage(lin.genus_hash, MRKR_DOMAIN_BAC,
                            static_cast<uint16_t>(std::min<uint32_t>(lin.ref_count, 65535)),
                            slots, expected);
     }
+    spdlog::info("markers: bac expected bits set: {}/{} ({:.1f}% of 120 per genus on avg)",
+                 bac_expected_set, bac_expected_total,
+                 bac.lineages.empty() ? 0.0
+                     : 100.0 * static_cast<double>(bac_expected_set)
+                             / static_cast<double>(bac.lineages.size() * 120));
 
     // Add arc lineages.
     for (const auto& lin : arc.lineages) {
         std::vector<CalibSlot> slots(53, CalibSlot{0, thresh_u16});
-        std::vector<bool> expected(53, true);
+        std::vector<bool> expected(53);
+        for (int mi = 0; mi < 53; ++mi)
+            expected[mi] = lin.ref_count > 0 &&
+                static_cast<float>(lin.marker_detected[mi]) / static_cast<float>(lin.ref_count)
+                    >= cfg.expected_min_frac;
         writer.add_lineage(lin.genus_hash, MRKR_DOMAIN_ARC,
                            static_cast<uint16_t>(std::min<uint32_t>(lin.ref_count, 65535)),
                            slots, expected);
