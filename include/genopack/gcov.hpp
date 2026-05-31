@@ -187,11 +187,19 @@ public:
         return nullptr;
     }
 
-    // Iterate all valid entries.
+    // Iterate all entries (void callback).
     void scan(const std::function<void(const GcovEntry&)>& cb) const {
         if (!data_) return;
         for (uint32_t i = 0; i < header_->n_genera; ++i)
             cb(entries_[i]);
+    }
+
+    // Iterate with early-exit: callback returns false to stop. Inlined (no std::function).
+    template<typename F>
+    void scan_early(F&& cb) const {
+        if (!data_) return;
+        for (uint32_t i = 0; i < header_->n_genera; ++i)
+            if (!cb(entries_[i])) return;
     }
 
     // Fraction of calibration contigs with Mahalanobis distance <= d.

@@ -360,17 +360,17 @@ void run_pass_b(ICheckReader& pack,
                 tnf_cache.clear();
                 tnf_cache.reserve(contigs.size());
 
-                // Qualifying contigs for batched cross-genus scan (genus-outer × contig-inner).
-                // At full GTDB scale (34,834 genera × ~11KB = 383MB), scanning each genus ONCE
-                // and evaluating all contigs in the inner loop reduces memory bandwidth from
-                // O(n_contigs × 383MB) to O(383MB) — loaded once into CPU cache per MAG.
+                // Qualifying contigs for the progressive-bound cross-genus scan.
+                // τ = host_ll + margin is the threshold a foreign genus must beat.
+                // Clean contigs (host fits well) prune ~99% of genera at the L2/λ_max step.
+                // Contaminated contigs early-exit the scan on the first winner.
                 struct QualContig {
                     const float* tnf;
-                    float dist2, spe, host_ll;
-                    float best_foreign_ll;
+                    float tau;          // host_ll + cross_genus_lr_margin
                     bool  family_inlier;
                     uint32_t length;
                     size_t   ci;
+                    bool     found;     // true once flagged — skip in subsequent genera
                 };
                 thread_local std::vector<QualContig> qual_contigs;
                 qual_contigs.clear();
@@ -442,10 +442,11 @@ void run_pass_b(ICheckReader& pack,
                                         if (rpc >= cfg.gcov_outlier_percentile) rho_out_bp += cf.contig_length;
                                     }
 
-                                    // Collect for batched cross-genus scan (executed after contig loop).
+                                    // Collect for progressive-bound cross-genus scan.
                                     {
                                         const float host_ll = gcov_log_likelihood(
                                             *gcov_entry, dist * dist, spe);
+                                        const float tau = host_ll + cfg.cross_genus_lr_margin;
                                         bool family_inlier = false;
                                         if (fcov_entry && fcov_rd) {
                                             float xmu_fam[136];
@@ -458,9 +459,8 @@ void run_pass_b(ICheckReader& pack,
                                             family_inlier = (f_pct  < cfg.gcov_outlier_percentile) &&
                                                             (f_spct < cfg.gcov_outlier_percentile);
                                         }
-                                        qual_contigs.push_back({tnf, dist * dist, spe, host_ll,
-                                                                -std::numeric_limits<float>::max(),
-                                                                family_inlier, cf.contig_length, ci});
+                                        qual_contigs.push_back({tnf, tau,
+                                                                family_inlier, cf.contig_length, ci, false});
                                     }
                                 }
                             } else {
@@ -480,31 +480,66 @@ void run_pass_b(ICheckReader& pack,
                     }
                 }
 
-                // Batched cross-genus scan: genus-outer × contig-inner.
-                // Each GcovEntry's eigvecs (8KB+) is loaded once and reused across all
-                // qualifying contigs in this MAG, rather than once per contig.
-                // At full GTDB scale: O(383MB) total loads vs O(n_contigs × 383MB).
+                // Progressive-bound cross-genus scan.
+                //
+                // For each (genus, contig) pair we maintain a running admissible lower
+                // bound on (d² + spe/σ²) after j eigenvector projections:
+                //   B_j = Σ_{k≤j} proj_k²/λ_k  +  (‖xf‖² − Σ_{k≤j} proj_k²) / max(λ_{j+1}, σ²)
+                //
+                // B_j is non-decreasing in j; at j=−1 it collapses to ‖xf‖²/λ_max (cheap L2 guard).
+                // If −0.5·(B_j + log_det) ≤ τ at any point, the genus can't beat the threshold
+                // and we abandon. At j=K−1 the bound equals the exact LL.
+                //
+                // τ = host_ll + margin is pre-computed per contig. Clean contigs (host fits well)
+                // prune ~99% of genera at j=−1. Contaminated contigs exit the scan on first hit.
                 if (!qual_contigs.empty() && gcov_rd) {
-                    gcov_rd->scan([&](const GcovEntry& fe) {
-                        if (&fe == gcov_entry || !(fe.flags & GCOV_FLAG_VALID)) return;
+                    uint32_t n_unfound = static_cast<uint32_t>(qual_contigs.size());
+                    constexpr int K = static_cast<int>(GCOV_N_EIGVECS);
+
+                    gcov_rd->scan_early([&](const GcovEntry& fe) -> bool {
+                        if (&fe == gcov_entry || !(fe.flags & GCOV_FLAG_VALID)) return true;
+
+                        const float ld  = gcov_log_det(fe);
+                        const float vmax = std::max(fe.eigenvalues[0], fe.sigma2_resid);
+
                         for (auto& qc : qual_contigs) {
-                            float xf[136];
-                            for (int di = 0; di < 136; ++di) xf[di] = qc.tnf[di] - fe.mu[di];
-                            const float fd  = gcov_mahalanobis(fe, xf);
-                            const float fsp = gcov_spe(fe, xf);
-                            const float fll = gcov_log_likelihood(fe, fd * fd, fsp);
-                            if (fll > qc.best_foreign_ll) qc.best_foreign_ll = fll;
-                        }
-                    });
-                    for (const auto& qc : qual_contigs) {
-                        if (qc.best_foreign_ll > qc.host_ll + cfg.cross_genus_lr_margin) {
-                            cross_genus_bp += qc.length;
+                            if (qc.found) continue;
+
+                            // j=−1: L2/λ_max admissible upper bound (136 multiply-adds)
+                            float xf[136], l2 = 0.f;
+                            for (int d = 0; d < 136; ++d) {
+                                const float v = qc.tnf[d] - fe.mu[d];
+                                xf[d] = v; l2 += v * v;
+                            }
+                            if (-0.5f * (l2 / vmax + ld) <= qc.tau) continue;
+
+                            // j=0..K−1: tighten bound one eigenvector at a time
+                            float sum_p2 = 0.f, d2 = 0.f;
+                            bool pruned = false;
+                            for (int k = 0; k < K; ++k) {
+                                float dot = 0.f;
+                                for (int d = 0; d < 136; ++d) dot += xf[d] * fe.eigvecs[k][d];
+                                sum_p2 += dot * dot;
+                                d2     += dot * dot / fe.eigenvalues[k];
+                                const float vsub = (k + 1 < K)
+                                    ? std::max(fe.eigenvalues[k + 1], fe.sigma2_resid)
+                                    : fe.sigma2_resid;
+                                const float spe_lb = std::max(0.f, l2 - sum_p2);
+                                if (-0.5f * (d2 + spe_lb / vsub + ld) <= qc.tau) {
+                                    pruned = true; break;
+                                }
+                            }
+                            if (pruned) continue;
+
+                            // Survived all K projections → LL > τ (bound is exact at j=K−1)
+                            qc.found = true;
+                            cross_genus_bp      += qc.length;
                             ctg_cross_genus[qc.ci] = true;
+                            if (qc.family_inlier) sibling_out_bp += qc.length;
+                            if (--n_unfound == 0) return false; // stop scan
                         }
-                        if (qc.family_inlier &&
-                            qc.best_foreign_ll > qc.host_ll + cfg.cross_genus_lr_margin)
-                            sibling_out_bp += qc.length;
-                    }
+                        return true; // continue scan
+                    });
                 }
 
                 float completeness_post = total_len > 0
