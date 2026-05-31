@@ -523,7 +523,7 @@ void run_pass_b(ICheckReader& pack,
                                 d2     += dot * dot / fe.eigenvalues[k];
                                 const float vsub = (k + 1 < K)
                                     ? std::max(fe.eigenvalues[k + 1], fe.sigma2_resid)
-                                    : fe.sigma2_resid;
+                                    : std::max(fe.sigma2_resid, 1e-12f);
                                 const float spe_lb = std::max(0.f, l2 - sum_p2);
                                 if (-0.5f * (d2 + spe_lb / vsub + ld) <= qc.tau) {
                                     pruned = true; break;
