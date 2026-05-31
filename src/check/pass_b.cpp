@@ -18,14 +18,7 @@
 
 namespace genopack::check {
 
-namespace {
-
-
-struct ContigRecord {
-    std::string header;
-    std::string seq;
-};
-
+// Defined here; declared in pass_b.hpp for use by pass_marker.cpp.
 std::vector<ContigRecord> parse_fasta(std::string_view fasta) {
     std::vector<ContigRecord> result;
     const char* p   = fasta.data();
@@ -108,8 +101,6 @@ bool compute_tnf(std::string_view seq, float out[136]) {
     for (int i = 0; i < 136; ++i) out[i] /= norm;
     return true;
 }
-
-} // namespace
 
 void run_pass_b(ICheckReader& pack,
                 const PassAResult& pass_a,

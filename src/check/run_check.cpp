@@ -1,6 +1,7 @@
 #include "run_check.hpp"
 #include "pass_a.hpp"
 #include "pass_b.hpp"
+#include "pass_marker.hpp"
 #include "pack_iface.hpp"
 #include <genopack/archive.hpp>
 #include <genopack/qual.hpp>
@@ -224,6 +225,17 @@ int cmd_check(const std::filesystem::path& pack_path,
         if (!markers_path.empty()) pb_cfg.markers_path = markers_path.string();
         run_pass_b(pack, pass_a, quality, pb_cfg, threads, qual_cache_ptr);
 
+        // Unconditional marker pass: score every genome with a valid genus assignment,
+        // not just Pass-B-flagged ones. Fills marker_completeness for clean/complete
+        // genomes that pass_b skips due to low TNF excess. Makes the SCG completeness
+        // metric available for all genomes (comparable to CheckM2's unconditional scoring).
+        if (!markers_path.empty()) {
+            PassMarkerConfig pm_cfg;
+            pm_cfg.markers_path   = markers_path.string();
+            pm_cfg.marker_min_hits = pb_cfg.marker_min_hits;
+            run_pass_marker(pack, pass_a, quality, pm_cfg, threads);
+        }
+
         // Re-score marker_redundancy_z using in-distribution per-genus calibration.
         // MSA-based calibration (in .mrk file) underestimates by ~16× because gap-spanning
         // k-mers from MSA columns differ from 6-frame translation k-mers used at check time.
@@ -340,6 +352,7 @@ int cmd_check(const std::filesystem::path& pack_path,
            "\tfiedler_tnf_bimod\tfiedler_tnf_gap"
            "\tfmh_minority_fraction"
            "\tmarker_completeness\tmarker_redundancy\tmarker_redundancy_z\tmarker_joint_contamination\tmarker_n_present\tmarker_n_expected"
+           "\tmarker_present_hex"
            "\tqual_flags\tsupport_tier\tinterval_width\n";
 
     auto tier_str = [](SupportTier t) -> const char* {
@@ -396,7 +409,15 @@ int cmd_check(const std::filesystem::path& pack_path,
             << fmt(q.marker_redundancy_z) << '\t'
             << fmt(q.marker_joint_contamination) << '\t'
             << q.marker_n_present << '\t'
-            << q.marker_n_expected << '\t'
+            << q.marker_n_expected << '\t';
+        // Per-SCG presence bitmask as lowercase hex string (empty when not scored).
+        if (!q.marker_present_bits.empty()) {
+            static constexpr char hex[] = "0123456789abcdef";
+            for (uint8_t b : q.marker_present_bits) {
+                tsv << hex[b >> 4] << hex[b & 0xf];
+            }
+        }
+        tsv << '\t'
             << static_cast<int>(q.qual_flags) << '\t'
             << tier_str(q.support_tier) << '\t'
             << q.interval_width << '\n';

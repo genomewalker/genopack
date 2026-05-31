@@ -67,7 +67,11 @@ struct GenomeQuality {
     float    marker_redundancy_z         = NAN;  // (observed - genus_median) / (1.4826 * MAD_eff)
     float    marker_joint_contamination  = NAN;  // markers with both native+cross_genus votes / expected
     int      marker_n_present            = -1;   // raw present count
-    int      marker_n_expected     = -1;   // expected marker count for this lineage
+    int      marker_n_expected           = -1;   // expected marker count for this lineage
+    // Per-SCG presence bitmask: bit i set if marker i had ≥1 contig vote.
+    // Max 173 markers (120 bac + 53 arc); stored as packed bytes (22 bytes covers 176 bits).
+    // Empty when marker scoring not run.
+    std::vector<uint8_t> marker_present_bits;
 
     uint8_t  qual_flags           = 0;
     float    sketch_breadth       = NAN; // NAN in check path (requires build-time consensus sketch)

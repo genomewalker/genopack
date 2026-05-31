@@ -164,6 +164,7 @@ add_executable(genopack
   cli/main.cpp
   src/check/pass_a.cpp
   src/check/pass_b.cpp
+  src/check/pass_marker.cpp
   src/check/run_check.cpp
   src/bench/bench_grid.cpp
   src/calibrate/calibrate.cpp

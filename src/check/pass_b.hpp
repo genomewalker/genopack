@@ -5,9 +5,20 @@
 #include <genopack/qual.hpp>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <vector>
 
 namespace genopack::check {
+
+// Minimal contig record used by pass_b and pass_marker.
+struct ContigRecord {
+    std::string header;
+    std::string seq;
+};
+
+// Parse a raw FASTA blob (from eg.fasta) into ContigRecord list.
+std::vector<ContigRecord> parse_fasta(std::string_view fasta);
 
 struct PassBConfig {
     float contamination_flag_threshold = 0.02f;
