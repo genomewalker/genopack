@@ -1,5 +1,6 @@
 #include "pass_marker.hpp"
 #include "pass_b.hpp"
+#include "genus_index_cache.hpp"
 #include <genopack/archive.hpp>
 #include <genopack/markers.hpp>
 #include <genopack/metamer.hpp>
@@ -56,6 +57,7 @@ void run_pass_marker(ICheckReader&                                   pack,
     const uint32_t minhit  = static_cast<uint32_t>(cfg.marker_min_hits);
     const int      min_seg = is_d6 ? 50 : METAMER_K;
 
+    GenusIndexCache idx_cache(64);
     std::mutex quality_mtx;
     constexpr int k_readers    = 8;
     const int     inner_threads = std::max(1, threads / k_readers);
@@ -79,18 +81,13 @@ void run_pass_marker(ICheckReader&                                   pack,
                 auto contigs = parse_fasta(eg.fasta);
                 if (contigs.empty()) continue;
 
-                const bool     is_arc = (calib.header->domain == MRKR_DOMAIN_ARC);
-                auto mh  = is_arc ? mrk_rd.merged_hashes_arc() : mrk_rd.merged_hashes_bac();
-                auto mid = is_arc ? mrk_rd.merged_ids_arc()    : mrk_rd.merged_ids_bac();
-                const BlockedBloom& bloom =
-                    is_arc ? mrk_rd.merged_bloom_arc() : mrk_rd.merged_bloom_bac();
                 const uint8_t n_markers = calib.header->n_markers;
-                const uint8_t base_id   = is_arc ? mrk_rd.n_bac() : 0;
 
-                std::vector<uint32_t> pool_sizes(n_markers);
-                for (uint8_t mi = 0; mi < n_markers; ++mi)
-                    pool_sizes[mi] = static_cast<uint32_t>(
-                        mrk_rd.pool_hashes(static_cast<uint8_t>(base_id + mi)).size());
+                auto genus_idx = idx_cache.get_or_build(gh, [&]() {
+                    GenusMarkerIndex gi;
+                    gi.build(mrk_rd, calib);
+                    return gi;
+                });
 
                 // null_floor_u16 / threshold_u16 are calibrated for complete-genome presence
                 // calls (threshold ~47% median containment). For completeness *estimation* on
@@ -113,16 +110,11 @@ void run_pass_marker(ICheckReader&                                   pack,
                                 std::sort(orf_mers.begin(), orf_mers.end());
                                 orf_mers.erase(std::unique(orf_mers.begin(), orf_mers.end()),
                                                orf_mers.end());
-                                std::vector<uint32_t> local(n_markers, 0);
-                                const uint64_t* mhp = mh.data(), *mhe = mhp + mh.size();
-                                const uint8_t*  mip = mid.data();
+                                uint32_t local[173] = {};
                                 for (uint64_t h : orf_mers) {
-                                    if (!bloom.might_contain(h)) continue;
-                                    auto it2 = std::lower_bound(mhp, mhe, h);
-                                    if (it2 != mhe && *it2 == h) {
-                                        const uint8_t id = mip[it2 - mhp];
-                                        if (id < n_markers) local[id]++;
-                                    }
+                                    if (!genus_idx->bloom.might_contain(h)) continue;
+                                    const uint8_t id = genus_idx->map.lookup(h);
+                                    if (id != UINT8_MAX) local[id]++;
                                 }
                                 for (uint8_t mi = 0; mi < n_markers; ++mi)
                                     if (local[mi] > best[mi]) best[mi] = local[mi];
@@ -134,16 +126,11 @@ void run_pass_marker(ICheckReader&                                   pack,
                             std::sort(orf_mers.begin(), orf_mers.end());
                             orf_mers.erase(std::unique(orf_mers.begin(), orf_mers.end()),
                                            orf_mers.end());
-                            std::vector<uint32_t> hits(n_markers, 0);
-                            const uint64_t* mhp = mh.data(), *mhe = mhp + mh.size();
-                            const uint8_t*  mip = mid.data();
+                            uint32_t hits[173] = {};
                             for (uint64_t h : orf_mers) {
-                                if (!bloom.might_contain(h)) continue;
-                                auto it2 = std::lower_bound(mhp, mhe, h);
-                                if (it2 != mhe && *it2 == h) {
-                                    const uint8_t id = mip[it2 - mhp];
-                                    if (id < n_markers) hits[id]++;
-                                }
+                                if (!genus_idx->bloom.might_contain(h)) continue;
+                                const uint8_t id = genus_idx->map.lookup(h);
+                                if (id != UINT8_MAX) hits[id]++;
                             }
                             for (uint8_t mi = 0; mi < n_markers; ++mi)
                                 if (hits[mi] > best[mi]) best[mi] = hits[mi];
