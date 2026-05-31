@@ -13,19 +13,30 @@ struct SimRef {
     std::string           taxonomy;
 };
 
+// One contamination source, optionally labelled (e.g. "genus", "family", "phylum").
+// Label appears in the output filename: sim_REF_r00_c050_x05_genus.fa
+// If label is empty the source index is used: ..._k00.fa
+struct SimContam {
+    std::filesystem::path fasta;
+    std::string           label;   // e.g. "genus", "family", "phylum", "ctrl"
+    std::string           taxonomy;
+};
+
 struct SimConfig {
-    std::vector<SimRef>       refs;
-    std::filesystem::path     contam;
-    std::vector<double>       completeness {0.1, 0.3, 0.5, 0.7, 0.9, 1.0};
-    std::vector<double>       contamination {0.0};
-    int                       reps        = 3;
-    uint64_t                  seed        = 42;
-    int                       chunk_size  = 20000;
-    int                       min_chunk   = 1000;
-    std::filesystem::path     output_dir;
-    std::filesystem::path     output_tsv;
-    std::filesystem::path     manifest_tsv;
-    int                       threads     = 4;
+    std::vector<SimRef>    refs;
+    std::vector<SimContam> contams;          // empty = no contamination
+    std::vector<double>    completeness {0.1, 0.3, 0.5, 0.7, 0.9, 1.0};
+    std::vector<double>    contamination {0.0};
+    int                    reps        = 3;
+    uint64_t               seed        = 42;
+    int                    chunk_size  = 20000;   // fixed chunk bp (used when contig_n50 == 0)
+    int                    min_chunk   = 1000;
+    int                    contig_n50  = 0;        // 0 = fixed chunk_size; >0 = lognormal N50
+    double                 contig_sigma = 1.2;     // lognormal sigma (spread of contig lengths)
+    std::filesystem::path  output_dir;
+    std::filesystem::path  output_tsv;
+    std::filesystem::path  manifest_tsv;
+    int                    threads     = 4;
 };
 
 std::vector<std::pair<std::string, std::string>>

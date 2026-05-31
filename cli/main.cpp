@@ -3115,23 +3115,34 @@ int main(int argc, char** argv) {
         "Generate synthetic fragmented/contaminated genomes for completeness/"
         "contamination benchmarking (CheckM2-compatible 20kb chunk fragmentation).");
     std::vector<std::string> sim_refs, sim_tax;
-    std::string sim_contam, sim_comp_str = "0.1,0.3,0.5,0.7,0.9,1.0";
+    // --contam, --contam-label, --contam-taxonomy are parallel repeatable arrays.
+    // --contam-self adds ref genome itself as a contam source (tests redundancy signal).
+    std::vector<std::string> sim_contams, sim_contam_labels, sim_contam_tax;
+    bool        sim_contam_self = false;
+    std::string sim_comp_str = "0.1,0.3,0.5,0.7,0.9,1.0";
     std::string sim_cont_str = "0.0", sim_outdir, sim_out_tsv, sim_manifest_tsv;
     int sim_reps = 3, sim_chunk = 20000, sim_min_chunk = 1000, sim_threads = 4;
     uint64_t sim_seed = 42;
-    sim_cmd->add_option("--ref",          sim_refs,     "Reference genome FASTA (repeatable)")->required();
-    sim_cmd->add_option("--taxonomy",     sim_tax,      "GTDB taxonomy string; one per --ref in order");
-    sim_cmd->add_option("--contam",       sim_contam,   "Contamination source FASTA (default: none)");
-    sim_cmd->add_option("--completeness", sim_comp_str, "Comma-separated completeness fractions 0.0-1.0");
-    sim_cmd->add_option("--contamination",sim_cont_str, "Comma-separated contamination fractions 0.0-0.5");
-    sim_cmd->add_option("--reps",         sim_reps,     "Replicates per combination (default: 3)");
-    sim_cmd->add_option("--seed",         sim_seed,     "Base random seed (default: 42)");
-    sim_cmd->add_option("--chunk-size",   sim_chunk,    "Fragment size in bp (default: 20000)");
-    sim_cmd->add_option("--min-chunk",    sim_min_chunk,"Min chunk size to keep in bp (default: 1000)");
-    sim_cmd->add_option("--output-dir",   sim_outdir,   "Output directory for FASTA files")->required();
-    sim_cmd->add_option("--output-tsv",   sim_out_tsv,  "Ground-truth TSV (default: <output-dir>/sim_manifest.tsv)");
-    sim_cmd->add_option("--manifest-tsv", sim_manifest_tsv, "genopack-add manifest TSV (default: <output-dir>/add_manifest.tsv)");
-    sim_cmd->add_option("-t,--threads",   sim_threads,  "Parallel workers (default: 4)");
+    sim_cmd->add_option("--ref",            sim_refs,         "Reference genome FASTA (repeatable)")->required();
+    sim_cmd->add_option("--taxonomy",       sim_tax,          "GTDB taxonomy; one per --ref in order");
+    sim_cmd->add_option("--contam",         sim_contams,      "Contamination source FASTA (repeatable; each adds a grid dimension)");
+    sim_cmd->add_option("--contam-label",   sim_contam_labels,"Label for each --contam source (e.g. genus,family,phylum); one per --contam");
+    sim_cmd->add_option("--contam-taxonomy",sim_contam_tax,   "GTDB taxonomy for each --contam source; one per --contam");
+    sim_cmd->add_flag ("--contam-self",     sim_contam_self,  "Add each ref as its own contam source (tests marker_redundancy; label=self)");
+    sim_cmd->add_option("--completeness",   sim_comp_str,     "Comma-separated completeness fractions 0.0-1.0");
+    sim_cmd->add_option("--contamination",  sim_cont_str,     "Comma-separated contamination fractions 0.0-0.5");
+    sim_cmd->add_option("--reps",           sim_reps,         "Replicates per combination (default: 3)");
+    sim_cmd->add_option("--seed",           sim_seed,         "Base random seed (default: 42)");
+    sim_cmd->add_option("--chunk-size",     sim_chunk,        "Fixed fragment size in bp (default: 20000; ignored if --contig-n50 set)");
+    sim_cmd->add_option("--min-chunk",      sim_min_chunk,    "Min chunk size to keep in bp (default: 1000)");
+    int    sim_contig_n50   = 0;
+    double sim_contig_sigma = 1.2;
+    sim_cmd->add_option("--contig-n50",    sim_contig_n50,   "N50 for lognormal contig length distribution (0=fixed --chunk-size)");
+    sim_cmd->add_option("--contig-sigma",  sim_contig_sigma, "Lognormal sigma for contig lengths (default: 1.2)");
+    sim_cmd->add_option("--output-dir",     sim_outdir,       "Output directory for FASTA files")->required();
+    sim_cmd->add_option("--output-tsv",     sim_out_tsv,      "Ground-truth TSV (default: <output-dir>/sim_manifest.tsv)");
+    sim_cmd->add_option("--manifest-tsv",   sim_manifest_tsv, "genopack-add manifest TSV (default: <output-dir>/add_manifest.tsv)");
+    sim_cmd->add_option("-t,--threads",     sim_threads,      "Parallel workers (default: 4)");
     sim_cmd->callback([&]() {
         auto parse_fracs = [](const std::string& s) {
             std::vector<double> out;
@@ -3146,17 +3157,42 @@ int main(int argc, char** argv) {
                           sim_tax.size(), sim_refs.size());
             std::exit(2);
         }
+        if (!sim_contam_labels.empty() && sim_contam_labels.size() != sim_contams.size()) {
+            spdlog::error("sim: --contam-label count ({}) != --contam count ({})",
+                          sim_contam_labels.size(), sim_contams.size());
+            std::exit(2);
+        }
         genopack::SimConfig cfg;
         cfg.refs.reserve(sim_refs.size());
         for (size_t i = 0; i < sim_refs.size(); ++i)
             cfg.refs.push_back({sim_refs[i], sim_tax.empty() ? std::string{} : sim_tax[i]});
-        cfg.contam        = sim_contam;
+        // Build contam list from explicit --contam entries
+        for (size_t k = 0; k < sim_contams.size(); ++k) {
+            genopack::SimContam sc;
+            sc.fasta    = sim_contams[k];
+            sc.label    = sim_contam_labels.empty() ? std::string{} : sim_contam_labels[k];
+            sc.taxonomy = sim_contam_tax.size() > k ? sim_contam_tax[k] : std::string{};
+            cfg.contams.push_back(std::move(sc));
+        }
+        // --contam-self: for each ref, also add that ref as a contam source (shared label "self")
+        // This is handled inside run_sim per-job; signal it via a sentinel SimContam with empty fasta.
+        if (sim_contam_self) {
+            for (size_t i = 0; i < sim_refs.size(); ++i) {
+                genopack::SimContam sc;
+                sc.fasta    = sim_refs[i];
+                sc.label    = "self";
+                sc.taxonomy = sim_tax.empty() ? std::string{} : sim_tax[i];
+                cfg.contams.push_back(std::move(sc));
+            }
+        }
         cfg.completeness  = parse_fracs(sim_comp_str);
         cfg.contamination = parse_fracs(sim_cont_str);
         cfg.reps          = sim_reps;
         cfg.seed          = sim_seed;
         cfg.chunk_size    = sim_chunk;
         cfg.min_chunk     = sim_min_chunk;
+        cfg.contig_n50    = sim_contig_n50;
+        cfg.contig_sigma  = sim_contig_sigma;
         cfg.output_dir    = sim_outdir;
         cfg.output_tsv    = sim_out_tsv;
         cfg.manifest_tsv  = sim_manifest_tsv;

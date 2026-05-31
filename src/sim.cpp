@@ -5,11 +5,10 @@
 #include <cmath>
 #include <cstdio>
 #include <fstream>
-#include <mutex>
 #include <numeric>
+#include <random>
 #include <stdexcept>
 #include <string>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -21,6 +20,7 @@ namespace genopack {
 
 namespace {
 
+// Fixed-size chunking (CheckM2-compatible).
 std::vector<std::string>
 chunk_contigs(const std::vector<std::pair<std::string, std::string>>& contigs,
               int chunk_size, int min_chunk)
@@ -33,6 +33,31 @@ chunk_contigs(const std::vector<std::pair<std::string, std::string>>& contigs,
             size_t len = std::min(cs, seq.size() - pos);
             if (len >= mc) chunks.push_back(seq.substr(pos, len));
         }
+    return chunks;
+}
+
+// Lognormal chunking: each chunk length is sampled from lognormal(ln(n50), sigma).
+// Mimics real MAG assemblies where N50 ~ n50 and contig lengths span 2–3 orders of magnitude.
+// Redundancy from any taxon sharing markers will appear proportional to shared SCG content.
+std::vector<std::string>
+chunk_contigs_lognormal(const std::vector<std::pair<std::string, std::string>>& contigs,
+                        int n50, double sigma, int min_chunk, std::mt19937_64& rng)
+{
+    std::vector<std::string> chunks;
+    const double mu = std::log(static_cast<double>(n50));
+    const size_t mc = static_cast<size_t>(min_chunk);
+    std::normal_distribution<double> nd(mu, sigma);
+    for (const auto& [name, seq] : contigs) {
+        size_t pos = 0;
+        while (pos < seq.size()) {
+            size_t cs = static_cast<size_t>(std::max(
+                static_cast<double>(min_chunk),
+                std::exp(nd(rng))));
+            cs = std::min(cs, seq.size() - pos);
+            if (cs >= mc) chunks.push_back(seq.substr(pos, cs));
+            pos += cs;
+        }
+    }
     return chunks;
 }
 
@@ -63,9 +88,7 @@ void write_fasta(const std::filesystem::path& path,
     std::string buf;
     buf.reserve(1 << 20);
     for (const auto& [name, seq] : contigs) {
-        buf += '>';
-        buf += name;
-        buf += '\n';
+        buf += '>'; buf += name; buf += '\n';
         for (size_t i = 0; i < seq.size(); i += 80) {
             buf.append(seq, i, std::min<size_t>(80, seq.size() - i));
             buf += '\n';
@@ -74,10 +97,13 @@ void write_fasta(const std::filesystem::path& path,
     out.write(buf.data(), static_cast<std::streamsize>(buf.size()));
 }
 
-struct Job { int ref_idx, comp_idx, cont_idx, rep; };
+// A job is one output file: (ref, comp, cont_level, contam_source, rep).
+// contam_idx == -1 means no contamination (cont_frac must be 0.0).
+struct Job { int ref_idx, comp_idx, cont_idx, contam_idx, rep; };
 
 struct GtRow {
     std::string synth_acc, source_acc, taxonomy;
+    std::string contam_source_acc, contam_label, contam_taxonomy;
     std::filesystem::path fa_path;
     int      rep;
     double   comp_target, comp_actual, cont_target, cont_actual;
@@ -120,9 +146,13 @@ parse_fasta_named(const std::string& fasta_buf)
 
 std::vector<std::pair<std::string, std::string>>
 make_fragment(const std::vector<std::pair<std::string, std::string>>& contigs,
-              double comp_frac, int chunk_size, int min_chunk, std::mt19937_64& rng)
+              double comp_frac, int chunk_size, int min_chunk,
+              int contig_n50, double contig_sigma,
+              std::mt19937_64& rng)
 {
-    std::vector<std::string> chunks = chunk_contigs(contigs, chunk_size, min_chunk);
+    std::vector<std::string> chunks = (contig_n50 > 0)
+        ? chunk_contigs_lognormal(contigs, contig_n50, contig_sigma, min_chunk, rng)
+        : chunk_contigs(contigs, chunk_size, min_chunk);
     std::vector<std::string> kept;
     if (comp_frac >= 1.0) {
         kept = std::move(chunks);
@@ -178,6 +208,7 @@ int run_sim(const SimConfig& cfg)
     const fs::path add_path = cfg.manifest_tsv.empty()
         ? cfg.output_dir / "add_manifest.tsv" : cfg.manifest_tsv;
 
+    // Load and chunk all reference genomes
     std::vector<std::vector<std::pair<std::string, std::string>>> ref_contigs(cfg.refs.size());
     std::vector<std::string> ref_acc(cfg.refs.size());
     std::vector<uint64_t>    ref_total_bp(cfg.refs.size(), 0);
@@ -189,89 +220,128 @@ int run_sim(const SimConfig& cfg)
         for (const auto& [n, s] : ref_contigs[i]) ref_total_bp[i] += s.size();
     }
 
-    std::vector<std::pair<std::string, std::string>> contam_chunks;
-    if (!cfg.contam.empty()) {
+    // Load and chunk all contamination sources
+    // contam_pools[k] = pre-chunked (renamed cx_N) entries for contam source k
+    const int n_contams = static_cast<int>(cfg.contams.size());
+    std::vector<std::vector<std::pair<std::string, std::string>>> contam_pools(n_contams);
+    std::vector<std::string> contam_acc(n_contams);
+    for (int k = 0; k < n_contams; ++k) {
         auto raw = chunk_contigs(
-            parse_fasta_named(decompress_gz(cfg.contam)), cfg.chunk_size, cfg.min_chunk);
-        contam_chunks.reserve(raw.size());
+            parse_fasta_named(decompress_gz(cfg.contams[k].fasta)),
+            cfg.chunk_size, cfg.min_chunk);
+        contam_pools[k].reserve(raw.size());
         for (size_t i = 0; i < raw.size(); ++i)
-            contam_chunks.emplace_back("cx_" + std::to_string(i), std::move(raw[i]));
+            contam_pools[k].emplace_back("cx_" + std::to_string(i), std::move(raw[i]));
+        contam_acc[k] = base_accession(cfg.contams[k].fasta);
     }
 
+    // Build job list.
+    // At cont_frac=0: one job per (ref, comp, rep) regardless of contam sources.
+    // At cont_frac>0 with no contam sources: skip (can't contaminate without a source).
+    // At cont_frac>0 with contam sources: one job per (ref, comp, cont_level, contam_src, rep).
     std::vector<Job> jobs;
     for (int ri = 0; ri < (int)cfg.refs.size(); ++ri)
         for (int ci = 0; ci < (int)cfg.completeness.size(); ++ci)
-            for (int xi = 0; xi < (int)cfg.contamination.size(); ++xi)
-                for (int rep = 0; rep < cfg.reps; ++rep)
-                    jobs.push_back({ri, ci, xi, rep});
+            for (int xi = 0; xi < (int)cfg.contamination.size(); ++xi) {
+                const double cont = cfg.contamination[xi];
+                if (cont <= 0.0) {
+                    for (int rep = 0; rep < cfg.reps; ++rep)
+                        jobs.push_back({ri, ci, xi, -1, rep});
+                } else {
+                    for (int ki = 0; ki < std::max(1, n_contams); ++ki)
+                        for (int rep = 0; rep < cfg.reps; ++rep)
+                            if (ki < n_contams)  // skip if no contam sources
+                                jobs.push_back({ri, ci, xi, ki, rep});
+                }
+            }
 
     std::vector<GtRow> rows(jobs.size());
-    spdlog::info("sim: {} refs × {} comp × {} cont × {} reps = {} jobs",
+    spdlog::info("sim: {} refs × {} comp × {} cont × {} contam_srcs × {} reps = {} jobs",
                  cfg.refs.size(), cfg.completeness.size(),
-                 cfg.contamination.size(), cfg.reps, jobs.size());
+                 cfg.contamination.size(), std::max(1, n_contams), cfg.reps, jobs.size());
 
 #ifdef _OPENMP
     omp_set_num_threads(std::max(1, cfg.threads));
     #pragma omp parallel for schedule(dynamic)
 #endif
     for (long j = 0; j < (long)jobs.size(); ++j) {
-        const Job& job  = jobs[j];
+        const Job& job    = jobs[j];
         const double comp = cfg.completeness[job.comp_idx];
         const double cont = cfg.contamination[job.cont_idx];
+        const int    ki   = job.contam_idx;
 
+        // Deterministic per-job seed
         uint64_t s = cfg.seed;
-        s = s * 1000003u + (uint64_t)(job.ref_idx  + 1);
-        s = s * 1000003u + (uint64_t)(job.comp_idx + 1);
-        s = s * 1000003u + (uint64_t)(job.cont_idx + 1);
-        s = s * 1000003u + (uint64_t)(job.rep       + 1);
+        s = s * 1000003u + (uint64_t)(job.ref_idx    + 1);
+        s = s * 1000003u + (uint64_t)(job.comp_idx   + 1);
+        s = s * 1000003u + (uint64_t)(job.cont_idx   + 1);
+        s = s * 1000003u + (uint64_t)((ki < 0 ? 0 : ki) + 1);
+        s = s * 1000003u + (uint64_t)(job.rep         + 1);
         std::mt19937_64 rng(s);
 
         auto frag = make_fragment(ref_contigs[job.ref_idx], comp,
-                                  cfg.chunk_size, cfg.min_chunk, rng);
+                                  cfg.chunk_size, cfg.min_chunk,
+                                  cfg.contig_n50, cfg.contig_sigma, rng);
         uint64_t host_bp = 0;
         for (const auto& [n, sq] : frag) host_bp += sq.size();
         const double comp_actual = static_cast<double>(host_bp)
                                  / static_cast<double>(ref_total_bp[job.ref_idx]);
 
-        const double cont_actual = mix_contamination(frag, contam_chunks, cont, rng);
+        const double cont_actual = (ki >= 0)
+            ? mix_contamination(frag, contam_pools[ki], cont, rng)
+            : 0.0;
 
         uint64_t out_bp = 0;
         for (const auto& [n, sq] : frag) out_bp += sq.size();
 
-        char fname[256];
-        std::snprintf(fname, sizeof(fname), "sim_%s_r%02d_c%03d_x%02d.fa",
+        // Filename: sim_REF_r00_c050_x05[_LABEL|_k00].fa
+        // No contam suffix when cont=0 (clean genome, source irrelevant)
+        std::string contam_tag;
+        if (ki >= 0) {
+            const std::string& lbl = cfg.contams[ki].label;
+            contam_tag = "_" + (lbl.empty() ? "k" + std::to_string(ki) : lbl);
+        }
+
+        char fname[320];
+        std::snprintf(fname, sizeof(fname), "sim_%s_r%02d_c%03d_x%02d%s.fa",
                       ref_acc[job.ref_idx].c_str(), job.rep,
                       (int)std::lround(comp * 100.0),
-                      (int)std::lround(cont * 100.0));
+                      (int)std::lround(cont * 100.0),
+                      contam_tag.c_str());
 
         const fs::path fa = cfg.output_dir / fname;
         write_fasta(fa, frag);
 
-        std::string synth(fname, std::strlen(fname) - 3); // drop ".fa"
-        GtRow& r        = rows[j];
-        r.synth_acc     = synth;
-        r.source_acc    = ref_acc[job.ref_idx];
-        r.taxonomy      = cfg.refs[job.ref_idx].taxonomy;
-        r.fa_path       = fa;
-        r.rep           = job.rep;
-        r.comp_target   = comp;
-        r.comp_actual   = comp_actual;
-        r.cont_target   = cont;
-        r.cont_actual   = cont_actual;
-        r.n_contigs     = static_cast<uint32_t>(frag.size());
-        r.total_bp_out  = out_bp;
+        std::string synth(fname, std::strlen(fname) - 3);
+        GtRow& r           = rows[j];
+        r.synth_acc        = synth;
+        r.source_acc       = ref_acc[job.ref_idx];
+        r.taxonomy         = cfg.refs[job.ref_idx].taxonomy;
+        r.contam_source_acc= ki >= 0 ? contam_acc[ki] : "";
+        r.contam_label     = ki >= 0 ? cfg.contams[ki].label : "";
+        r.contam_taxonomy  = ki >= 0 ? cfg.contams[ki].taxonomy : "";
+        r.fa_path          = fa;
+        r.rep              = job.rep;
+        r.comp_target      = comp;
+        r.comp_actual      = comp_actual;
+        r.cont_target      = cont;
+        r.cont_actual      = cont_actual;
+        r.n_contigs        = static_cast<uint32_t>(frag.size());
+        r.total_bp_out     = out_bp;
     }
 
     {
         std::ofstream tsv(gt_path);
         if (!tsv) throw std::runtime_error("sim: cannot write " + gt_path.string());
         tsv << "synth_acc\tsource_acc\trep\tcomp_target\tcomp_actual\t"
-               "cont_target\tcont_actual\tn_contigs\ttotal_bp\n";
+               "cont_target\tcont_actual\tcontam_label\tcontam_source_acc\t"
+               "n_contigs\ttotal_bp\n";
         for (const auto& r : rows)
             tsv << r.synth_acc << '\t' << r.source_acc << '\t' << r.rep << '\t'
                 << r.comp_target << '\t' << r.comp_actual << '\t'
                 << r.cont_target << '\t' << r.cont_actual << '\t'
-                << r.n_contigs   << '\t' << r.total_bp_out << '\n';
+                << r.contam_label << '\t' << r.contam_source_acc << '\t'
+                << r.n_contigs << '\t' << r.total_bp_out << '\n';
     }
     {
         std::ofstream man(add_path);
