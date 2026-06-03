@@ -63,7 +63,8 @@ static int cmd_build(const std::string& input_tsv, const std::string& output_dir
                      bool sketch, int sketch_kmer, int sketch_size, int sketch_syncmer,
                      std::vector<int> sketch_kmers = {},
                      bool no_gstx = false,
-                     std::string markers_path = {}) {
+                     std::string markers_path = {},
+                     std::string from_gpk = {}) {
     ArchiveBuilder::Config cfg;
     const bool explicit_codec = no_dict || ref_dict || delta || mem_delta;
     cfg.io_threads                        = static_cast<size_t>(std::max(1, threads));
@@ -92,6 +93,17 @@ static int cmd_build(const std::string& input_tsv, const std::string& output_dir
         cfg.sketch_kmer_size  = sketch_kmers[0];
     }
     cfg.markers_path = markers_path;
+
+    if (!from_gpk.empty()) {
+        // Rebuild from an existing .gpk: stream decoded sequence from its shards
+        // (sequential reads) instead of opening per-genome FASTA files on NFS.
+        // Single process — parallelism is within the worker pool, no merge needed.
+        cfg.from_gpk_source = from_gpk;
+        ArchiveBuilder builder(output_dir, cfg);
+        builder.add_from_gpk(from_gpk);
+        builder.finalize();
+        return 0;
+    }
 
     if (n_parallel <= 1) {
         // Single-process build
@@ -2114,7 +2126,7 @@ int main(int argc, char** argv) {
     int build_sketch_kmer = 16, build_sketch_size = 10000, build_sketch_syncmer = -1;
     std::string build_taxon_rank = "g";
     std::string build_sketch_kmers_str = "16,21,31";
-    build->add_option("-i,--input",  build_input,  "Input TSV (accession, file_path, ...)")->required();
+    build->add_option("-i,--input",  build_input,  "Input TSV (accession, file_path, ...). Not required with --from-gpk.");
     build->add_option("-o,--output", build_output, "Output archive directory (.gpk)")->required();
     build->add_option("-t,--threads", build_threads, "I/O threads (decompression + compression)");
     build->add_option("-z,--zstd-level", build_level, "zstd compression level (1-22)");
@@ -2139,12 +2151,18 @@ int main(int argc, char** argv) {
     std::string build_markers;
     build->add_option("--markers", build_markers,
         "Path to markers.mrk; enables build-time marker completeness scoring (no check re-scan)");
+    std::string build_from_gpk;
+    build->add_option("--from-gpk", build_from_gpk,
+        "Rebuild from an existing .gpk: stream decoded sequence from its shards "
+        "(sequential reads) instead of opening per-genome FASTA files on NFS. -i not required.");
     std::string build_coordinator; // "manifest_dir:output.gpk" or empty
     build->add_option("--coordinator", build_coordinator,
         "NFS manifest coordinator: manifest_dir:/path/to/output.gpk. "
         "Build to a temp file then transfer sections via NFS manifest protocol. "
         "The legacy 'nfs:' prefix is accepted and stripped for backward compatibility.");
     build->callback([&]() {
+        if (build_input.empty() && build_from_gpk.empty())
+            throw std::runtime_error("build: provide -i <TSV> or --from-gpk <source.gpk>");
         // Parse --sketch-kmers "16,21,31" into vector<int>
         std::vector<int> build_sketch_kmers;
         if (!build_sketch_kmers_str.empty()) {
@@ -2172,7 +2190,7 @@ int main(int argc, char** argv) {
                                 build_taxon_group, build_taxon_rank,
                                 build_sketch, build_sketch_kmer, build_sketch_size,
                                 build_sketch_syncmer, build_sketch_kmers,
-                                build_no_gstx, build_markers);
+                                build_no_gstx, build_markers, build_from_gpk);
             if (rc != 0) std::exit(rc);
             std::string hostname = "worker";
             {
@@ -2201,7 +2219,7 @@ int main(int argc, char** argv) {
                              build_taxon_group, build_taxon_rank,
                              build_sketch, build_sketch_kmer, build_sketch_size,
                              build_sketch_syncmer, build_sketch_kmers,
-                             build_no_gstx, build_markers));
+                             build_no_gstx, build_markers, build_from_gpk));
     });
 
     // genopack extract

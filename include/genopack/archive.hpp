@@ -251,6 +251,7 @@ struct ArchiveBuilderConfig {
     uint64_t sketch_seed         = 42;
     std::string markers_path;           // path to .mrk file; empty = skip build-time marker scoring
     int         marker_min_hits  = 5;  // min pool hits to call a marker present (matches check default)
+    std::filesystem::path from_gpk_source;  // non-empty: rebuild by streaming decoded sequence from this .gpk
 };
 
 class ArchiveBuilder {
@@ -263,6 +264,10 @@ public:
 
     // Add all genomes from a TSV (accession, file_path [, completeness, contamination])
     void add_from_tsv(const std::filesystem::path& tsv_path);
+
+    // Rebuild from an existing .gpk: stream decoded sequence from its shards
+    // (sequential reads) instead of opening per-genome FASTA files on NFS.
+    void add_from_gpk(const std::filesystem::path& source);
 
     // Add individual record
     void add(const BuildRecord& rec);

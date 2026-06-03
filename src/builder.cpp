@@ -180,6 +180,7 @@ struct GenomeCkptFixed {
 struct ArchiveBuilder::Impl {
     std::filesystem::path archive_dir;   // base path (no extension)
     std::filesystem::path gpk_path_;     // output .gpk file
+    std::unique_ptr<ArchiveReader> src_reader_;  // from-gpk source (streams decoded sequence)
     Config                cfg;
 
     std::vector<BuildRecord> pending;
@@ -212,6 +213,27 @@ struct ArchiveBuilder::Impl {
     void add(const BuildRecord& rec) {
         pending.push_back(rec);
         pending_input_rows.push_back(static_cast<uint64_t>(pending_input_rows.size()));
+    }
+
+    void add_from_gpk(const std::filesystem::path& source) {
+        cfg.from_gpk_source = source;
+        src_reader_ = std::make_unique<ArchiveReader>();
+        src_reader_->open(source);
+        // Collect accession -> taxonomy from the source TAXN section.
+        std::unordered_map<std::string, std::string> tax;
+        src_reader_->scan_taxonomy([&](std::string_view acc, std::string_view t) {
+            tax.emplace(std::string(acc), std::string(t));
+        });
+        // One BuildRecord per source genome; the sequence is streamed in finalize().
+        src_reader_->scan_genome_accessions([&](std::string_view acc, GenomeId) {
+            BuildRecord r;
+            r.accession = std::string(acc);
+            auto it = tax.find(r.accession);
+            if (it != tax.end())
+                r.extra_fields.emplace_back("taxonomy", it->second);
+            add(r);
+        });
+        spdlog::info("from-gpk: {} genomes from {}", pending.size(), source.string());
     }
 
     void add_from_tsv(const std::filesystem::path& tsv_path) {
@@ -661,7 +683,8 @@ struct ArchiveBuilder::Impl {
         // Task queue (all tasks submitted upfront; poison-pill sentinel at end)
         // fd=-1 on poison pill; producer opens file + fadvise(WILLNEED) before queuing
         // so the kernel starts NFS prefetch 4*n_workers genomes ahead of workers.
-        struct Task { BuildRecord* record; GenomeId gid; uint64_t input_row_index; int fd = -1; };
+        struct Task { BuildRecord* record; GenomeId gid; uint64_t input_row_index; int fd = -1;
+                      std::shared_ptr<std::string> seq; };  // from-gpk: in-memory decoded FASTA
         std::queue<Task>        task_q;
         std::mutex              task_mx;
         std::condition_variable task_cv;
@@ -707,19 +730,47 @@ struct ArchiveBuilder::Impl {
         const size_t task_q_max = n_workers * 4;
 
         std::thread producer([&]() {
-            for (size_t i = 0; i < total_records; ++i) {
-                // Open + fadvise before acquiring the lock so kernel starts NFS
-                // prefetch while we wait for queue space. Workers read from this fd.
-                int fd = ::open(pending[i].file_path.c_str(), O_RDONLY);
+            if (src_reader_) {
+                // from-gpk: stream decoded sequence shard-by-shard from the source
+                // archive (sequential reads, no per-genome NFS file opens). Each
+                // genome's FASTA is handed to a worker via the in-memory Task.seq;
+                // the drain loop re-buckets by genus regardless of arrival order.
+                std::vector<std::string> accs;
+                accs.reserve(total_records);
+                for (size_t i = 0; i < total_records; ++i) accs.push_back(pending[i].accession);
+                src_reader_->visit_shard_batches(accs,
+                    [&](ArchiveReader::ShardBatch& batch) {
+                        for (auto& pr : batch) {
+                            size_t idx = pr.first;
+                            auto seq = std::make_shared<std::string>(std::move(pr.second.fasta));
+                            std::unique_lock lk(task_mx);
+                            task_cv.wait(lk, [&]{ return task_q.size() < task_q_max; });
+                            Task t;
+                            t.record          = &pending[idx];
+                            t.gid             = next_genome_id++;
+                            t.input_row_index = pending_input_rows[idx];
+                            t.fd              = -1;
+                            t.seq             = std::move(seq);
+                            task_q.push(std::move(t));
+                            lk.unlock();
+                            task_cv.notify_one();
+                        }
+                    });
+            } else {
+                for (size_t i = 0; i < total_records; ++i) {
+                    // Open + fadvise before acquiring the lock so kernel starts NFS
+                    // prefetch while we wait for queue space. Workers read from this fd.
+                    int fd = ::open(pending[i].file_path.c_str(), O_RDONLY);
 #ifdef POSIX_FADV_WILLNEED
-                if (fd >= 0)
-                    ::posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED | POSIX_FADV_SEQUENTIAL);
+                    if (fd >= 0)
+                        ::posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED | POSIX_FADV_SEQUENTIAL);
 #endif
-                std::unique_lock lk(task_mx);
-                task_cv.wait(lk, [&]{ return task_q.size() < task_q_max; });
-                task_q.push({&pending[i], next_genome_id++, pending_input_rows[i], fd});
-                lk.unlock();
-                task_cv.notify_one();
+                    std::unique_lock lk(task_mx);
+                    task_cv.wait(lk, [&]{ return task_q.size() < task_q_max; });
+                    task_q.push({&pending[i], next_genome_id++, pending_input_rows[i], fd});
+                    lk.unlock();
+                    task_cv.notify_one();
+                }
             }
             for (size_t i = 0; i < n_workers; ++i) {
                 std::unique_lock lk(task_mx);
@@ -747,9 +798,11 @@ struct ArchiveBuilder::Impl {
 
                     Done d;
                     try {
-                        std::string fasta = (t.fd >= 0)
-                            ? decompress_gz_fd(t.fd, t.record->file_path)
-                            : decompress_gz(t.record->file_path);
+                        std::string fasta = t.seq
+                            ? std::move(*t.seq)
+                            : ((t.fd >= 0)
+                                ? decompress_gz_fd(t.fd, t.record->file_path)
+                                : decompress_gz(t.record->file_path));
                         FastaStats stats  = compute_fasta_stats(fasta);
                         OPHDualSketchResult sk;
                         std::vector<OPHDualSketchResult> sks_mk;
@@ -1727,6 +1780,9 @@ ArchiveBuilder::~ArchiveBuilder() = default;
 
 void ArchiveBuilder::add_from_tsv(const std::filesystem::path& tsv_path) {
     impl_->add_from_tsv(tsv_path);
+}
+void ArchiveBuilder::add_from_gpk(const std::filesystem::path& source) {
+    impl_->add_from_gpk(source);
 }
 void ArchiveBuilder::add(const BuildRecord& rec) { impl_->add(rec); }
 void ArchiveBuilder::finalize() { impl_->finalize(); }
