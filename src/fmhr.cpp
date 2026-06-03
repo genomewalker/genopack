@@ -3,7 +3,8 @@
 
 namespace genopack {
 
-SectionDesc FmhrWriter::finalize(AppendWriter& w, uint64_t section_id) {
+SectionDesc FmhrWriter::finalize(AppendWriter& w, uint64_t section_id,
+                                 uint32_t k, uint32_t c) {
     const uint32_t n = static_cast<uint32_t>(entries_.size());
     const uint32_t min_buckets = (n == 0) ? 1
         : static_cast<uint32_t>(static_cast<double>(n) / 0.7 + 1.0);
@@ -41,8 +42,8 @@ SectionDesc FmhrWriter::finalize(AppendWriter& w, uint64_t section_id) {
     hdr.magic          = SEC_FMHR;
     hdr.n_genera       = n;
     hdr.n_buckets      = n_buckets;
-    hdr.k              = 21;
-    hdr.c              = 125;
+    hdr.k              = k;
+    hdr.c              = c;
     hdr.entries_offset = entries_off;
     hdr.buckets_offset = buckets_off;
     hdr.hashes_offset  = hashes_off;

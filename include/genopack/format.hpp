@@ -29,6 +29,13 @@ static constexpr uint32_t SEC_QUAL = 0x4C415551u; // "QUAL" - per-genome quality
 static constexpr uint32_t SEC_GCOV = 0x564F4347u; // "GCOV" - per-genus biological covariance (whitening basis + calibrated quantiles)
 static constexpr uint32_t SEC_FCOV = 0x564F4346u; // "FCOV" - per-family biological covariance (same layout as GCOV, keyed by family hash)
 static constexpr uint32_t SEC_FMHR = 0x52484D46u; // "FMHR" - per-genus FracMinHash reference sketches (k=21,c=125)
+static constexpr uint32_t SEC_BPRM = 0x4D525042u; // "BPRM" - self-describing build parameters (one per archive)
+
+// Model/pipeline versions folded into BPRM.params_hash (and GPK3 derivation_hash).
+// Bump when a section's computation semantics change in a byte-incompatible way.
+static constexpr uint32_t GSTX_MODEL_VERSION = 1;
+static constexpr uint32_t GCOV_MODEL_VERSION = 1;
+static constexpr uint32_t TNF_ORDER          = 4;
 
 // ── FileHeader: 128 bytes ─────────────────────────────────────────────────────
 // 4+2+2+8+8+8+8+88 = 128

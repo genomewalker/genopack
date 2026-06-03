@@ -4,6 +4,7 @@
 #include <genopack/meta.hpp>
 #include <genopack/gidx.hpp>
 #include <genopack/gcov.hpp>
+#include <genopack/bprm.hpp>
 #include <genopack/gstx.hpp>
 #include <genopack/qual.hpp>
 #include <genopack/kmrx.hpp>
@@ -124,6 +125,9 @@ struct ArchiveReader::Impl {
     // FMHR reader: per-genus FracMinHash reference sketches (k=21, c=125)
     FmhrReader fmhr_;
     bool       has_fmhr_ = false;
+    // BPRM: self-describing build parameters (one per archive)
+    BprmReader bprm_;
+    bool       has_bprm_ = false;
 
     // QUAL reader: per-genome quality scores
     std::vector<uint8_t> qual_buf_;  // pread heap buffer — avoids NFS mmap page faults
@@ -388,6 +392,23 @@ struct ArchiveReader::Impl {
             }
         }
 
+        // Load BPRM section (self-describing build params; highest section_id wins)
+        {
+            uint64_t best_id = 0;
+            const SectionDesc* best_sd = nullptr;
+            for (auto* sd : toc_.find_by_type(SEC_BPRM)) {
+                if (sd->section_id > best_id) { best_id = sd->section_id; best_sd = sd; }
+            }
+            if (best_sd) {
+                try {
+                    bprm_.open(mmap_.data(), best_sd->file_offset, best_sd->compressed_size);
+                    has_bprm_ = true;
+                } catch (const std::exception& ex) {
+                    spdlog::warn("BPRM section unreadable ({})", ex.what());
+                }
+            }
+        }
+
         // Load QUAL section (highest section_id wins)
         {
             uint64_t best_id = 0;
@@ -506,6 +527,8 @@ struct ArchiveReader::Impl {
             fcov_buf_.clear();
             fmhr_                 = FmhrReader{};
             has_fmhr_             = false;
+            bprm_                 = BprmReader{};
+            has_bprm_             = false;
             qual_                 = QualReader{};
             has_qual_             = false;
             kmrx_readers_.clear();
@@ -1272,6 +1295,16 @@ FmhrView ArchiveReader::fmhr_for_genus(std::string_view genus) const {
 
 const FmhrReader* ArchiveReader::fmhr_reader() const {
     return impl_->has_fmhr_ ? &impl_->fmhr_ : nullptr;
+}
+
+bool ArchiveReader::has_bprm() const { return impl_->has_bprm_; }
+
+const BprmHeader* ArchiveReader::build_params() const {
+    return impl_->has_bprm_ ? &impl_->bprm_.header() : nullptr;
+}
+
+uint64_t ArchiveReader::build_params_hash() const {
+    return impl_->has_bprm_ ? impl_->bprm_.params_hash() : 0;
 }
 
 bool ArchiveReader::has_qual() const { return impl_->has_qual_; }

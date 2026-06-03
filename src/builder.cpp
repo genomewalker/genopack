@@ -15,6 +15,7 @@
 #include <genopack/txdb.hpp>
 #include <genopack/catalog.hpp>
 #include <genopack/format.hpp>
+#include <genopack/bprm.hpp>
 #include <genopack/mmap_file.hpp>
 #include <genopack/shard.hpp>
 #include <genopack/toc.hpp>
@@ -860,7 +861,7 @@ struct ArchiveBuilder::Impl {
         GcovWriter build_gcov_w, build_fcov_w;
         FmhrWriter build_fmhr_w;
         static constexpr float  kGcovOutlierPct = 0.99f;
-        static constexpr int    kFmhK           = 21, kFmhC = 125;
+        const int               kFmhK           = cfg.fmh_k, kFmhC = cfg.fmh_c;
         static constexpr uint32_t kFmhMinBp     = 1000;
 
         // Marker scoring at build time — same FASTA pass as GCOV/FMH.
@@ -1660,10 +1661,40 @@ struct ArchiveBuilder::Impl {
                 spdlog::info("FCOV: {} genera", build_fcov_w.n_genera());
             }
             if (build_fmhr_w.n_genera() > 0) {
-                SectionDesc sd = build_fmhr_w.finalize(mw, next_section_id++);
+                SectionDesc sd = build_fmhr_w.finalize(mw, next_section_id++,
+                                                       cfg.fmh_k, cfg.fmh_c);
                 toc.add_section(sd);
                 spdlog::info("FMHR: {} genera", build_fmhr_w.n_genera());
             }
+        }
+
+        // BPRM — self-describing build parameters (mandatory, one per archive).
+        // Written into the same metadata block so it is checksummed and covered
+        // by the TOC/MetaBundle. Records the concrete param VALUES every
+        // param-bearing section was built with (kills hardcoded literals).
+        {
+            BprmHeader bp{};
+            bp.sketch_kmer_size = static_cast<uint32_t>(cfg.sketch_kmer_size);
+            bp.sketch_size      = static_cast<uint32_t>(cfg.sketch_size);
+            bp.sketch_syncmer_s = static_cast<uint32_t>(cfg.sketch_syncmer_s);
+            const uint32_t nk = static_cast<uint32_t>(
+                std::min<size_t>(cfg.sketch_kmer_sizes.size(), 8));
+            bp.n_kmer_sizes = nk;
+            for (uint32_t i = 0; i < nk; ++i)
+                bp.kmer_sizes[i] = static_cast<uint32_t>(cfg.sketch_kmer_sizes[i]);
+            bp.sketch_seed        = cfg.sketch_seed;
+            bp.fmh_k              = static_cast<uint32_t>(cfg.fmh_k);
+            bp.fmh_c              = static_cast<uint32_t>(cfg.fmh_c);
+            bp.tnf_order          = TNF_ORDER;
+            bp.gstx_model_version = GSTX_MODEL_VERSION;
+            bp.gcov_model_version = GCOV_MODEL_VERSION;
+            bp.taxonomy_rank      = cfg.taxonomy_rank.empty()
+                ? static_cast<uint8_t>('g')
+                : static_cast<uint8_t>(cfg.taxonomy_rank[0]);
+            BprmWriter bw(bp);
+            SectionDesc bprm_sd = bw.finalize(mw, next_section_id++);
+            toc.add_section(bprm_sd);
+            spdlog::info("BPRM: params_hash={:#018x}", bw.params_hash());
         }
 
         // Populate per-section content checksums (P1) for the metadata sections.

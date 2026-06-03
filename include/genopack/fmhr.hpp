@@ -57,7 +57,8 @@ public:
     void add(uint64_t genus_hash, std::vector<uint64_t> hashes) {
         entries_.push_back({genus_hash, std::move(hashes)});
     }
-    SectionDesc finalize(AppendWriter& w, uint64_t section_id);
+    SectionDesc finalize(AppendWriter& w, uint64_t section_id,
+                         uint32_t k = 21, uint32_t c = 125);
     size_t n_genera() const { return entries_.size(); }
 
 private:

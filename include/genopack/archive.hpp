@@ -2,6 +2,7 @@
 #include "types.hpp"
 #include "catalog.hpp"
 #include "fmhr.hpp"
+#include "bprm.hpp"
 #include "gcov.hpp"
 #include "gstx.hpp"
 #include "qual.hpp"
@@ -202,6 +203,13 @@ public:
     // Raw reader pointer (nullptr if no FMHR section); valid for archive lifetime.
     const FmhrReader* fmhr_reader() const;
 
+    // BPRM: self-describing build parameters (one per archive).
+    bool has_bprm() const;
+    // Pointer to the build-params header (nullptr if no BPRM section).
+    const BprmHeader* build_params() const;
+    // O(1) cross-section consistency key; 0 if no BPRM section.
+    uint64_t build_params_hash() const;
+
     // QUAL: per-genome quality scores (completeness, contamination, consistency).
     // Written during build; enables O(1) quality lookup without re-computing.
     bool has_qual() const;
@@ -249,6 +257,8 @@ struct ArchiveBuilderConfig {
     int      sketch_size         = 10000;  // number of OPH bins
     int      sketch_syncmer_s    = 0;      // 0 = disabled; >0 = open syncmer prefilter
     uint64_t sketch_seed         = 42;
+    int      fmh_k               = 21;     // FracMinHash k for FMHR reference sketches
+    int      fmh_c               = 125;    // FracMinHash density (1/c) for FMHR sketches
     std::string markers_path;           // path to .mrk file; empty = skip build-time marker scoring
     int         marker_min_hits  = 5;  // min pool hits to call a marker present (matches check default)
     std::filesystem::path from_gpk_source;  // non-empty: rebuild by streaming decoded sequence from this .gpk
