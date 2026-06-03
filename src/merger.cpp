@@ -67,7 +67,7 @@ void merge_archives(const std::vector<std::filesystem::path>& inputs,
         if (a.mmap.size() < sizeof(FileHeader))
             throw std::runtime_error("merge: too small: " + p.string());
         const auto* fhdr = a.mmap.ptr_at<FileHeader>(0);
-        if (fhdr->magic != GPK2_MAGIC)
+        if (fhdr->magic != GPK_MAGIC)
             throw std::runtime_error("merge: not a v2 .gpk file: " + p.string());
         // Validate TailLocator before reading the TOC.
         // A corrupt TailLocator (from NFS write-back failure) would cause
@@ -201,8 +201,9 @@ void merge_archives(const std::vector<std::filesystem::path>& inputs,
     writer.create(out_path);
     {
         FileHeader fhdr{};
-        fhdr.magic           = GPK2_MAGIC;
+        fhdr.magic           = GPK_MAGIC;
         fhdr.version_major   = FORMAT_MAJOR;
+        fhdr.endian_abi_tag  = ENDIAN_ABI_TAG;
         fhdr.version_minor   = FORMAT_MINOR;
         uint64_t t           = static_cast<uint64_t>(std::time(nullptr));
         fhdr.file_uuid_lo    = t ^ 0xdeadbeefcafe0001ULL;

@@ -217,7 +217,7 @@ struct ArchiveReader::Impl {
 
         // Read FileHeader from mmap offset 0 — always a warm page, no fault.
         auto* fh = mmap_.ptr_at<FileHeader>(0);
-        if (fh->magic != GPK2_MAGIC)
+        if (fh->magic != GPK_MAGIC)
             throw std::runtime_error("Not a .gpk file");
         // Reject archives whose major format version is newer than we support,
         // rather than silently misparsing a future layout as garbage (P15).
@@ -226,6 +226,13 @@ struct ArchiveReader::Impl {
                 "genopack: archive format major v" + std::to_string(fh->version_major) +
                 " > supported v" + std::to_string(FORMAT_MAJOR) +
                 " — upgrade genopack to read this archive");
+        // Byte-order / ABI canary: a mismatch means the file was written on an
+        // incompatible ABI (e.g. opposite endianness) — reject rather than
+        // misread every integer field (P26).
+        if (fh->endian_abi_tag != ENDIAN_ABI_TAG)
+            throw std::runtime_error(
+                "genopack: ABI/endianness tag mismatch — archive written on an "
+                "incompatible platform");
 
         // pread TailLocator from EOF — avoids mmap page-fault at multi-TB offset.
         TailLocator tail{};

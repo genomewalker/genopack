@@ -664,7 +664,7 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
         return 1;
     }
     auto* fh = mmap.ptr_at<FileHeader>(0);
-    if (fh->magic != GPK2_MAGIC) {
+    if (fh->magic != GPK_MAGIC) {
         spdlog::error("Not a v2 .gpk file (bad magic)");
         return 1;
     }
@@ -1563,7 +1563,7 @@ static size_t patch_gpk_taxn(const std::filesystem::path& gpk_path,
         spdlog::warn("Skipping {}: too small", gpk_path.string()); return 0;
     }
     auto* fh = mmap.ptr_at<FileHeader>(0);
-    if (fh->magic != GPK2_MAGIC) {
+    if (fh->magic != GPK_MAGIC) {
         spdlog::warn("Skipping {}: not a v2 .gpk", gpk_path.string()); return 0;
     }
 
@@ -3047,7 +3047,14 @@ int main(int argc, char** argv) {
     bool verify_verbose = false;
     verify_cmd->add_option("archive", verify_path, "Path to .gpk archive or part directory")->required();
     verify_cmd->add_flag("-v,--verbose", verify_verbose, "Print OK lines for every shard");
-    verify_cmd->callback([&]() { std::exit(cmd_verify(verify_path, verify_verbose)); });
+    verify_cmd->callback([&]() {
+        try {
+            std::exit(cmd_verify(verify_path, verify_verbose));
+        } catch (const std::exception& e) {
+            spdlog::error("verify: {}", e.what());
+            std::exit(1);
+        }
+    });
 
     // genopack check
     auto* check_cmd = app.add_subcommand("check",

@@ -34,6 +34,7 @@
 #include <numeric>
 #include <optional>
 #include <queue>
+#include <random>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
@@ -44,6 +45,36 @@
 #include <vector>
 
 namespace genopack {
+
+// ── Build-params (BPRM) ───────────────────────────────────────────────────────
+// Build the canonical BprmHeader from the config. Pure function of cfg, so it is
+// computed once at header-write time (for FileHeader.build_params_hash) and again
+// at section-write time (for the BPRM body) — guaranteeing the two agree.
+static BprmHeader make_bprm_header_from_cfg(const ArchiveBuilderConfig& cfg) {
+    BprmHeader bp{};
+    bp.sketch_kmer_size = static_cast<uint32_t>(cfg.sketch_kmer_size);
+    bp.sketch_size      = static_cast<uint32_t>(cfg.sketch_size);
+    bp.sketch_syncmer_s = static_cast<uint32_t>(cfg.sketch_syncmer_s);
+    const uint32_t nk = static_cast<uint32_t>(
+        std::min<size_t>(cfg.sketch_kmer_sizes.size(), 8));
+    bp.n_kmer_sizes = nk;
+    for (uint32_t i = 0; i < nk; ++i)
+        bp.kmer_sizes[i] = static_cast<uint32_t>(cfg.sketch_kmer_sizes[i]);
+    bp.sketch_seed        = cfg.sketch_seed;
+    bp.fmh_k              = static_cast<uint32_t>(cfg.fmh_k);
+    bp.fmh_c              = static_cast<uint32_t>(cfg.fmh_c);
+    bp.tnf_order          = TNF_ORDER;
+    bp.gstx_model_version = GSTX_MODEL_VERSION;
+    bp.gcov_model_version = GCOV_MODEL_VERSION;
+    bp.taxonomy_rank      = cfg.taxonomy_rank.empty()
+        ? static_cast<uint8_t>('g')
+        : static_cast<uint8_t>(cfg.taxonomy_rank[0]);
+    bp.magic       = SEC_BPRM;
+    bp.version     = 1;
+    bp.header_size = sizeof(BprmHeader);
+    bp.params_hash = bprm_compute_params_hash(bp);
+    return bp;
+}
 
 // ── Shard grouping helpers ────────────────────────────────────────────────────
 
@@ -471,18 +502,21 @@ struct ArchiveBuilder::Impl {
         if (!resuming) {
             app_writer.create(partial_path);
 
-            // Write FileHeader (128B)
+            // Write FileHeader (256B, GPK3)
             {
                 FileHeader fhdr{};
-                fhdr.magic         = GPK2_MAGIC;
+                fhdr.magic         = GPK_MAGIC;
                 fhdr.version_major = FORMAT_MAJOR;
                 fhdr.version_minor = FORMAT_MINOR;
-                uint64_t t = static_cast<uint64_t>(std::time(nullptr));
-                fhdr.file_uuid_lo  = t ^ 0xdeadbeefcafe0001ULL;
-                fhdr.file_uuid_hi  = (t << 17) ^ 0x1234567890abcdefULL;
-                fhdr.created_at_unix = t;
+                // Real random 128-bit file UUID (P23).
+                std::random_device rd;
+                fhdr.file_uuid_lo  = (static_cast<uint64_t>(rd()) << 32) | rd();
+                fhdr.file_uuid_hi  = (static_cast<uint64_t>(rd()) << 32) | rd();
+                fhdr.created_at_unix = static_cast<uint64_t>(std::time(nullptr));
                 fhdr.flags         = 0;
-                std::memset(fhdr.reserved, 0, sizeof(fhdr.reserved));
+                fhdr.endian_abi_tag   = ENDIAN_ABI_TAG;                     // P26
+                fhdr.build_params_hash = make_bprm_header_from_cfg(cfg).params_hash;
+                fhdr.generation    = 1;
                 app_writer.append(&fhdr, sizeof(fhdr));
             }
 
@@ -1673,25 +1707,7 @@ struct ArchiveBuilder::Impl {
         // by the TOC/MetaBundle. Records the concrete param VALUES every
         // param-bearing section was built with (kills hardcoded literals).
         {
-            BprmHeader bp{};
-            bp.sketch_kmer_size = static_cast<uint32_t>(cfg.sketch_kmer_size);
-            bp.sketch_size      = static_cast<uint32_t>(cfg.sketch_size);
-            bp.sketch_syncmer_s = static_cast<uint32_t>(cfg.sketch_syncmer_s);
-            const uint32_t nk = static_cast<uint32_t>(
-                std::min<size_t>(cfg.sketch_kmer_sizes.size(), 8));
-            bp.n_kmer_sizes = nk;
-            for (uint32_t i = 0; i < nk; ++i)
-                bp.kmer_sizes[i] = static_cast<uint32_t>(cfg.sketch_kmer_sizes[i]);
-            bp.sketch_seed        = cfg.sketch_seed;
-            bp.fmh_k              = static_cast<uint32_t>(cfg.fmh_k);
-            bp.fmh_c              = static_cast<uint32_t>(cfg.fmh_c);
-            bp.tnf_order          = TNF_ORDER;
-            bp.gstx_model_version = GSTX_MODEL_VERSION;
-            bp.gcov_model_version = GCOV_MODEL_VERSION;
-            bp.taxonomy_rank      = cfg.taxonomy_rank.empty()
-                ? static_cast<uint8_t>('g')
-                : static_cast<uint8_t>(cfg.taxonomy_rank[0]);
-            BprmWriter bw(bp);
+            BprmWriter bw(make_bprm_header_from_cfg(cfg));
             SectionDesc bprm_sd = bw.finalize(mw, next_section_id++);
             toc.add_section(bprm_sd);
             spdlog::info("BPRM: params_hash={:#018x}", bw.params_hash());

@@ -101,7 +101,7 @@ void subset_archive(const std::filesystem::path& input_gpk,
     src_mmap.open(input_gpk);
     if (src_mmap.size() < sizeof(FileHeader))
         throw std::runtime_error("subset: file too small: " + input_gpk.string());
-    if (src_mmap.ptr_at<FileHeader>(0)->magic != GPK2_MAGIC)
+    if (src_mmap.ptr_at<FileHeader>(0)->magic != GPK_MAGIC)
         throw std::runtime_error("subset: not a v2 .gpk archive: " + input_gpk.string());
 
     Toc src_toc = TocReader::read(src_mmap);
@@ -229,8 +229,9 @@ void subset_archive(const std::filesystem::path& input_gpk,
 
     {
         FileHeader ofh{};
-        ofh.magic           = GPK2_MAGIC;
+        ofh.magic           = GPK_MAGIC;
         ofh.version_major   = FORMAT_MAJOR;
+        ofh.endian_abi_tag  = ENDIAN_ABI_TAG;
         ofh.version_minor   = FORMAT_MINOR;
         uint64_t t = static_cast<uint64_t>(std::time(nullptr));
         ofh.file_uuid_lo    = t ^ 0xdeadbeefcafe0003ULL;

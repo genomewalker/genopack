@@ -25,7 +25,7 @@ namespace genopack {
 
 namespace {
 
-// Encode/decode a SectionDesc as a fixed-size hex blob (160 hex chars = 80 bytes).
+// Encode/decode a SectionDesc as a fixed-size hex blob (sizeof(SectionDesc)*2 hex chars).
 static std::string encode_section(const SectionDesc& sd) {
     const uint8_t* p = reinterpret_cast<const uint8_t*>(&sd);
     static constexpr char hex[] = "0123456789abcdef";
@@ -147,8 +147,9 @@ void CoordinatorServer::run_nfs(
     writer.create(output_path);
 
     FileHeader fhdr{};
-    fhdr.magic           = GPK2_MAGIC;
+    fhdr.magic           = GPK_MAGIC;
     fhdr.version_major   = FORMAT_MAJOR;
+    fhdr.endian_abi_tag  = ENDIAN_ABI_TAG;
     fhdr.version_minor   = FORMAT_MINOR;
     fhdr.created_at_unix = static_cast<uint64_t>(std::time(nullptr));
     if (FILE* ufd = fopen("/dev/urandom", "rb")) {

@@ -48,7 +48,7 @@ struct ArchiveAppender::Impl {
             throw std::runtime_error("File too small to be a .gpk: " + gpk.string());
 
         auto* fh = mmap.ptr_at<FileHeader>(0);
-        if (fh->magic != GPK2_MAGIC)
+        if (fh->magic != GPK_MAGIC)
             throw std::runtime_error("Not a .gpk file: " + gpk.string());
 
         gpk_path_ = gpk;
