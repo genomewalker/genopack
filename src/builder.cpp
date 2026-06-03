@@ -16,6 +16,7 @@
 #include <genopack/catalog.hpp>
 #include <genopack/format.hpp>
 #include <genopack/bprm.hpp>
+#include <genopack/derivation.hpp>
 #include <genopack/mmap_file.hpp>
 #include <genopack/shard.hpp>
 #include <genopack/toc.hpp>
@@ -1738,6 +1739,16 @@ struct ArchiveBuilder::Impl {
                 ::close(tfd);
             }
         }
+
+        // Content-addressed derivation (§5): now that every section's
+        // content_xxh128 is populated, fold each non-SOURCE section's params +
+        // upstream content hashes into derivation_hash + semantic_schema_hash.
+        // Both the MetaBundle and the legacy TOC are written from toc.sections()
+        // inside finalize(), so populating here covers both. Fresh build ⇒ no
+        // deletions ⇒ deletion_set_hash = 0.
+        populate_derivation(toc.sections(),
+                            make_bprm_header_from_cfg(cfg).params_hash,
+                            /*deletion_set_hash=*/0);
 
         // Write TOC + TailLocator to local file
         toc.finalize(mw,

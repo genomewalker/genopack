@@ -2094,7 +2094,8 @@ static int cmd_verify(const std::string& archive_path, bool verbose) {
             ++failures;
         } else {
             ++n_checked;
-            if (verbose) spdlog::info("verify: section type={:#x} id={} OK", sd.type, sd.section_id);
+            if (verbose) spdlog::info("verify: section type={:#x} id={} deriv={:#018x} schema={:#018x} OK",
+                                      sd.type, sd.section_id, sd.derivation_hash, sd.semantic_schema_hash);
         }
     }
 
