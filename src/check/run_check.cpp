@@ -170,7 +170,8 @@ int cmd_check(const std::filesystem::path& pack_path,
               int min_genus_size,
               float leakage_threshold,
               const std::filesystem::path& output,
-              bool recompute)
+              bool recompute,
+              const std::filesystem::path& markers_path)
 {
     auto gpk_paths = collect_gpk_paths(pack_path);
     if (gpk_paths.empty())
@@ -227,6 +228,7 @@ int cmd_check(const std::filesystem::path& pack_path,
         auto quality = pass_a.quality;
 
         PassBConfig pb_cfg;
+        pb_cfg.markers_path = markers_path.string();   // empty = marker scoring disabled
         const auto* baseline_ptr = qual_cache.empty() ? nullptr : &qual_cache;
         run_pass_b(pack, pass_a, quality, pb_cfg, threads, qual_cache_ptr, baseline_ptr);
 

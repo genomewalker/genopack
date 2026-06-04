@@ -7,6 +7,7 @@
 #include <genopack/gidx.hpp>
 #include <genopack/kmrx.hpp>
 #include <genopack/mmap_file.hpp>
+#include <genopack/section_checksum.hpp>
 #include <genopack/shard.hpp>
 #include <genopack/taxn.hpp>
 #include <genopack/toc.hpp>
@@ -504,6 +505,13 @@ void repack_archive(const std::filesystem::path& input_gpk,
             new_toc.add_section(new_sd);
         }
     }
+
+    // Populate per-section content checksums (P1) so verify can validate the
+    // rebuilt metadata bodies. SHRD was hashed inline at write time; everything
+    // else lives in the local temp file. Must run before the TOC/MetaBundle
+    // (which embed these descriptors) are finalized.
+    mw.flush();
+    stamp_section_checksums(meta_tmp.data(), new_toc.sections());
 
     // TOC + TailLocator
     new_toc.finalize(mw,

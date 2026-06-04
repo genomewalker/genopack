@@ -19,6 +19,7 @@
 #include <genopack/catalog.hpp>
 #include <genopack/cidx.hpp>
 #include <genopack/checksum.hpp>
+#include <genopack/section_checksum.hpp>
 #include <genopack/format.hpp>
 #include <genopack/gidx.hpp>
 #include <genopack/qual.hpp>
@@ -1490,6 +1491,14 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
                      qual_sd.file_offset, qual_sd.compressed_size, qual_sd.item_count);
     }
 
+    // Stamp content checksums on the newly appended sections so verify can
+    // validate them (mirrors build/merge). Read from the gpk itself — sections
+    // were appended at absolute offsets; only_if_zero leaves the large
+    // pre-existing SHRD/SKCH bodies (already checksummed) untouched.
+    writer.flush();
+    stamp_section_checksums(gpk.c_str(), new_toc.sections(), (512ull << 20),
+                            /*only_if_zero=*/true);
+
     // Write new TOC + TailLocator
     new_toc.finalize(writer,
                      prev_generation + 1,
@@ -2033,7 +2042,7 @@ static int cmd_repack(const std::string& input, const std::string& output,
 }
 
 // ── genopack verify ──────────────────────────────────────────────────────────
-static int cmd_verify(const std::string& archive_path, bool verbose) {
+static int cmd_verify(const std::string& archive_path, bool verbose, bool strict) {
     MmapFileReader mmap;
     mmap.open(archive_path);
     if (mmap.size() < sizeof(TailLocator))
@@ -2083,7 +2092,15 @@ static int cmd_verify(const std::string& archive_path, bool verbose) {
     size_t n_checked  = 0;
     static const uint8_t zeros[16] = {};
     for (const auto& sd : toc.sections) {
-        if (std::memcmp(sd.checksum, zeros, 16) == 0) { ++n_zero; continue; }
+        if (std::memcmp(sd.checksum, zeros, 16) == 0) {
+            ++n_zero;
+            if (strict) {
+                spdlog::error("verify: section type={:#x} id={} has no content checksum (--strict)",
+                              sd.type, sd.section_id);
+                ++failures;
+            }
+            continue;
+        }
         if (sd.compressed_size > mmap.size() ||
             sd.file_offset > mmap.size() - sd.compressed_size) {
             spdlog::error("verify: section type={:#x} id={} out of bounds",
@@ -2102,12 +2119,19 @@ static int cmd_verify(const std::string& archive_path, bool verbose) {
         }
     }
 
-    if (n_zero > 0)
-        spdlog::warn("verify: {} of {} sections have zero checksum (pre-feature/over-cap, skipped)",
-                     n_zero, n_sections);
+    if (n_zero > 0) {
+        if (strict)
+            spdlog::error("verify: {} of {} sections have no content checksum "
+                          "(--strict: counted as failures)", n_zero, n_sections);
+        else
+            spdlog::warn("verify: {} of {} sections have no content checksum "
+                         "(index/metadata or >512MB section bodies — bytes unverified)",
+                         n_zero, n_sections);
+    }
 
     if (failures == 0)
-        spdlog::info("verify: {} section(s) checked, all OK", n_checked);
+        spdlog::info("verify: {} section(s) content-checked, {} skipped (no checksum)",
+                     n_checked, n_zero);
     else
         spdlog::error("verify: {} checksum failure(s)", failures);
 
@@ -3051,9 +3075,12 @@ int main(int argc, char** argv) {
     bool verify_verbose = false;
     verify_cmd->add_option("archive", verify_path, "Path to .gpk archive or part directory")->required();
     verify_cmd->add_flag("-v,--verbose", verify_verbose, "Print OK lines for every shard");
+    bool verify_strict = false;
+    verify_cmd->add_flag("--strict", verify_strict,
+        "Treat sections without a content checksum (index/metadata or >512MB) as failures");
     verify_cmd->callback([&]() {
         try {
-            std::exit(cmd_verify(verify_path, verify_verbose));
+            std::exit(cmd_verify(verify_path, verify_verbose, verify_strict));
         } catch (const std::exception& e) {
             spdlog::error("verify: {}", e.what());
             std::exit(1);
@@ -3077,6 +3104,9 @@ int main(int argc, char** argv) {
     check_cmd->add_option("--min-genus-size", check_min_genus_size, "Min genus members for saturated tier (default: 3)");
     check_cmd->add_option("--leakage-threshold", check_leakage_threshold, "Containment leakage threshold (default: 0.05)");
     check_cmd->add_flag("--recompute", check_recompute, "Ignore existing QUAL section and force full rescan");
+    std::string check_markers;
+    check_cmd->add_option("--markers", check_markers,
+        "Path to markers .mrk DB; enables marker-based completeness/redundancy scoring");
     check_cmd->callback([&]() {
         std::exit(genopack::check::cmd_check(
             check_pack,
@@ -3085,7 +3115,8 @@ int main(int argc, char** argv) {
             check_min_genus_size,
             check_leakage_threshold,
             check_output.empty() ? std::filesystem::path{} : std::filesystem::path{check_output},
-            check_recompute));
+            check_recompute,
+            check_markers.empty() ? std::filesystem::path{} : std::filesystem::path{check_markers}));
     });
 
     // genopack gcov

@@ -207,6 +207,12 @@ target_link_libraries(genopack_derep_view_test PRIVATE genopack_lib)
 add_test(NAME genopack-derep-view COMMAND genopack_derep_view_test)
 set_tests_properties(genopack-derep-view PROPERTIES LABELS "unit")
 
+add_executable(genopack_check_roundtrip_test tests/check_roundtrip.cpp)
+target_link_libraries(genopack_check_roundtrip_test PRIVATE genopack_lib)
+target_compile_definitions(genopack_check_roundtrip_test PRIVATE GENOPACK_BIN="$<TARGET_FILE:genopack>")
+add_test(NAME genopack-check-roundtrip COMMAND genopack_check_roundtrip_test)
+set_tests_properties(genopack-check-roundtrip PROPERTIES LABELS "unit")
+
 add_executable(genopack_benchmark tests/benchmark.cpp)
 target_link_libraries(genopack_benchmark PRIVATE genopack_lib)
 target_compile_definitions(genopack_benchmark PRIVATE GENOPACK_BIN="$<TARGET_FILE:genopack>")
