@@ -50,6 +50,7 @@ struct QualRecord {
     static constexpr uint8_t QUAL_FLAG_MARKER_SCORED      = 0x10; // marker_redundancy_u16 is valid
     static constexpr uint8_t QUAL_FLAG_BUILD_SIGNALS      = 0x20; // AllSignals computed at build time (chargaff/spectral/scale_kink valid)
     static constexpr uint8_t QUAL_FLAG_GCOV_SCORED        = 0x40; // per-contig GCOV scoring cached (contig_outlier/spe/sibling/rho valid)
+    static constexpr uint8_t QUAL_FLAG_FMH_AXIS_ABSENT    = 0x80; // FMH minority axis unavailable -> contamination tier used the sketch-leakage fallback
 
     // support_tier sentinel: no genus-level reference available (singleton genus)
     static constexpr uint8_t TIER_NO_GENUS_REF = 0xFF;

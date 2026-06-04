@@ -324,6 +324,14 @@ int cmd_check(const std::filesystem::path& pack_path,
 
         ar.close();
 
+        // Contamination-axis provenance: when the FMH minority axis is absent
+        // (no FMHR section / not computed -> NaN), the quality tier falls back to
+        // the sketch-leakage axis. Flag it per genome so the axis used is
+        // auditable in both the on-disk QUAL record and the TSV.
+        for (auto& [acc, q] : quality)
+            if (std::isnan(q.fmh_minority_fraction))
+                q.qual_flags |= QualRecord::QUAL_FLAG_FMH_AXIS_ABSENT;
+
         write_qual_to_archive(gp, quality, acc_to_id);
 
         for (auto& [acc, q] : quality)

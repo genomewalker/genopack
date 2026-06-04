@@ -161,7 +161,10 @@ void run_pass_b(ICheckReader& pack,
             q.chargaff_parity            = r.chargaff_parity;
             q.spectral_gap               = r.spectral_gap;
             q.scale_kink                 = r.scale_kink;
-            q.fmh_minority_fraction      = r.fmh_minority_u8 / 255.0f;
+            // No FMHR section -> the FMH axis is unavailable; degrade to NaN so
+            // cache-served genomes match the FASTA-scan path (which leaves it NaN)
+            // and the axis-fallback flag fires consistently.
+            q.fmh_minority_fraction      = fmhr_rd ? (r.fmh_minority_u8 / 255.0f) : NAN;
             if (r.marker_completeness_u8 > 0)
                 q.marker_completeness = (r.marker_completeness_u8 - 1) / 254.0f;
             q.contamination_contig_outlier  = r.contig_outlier_u8  / 255.0f;
