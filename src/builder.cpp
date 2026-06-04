@@ -87,10 +87,14 @@ static BprmHeader make_bprm_header_from_cfg(const ArchiveBuilderConfig& cfg) {
 
 // ── --from-gpk verbatim reuse fast-path (§5.3, the reuse oracle) ──────────────
 // If the source archive's build_params_hash equals the params hash cfg would
-// produce, every section's derivation inputs (params + section set + upstream
-// content) are identical, so the whole archive can be repacked VERBATIM — no
-// decompress, no recompute. Returns false when params differ; the caller then
-// falls back to a full streaming rebuild (which recomputes the changed sections).
+// produce, params + section set are identical, so the whole archive can be
+// repacked VERBATIM — no decompress, no recompute. Corpus/content identity is
+// NOT proven by the hash (it is corpus-blind, see bprm.hpp); it holds here only
+// because this path repacks a SINGLE source archive and copies its own bodies,
+// so every derived section travels with the content it was derived from. Do NOT
+// reuse this oracle to justify copying derived sections across a corpus-changing
+// op (e.g. merge), where source and destination corpora differ. Returns false
+// when params differ; the caller then falls back to a full streaming rebuild.
 bool from_gpk_try_verbatim_reuse(const std::filesystem::path& source,
                                  const std::filesystem::path& output,
                                  const ArchiveBuilderConfig& cfg) {

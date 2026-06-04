@@ -34,10 +34,13 @@ inline std::vector<uint32_t> upstream_types(uint32_t type) {
         case SEC_SKCH: return {SEC_SHRD};
         case SEC_FMHR: return {SEC_SHRD};
         case SEC_KMRX: return {SEC_SHRD};
-        case SEC_GSTX: return {SEC_SKCH};
-        case SEC_GCOV: return {SEC_SKCH};
-        case SEC_FCOV: return {SEC_SKCH};
-        case SEC_QUAL: return {SEC_FMHR, SEC_GSTX, SEC_GCOV};
+        // GSTX/GCOV/FCOV bucket and key by taxonomy (CATL) and are computed from
+        // raw sequence (SHRD), not from SKCH alone — fold both so a taxonomy
+        // relabel with identical sketches/params still changes derivation_hash.
+        case SEC_GSTX: return {SEC_SKCH, SEC_SHRD, SEC_CATL};
+        case SEC_GCOV: return {SEC_SKCH, SEC_SHRD, SEC_CATL};
+        case SEC_FCOV: return {SEC_SKCH, SEC_SHRD, SEC_CATL};
+        case SEC_QUAL: return {SEC_FMHR, SEC_GSTX, SEC_GCOV, SEC_SHRD, SEC_CATL};
         case SEC_ACCX: case SEC_TAXN:
         case SEC_GIDX: case SEC_CIDX: return {SEC_CATL};
         default: return {};

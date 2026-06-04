@@ -8,7 +8,7 @@
 
 namespace genopack {
 
-// On-disk per-genome quality record (64 bytes, POD).
+// On-disk per-genome quality record (80 bytes, POD).
 // Layout is fixed; add fields by shrinking _reserved only.
 struct QualRecord {
     uint64_t genome_id;                     //  8
