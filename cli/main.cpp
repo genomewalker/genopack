@@ -48,11 +48,25 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <optional>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
 
 using namespace genopack;
+
+// Re-derive genus/quality sections on a merged archive (defined below; called by
+// the parallel build after the internal merge).
+static int cmd_reindex(const std::string& archive_path, bool force, bool build_txdb,
+                       const std::string& cidx_tsv, int cidx_threads,
+                       bool build_skch, int skch_threads,
+                       int skch_kmer, int skch_size, int skch_syncmer,
+                       std::vector<int> skch_kmers,
+                       bool skip_gidx,
+                       int repack_threads,
+                       bool build_gstx,
+                       bool build_qual,
+                       bool build_gcov);
 
 // ── genopack build ─────────────────────────────────────────────────────────────
 static int cmd_build(const std::string& input_tsv, const std::string& output_dir,
@@ -219,6 +233,21 @@ static int cmd_build(const std::string& input_tsv, const std::string& output_dir
     spdlog::info("All {} parts built, merging…", part_paths.size());
 
     merge_archives(part_paths, output_dir, /*remap_genome_ids=*/false, cfg.build_cidx);
+
+    // Per-part GSTX/GCOV/QUAL are partial aggregates (a genus can span parts), so
+    // merge drops them. Re-derive once on the merged corpus so the -p archive is
+    // complete and matches a single-process build.
+    if (cfg.build_gstx) {
+        spdlog::info("Re-deriving genus stats / quality on merged archive…");
+        cmd_reindex(output_dir, /*force=*/false, /*build_txdb=*/false,
+                    /*cidx_tsv=*/"", /*cidx_threads=*/8,
+                    /*build_skch=*/false, /*skch_threads=*/8,
+                    /*skch_kmer=*/-1, /*skch_size=*/-1, /*skch_syncmer=*/-1,
+                    /*skch_kmers=*/{}, /*skip_gidx=*/true,
+                    /*repack_threads=*/cfg.io_threads > 0 ? cfg.io_threads : 16,
+                    /*build_gstx=*/true, /*build_qual=*/true,
+                    /*build_gcov=*/cfg.build_gcov);
+    }
 
     // Cleanup temp parts only after a fully successful merge.
     std::error_code ec;
@@ -649,8 +678,8 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
                        bool skip_gidx = false,
                        int repack_threads = 16,
                        bool build_gstx = false,
-                       bool build_qual = true) {
-    (void)repack_threads;
+                       bool build_qual = true,
+                       bool build_gcov = false) {
     // Resolve .gpk path
     std::filesystem::path gpk = archive_path;
     if (!std::filesystem::exists(gpk) && gpk.extension() != ".gpk")
@@ -691,9 +720,11 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
     bool need_gstx_check = build_gstx && (!has_gstx_sec || force);
     bool has_qual_sec = !toc.find_by_type(SEC_QUAL).empty();
     bool need_qual_check = build_qual && build_gstx && (!has_qual_sec || force);
+    bool has_gcov_sec = !toc.find_by_type(SEC_GCOV).empty();
+    bool need_gcov = build_gcov && (!has_gcov_sec || force);
     bool need_metabundle = (tail->meta_bundle_offset() == 0);
 
-    if (!need_gidx && !need_txdb && !need_cidx && !need_skch && !need_gstx_check && !need_qual_check && !need_metabundle) {
+    if (!need_gidx && !need_txdb && !need_cidx && !need_skch && !need_gstx_check && !need_qual_check && !need_gcov && !need_metabundle) {
         spdlog::info("GIDX: already present (use --force to rebuild)");
         if (build_txdb) spdlog::info("TXDB: already present (use --force to rebuild)");
         if (!cidx_tsv.empty()) spdlog::info("CIDX: already present (use --force to rebuild)");
@@ -1425,6 +1456,31 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
         }
     }
 
+    // ── Rebuild GCOV/FCOV/FMHR (per-genus covariance + FMH) ─────────────────────
+    // Full shard rescan — needed after merge, which drops these derived sections.
+    // Computed before open_append so the reader sees the current, valid footer.
+    std::optional<GcovFcovFmhrResult> gcov_res;
+    if (need_gcov) {
+        if (toc.find_by_type(SEC_TAXN).empty()) {
+            spdlog::warn("GCOV: no TAXN section — skipping covariance rebuild");
+            need_gcov = false;
+        } else {
+            ArchiveReader ar;
+            ar.open(gpk);
+            gcov_res = build_gcov_fcov_fmhr(ar, repack_threads > 0 ? repack_threads : 8);
+            ar.close();
+            if (gcov_res->gcov.n_genera() == 0) {
+                spdlog::warn("GCOV: no genera produced — skipping");
+                need_gcov = false;
+                gcov_res.reset();
+            } else {
+                spdlog::info("GCOV: {} genera, {} families, {} fmhr genera",
+                             gcov_res->gcov.n_genera(), gcov_res->fcov.n_genera(),
+                             gcov_res->fmhr.n_genera());
+            }
+        }
+    }
+
     // Copy existing sections into new TocWriter (excluding rebuilt types if --force)
     TocWriter new_toc;
     for (const auto& s : toc.sections) {
@@ -1433,6 +1489,7 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
         if (force && need_cidx && s.type == SEC_CIDX) continue;
         if (force && need_gstx && s.type == SEC_GSTX) continue;
         if (force && need_qual && s.type == SEC_QUAL) continue;
+        if (force && need_gcov && (s.type == SEC_GCOV || s.type == SEC_FCOV || s.type == SEC_FMHR)) continue;
         new_toc.add_section(s);
     }
 
@@ -1491,6 +1548,17 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
                      qual_sd.file_offset, qual_sd.compressed_size, qual_sd.item_count);
     }
 
+    if (need_gcov && gcov_res) {
+        SectionDesc gcov_sd = gcov_res->gcov.finalize(writer, next_section_id++);
+        new_toc.add_section(gcov_sd);
+        spdlog::info("GCOV: written at offset {}, {} bytes ({} genera)",
+                     gcov_sd.file_offset, gcov_sd.compressed_size, gcov_sd.item_count);
+        if (gcov_res->fcov.n_genera() > 0)
+            new_toc.add_section(gcov_res->fcov.finalize(writer, next_section_id++, SEC_FCOV));
+        if (gcov_res->fmhr.n_genera() > 0)
+            new_toc.add_section(gcov_res->fmhr.finalize(writer, next_section_id++));
+    }
+
     // Stamp content checksums on the newly appended sections so verify can
     // validate them (mirrors build/merge). Read from the gpk itself — sections
     // were appended at absolute offsets; only_if_zero leaves the large
@@ -1507,6 +1575,31 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
                      catalog_root_id, accession_root_id, tombstone_root_id);
 
     writer.flush();
+
+    // If this reindex restored the genus-stats set that merge dropped (GSTX +
+    // GCOV both present now), clear the FileHeader STATS_STALE marker so readers
+    // stop warning about absent genus stats.
+    {
+        bool has_gstx_now = false, has_gcov_now = false;
+        for (const auto& s : new_toc.sections()) {
+            if (s.type == SEC_GSTX) has_gstx_now = true;
+            if (s.type == SEC_GCOV) has_gcov_now = true;
+        }
+        if (has_gstx_now && has_gcov_now) {
+            int ffd = ::open(gpk.c_str(), O_RDWR);
+            if (ffd >= 0) {
+                uint64_t flags = 0;
+                if (::pread(ffd, &flags, sizeof(flags), offsetof(FileHeader, flags))
+                        == static_cast<ssize_t>(sizeof(flags))
+                    && (flags & FH_FLAG_STATS_STALE)) {
+                    flags &= ~FH_FLAG_STATS_STALE;
+                    ::pwrite(ffd, &flags, sizeof(flags), offsetof(FileHeader, flags));
+                    ::fsync(ffd);
+                }
+                ::close(ffd);
+            }
+        }
+    }
 
     spdlog::info("Reindex complete: gen {} -> {}", prev_generation, prev_generation + 1);
     return 0;
@@ -2991,6 +3084,8 @@ int main(int argc, char** argv) {
     reindex_cmd->add_flag("--no-gstx", reindex_no_gstx, "Skip GSTX genus-stats index build");
     bool reindex_no_qual = false;
     reindex_cmd->add_flag("--no-qual", reindex_no_qual, "Skip QUAL per-genome quality score build");
+    bool reindex_gcov = false;
+    reindex_cmd->add_flag("--gcov", reindex_gcov, "Rebuild per-genus covariance (GCOV/FCOV/FMHR) — full shard rescan");
     reindex_cmd->add_flag("--txdb", reindex_txdb, "Build taxonomy tree (TXDB) from TAXN lineage strings");
     reindex_cmd->add_option("--cidx", reindex_cidx_tsv, "Build contig accession index (CIDX) from build TSV (accession<TAB>taxonomy<TAB>file_path)");
     reindex_cmd->add_option("--cidx-threads", reindex_cidx_threads, "Threads for parallel FASTA decompression (default: 8)");
@@ -3018,7 +3113,8 @@ int main(int argc, char** argv) {
                               reindex_skch, reindex_skch_threads,
                               reindex_skch_kmer, reindex_skch_size, reindex_skch_syncmer,
                               std::move(reindex_skch_kmers),
-                              reindex_no_gidx, 16, !reindex_no_gstx, !reindex_no_qual));
+                              reindex_no_gidx, 16, !reindex_no_gstx, !reindex_no_qual,
+                              reindex_gcov));
     });
 
     // genopack repack

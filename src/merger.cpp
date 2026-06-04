@@ -197,6 +197,18 @@ void merge_archives(const std::vector<std::filesystem::path>& inputs,
         old_to_new_secid[job.archive_idx][static_cast<uint32_t>(job.sd->section_id)] =
             static_cast<uint32_t>(job.new_sd.section_id);
 
+    // Derived genus/quality sections (GSTX/GCOV/FCOV/FMHR/QUAL) are corpus-wide
+    // aggregates / per-genome scores that cannot be concatenated across inputs
+    // (a genus can span inputs, so each input's stats are partial). They are
+    // dropped by merge and must be re-derived on the merged archive; mark the
+    // header so readers and downstream tools know the genus stats are stale.
+    bool dropped_quality = false;
+    for (const auto& a : archives) {
+        for (uint32_t qt : {SEC_GSTX, SEC_GCOV, SEC_FCOV, SEC_FMHR, SEC_QUAL})
+            if (!a.toc.find_by_type(qt).empty()) { dropped_quality = true; break; }
+        if (dropped_quality) break;
+    }
+
     AppendWriter writer;
     writer.create(out_path);
     {
@@ -209,7 +221,7 @@ void merge_archives(const std::vector<std::filesystem::path>& inputs,
         fhdr.file_uuid_lo    = t ^ 0xdeadbeefcafe0001ULL;
         fhdr.file_uuid_hi    = (t << 17) ^ 0x1234567890abcdefULL;
         fhdr.created_at_unix = t;
-        fhdr.flags           = 0;
+        fhdr.flags           = dropped_quality ? FH_FLAG_STATS_STALE : 0;
         std::memset(fhdr.reserved, 0, sizeof(fhdr.reserved));
         writer.append(&fhdr, sizeof(fhdr));
     }
@@ -799,6 +811,11 @@ void merge_archives(const std::vector<std::filesystem::path>& inputs,
 
     ::unlink(meta_tmp_path.data());
     spdlog::info("Merge complete: {} inputs -> {}", inputs.size(), out_path.string());
+    if (dropped_quality)
+        spdlog::warn("merge: GSTX/GCOV/FCOV/FMHR/QUAL were dropped — genus/family "
+                     "aggregates and per-genome quality cannot be concatenated. "
+                     "Re-derive on the output before scoring: "
+                     "genopack reindex {} --gcov", out_path.string());
 }
 
 } // namespace genopack

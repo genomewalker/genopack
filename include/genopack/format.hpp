@@ -72,6 +72,15 @@ static_assert(sizeof(FileHeader) == 256);
 static_assert(offsetof(FileHeader, endian_abi_tag) == 40);
 static_assert(offsetof(FileHeader, dir_back_offset) == 88);
 
+// FileHeader.flags bits.
+// Set by merge when it drops the derived genus/quality sections
+// (GSTX/GCOV/FCOV/FMHR/QUAL): those are corpus-wide aggregates / per-genome
+// scores that cannot be concatenated across inputs (a genus can span inputs, so
+// each input's stats are partial). A merged archive carries this marker until
+// the sections are re-derived (genopack reindex --gcov). Readers may warn before
+// using genus stats while it is set.
+static constexpr uint64_t FH_FLAG_STATS_STALE = 0x1;
+
 // ── SectionDesc: 112 bytes (GPK3) ─────────────────────────────────────────────
 // Offsets 0..79 are byte-identical to GPK2; the three GPK3 fields are appended.
 // `checksum` is the per-section content_xxh128 (P1). derivation_hash /
