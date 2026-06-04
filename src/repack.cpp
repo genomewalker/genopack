@@ -1,6 +1,7 @@
 #include <genopack/repack.hpp>
 #include <genopack/accx.hpp>
 #include <genopack/catalog.hpp>
+#include <genopack/checksum.hpp>
 #include <genopack/cidx.hpp>
 #include <genopack/format.hpp>
 #include <genopack/gidx.hpp>
@@ -176,7 +177,8 @@ void repack_archive(const std::filesystem::path& input_gpk,
     std::filesystem::path out_path = output_gpk;
     if (out_path.extension() != ".gpk")
         out_path = std::filesystem::path(out_path.string() + ".gpk");
-    std::filesystem::create_directories(out_path.parent_path());
+    if (!out_path.parent_path().empty())
+        std::filesystem::create_directories(out_path.parent_path());
 
     AppendWriter app_writer;
     app_writer.create(out_path);
@@ -241,7 +243,7 @@ void repack_archive(const std::filesystem::path& input_gpk,
             sd.item_count        = frozen.n_genomes;
             sd.aux0              = wt.shard_id;
             sd.aux1              = 0;
-            std::memset(sd.checksum, 0, sizeof(sd.checksum));
+            checksum_of(frozen.bytes.data(), frozen.bytes.size(), sd.checksum);
             new_toc.add_section(sd);
         }
     });
