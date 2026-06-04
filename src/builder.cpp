@@ -70,11 +70,105 @@ static BprmHeader make_bprm_header_from_cfg(const ArchiveBuilderConfig& cfg) {
     bp.taxonomy_rank      = cfg.taxonomy_rank.empty()
         ? static_cast<uint8_t>('g')
         : static_cast<uint8_t>(cfg.taxonomy_rank[0]);
+    uint32_t bf = 0;
+    if (cfg.build_cidx)            bf |= BPRM_F_CIDX;
+    if (cfg.build_sketch)          bf |= BPRM_F_SKETCH;
+    if (cfg.build_gstx)            bf |= BPRM_F_GSTX;
+    if (cfg.build_gcov)            bf |= BPRM_F_GCOV;
+    if (cfg.taxonomy_group)        bf |= BPRM_F_TAXGROUP;
+    if (!cfg.markers_path.empty()) bf |= BPRM_F_MARKERS;
+    bp.build_flags = bf;
     bp.magic       = SEC_BPRM;
     bp.version     = 1;
     bp.header_size = sizeof(BprmHeader);
     bp.params_hash = bprm_compute_params_hash(bp);
     return bp;
+}
+
+// ── --from-gpk verbatim reuse fast-path (§5.3, the reuse oracle) ──────────────
+// If the source archive's build_params_hash equals the params hash cfg would
+// produce, every section's derivation inputs (params + section set + upstream
+// content) are identical, so the whole archive can be repacked VERBATIM — no
+// decompress, no recompute. Returns false when params differ; the caller then
+// falls back to a full streaming rebuild (which recomputes the changed sections).
+bool from_gpk_try_verbatim_reuse(const std::filesystem::path& source,
+                                 const std::filesystem::path& output,
+                                 const ArchiveBuilderConfig& cfg) {
+    MmapFileReader src;
+    src.open(source);
+    if (src.size() < sizeof(FileHeader)) return false;
+    const auto* sfh = src.ptr_at<FileHeader>(0);
+    if (sfh->magic != GPK_MAGIC) return false;
+    // The source must record its build params for an equivalence proof.
+    if (sfh->build_params_hash == 0) return false;
+    const uint64_t new_params = make_bprm_header_from_cfg(cfg).params_hash;
+    if (sfh->build_params_hash != new_params) return false;   // params/section-set changed
+
+    Toc toc = TocReader::read(src);
+
+    std::filesystem::path partial = output;
+    partial += ".partial";
+    if (!output.parent_path().empty())
+        std::filesystem::create_directories(output.parent_path());
+
+    std::random_device rd;
+    const uint64_t new_uuid_lo = (static_cast<uint64_t>(rd()) << 32) | rd();
+    const uint64_t new_uuid_hi = (static_cast<uint64_t>(rd()) << 32) | rd();
+    const uint64_t new_gen     = sfh->generation + 1;
+
+    AppendWriter w;
+    w.create(partial);
+    {
+        FileHeader fh{};
+        fh.magic             = GPK_MAGIC;
+        fh.version_major     = FORMAT_MAJOR;
+        fh.version_minor     = FORMAT_MINOR;
+        fh.file_uuid_lo      = new_uuid_lo;
+        fh.file_uuid_hi      = new_uuid_hi;
+        fh.created_at_unix   = static_cast<uint64_t>(std::time(nullptr));
+        fh.endian_abi_tag    = ENDIAN_ABI_TAG;
+        fh.build_params_hash = sfh->build_params_hash;
+        fh.generation        = new_gen;
+        fh.shard_set_uuid_lo = sfh->shard_set_uuid_lo;
+        fh.shard_set_uuid_hi = sfh->shard_set_uuid_hi;
+        fh.shard_id          = sfh->shard_id;
+        w.append(&fh, sizeof(fh));
+    }
+
+    // Copy every section body verbatim; bodies use section-relative offsets, so a
+    // new 8-aligned start is valid (the directory is the only absolute reference,
+    // and it is rewritten below). content_xxh128 / derivation_hash /
+    // semantic_schema_hash carry over unchanged because the bytes are unchanged.
+    TocWriter tw;
+    for (const auto& sd : toc.sections) {
+        if (sd.compressed_size == 0) { tw.add_section(sd); continue; }
+        if (sd.file_offset > src.size() ||
+            sd.compressed_size > src.size() - sd.file_offset)
+            throw std::runtime_error("from-gpk reuse: section out of bounds in source");
+        w.align(8);
+        SectionDesc nd = sd;
+        nd.file_offset = w.current_offset();
+        w.append(src.data() + sd.file_offset, sd.compressed_size);
+        tw.add_section(nd);
+    }
+
+    tw.finalize(w, new_gen,
+                toc.header.live_genome_count, toc.header.total_genome_count,
+                /*prev_toc_offset=*/0,
+                toc.header.catalog_root_section_id,
+                toc.header.accession_root_section_id,
+                toc.header.tombstone_root_section_id,
+                new_uuid_lo, new_uuid_hi);
+    w.flush();
+    w.close();
+    std::filesystem::rename(partial, output);
+    if (!output.parent_path().empty()) {
+        int dfd = ::open(output.parent_path().c_str(), O_RDONLY | O_DIRECTORY);
+        if (dfd >= 0) { ::fsync(dfd); ::close(dfd); }
+    }
+    spdlog::info("from-gpk: params unchanged — verbatim repack of {} section(s), no recompute",
+                 toc.sections.size());
+    return true;
 }
 
 // ── Shard grouping helpers ────────────────────────────────────────────────────

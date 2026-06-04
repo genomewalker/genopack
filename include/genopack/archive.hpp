@@ -264,6 +264,13 @@ struct ArchiveBuilderConfig {
     std::filesystem::path from_gpk_source;  // non-empty: rebuild by streaming decoded sequence from this .gpk
 };
 
+// `build --from-gpk` fast-path: if the source's build params equal what cfg
+// would produce, repack it verbatim (no decompress/recompute) into output and
+// return true. Returns false if params differ — caller does a streaming rebuild.
+bool from_gpk_try_verbatim_reuse(const std::filesystem::path& source,
+                                 const std::filesystem::path& output,
+                                 const ArchiveBuilderConfig& cfg);
+
 class ArchiveBuilder {
 public:
     using Config = ArchiveBuilderConfig;

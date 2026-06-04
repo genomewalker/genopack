@@ -33,9 +33,23 @@ struct BprmHeader {                  // 128 bytes — explicit offsets, no natur
     uint8_t  taxonomy_rank;          //  84  'g' / 'f'
     uint8_t  _pad0[3];               //  85
     uint64_t params_hash;            //  88  XXH3_64 of this struct, params_hash field zeroed
-    uint8_t  _reserved[32];          //  96  pad to 128
+    uint32_t build_flags;            //  96  section-set toggles (BprmBuildFlags)
+    uint8_t  _reserved[28];          // 100  pad to 128
 };
 static_assert(sizeof(BprmHeader) == 128);
+
+// Section-set toggles folded into build_flags (and thus params_hash): two
+// archives with the same params_hash produce the same section SET, so a verbatim
+// --from-gpk repack can reuse one for the other without losing/keeping a section
+// the new flags would have dropped/added.
+enum BprmBuildFlags : uint32_t {
+    BPRM_F_CIDX     = 1u << 0,
+    BPRM_F_SKETCH   = 1u << 1,
+    BPRM_F_GSTX     = 1u << 2,
+    BPRM_F_GCOV     = 1u << 3,
+    BPRM_F_TAXGROUP = 1u << 4,
+    BPRM_F_MARKERS  = 1u << 5,
+};
 static_assert(offsetof(BprmHeader, sketch_seed) == 56);
 static_assert(offsetof(BprmHeader, params_hash) == 88);
 

@@ -99,6 +99,10 @@ static int cmd_build(const std::string& input_tsv, const std::string& output_dir
         // (sequential reads) instead of opening per-genome FASTA files on NFS.
         // Single process — parallelism is within the worker pool, no merge needed.
         cfg.from_gpk_source = from_gpk;
+        // Reuse oracle: if params are unchanged, repack verbatim (no recompute).
+        if (genopack::from_gpk_try_verbatim_reuse(from_gpk, output_dir, cfg))
+            return 0;
+        // Params changed — recompute by streaming decoded sequence from the shards.
         ArchiveBuilder builder(output_dir, cfg);
         builder.add_from_gpk(from_gpk);
         builder.finalize();
