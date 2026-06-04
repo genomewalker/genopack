@@ -52,6 +52,18 @@ namespace genopack {
 // Build the canonical BprmHeader from the config. Pure function of cfg, so it is
 // computed once at header-write time (for FileHeader.build_params_hash) and again
 // at section-write time (for the BPRM body) — guaranteeing the two agree.
+// Resolve the micro-genus threshold: genera with fewer members than this are
+// bin-packed into combined shards and get no GSTX/GCOV/FMHR consensus model.
+// configured==0 means auto — scale with corpus size so small corpora model
+// nearly every genus while huge corpora bound shard fragmentation.
+static uint32_t resolve_micro_threshold(uint32_t configured, uint64_t n_genomes) {
+    if (configured != 0) return configured;
+    if (n_genomes <=   50000) return 4;
+    if (n_genomes <=  500000) return 8;
+    if (n_genomes <= 2000000) return 16;
+    return 32;
+}
+
 static BprmHeader make_bprm_header_from_cfg(const ArchiveBuilderConfig& cfg) {
     BprmHeader bp{};
     bp.sketch_kmer_size = static_cast<uint32_t>(cfg.sketch_kmer_size);
@@ -1580,7 +1592,11 @@ struct ArchiveBuilder::Impl {
         // Micro-genera (below threshold) are bin-packed together to avoid
         // thousands of tiny shards from singleton-genus inputs.
         if (cfg.taxonomy_group) {
-            const uint32_t micro_genome_threshold = cfg.micro_genus_threshold;
+            const uint32_t micro_genome_threshold =
+                resolve_micro_threshold(cfg.micro_genus_threshold, original_total_records);
+            if (cfg.micro_genus_threshold == 0)
+                spdlog::info("micro-genus-threshold: auto -> {} ({} genomes)",
+                             micro_genome_threshold, original_total_records);
 
             std::vector<std::pair<std::string, std::vector<ChunkItem>>> micro_queue;
             for (auto& [key, bucket] : taxon_buckets) {

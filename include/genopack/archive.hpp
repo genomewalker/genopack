@@ -252,10 +252,11 @@ struct ArchiveBuilderConfig {
     bool     build_sketch        = false;  // compute OPH sketches and write SKCH section
     bool     build_gstx          = true;   // build GSTX genus-stats index (needs taxonomy_group + build_sketch)
     bool     build_gcov          = true;   // build GCOV per-genus covariance eigenbasis (needs build_gstx)
-    uint32_t micro_genus_threshold = 8;    // genera with fewer members are bin-packed into combined
-                                           // shards and get NO GSTX/GCOV/FMHR consensus model; lower =
-                                           // more genera modeled (better contamination/quality coverage)
-                                           // at the cost of more, smaller shards
+    uint32_t micro_genus_threshold = 0;    // min genus members for a dedicated shard + GSTX/GCOV/FMHR
+                                           // model; smaller genera are bin-packed and unmodeled.
+                                           // 0 = auto (scales with corpus: 4 if <=50k genomes, 8 if
+                                           // <=500k, 16 if <=2M, else 32). Lower = more genera modeled,
+                                           // more shards
     int      sketch_kmer_size    = 16;     // k-mer size for OPH sketching (single-k path)
     std::vector<int> sketch_kmer_sizes;   // if size > 1: write multi-k SKCH v2 (overrides sketch_kmer_size)
     int      sketch_size         = 10000;  // number of OPH bins
