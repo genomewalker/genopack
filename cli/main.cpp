@@ -1,4 +1,8 @@
 #include "check/run_check.hpp"
+#include "check/pass_b.hpp"
+#include <genopack/score_bin.hpp>
+#include <genopack/fmhr.hpp>
+#include <set>
 #include "bench/bench_grid.hpp"
 #include <genopack/sim.hpp>
 #include <genopack/markers_build.hpp>
@@ -594,6 +598,98 @@ static int cmd_rm(const std::string& archive_dir,
     return 0;
 }
 
+// Per-genus FMH null-background contamination scorer — the genus-band signal.
+// Computes fmh_minority for EVERY live genome (per-contig FracMinHash containment
+// vs its own genus FMHR ref + same-family candidate genus refs), then scores the
+// DELTA from the genus's own baseline as a robust z (median + MAD). Absolute
+// fmh_minority thresholds fail because closely-related genera share a conserved-
+// core containment background (~11.6% E.coli/Salmonella), so only the per-genus
+// delta is meaningful. Sketch-based (contigs >=10kb) -> works on fragmented MAGs
+// where the per-contig TNF/CCO axis is dark. Builds on the validated
+// score_bin_fmh_containment + SEC_FMHR refs; the baseline is robust to a
+// contaminated minority because median/MAD ignore the tail.
+static void compute_fmh_minority_z(const std::filesystem::path& gpk,
+                                   std::unordered_map<std::string, float>& fmh_raw,
+                                   std::unordered_map<std::string, float>& fmh_z,
+                                   std::unordered_map<std::string, float>& genus_median) {
+    ArchiveReader ar;
+    ar.open(gpk);
+    std::unordered_map<std::string, GenomeId> acc_gid;
+    ar.scan_genome_accessions([&](std::string_view a, GenomeId g) {
+        if (!ar.is_deleted(g)) acc_gid.emplace(std::string(a), g);
+    });
+    auto rank = [](std::string_view tax, const char* pre) -> std::string {
+        auto p = tax.find(pre);
+        if (p == std::string_view::npos) return {};
+        auto e = tax.find(';', p);
+        std::string s(tax.substr(p, e == std::string_view::npos ? tax.size() - p : e - p));
+        return s == std::string(pre) ? std::string{} : s;
+    };
+    std::unordered_map<std::string, std::string> acc_genus, acc_family;
+    std::unordered_map<std::string, std::set<std::string>> family_genera;
+    ar.scan_taxonomy([&](std::string_view a, std::string_view tax) {
+        std::string acc(a);
+        if (!acc_gid.count(acc)) return;
+        std::string g = rank(tax, "g__"), f = rank(tax, "f__");
+        if (g.empty()) return;
+        acc_genus[acc] = g;
+        if (!f.empty()) { acc_family[acc] = f; family_genera[f].insert(g); }
+    });
+    std::unordered_map<std::string, FmhrView> host;
+    for (auto& [acc, g] : acc_genus) {
+        if (host.count(g)) continue;
+        auto v = ar.fmhr_for_genus(g);
+        if (v.valid()) host[g] = v;
+    }
+    std::unordered_map<std::string, std::vector<FmhrView>> fam_cands;
+    for (auto& [f, genera] : family_genera)
+        for (auto& g : genera) { auto it = host.find(g); if (it != host.end()) fam_cands[f].push_back(it->second); }
+
+    std::vector<std::string> accs;
+    for (auto& [acc, g] : acc_genus) if (host.count(g)) accs.push_back(acc);
+    std::sort(accs.begin(), accs.end());
+    auto egs = ar.batch_fetch_by_accessions(accs);
+
+    std::unordered_map<std::string, std::vector<float>> by_genus;
+    for (size_t i = 0; i < accs.size(); ++i) {
+        if (!egs[i]) continue;
+        const std::string& acc = accs[i];
+        const FmhrView& h = host[acc_genus[acc]];
+        std::vector<FmhrView> refs{ h };
+        auto fit = acc_family.find(acc);
+        if (fit != acc_family.end())
+            for (auto& v : fam_cands[fit->second])
+                if (v.genus_hash != h.genus_hash) refs.push_back(v);
+        if (refs.size() < 2) continue;                       // no foreign candidate genus in pack
+        auto contigs = genopack::check::parse_fasta(egs[i]->fasta);
+        std::vector<std::string_view> seqs;
+        seqs.reserve(contigs.size());
+        for (auto& c : contigs) seqs.emplace_back(c.seq);
+        float v = score_bin_fmh_containment(seqs, h.genus_hash, refs, 21, 125);
+        if (!std::isnan(v)) { fmh_raw[acc] = v; by_genus[acc_genus[acc]].push_back(v); }
+    }
+    // Per-genus robust baseline: z = (fmh - median) / (1.4826 * MAD).
+    std::unordered_map<std::string, std::pair<float, float>> base;   // genus -> (median, mad)
+    for (auto& [g, vals] : by_genus) {
+        if (vals.size() < 3) continue;
+        std::vector<float> v = vals;
+        std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+        float med = v[v.size() / 2];
+        std::vector<float> dev;
+        dev.reserve(v.size());
+        for (float x : vals) dev.push_back(std::fabs(x - med));
+        std::nth_element(dev.begin(), dev.begin() + dev.size() / 2, dev.end());
+        float mad = std::max(dev[dev.size() / 2], 1e-4f);
+        base[g] = { med, mad };
+    }
+    for (auto& [acc, v] : fmh_raw) {
+        auto bit = base.find(acc_genus[acc]);
+        if (bit == base.end()) continue;
+        genus_median[acc] = bit->second.first;
+        fmh_z[acc] = (v - bit->second.first) / (1.4826f * bit->second.second);
+    }
+}
+
 // ── genopack decontaminate ──────────────────────────────────────────────────────
 // Iteratively remove contaminated genomes so neither the DB nor its consensus
 // models carry contamination. Each round rebuilds the genus/family models from the
@@ -602,8 +698,9 @@ static int cmd_rm(const std::string& archive_dir,
 // broken by construction. CCO (per-contig outlier vs the genus covariance) is the
 // gate: it is reference-internal, so it flags foreign contigs whether or not the
 // contaminant's genus is in the DB.
-static int cmd_decontaminate(const std::string& archive_path, float max_leak, float max_cco,
+static int cmd_decontaminate(const std::string& archive_path, float max_fmh_z, float min_delta,
                              int max_iters, int threads, bool dry_run) {
+    (void)threads;
     std::filesystem::path gpk = archive_path;
     if (!std::filesystem::exists(gpk) && gpk.extension() != ".gpk")
         gpk = std::filesystem::path(gpk.string() + ".gpk");
@@ -615,61 +712,46 @@ static int cmd_decontaminate(const std::string& archive_path, float max_leak, fl
     size_t total_removed = 0;
     bool converged = false;
     for (int it = 1; it <= max_iters; ++it) {
-        // Rebuild genus/family models (GSTX/GCOV/FMHR) from live genomes only.
-        cmd_reindex(gpk.string(), /*force=*/true, /*build_txdb=*/false, /*cidx_tsv=*/"",
-                    /*cidx_threads=*/threads, /*build_skch=*/false, /*skch_threads=*/threads,
-                    /*skch_kmer=*/-1, /*skch_size=*/-1, /*skch_syncmer=*/-1, /*skch_kmers=*/{},
-                    /*skip_gidx=*/true, /*repack_threads=*/threads,
-                    /*build_gstx=*/true, /*build_qual=*/false, /*build_gcov=*/true);
+        // Score against the EXISTING FMHR refs — no per-iteration rebuild. The
+        // per-genus median+MAD baseline is itself robust to a contaminated minority
+        // (the tail does not move the median), so rebuilding refs is unnecessary;
+        // rebuilding from the still-dirty live set would fold contaminant k-mers
+        // into the host ref and mask detection. compute_fmh_minority_z already
+        // excludes tombstoned genomes (live-only).
 
-        // Score per-genome contamination (CCO vs the freshly-cleaned models).
-        genopack::check::cmd_check(gpk, /*genomes_file=*/{}, threads, /*min_genus_size=*/3,
-                                   /*leakage_threshold=*/0.05f, /*output=*/{},
-                                   /*recompute=*/true, /*markers_path=*/{});
+        // Genus-band contamination: per-genus FMH minority, delta-from-baseline z.
+        std::unordered_map<std::string, float> fmh_raw, fmh_z, gmed;
+        compute_fmh_minority_z(gpk, fmh_raw, fmh_z, gmed);
 
-        // Collect live genomes whose per-contig contamination exceeds the gate.
-        std::vector<std::string> contaminated;
-        {
-            ArchiveReader ar;
-            ar.open(gpk);
-            std::unordered_map<GenomeId, std::string> gid2acc;
-            ar.scan_genome_accessions([&](std::string_view a, GenomeId g) {
-                if (!ar.is_deleted(g)) gid2acc.emplace(g, std::string(a));
-            });
-            ar.scan_qual([&](const QualRecord& r) {
-                // leakage_residual (multi-k containment power-law misfit) is
-                // sketch-based, so it catches contamination on fragmented MAGs
-                // where the per-contig CCO axis is dark (GCOV needs >=20kb contigs).
-                // CCO is the sharper signal when long contigs exist — gate on either.
-                const float leak = r.leakage_residual;                 // NaN => not flagged
-                const float cco  = r.contig_outlier_u8 / 255.0f;
-                if (leak > max_leak || cco > max_cco) {
-                    auto i = gid2acc.find(r.genome_id);
-                    if (i != gid2acc.end()) contaminated.push_back(i->second);
-                }
-            });
-        }
+        std::vector<std::pair<std::string, float>> flagged;
+        for (auto& [acc, z] : fmh_z)
+            if (z > max_fmh_z && (fmh_raw[acc] - gmed[acc]) > min_delta)
+                flagged.push_back({ acc, z });
+        std::sort(flagged.begin(), flagged.end(),
+                  [](auto& a, auto& b) { return a.second > b.second; });
 
-        spdlog::info("decontaminate iter {}: {} genome(s) exceed leakage {:.3f} or CCO {:.3f}",
-                     it, contaminated.size(), max_leak, max_cco);
-        if (contaminated.empty()) { converged = true; break; }
+        spdlog::info("decontaminate iter {}: scored {} genomes; {} exceed FMH z>{:.1f} & delta>{:.3f}",
+                     it, fmh_z.size(), flagged.size(), max_fmh_z, min_delta);
+        if (flagged.empty()) { converged = true; break; }
         if (dry_run) {
-            for (const auto& a : contaminated) spdlog::info("  would remove: {}", a);
+            for (auto& [acc, z] : flagged)
+                spdlog::info("  would remove: {}  fmh_minority={:.3f} genus_baseline={:.3f} z={:.1f}",
+                             acc, fmh_raw[acc], gmed[acc], z);
             spdlog::info("decontaminate: dry-run — {} genome(s) would be removed; no changes made",
-                         contaminated.size());
+                         flagged.size());
             return 0;
         }
-        cmd_rm(gpk.string(), contaminated);
-        total_removed += contaminated.size();
+        std::vector<std::string> rm_accs;
+        rm_accs.reserve(flagged.size());
+        for (auto& [acc, z] : flagged) rm_accs.push_back(acc);
+        cmd_rm(gpk.string(), rm_accs);
+        total_removed += rm_accs.size();
     }
 
-    // If we stopped on the iteration cap (not convergence) after removing genomes,
-    // rebuild once more so the final models exclude the last batch too.
-    if (!dry_run && total_removed > 0 && !converged)
-        cmd_reindex(gpk.string(), true, false, "", threads, false, threads, -1, -1, -1, {},
-                    true, threads, true, false, true);
-
-    spdlog::info("decontaminate: {} — removed {} contaminated genome(s); models rebuilt from the clean set",
+    if (!dry_run && total_removed > 0)
+        spdlog::info("decontaminate: run 'genopack gcov {}' to rebuild genus refs from the clean set",
+                     gpk.string());
+    spdlog::info("decontaminate: {} — removed {} contaminated genome(s)",
                  converged ? "converged" : "stopped at iteration cap", total_removed);
     return 0;
 }
@@ -3311,25 +3393,24 @@ int main(int argc, char** argv) {
         "Iteratively remove contaminated genomes (per-contig CCO above a threshold), rebuilding "
         "genus/family models from the survivors each round so the DB and its consensus stay clean.");
     std::string decon_archive;
-    float decon_max_leak = 1.0f;     // off by default — noisy on fragmented genomes (opt-in)
-    float decon_max_cco  = 0.15f;    // precise; fires on genomes with >=20kb contigs
-    int   decon_iters    = 5;
-    int   decon_threads  = 8;
-    bool  decon_dry      = false;
+    float decon_max_fmh_z = 5.0f;    // robust SDs above the genus FMH baseline
+    float decon_min_delta = 0.02f;   // absolute fmh_minority above baseline (guards tight genera)
+    int   decon_iters     = 5;
+    int   decon_threads   = 8;
+    bool  decon_dry       = false;
     decon_cmd->add_option("archive", decon_archive, "Path to .gpk archive")->required();
-    decon_cmd->add_option("--max-cco", decon_max_cco,
-        "Remove genomes whose per-contig outlier (CCO) exceeds this — precise, but only fires on "
-        "genomes with >=20kb contigs (default: 0.15)");
-    decon_cmd->add_option("--max-leakage", decon_max_leak,
-        "Also remove genomes whose containment-leakage residual exceeds this — works on fragmented "
-        "MAGs where CCO is dark, but noisy (clean ~0.085, separates poorly below ~10%% contamination; "
-        "use --dry-run to tune). Default 1.0 = off.");
+    decon_cmd->add_option("--max-fmh-z", decon_max_fmh_z,
+        "Remove genomes whose per-genus FMH-minority z (delta-from-genus-baseline, robust median+MAD) "
+        "exceeds this — the genus-band signal, fragmentation-robust (default: 5.0)");
+    decon_cmd->add_option("--min-delta", decon_min_delta,
+        "Also require fmh_minority to exceed the genus baseline by this absolute amount (guards "
+        "tight-baseline genera from z blow-up; default: 0.02)");
     decon_cmd->add_option("--max-iters", decon_iters, "Max decontamination rounds (default: 5)");
     decon_cmd->add_option("-t,--threads", decon_threads, "Threads (default: 8)");
     decon_cmd->add_flag("--dry-run", decon_dry,
-        "Report what would be removed without modifying the archive");
+        "Report what would be removed (with fmh/baseline/z) without modifying the archive");
     decon_cmd->callback([&]() {
-        std::exit(cmd_decontaminate(decon_archive, decon_max_leak, decon_max_cco,
+        std::exit(cmd_decontaminate(decon_archive, decon_max_fmh_z, decon_min_delta,
                                     decon_iters, decon_threads, decon_dry));
     });
 
