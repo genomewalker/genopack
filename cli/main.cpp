@@ -594,6 +594,86 @@ static int cmd_rm(const std::string& archive_dir,
     return 0;
 }
 
+// ── genopack decontaminate ──────────────────────────────────────────────────────
+// Iteratively remove contaminated genomes so neither the DB nor its consensus
+// models carry contamination. Each round rebuilds the genus/family models from the
+// LIVE (non-tombstoned) genomes, so the consensus gets cleaner every pass and the
+// circularity — contaminated members inflating the model that scores them — is
+// broken by construction. CCO (per-contig outlier vs the genus covariance) is the
+// gate: it is reference-internal, so it flags foreign contigs whether or not the
+// contaminant's genus is in the DB.
+static int cmd_decontaminate(const std::string& archive_path, float max_leak, float max_cco,
+                             int max_iters, int threads, bool dry_run) {
+    std::filesystem::path gpk = archive_path;
+    if (!std::filesystem::exists(gpk) && gpk.extension() != ".gpk")
+        gpk = std::filesystem::path(gpk.string() + ".gpk");
+    if (!std::filesystem::exists(gpk)) {
+        spdlog::error("decontaminate: archive not found: {}", archive_path);
+        return 1;
+    }
+
+    size_t total_removed = 0;
+    bool converged = false;
+    for (int it = 1; it <= max_iters; ++it) {
+        // Rebuild genus/family models (GSTX/GCOV/FMHR) from live genomes only.
+        cmd_reindex(gpk.string(), /*force=*/true, /*build_txdb=*/false, /*cidx_tsv=*/"",
+                    /*cidx_threads=*/threads, /*build_skch=*/false, /*skch_threads=*/threads,
+                    /*skch_kmer=*/-1, /*skch_size=*/-1, /*skch_syncmer=*/-1, /*skch_kmers=*/{},
+                    /*skip_gidx=*/true, /*repack_threads=*/threads,
+                    /*build_gstx=*/true, /*build_qual=*/false, /*build_gcov=*/true);
+
+        // Score per-genome contamination (CCO vs the freshly-cleaned models).
+        genopack::check::cmd_check(gpk, /*genomes_file=*/{}, threads, /*min_genus_size=*/3,
+                                   /*leakage_threshold=*/0.05f, /*output=*/{},
+                                   /*recompute=*/true, /*markers_path=*/{});
+
+        // Collect live genomes whose per-contig contamination exceeds the gate.
+        std::vector<std::string> contaminated;
+        {
+            ArchiveReader ar;
+            ar.open(gpk);
+            std::unordered_map<GenomeId, std::string> gid2acc;
+            ar.scan_genome_accessions([&](std::string_view a, GenomeId g) {
+                if (!ar.is_deleted(g)) gid2acc.emplace(g, std::string(a));
+            });
+            ar.scan_qual([&](const QualRecord& r) {
+                // leakage_residual (multi-k containment power-law misfit) is
+                // sketch-based, so it catches contamination on fragmented MAGs
+                // where the per-contig CCO axis is dark (GCOV needs >=20kb contigs).
+                // CCO is the sharper signal when long contigs exist — gate on either.
+                const float leak = r.leakage_residual;                 // NaN => not flagged
+                const float cco  = r.contig_outlier_u8 / 255.0f;
+                if (leak > max_leak || cco > max_cco) {
+                    auto i = gid2acc.find(r.genome_id);
+                    if (i != gid2acc.end()) contaminated.push_back(i->second);
+                }
+            });
+        }
+
+        spdlog::info("decontaminate iter {}: {} genome(s) exceed leakage {:.3f} or CCO {:.3f}",
+                     it, contaminated.size(), max_leak, max_cco);
+        if (contaminated.empty()) { converged = true; break; }
+        if (dry_run) {
+            for (const auto& a : contaminated) spdlog::info("  would remove: {}", a);
+            spdlog::info("decontaminate: dry-run — {} genome(s) would be removed; no changes made",
+                         contaminated.size());
+            return 0;
+        }
+        cmd_rm(gpk.string(), contaminated);
+        total_removed += contaminated.size();
+    }
+
+    // If we stopped on the iteration cap (not convergence) after removing genomes,
+    // rebuild once more so the final models exclude the last batch too.
+    if (!dry_run && total_removed > 0 && !converged)
+        cmd_reindex(gpk.string(), true, false, "", threads, false, threads, -1, -1, -1, {},
+                    true, threads, true, false, true);
+
+    spdlog::info("decontaminate: {} — removed {} contaminated genome(s); models rebuilt from the clean set",
+                 converged ? "converged" : "stopped at iteration cap", total_removed);
+    return 0;
+}
+
 // ── genopack taxonomy ──────────────────────────────────────────────────────────
 static int cmd_taxonomy(const std::string& archive_dir, const std::string& accession,
                         bool json) {
@@ -1183,7 +1263,7 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
                 // acc→gid
                 std::unordered_map<std::string, GenomeId> acc_to_gid;
                 ar.scan_genome_accessions([&](std::string_view acc, GenomeId gid) {
-                    acc_to_gid.emplace(acc, gid);
+                    if (!ar.is_deleted(gid)) acc_to_gid.emplace(acc, gid);
                 });
 
                 // genus→members
@@ -3224,6 +3304,33 @@ int main(int argc, char** argv) {
             check_output.empty() ? std::filesystem::path{} : std::filesystem::path{check_output},
             check_recompute,
             check_markers.empty() ? std::filesystem::path{} : std::filesystem::path{check_markers}));
+    });
+
+    // genopack decontaminate
+    auto* decon_cmd = app.add_subcommand("decontaminate",
+        "Iteratively remove contaminated genomes (per-contig CCO above a threshold), rebuilding "
+        "genus/family models from the survivors each round so the DB and its consensus stay clean.");
+    std::string decon_archive;
+    float decon_max_leak = 1.0f;     // off by default — noisy on fragmented genomes (opt-in)
+    float decon_max_cco  = 0.15f;    // precise; fires on genomes with >=20kb contigs
+    int   decon_iters    = 5;
+    int   decon_threads  = 8;
+    bool  decon_dry      = false;
+    decon_cmd->add_option("archive", decon_archive, "Path to .gpk archive")->required();
+    decon_cmd->add_option("--max-cco", decon_max_cco,
+        "Remove genomes whose per-contig outlier (CCO) exceeds this — precise, but only fires on "
+        "genomes with >=20kb contigs (default: 0.15)");
+    decon_cmd->add_option("--max-leakage", decon_max_leak,
+        "Also remove genomes whose containment-leakage residual exceeds this — works on fragmented "
+        "MAGs where CCO is dark, but noisy (clean ~0.085, separates poorly below ~10%% contamination; "
+        "use --dry-run to tune). Default 1.0 = off.");
+    decon_cmd->add_option("--max-iters", decon_iters, "Max decontamination rounds (default: 5)");
+    decon_cmd->add_option("-t,--threads", decon_threads, "Threads (default: 8)");
+    decon_cmd->add_flag("--dry-run", decon_dry,
+        "Report what would be removed without modifying the archive");
+    decon_cmd->callback([&]() {
+        std::exit(cmd_decontaminate(decon_archive, decon_max_leak, decon_max_cco,
+                                    decon_iters, decon_threads, decon_dry));
     });
 
     // genopack gcov

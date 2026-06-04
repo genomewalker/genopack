@@ -10,6 +10,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <unordered_set>
 #include <unordered_map>
 #include <vector>
 
@@ -381,7 +382,14 @@ GcovFcovFmhrResult build_gcov_fcov_fmhr(const ArchiveReader& ar, int threads) {
     std::unordered_map<std::string, Taxon> acc_taxon;
     std::unordered_map<std::string, uint32_t> genus_count, family_count;
 
+    // Exclude tombstoned genomes so the consensus is built from live genomes only.
+    std::unordered_set<std::string> deleted_accs;
+    ar.scan_genome_accessions([&](std::string_view acc, GenomeId gid) {
+        if (ar.is_deleted(gid)) deleted_accs.insert(std::string(acc));
+    });
+
     ar.scan_taxonomy([&](std::string_view acc, std::string_view tax) {
+        if (deleted_accs.count(std::string(acc))) return;   // skip tombstoned
         Taxon t;
         auto gp = tax.find("g__");
         if (gp != std::string_view::npos) {

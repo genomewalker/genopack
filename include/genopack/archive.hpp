@@ -114,6 +114,10 @@ public:
     // Iterate all (accession, genome_id) pairs from ACCX sections
     void scan_genome_accessions(const std::function<void(std::string_view, GenomeId)>& cb) const;
 
+    // True if `id` has been tombstoned (soft-deleted). The raw ACCX/TAXN/QUAL
+    // scans do NOT filter on this, so live-only consumers must check it.
+    bool is_deleted(GenomeId id) const;
+
     // Parsed taxonomy tree from TXDB section (or auto-built from TAXN)
     std::optional<TaxonomyTree> taxonomy_tree() const;
 

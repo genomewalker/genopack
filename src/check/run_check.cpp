@@ -197,13 +197,13 @@ int cmd_check(const std::filesystem::path& pack_path,
         if (!genomes_file.empty()) {
             auto all_acc = read_accession_list(genomes_file);
             std::unordered_set<std::string> filter(all_acc.begin(), all_acc.end());
-            ar.scan_genome_accessions([&](std::string_view acc, GenomeId) {
-                if (filter.count(std::string(acc)))
+            ar.scan_genome_accessions([&](std::string_view acc, GenomeId gid) {
+                if (!ar.is_deleted(gid) && filter.count(std::string(acc)))
                     accessions.emplace_back(acc);
             });
         } else {
-            ar.scan_genome_accessions([&](std::string_view acc, GenomeId) {
-                accessions.emplace_back(acc);
+            ar.scan_genome_accessions([&](std::string_view acc, GenomeId gid) {
+                if (!ar.is_deleted(gid)) accessions.emplace_back(acc);
             });
         }
 

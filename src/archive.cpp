@@ -1224,6 +1224,10 @@ void ArchiveReader::scan_genome_accessions(
         r.scan(cb);
 }
 
+bool ArchiveReader::is_deleted(GenomeId id) const {
+    return impl_->is_deleted(id);
+}
+
 std::optional<TaxonomyTree> ArchiveReader::taxonomy_tree() const {
     return impl_->get_tree();
 }
