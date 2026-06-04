@@ -22,7 +22,7 @@ std::vector<ContigRecord> parse_fasta(std::string_view fasta);
 
 struct PassBConfig {
     float contamination_flag_threshold = 0.02f;
-    float tnf_flag_threshold           = 0.02f;  // lowered from 0.10 — fires at ~2% phylum spike
+    float tnf_flag_threshold           = 0.0f;   // 0 = always run GCOV scan; genus-level contamination doesn't shift aggregate TNF
     float completeness_flag_threshold  = 0.70f;
     float contig_tnf_threshold         = 3.0f;
     float contig_leakage_threshold     = 0.20f;
@@ -39,6 +39,7 @@ void run_pass_b(ICheckReader& pack,
                 std::unordered_map<std::string, GenomeQuality>& quality,
                 const PassBConfig& cfg,
                 int threads,
-                const std::unordered_map<uint64_t, QualRecord>* qual_cache = nullptr);
+                const std::unordered_map<uint64_t, QualRecord>* qual_cache = nullptr,
+                const std::unordered_map<uint64_t, QualRecord>* baseline_cache = nullptr);
 
 } // namespace genopack::check

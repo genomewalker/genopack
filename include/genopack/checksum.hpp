@@ -34,4 +34,22 @@ inline bool verify_checksum(const uint8_t* data, size_t size, size_t checksum_of
     return std::memcmp(data + checksum_offset, canon.digest, 16) == 0;
 }
 
+// Compute XXH128 over a standalone section body (no embedded checksum field) and
+// store the 16-byte canonical digest into out16. This is the SectionDesc.checksum
+// operation: the digest lives in the descriptor, separate from the body.
+inline void checksum_of(const uint8_t* data, size_t size, uint8_t out16[16]) {
+    XXH128_hash_t h = XXH3_128bits(data, size);
+    XXH128_canonical_t canon;
+    XXH128_canonicalFromHash(&canon, h);
+    std::memcpy(out16, canon.digest, 16);
+}
+
+// True if XXH128(data,size) equals the 16-byte canonical digest in expect16.
+inline bool checksum_matches(const uint8_t* data, size_t size, const uint8_t expect16[16]) {
+    XXH128_hash_t h = XXH3_128bits(data, size);
+    XXH128_canonical_t canon;
+    XXH128_canonicalFromHash(&canon, h);
+    return std::memcmp(expect16, canon.digest, 16) == 0;
+}
+
 } // namespace genopack

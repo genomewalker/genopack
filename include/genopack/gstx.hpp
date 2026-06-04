@@ -15,6 +15,10 @@ namespace genopack {
 
 static constexpr uint32_t GSTX_MAX_K    = 3;    // max k-values stored per genus
 static constexpr uint32_t GSTX_BINS     = 10000; // OPH bins per sketch
+// Members with k=0 containment < GSTX_P90_COMPLETE_FRAC * cluster_max are excluded
+// from p90 computation — this prevents incomplete genomes from deflating the p90
+// reference and causing systematic CCR underestimates at high completeness.
+static constexpr float    GSTX_P90_COMPLETE_FRAC = 0.5f;
 
 // ── On-disk layout ────────────────────────────────────────────────────────────
 

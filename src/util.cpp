@@ -54,10 +54,15 @@ static std::string read_fd_bytes(int fd, const std::filesystem::path& path) {
     size_t total = 0;
     while (total < static_cast<size_t>(sz)) {
         ssize_t n = ::read(fd, buf.data() + total, static_cast<size_t>(sz) - total);
-        if (n <= 0) { ::close(fd); throw std::runtime_error("Read error: " + path.string()); }
+        if (n < 0) {
+            if (errno == EINTR) continue; // retry on signal interrupt
+            ::close(fd); throw std::runtime_error("Read error: " + path.string());
+        }
+        if (n == 0) break; // NFS may report stale inode size; treat early EOF as end of data
         total += static_cast<size_t>(n);
     }
     ::close(fd);
+    buf.resize(total);
     return buf;
 }
 

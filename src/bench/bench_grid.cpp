@@ -20,6 +20,8 @@ namespace genopack::bench {
 
 namespace {
 
+
+
 static constexpr std::array<float, 6> SPIKE_FRACS  = {0.0f, 0.01f, 0.02f, 0.05f, 0.10f, 0.20f};
 static constexpr uint32_t N_HOST       = 8;
 static constexpr uint32_t N_SPIKE_POOL = 8;
@@ -138,7 +140,8 @@ int cmd_bench_grid(
     const std::filesystem::path& output,
     int      threads,
     int      reps,
-    uint32_t seed)
+    uint32_t seed,
+    const std::vector<float>&    completeness_fracs)
 {
     auto manifest = load_manifest(manifest_path);
     if (manifest.empty()) throw std::runtime_error("bench-grid: empty manifest");
@@ -147,6 +150,7 @@ int cmd_bench_grid(
     ArchiveReader ar;
     ar.open(archive_path);
     check::SingleArchiveCheckReader pack(ar);
+
 
     // ── Taxonomy scan ──────────────────────────────────────────────────────────
     std::unordered_map<std::string, std::vector<std::string>> genus_accs;
@@ -255,13 +259,15 @@ int cmd_bench_grid(
         float       fiedler_tnf_bimod, fiedler_tnf_gap;
         float       fmh_minority;
         std::array<float, N_FMH> fmh;  // [k21c30, k21c125, k21c500, k31c30, k31c125, k31c500]
+        float       completeness_target;
         uint32_t    scored_bp;
     };
     std::vector<Row> rows;
 
     const BinScoreConfig score_cfg;
     const int n_fracs   = static_cast<int>(SPIKE_FRACS.size());
-    const int n_total   = static_cast<int>(manifest.size()) * reps * n_fracs;
+    const int n_total   = static_cast<int>(manifest.size()) * reps * n_fracs
+                          * static_cast<int>(completeness_fracs.size());
     int done = 0;
 
     for (const auto& mrow : manifest) {
@@ -307,14 +313,33 @@ int cmd_bench_grid(
             }
         }
 
+        for (float comp : completeness_fracs) {
         for (int rep = 0; rep < reps; ++rep) {
             std::mt19937 host_rng(seed + static_cast<uint32_t>(rep) * 1000);
-            std::vector<std::string> host_frags;
+            std::vector<std::string> host_frags_all;
             for (const auto& acc : ctx.host_accs) {
                 auto it = genome_seqs.find(acc);
                 if (it == genome_seqs.end()) continue;
                 auto f = fragment_genome(it->second, host_rng);
-                host_frags.insert(host_frags.end(), f.begin(), f.end());
+                host_frags_all.insert(host_frags_all.end(), f.begin(), f.end());
+            }
+            // Subsample host fragments to target completeness
+            std::vector<std::string> host_frags;
+            if (comp >= 1.0f) {
+                host_frags = host_frags_all;
+            } else {
+                uint64_t total_bp = 0;
+                for (const auto& f : host_frags_all) total_bp += f.size();
+                uint64_t target_bp = static_cast<uint64_t>(static_cast<double>(total_bp) * comp);
+                std::mt19937 comp_rng(seed + static_cast<uint32_t>(rep) * 777 +
+                                      static_cast<uint32_t>(comp * 1000));
+                std::shuffle(host_frags_all.begin(), host_frags_all.end(), comp_rng);
+                uint64_t acc = 0;
+                for (auto& f : host_frags_all) {
+                    if (acc >= target_bp) break;
+                    acc += f.size();
+                    host_frags.push_back(std::move(f));
+                }
             }
             uint64_t host_bp = 0;
             for (const auto& f : host_frags) host_bp += f.size();
@@ -371,14 +396,16 @@ int cmd_bench_grid(
                                 std::isnan(sc.sibling_fraction)  ? NAN : sc.sibling_fraction  * 100.f,
                                 std::isnan(sc.rho_fraction)      ? NAN : sc.rho_fraction      * 100.f,
                                 cs_pct, cs_self, cs_fiedler, cs_tnf_bimod, cs_tnf_gap,
-                                fmh_ok ? fmh_scores[1] : NAN,  // fmh_minority = k21 c125 minority
+                                fmh_ok ? fmh_scores[1] : NAN,
                                 fmh_scores,
+                                comp * 100.f,
                                 sc.scored_bp});
 
                 if (++done % 20 == 0)
                     spdlog::info("bench-grid: {}/{}", done, n_total);
             }
         }
+        } // comp loop
     }
 
     // ── TSV output ─────────────────────────────────────────────────────────────
@@ -391,6 +418,7 @@ int cmd_bench_grid(
            "\tfmh_minority"
            "\tfmh_k21_c30\tfmh_k21_c125\tfmh_k21_c500"
            "\tfmh_k31_c30\tfmh_k31_c125\tfmh_k31_c500"
+           "\tcompleteness_target"
            "\tscored_bp\n";
     auto fv = [](float v) { return std::isnan(v) ? std::string("NA") : std::to_string(v); };
     for (const auto& r : rows) {
@@ -404,6 +432,7 @@ int cmd_bench_grid(
             << fv(r.fmh_minority) << '\t'
             << fv(r.fmh[0]) << '\t' << fv(r.fmh[1]) << '\t' << fv(r.fmh[2]) << '\t'
             << fv(r.fmh[3]) << '\t' << fv(r.fmh[4]) << '\t' << fv(r.fmh[5]) << '\t'
+            << fv(r.completeness_target) << '\t'
             << r.scored_bp    << '\n';
     }
     spdlog::info("bench-grid: results → {}", output.string());

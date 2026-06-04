@@ -215,6 +215,13 @@ struct ArchiveReader::Impl {
         auto* fh = mmap_.ptr_at<FileHeader>(0);
         if (fh->magic != GPK2_MAGIC)
             throw std::runtime_error("Not a .gpk file");
+        // Reject archives whose major format version is newer than we support,
+        // rather than silently misparsing a future layout as garbage (P15).
+        if (fh->version_major > FORMAT_MAJOR)
+            throw std::runtime_error(
+                "genopack: archive format major v" + std::to_string(fh->version_major) +
+                " > supported v" + std::to_string(FORMAT_MAJOR) +
+                " — upgrade genopack to read this archive");
 
         // pread TailLocator from EOF — avoids mmap page-fault at multi-TB offset.
         TailLocator tail{};
@@ -247,6 +254,21 @@ struct ArchiveReader::Impl {
             if (nr != static_cast<ssize_t>(toc_size))
                 throw std::runtime_error("genopack: legacy archive TOC pread failed");
             toc_ = TocReader::read_at(toc_buf.data(), 0, toc_size);
+        }
+
+        // Validate every section descriptor against the file size so a truncated
+        // or corrupt directory fails loudly here instead of faulting (SIGBUS/OOB)
+        // when a section is lazily touched (P5).
+        {
+            const uint64_t fsz = mmap_.size();
+            for (const auto& sd : toc_.sections) {
+                if (sd.compressed_size > fsz || sd.file_offset > fsz - sd.compressed_size)
+                    throw std::runtime_error(
+                        "genopack: section descriptor out of bounds (type=" +
+                        std::to_string(sd.type) + " offset=" + std::to_string(sd.file_offset) +
+                        " size=" + std::to_string(sd.compressed_size) +
+                        " file=" + std::to_string(fsz) + ") — archive truncated/corrupt");
+            }
         }
 
         // Load catalog fragments (all CATL sections)

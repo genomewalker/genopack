@@ -107,7 +107,8 @@ void run_pass_b(ICheckReader& pack,
                 std::unordered_map<std::string, GenomeQuality>& quality,
                 const PassBConfig& cfg,
                 int threads,
-                const std::unordered_map<uint64_t, QualRecord>* qual_cache)
+                const std::unordered_map<uint64_t, QualRecord>* qual_cache,
+                const std::unordered_map<uint64_t, QualRecord>* baseline_cache)
 {
     // needs_full_analysis: completeness or leakage triggered — run mixture+Fiedler window model.
     // tnf-only flagged genomes skip the expensive PCA/GMM pass (skip_mixture=true).
@@ -834,6 +835,58 @@ void run_pass_b(ICheckReader& pack,
         });
 
     spdlog::info("check pass-B: complete ({} genomes)", n_flagged);
+
+    // ── CCO baseline subtraction ─────────────────────────────────────────────
+    // Per-genus 20th-percentile CCO of reference genomes (from qual_cache) gives
+    // the natural genomic-heterogeneity floor. Subtract it from target CCO and
+    // clamp to [0,1] to produce contamination_contig_outlier_adj.
+    // ── CCO self-calibrating baseline ───────────────────────────────────────
+    // Use the 20th percentile of ALL non-NaN CCO values across current targets as
+    // the natural-heterogeneity floor. Under the assumption that most genomes in the
+    // query set are clean, the low percentile captures the background noise level.
+    // This avoids dependency on cached reference QUAL records (which are overwritten
+    // by each check run) while still removing the systematic 6% FP offset.
+    {
+        std::unordered_map<std::string, std::vector<float>> genus_cco;
+        for (const auto& [acc, q] : quality) {
+            if (std::isnan(q.contamination_contig_outlier)) continue;
+            for (const auto& [genus, members] : pass_a.genus_members) {
+                bool found = false;
+                for (const auto& m : members) { if (m == acc) { found = true; break; } }
+                if (!found) continue;
+                genus_cco[genus].push_back(q.contamination_contig_outlier);
+                break;
+            }
+        }
+
+        std::unordered_map<std::string, float> genus_baseline;
+        for (auto& [genus, vec] : genus_cco) {
+            if (vec.size() < 5) continue;
+            size_t p20_idx = static_cast<size_t>(0.2f * static_cast<float>(vec.size()));
+            if (p20_idx >= vec.size()) p20_idx = 0;
+            std::nth_element(vec.begin(), vec.begin() + static_cast<ptrdiff_t>(p20_idx), vec.end());
+            genus_baseline[genus] = vec[p20_idx];
+        }
+
+        if (!genus_baseline.empty()) {
+            spdlog::info("CCO baseline: {} genera with self-calibrated floor", genus_baseline.size());
+            for (auto& [acc, q] : quality) {
+                if (std::isnan(q.contamination_contig_outlier)) continue;
+                for (const auto& [genus, members] : pass_a.genus_members) {
+                    auto bit = genus_baseline.find(genus);
+                    if (bit == genus_baseline.end()) continue;
+                    for (const auto& m : members) {
+                        if (m == acc) {
+                            q.contamination_contig_outlier_adj = std::max(
+                                0.0f, q.contamination_contig_outlier - bit->second);
+                            goto next_acc;
+                        }
+                    }
+                }
+                next_acc:;
+            }
+        }
+    }
 }
 
 } // namespace genopack::check

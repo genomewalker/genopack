@@ -205,11 +205,25 @@ Soft-deletes (tombstones) genomes. Physical space is not reclaimed; use `genopac
 
 ## Distributed build
 
-For collections too large for a single node:
+For large collections on a **shared NFS filesystem**, partition by genus (LPT bin-packing keeps each genus whole in one part), build on separate nodes in parallel, and query the parts directory directly — no merge or coordinator needed:
 
-## Distributed build
+```bash
+# 1. Partition by genus into N balanced parts
+genopack taxonomy partition -i genomes.tsv -n 6 -o parts/ -r g
 
-For collections too large for a single node, use the NFS manifest coordinator:
+# 2. Build each part on a separate node (run in parallel via SSH / pdsh / sbatch)
+genopack build -i parts/part_0.tsv -o parts/part_0.gpk -p 16 -t 8
+genopack build -i parts/part_1.tsv -o parts/part_1.gpk -p 8  -t 8
+# ...
+
+# 3. Query the parts directory directly — no merge step
+genopack check parts/ --genomes query.txt -o quality.tsv -t 16
+genopack stat  parts/
+```
+
+Every CLI command that takes an archive path also accepts a directory containing `part_*.gpk`. Genus-partitioning ensures each part's GSTX is built from the complete membership of every genus it contains — no cross-part fragmentation.
+
+**For disconnected nodes with local scratch** (workers cannot write to a shared NFS output), use the coordinator instead:
 
 ```bash
 # Coordinator: allocates write offsets, assembles final TOC
@@ -223,16 +237,11 @@ genopack build -i part_N.tsv -o /scratch/part_N.gpk -t 24 -z 6 \
 
 `--ntdb` makes the coordinator embed the NCBI tree as an NTDB section in the final archive.
 
-Alternatively, build parts independently and merge:
+To produce a single merged archive from parts:
 
 ```bash
-for i in 0 1 2 3; do
-    genopack build -i part_$i.tsv -o parts/part_$i.gpk -t 24 -z 6
-done
 genopack merge -l <(ls parts/*.gpk) -o merged.gpk
 ```
-
-Or skip the merge and keep the parts as a multipart set — `ArchiveSetReader` (and every CLI command that takes an archive path) accepts a directory containing `part_*.gpk`.
 
 ---
 

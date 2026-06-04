@@ -26,6 +26,7 @@ PassAResult run_pass_a(ICheckReader& pack,
                        int threads,
                        int min_genus_size,
                        float leakage_threshold,
+                       int min_gstx_members = 50,
                        const std::unordered_map<uint64_t, QualRecord>* qual_cache = nullptr);
 
 } // namespace genopack::check

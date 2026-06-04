@@ -107,6 +107,7 @@ add_library(genopack_lib STATIC
   src/gtax.cpp
   src/sim.cpp
   src/calibrate/calibrate.cpp
+  src/stage.cpp
 )
 
 target_include_directories(genopack_lib PUBLIC
@@ -165,10 +166,10 @@ add_executable(genopack
   cli/main.cpp
   src/check/pass_a.cpp
   src/check/pass_b.cpp
-  src/check/pass_marker.cpp
   src/check/run_check.cpp
   src/bench/bench_grid.cpp
   src/calibrate/calibrate.cpp
+  src/cmd_stage.cpp
 )
 target_include_directories(genopack PRIVATE src)
 target_link_libraries(genopack PRIVATE genopack_lib)

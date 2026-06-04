@@ -1,7 +1,6 @@
 #include "run_check.hpp"
 #include "pass_a.hpp"
 #include "pass_b.hpp"
-#include "pass_marker.hpp"
 #include "pack_iface.hpp"
 #include <genopack/archive.hpp>
 #include <genopack/qual.hpp>
@@ -171,8 +170,7 @@ int cmd_check(const std::filesystem::path& pack_path,
               int min_genus_size,
               float leakage_threshold,
               const std::filesystem::path& output,
-              bool recompute,
-              const std::filesystem::path& markers_path)
+              bool recompute)
 {
     auto gpk_paths = collect_gpk_paths(pack_path);
     if (gpk_paths.empty())
@@ -208,36 +206,29 @@ int cmd_check(const std::filesystem::path& pack_path,
         }
         spdlog::info("check: {} accessions in {}", accessions.size(), gp.filename().string());
 
-        // Load existing QUAL section as a cache to skip the SKCH scan.
+        // Load existing QUAL section.
+        // Used to: (a) skip SKCH scan when !recompute, (b) compute CCO baseline always.
         std::unordered_map<uint64_t, QualRecord> qual_cache;
         const std::unordered_map<uint64_t, QualRecord>* qual_cache_ptr = nullptr;
-        if (!recompute && ar.has_qual()) {
+        if (ar.has_qual()) {
             ar.scan_qual([&](const QualRecord& r) {
                 qual_cache.emplace(r.genome_id, r);
             });
-            spdlog::info("check: loaded {} cached QUAL records (use --recompute to force rescan)",
-                         qual_cache.size());
-            qual_cache_ptr = &qual_cache;
+            if (!recompute) {
+                spdlog::info("check: loaded {} cached QUAL records (use --recompute to force rescan)",
+                             qual_cache.size());
+                qual_cache_ptr = &qual_cache;
+            }
         }
 
         auto pass_a = run_pass_a(pack, accessions, threads, min_genus_size,
-                                 leakage_threshold, qual_cache_ptr);
+                                 leakage_threshold, /*min_gstx_members=*/50,
+                                 qual_cache_ptr);
         auto quality = pass_a.quality;
 
         PassBConfig pb_cfg;
-        if (!markers_path.empty()) pb_cfg.markers_path = markers_path.string();
-        run_pass_b(pack, pass_a, quality, pb_cfg, threads, qual_cache_ptr);
-
-        // Unconditional marker pass: score every genome with a valid genus assignment,
-        // not just Pass-B-flagged ones. Fills marker_completeness for clean/complete
-        // genomes that pass_b skips due to low TNF excess. Makes the SCG completeness
-        // metric available for all genomes (comparable to CheckM2's unconditional scoring).
-        if (!markers_path.empty()) {
-            PassMarkerConfig pm_cfg;
-            pm_cfg.markers_path   = markers_path.string();
-            pm_cfg.marker_min_hits = pb_cfg.marker_min_hits;
-            run_pass_marker(pack, pass_a, quality, pm_cfg, threads);
-        }
+        const auto* baseline_ptr = qual_cache.empty() ? nullptr : &qual_cache;
+        run_pass_b(pack, pass_a, quality, pb_cfg, threads, qual_cache_ptr, baseline_ptr);
 
         // Re-score marker_redundancy_z using in-distribution per-genus calibration.
         // MSA-based calibration (in .mrk file) underestimates by ~16× because gap-spanning
@@ -346,17 +337,15 @@ int cmd_check(const std::filesystem::path& pack_path,
     std::ofstream tsv(output);
     if (!tsv) throw std::runtime_error("check: cannot open output: " + output.string());
     tsv << "accession\tquality_tier\tcompleteness_effective\tcompleteness_cluster_relative\tcompleteness_sketch_fill\tcompleteness_fragmentation"
-           "\tcompleteness_post_decontam\tcontamination_leakage\tcontamination_tnf_excess"
+           "\tcompleteness_post_decontam"
+           "\tfmh_contamination"
+           "\tcontamination_leakage\tcontamination_tnf_excess"
            "\tchromosome_skew_closure\tleakage_residual\tself_coherence"
            "\tchargaff_parity\tspectral_gap\tscale_kink\tcontamination_mixture\tmixture_sources"
-           "\tn_mix_windows\tfiedler_value\tcontamination_contig_outlier\tcontamination_spe"
-           "\tcontamination_sibling_outlier\tcontamination_rho_outlier\tcontamination_cross_genus\tcontamination_contig_split"
-           "\tcontamination_self_outlier\tfiedler_oph_split"
-           "\tfiedler_tnf_bimod\tfiedler_tnf_gap"
-           "\tfmh_minority_fraction"
-           "\tmarker_completeness\tmarker_redundancy\tmarker_redundancy_z\tmarker_joint_contamination\tmarker_n_present\tmarker_n_expected"
-           "\tmarker_present_hex"
-           "\tqual_flags\tsupport_tier\tinterval_width\n";
+           "\tn_mix_windows\tcontamination_contig_outlier\tcontamination_spe"
+           "\tcontamination_rho_outlier\tcontamination_cross_genus\tcontamination_contig_split"
+           "\tqual_flags\tsupport_tier\tinterval_width"
+           "\tcontamination_contig_outlier_adj\tmimag_tier\n";
 
     auto tier_str = [](SupportTier t) -> const char* {
         switch (t) {
@@ -371,13 +360,15 @@ int cmd_check(const std::filesystem::path& pack_path,
     };
 
     for (const auto& [acc, q] : all_quality) {
-        const float comp_eff = (!std::isnan(q.marker_completeness) && q.marker_completeness > q.completeness_cluster_relative)
-                                   ? q.marker_completeness
-                                   : q.completeness_cluster_relative;
-        const float tnf = std::isnan(q.contamination_tnf_excess) ? 0.0f : q.contamination_tnf_excess;
+        const float comp_eff = !std::isnan(q.completeness_post_decontam)
+                               ? q.completeness_post_decontam
+                               : q.completeness_cluster_relative;
+        const float fmh_cont = !std::isnan(q.fmh_minority_fraction) ? q.fmh_minority_fraction : NAN;
+        const float cont_primary = !std::isnan(fmh_cont) ? fmh_cont : q.contamination_leakage;
+        const float cont_val = std::isnan(cont_primary) ? 0.0f : cont_primary;
         const char* qtier = "LQ";
-        if (!std::isnan(comp_eff) && comp_eff >= 0.90f && tnf < 0.05f) qtier = "HQ";
-        else if (!std::isnan(comp_eff) && comp_eff >= 0.50f && tnf < 0.20f) qtier = "MQ";
+        if (!std::isnan(comp_eff) && comp_eff >= 0.90f && cont_val < 0.05f) qtier = "HQ";
+        else if (!std::isnan(comp_eff) && comp_eff >= 0.50f && cont_val < 0.10f) qtier = "MQ";
         tsv << acc << '\t'
             << qtier << '\t'
             << fmt(comp_eff) << '\t'
@@ -385,6 +376,7 @@ int cmd_check(const std::filesystem::path& pack_path,
             << fmt(q.completeness_sketch_fill) << '\t'
             << fmt(q.completeness_fragmentation) << '\t'
             << fmt(q.completeness_post_decontam) << '\t'
+            << fmt(fmh_cont) << '\t'
             << fmt(q.contamination_leakage) << '\t'
             << fmt(q.contamination_tnf_excess) << '\t'
             << fmt(q.chromosome_skew_closure) << '\t'
@@ -396,24 +388,11 @@ int cmd_check(const std::filesystem::path& pack_path,
             << fmt(q.contamination_mixture) << '\t'
             << q.mixture_sources << '\t'
             << q.n_mix_windows << '\t'
-            << fmt(q.fiedler_value) << '\t'
             << fmt(q.contamination_contig_outlier) << '\t'
             << fmt(q.contamination_spe) << '\t'
-            << fmt(q.contamination_sibling_outlier) << '\t'
             << fmt(q.contamination_rho_outlier) << '\t'
             << fmt(q.contamination_cross_genus) << '\t'
-            << fmt(q.contamination_contig_split) << '\t'
-            << fmt(q.contamination_self_outlier) << '\t'
-            << fmt(q.fiedler_oph_split) << '\t'
-            << fmt(q.fiedler_tnf_bimod) << '\t'
-            << fmt(q.fiedler_tnf_gap) << '\t'
-            << fmt(q.fmh_minority_fraction) << '\t'
-            << fmt(q.marker_completeness) << '\t'
-            << fmt(q.marker_redundancy) << '\t'
-            << fmt(q.marker_redundancy_z) << '\t'
-            << fmt(q.marker_joint_contamination) << '\t'
-            << q.marker_n_present << '\t'
-            << q.marker_n_expected << '\t';
+            << fmt(q.contamination_contig_split) << '\t';
         // Per-SCG presence bitmask as lowercase hex string (empty when not scored).
         if (!q.marker_present_bits.empty()) {
             static constexpr char hex[] = "0123456789abcdef";
@@ -421,10 +400,21 @@ int cmd_check(const std::filesystem::path& pack_path,
                 tsv << hex[b >> 4] << hex[b & 0xf];
             }
         }
+        // MIMAG-standard tier using completeness_effective + adjusted CCO.
+        const float cont_axis = !std::isnan(q.contamination_contig_outlier_adj)
+                                    ? q.contamination_contig_outlier_adj
+                                    : (std::isnan(q.contamination_contig_outlier) ? 0.0f
+                                                                                  : q.contamination_contig_outlier);
+        const char* mimag = "LQ";
+        if (!std::isnan(comp_eff) && comp_eff >= 0.90f && cont_axis < 0.05f) mimag = "HQ";
+        else if (!std::isnan(comp_eff) && comp_eff >= 0.50f && cont_axis < 0.10f) mimag = "MQ";
+
         tsv << '\t'
             << static_cast<int>(q.qual_flags) << '\t'
             << tier_str(q.support_tier) << '\t'
-            << q.interval_width << '\n';
+            << q.interval_width << '\t'
+            << fmt(q.contamination_contig_outlier_adj) << '\t'
+            << mimag << '\n';
     }
     spdlog::info("check: TSV written to {}", output.string());
     return 0;

@@ -22,6 +22,7 @@
 #include <cstring>
 #include <ctime>
 #include <fcntl.h>
+#include <genopack/checksum.hpp>
 #include <filesystem>
 #include <future>
 #include <stdexcept>
@@ -234,7 +235,7 @@ void merge_archives(const std::vector<std::filesystem::path>& inputs,
             // pread returns EIO on NFS error instead of delivering SIGBUS.
             // POSIX_FADV_DONTNEED after each shard evicts NFS page cache,
             // keeping RSS bounded regardless of archive size.
-            for (const auto& job : shrd_jobs) {
+            for (auto& job : shrd_jobs) {
                 if (job.archive_idx != i) continue;
 
                 std::vector<uint8_t> shard_bytes(job.sd->compressed_size);
@@ -265,6 +266,12 @@ void merge_archives(const std::vector<std::filesystem::path>& inputs,
                     if (remap_genome_ids)
                         dir[di].genome_id += gid_off;
                 }
+
+                // Recompute the content checksum over the PATCHED bytes (shard_id/
+                // cluster_id and remapped genome_ids changed the body), so the merged
+                // descriptor's checksum is valid (P1). Each job is touched by exactly
+                // one archive future, so this write is race-free.
+                checksum_of(shard_bytes.data(), job.sd->compressed_size, job.new_sd.checksum);
 
                 writer.write_at(job.out_offset, shard_bytes.data(), job.sd->compressed_size);
             }
@@ -681,6 +688,30 @@ void merge_archives(const std::vector<std::filesystem::path>& inputs,
     for (const auto& m : all_metas) {
         if (!m.is_deleted() && !all_tombstones.contains(m.genome_id))
             ++live_count;
+    }
+
+    // Populate per-section content checksums for the merged metadata sections
+    // (those written to the local temp file at offset >= meta_start_offset). SHRD
+    // checksums were recomputed during the patched copy; HNSW/KMRX live in the NFS
+    // output and are left as-is.
+    mw.flush();
+    {
+        constexpr uint64_t CHECKSUM_MAX_SECTION_BYTES = 512ull << 20;
+        int tfd = ::open(meta_tmp_path.data(), O_RDONLY);
+        if (tfd >= 0) {
+            std::vector<uint8_t> sbuf;
+            for (auto& sd : toc_out.sections()) {
+                if (sd.file_offset < meta_start_offset) continue;   // SHRD/HNSW/KMRX in NFS output
+                if (sd.compressed_size == 0) continue;
+                if (sd.compressed_size > CHECKSUM_MAX_SECTION_BYTES) continue;
+                sbuf.resize(static_cast<size_t>(sd.compressed_size));
+                ssize_t nr = ::pread(tfd, sbuf.data(), sbuf.size(),
+                                     static_cast<off_t>(sd.file_offset));
+                if (nr == static_cast<ssize_t>(sbuf.size()))
+                    checksum_of(sbuf.data(), sbuf.size(), sd.checksum);
+            }
+            ::close(tfd);
+        }
     }
 
     toc_out.finalize(mw,

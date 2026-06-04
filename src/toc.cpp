@@ -187,6 +187,16 @@ Toc TocReader::read_at(const uint8_t* base, uint64_t offset, uint64_t size) {
     if (required > size)
         throw std::runtime_error("TocReader: TOC block truncated");
 
+    // Verify the TOC block checksum so the legacy (non-MetaBundle) path gets the
+    // same integrity guarantee the MetaBundle fast-path already enforces (P10).
+    // Skip if zero (archive written before TOC checksums existed).
+    {
+        static const uint8_t zeros16[16] = {};
+        if (std::memcmp(hdr->checksum, zeros16, 16) != 0 &&
+            !verify_checksum(base + offset, required, offsetof(TocHeader, checksum)))
+            throw std::runtime_error("TocReader: TOC checksum mismatch — archive corrupt");
+    }
+
     Toc toc;
     toc.header = *hdr;
 

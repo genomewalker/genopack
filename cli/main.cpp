@@ -1,4 +1,5 @@
 #include "check/run_check.hpp"
+#include <genopack/stage.hpp>
 #include "bench/bench_grid.hpp"
 #include <genopack/sim.hpp>
 #include <genopack/markers_build.hpp>
@@ -120,7 +121,7 @@ static int cmd_build(const std::string& input_tsv, const std::string& output_dir
     std::vector<std::filesystem::path> part_paths;
     part_paths.reserve(n_parts);
 
-    std::vector<std::future<void>> futs;
+    std::vector<std::future<std::exception_ptr>> futs;
     futs.reserve(n_parts);
 
     GenomeId gid_cursor = 1;
@@ -143,43 +144,67 @@ static int cmd_build(const std::string& input_tsv, const std::string& output_dir
         gid_cursor += static_cast<GenomeId>(slice.size());
 
         futs.push_back(std::async(std::launch::async,
-            [part_cfg, part_path, slice = std::move(slice), p]() mutable {
-                // Skip building if a valid complete archive already exists.
-                // Validate by checking the TailLocator magic at end of file.
-                if (std::filesystem::exists(part_path)) {
-                    bool valid = false;
-                    try {
-                        MmapFileReader mm;
-                        mm.open(part_path);
-                        if (mm.size() >= sizeof(TailLocator)) {
-                            const auto* tail = mm.ptr_at<TailLocator>(
-                                mm.size() - sizeof(TailLocator));
-                            valid = (tail->magic == GPKT_MAGIC);
+            [part_cfg, part_path, slice = std::move(slice), p]() mutable -> std::exception_ptr {
+                try {
+                    // A sealed part (valid TailLocator at EOF) is already done.
+                    if (std::filesystem::exists(part_path)) {
+                        bool sealed = false;
+                        try {
+                            MmapFileReader mm;
+                            mm.open(part_path);
+                            if (mm.size() >= sizeof(TailLocator)) {
+                                const auto* tail = mm.ptr_at<TailLocator>(
+                                    mm.size() - sizeof(TailLocator));
+                                sealed = (tail->magic == GPKT_MAGIC);
+                            }
+                        } catch (...) {}
+                        if (sealed) {
+                            spdlog::info("Part {}: skipping — sealed archive exists ({})",
+                                         p, part_path.string());
+                            return nullptr;
                         }
-                    } catch (...) {}
-                    if (valid) {
-                        spdlog::info("Part {}: skipping — valid archive exists ({})",
-                                     p, part_path.string());
-                        return;
+                        // A stale .gpk without a valid footer is removed. Resumable
+                        // work lives in <part>.partial + .ckpt, which the builder
+                        // picks up — we NEVER delete those (P2/P3).
+                        spdlog::warn("Part {}: stale .gpk without footer, removing; "
+                                     "resume (if any) uses .partial", p);
+                        std::filesystem::remove(part_path);
                     }
-                    spdlog::warn("Part {}: existing file invalid, rebuilding", p);
-                    std::filesystem::remove(part_path);
+                    spdlog::info("Part {}: {} genomes (gid_start={}) → {}", p, slice.size(),
+                                 part_cfg.starting_genome_id, part_path.string());
+                    ArchiveBuilder builder(part_path, part_cfg);
+                    for (auto& r : slice) builder.add(r);
+                    builder.finalize();
+                    spdlog::info("Part {} done", p);
+                    return nullptr;
+                } catch (...) {
+                    return std::current_exception();
                 }
-                spdlog::info("Part {}: {} genomes (gid_start={}) → {}", p, slice.size(),
-                             part_cfg.starting_genome_id, part_path.string());
-                ArchiveBuilder builder(part_path, part_cfg);
-                for (auto& r : slice) builder.add(r);
-                builder.finalize();
-                spdlog::info("Part {} done", p);
             }));
     }
 
-    for (auto& f : futs) f.get();
+    // Fault-tolerant join: collect per-part failures instead of aborting on the
+    // first. Completed parts and resumable .partial/.ckpt state stay in tmp_dir so
+    // a re-run resumes only the parts that need it (P28).
+    size_t n_failed_parts = 0;
+    std::exception_ptr first_error;
+    for (auto& f : futs) {
+        std::exception_ptr e = f.get();
+        if (e) {
+            ++n_failed_parts;
+            if (!first_error) first_error = e;
+        }
+    }
+    if (n_failed_parts > 0) {
+        spdlog::error("{} of {} parts failed; keeping {} for resume on re-run",
+                      n_failed_parts, part_paths.size(), tmp_dir.string());
+        std::rethrow_exception(first_error);
+    }
     spdlog::info("All {} parts built, merging…", part_paths.size());
 
     merge_archives(part_paths, output_dir, /*remap_genome_ids=*/false, cfg.build_cidx);
 
-    // Cleanup temp parts
+    // Cleanup temp parts only after a fully successful merge.
     std::error_code ec;
     std::filesystem::remove_all(tmp_dir, ec);
 
@@ -1121,17 +1146,23 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
                 genus_members.reserve(65536);
 
                 ar.scan_taxonomy([&](std::string_view acc, std::string_view tax) {
-                    constexpr std::string_view needle = ";g__";
+                    // Key GSTX by species; fall back to genus if species is absent/empty.
+                    constexpr std::string_view s_needle = ";s__";
+                    constexpr std::string_view g_needle = ";g__";
                     std::string_view gsv;
-                    auto pos = tax.find(needle);
-                    if (pos != std::string_view::npos) {
-                        auto s = pos + 1;
-                        auto e = tax.find(';', s);
-                        gsv = tax.substr(s, e == std::string_view::npos ? e : e - s);
-                    } else if (tax.starts_with("g__")) {
-                        auto e = tax.find(';', 3);
-                        gsv = tax.substr(0, e);
-                    }
+                    auto try_extract = [&](std::string_view needle, std::string_view prefix) {
+                        auto pos = tax.find(needle);
+                        if (pos != std::string_view::npos) {
+                            auto s = pos + 1;
+                            auto e = tax.find(';', s);
+                            gsv = tax.substr(s, e == std::string_view::npos ? e : e - s);
+                        } else if (tax.starts_with(prefix)) {
+                            auto e = tax.find(';', prefix.size());
+                            gsv = tax.substr(0, e);
+                        }
+                    };
+                    try_extract(s_needle, "s__");
+                    if (gsv.empty() || gsv == "s__") { gsv = {}; try_extract(g_needle, "g__"); }
                     if (gsv.empty() || gsv == "g__") return;
                     auto it = acc_to_gid.find(std::string(acc));
                     if (it == acc_to_gid.end() || it->second == 0) return;
@@ -1234,9 +1265,22 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
                     const size_t gi = multi_gi[mgi];
                     const auto& members = genus_members[gi];
 
+                    // Exclude incomplete members from the p90 base — members with k=0
+                    // containment < GSTX_P90_COMPLETE_FRAC * cluster_max are skipped so
+                    // incomplete genomes don't deflate p90 and bias CCR at high completeness.
+                    const auto& c0 = conts[mgi][0];
+                    float max_c0 = 0.0f;
+                    for (float v : c0) max_c0 = std::max(max_c0, v);
+                    const float keep_thr = GSTX_P90_COMPLETE_FRAC * max_c0;
+
                     std::vector<float> p90(nk, 0.0f);
                     for (int ki = 0; ki < nk; ++ki) {
-                        auto cv = conts[mgi][ki];
+                        std::vector<float> cv;
+                        cv.reserve(conts[mgi][ki].size());
+                        for (size_t i = 0; i < conts[mgi][ki].size(); ++i)
+                            if (i < c0.size() && c0[i] >= keep_thr)
+                                cv.push_back(conts[mgi][ki][i]);
+                        if (cv.empty()) cv = conts[mgi][ki]; // fallback: never empty p90
                         if (cv.empty()) continue;
                         std::sort(cv.begin(), cv.end());
                         size_t idx = static_cast<size_t>(
@@ -2015,32 +2059,39 @@ static int cmd_verify(const std::string& archive_path, bool verbose) {
         else if (verbose) spdlog::info("verify: TocHeader.checksum OK");
     }
 
-    // --- Verify each shard ---
-    auto shard_descs = toc.find_by_type(SEC_SHRD);
-    size_t n_shards = shard_descs.size();
-    size_t n_zero   = 0; // shards with zeroed checksum (written before this feature)
-
-    for (const auto* sd : shard_descs) {
-        // Skip shards with all-zero checksum — they predate this feature.
-        static const uint8_t zeros[16] = {};
-        if (std::memcmp(sd->checksum, zeros, 16) == 0) { ++n_zero; continue; }
-
-        const uint8_t* sec = mmap.data() + sd->file_offset;
-        bool ok = verify_checksum(sec, sd->compressed_size, offsetof(ShardHeader, checksum));
-        if (!ok) {
-            spdlog::error("verify: shard section_id={} MISMATCH", sd->section_id);
+    // --- Verify every section's content checksum (SectionDesc.checksum) ---
+    // The descriptor checksum is the XXH128 of the whole section body. Sections
+    // with an all-zero checksum predate the feature (or exceeded the build-time
+    // hashing cap) and are skipped.
+    size_t n_sections = toc.sections.size();
+    size_t n_zero     = 0;
+    size_t n_checked  = 0;
+    static const uint8_t zeros[16] = {};
+    for (const auto& sd : toc.sections) {
+        if (std::memcmp(sd.checksum, zeros, 16) == 0) { ++n_zero; continue; }
+        if (sd.compressed_size > mmap.size() ||
+            sd.file_offset > mmap.size() - sd.compressed_size) {
+            spdlog::error("verify: section type={:#x} id={} out of bounds",
+                          sd.type, sd.section_id);
+            ++failures; continue;
+        }
+        const uint8_t* sec = mmap.data() + sd.file_offset;
+        if (!checksum_matches(sec, sd.compressed_size, sd.checksum)) {
+            spdlog::error("verify: section type={:#x} id={} checksum MISMATCH",
+                          sd.type, sd.section_id);
             ++failures;
-        } else if (verbose) {
-            spdlog::info("verify: shard section_id={} OK", sd->section_id);
+        } else {
+            ++n_checked;
+            if (verbose) spdlog::info("verify: section type={:#x} id={} OK", sd.type, sd.section_id);
         }
     }
 
     if (n_zero > 0)
-        spdlog::warn("verify: {} of {} shards have zero checksum (pre-feature, skipped)",
-                     n_zero, n_shards);
+        spdlog::warn("verify: {} of {} sections have zero checksum (pre-feature/over-cap, skipped)",
+                     n_zero, n_sections);
 
     if (failures == 0)
-        spdlog::info("verify: {} shard(s) checked, all OK", n_shards - n_zero);
+        spdlog::info("verify: {} section(s) checked, all OK", n_checked);
     else
         spdlog::error("verify: {} checksum failure(s)", failures);
 
@@ -2997,8 +3048,6 @@ int main(int argc, char** argv) {
     check_cmd->add_option("--min-genus-size", check_min_genus_size, "Min genus members for saturated tier (default: 3)");
     check_cmd->add_option("--leakage-threshold", check_leakage_threshold, "Containment leakage threshold (default: 0.05)");
     check_cmd->add_flag("--recompute", check_recompute, "Ignore existing QUAL section and force full rescan");
-    std::string check_markers;
-    check_cmd->add_option("--markers", check_markers, "Path to markers.mrk sidecar for SCG completeness scoring");
     check_cmd->callback([&]() {
         std::exit(genopack::check::cmd_check(
             check_pack,
@@ -3007,8 +3056,7 @@ int main(int argc, char** argv) {
             check_min_genus_size,
             check_leakage_threshold,
             check_output.empty() ? std::filesystem::path{} : std::filesystem::path{check_output},
-            check_recompute,
-            check_markers.empty() ? std::filesystem::path{} : std::filesystem::path{check_markers}));
+            check_recompute));
     });
 
     // genopack gcov
@@ -3072,6 +3120,7 @@ int main(int argc, char** argv) {
         std::exit(0);
     });
 
+
     // genopack calibrate
     auto* cal_cmd = app.add_subcommand("calibrate",
         "Fit a completeness calibration model from a genopack archive + CheckM2 ground truth. "
@@ -3096,18 +3145,28 @@ int main(int argc, char** argv) {
     // genopack bench-grid
     auto* bg_cmd = app.add_subcommand("bench-grid",
         "Heterogeneous spike-fraction × ANI-distance benchmark from a manifest TSV");
-    std::string bg_archive, bg_manifest, bg_output;
+    std::string bg_archive, bg_manifest, bg_output, bg_completeness_str;
     int bg_threads = 4, bg_reps = 5;
     uint32_t bg_seed = 42;
-    bg_cmd->add_option("archive",        bg_archive,    "Archive path (.gpk)")->required();
-    bg_cmd->add_option("-o,--output",    bg_output,     "TSV output path")->required();
-    bg_cmd->add_option("--manifest",     bg_manifest,   "Manifest TSV (host_genus, contam_genus, ani_label, intra_offset)")->required();
-    bg_cmd->add_option("-t,--threads",   bg_threads,    "Thread count");
-    bg_cmd->add_option("-r,--reps",      bg_reps,       "Replicates per cell");
-    bg_cmd->add_option("--seed",         bg_seed,       "Random seed");
+    bg_cmd->add_option("archive",          bg_archive,          "Archive path (.gpk)")->required();
+    bg_cmd->add_option("-o,--output",      bg_output,           "TSV output path")->required();
+    bg_cmd->add_option("--manifest",       bg_manifest,         "Manifest TSV (host_genus, contam_genus, ani_label, intra_offset)")->required();
+    bg_cmd->add_option("-t,--threads",     bg_threads,          "Thread count");
+    bg_cmd->add_option("-r,--reps",        bg_reps,             "Replicates per cell");
+    bg_cmd->add_option("--seed",           bg_seed,             "Random seed");
+    bg_cmd->add_option("--completeness",   bg_completeness_str, "Comma-separated host completeness fractions 0.0-1.0 (default: 1.0)");
     bg_cmd->callback([&]() {
+        std::vector<float> comp_fracs = {1.0f};
+        if (!bg_completeness_str.empty()) {
+            comp_fracs.clear();
+            std::istringstream ss(bg_completeness_str);
+            std::string tok;
+            while (std::getline(ss, tok, ','))
+                comp_fracs.push_back(std::stof(tok));
+        }
         std::exit(genopack::bench::cmd_bench_grid(
-            bg_archive, bg_manifest, bg_output, bg_threads, bg_reps, bg_seed));
+            bg_archive, bg_manifest, bg_output, bg_threads, bg_reps, bg_seed,
+            comp_fracs));
     });
 
     // genopack sim
@@ -3365,6 +3424,20 @@ int main(int argc, char** argv) {
         };
         std::cout << fmtf(completeness) << "\t" << fmtf(redundancy)
                   << "\t" << n_present << "\t" << n_expected << "\n";
+    });
+
+    // ── stage subcommand ──────────────────────────────────────────────────────
+    std::string stage_input, stage_output;
+    int stage_threads = 48;
+    uint64_t stage_block_mb = 64;
+    auto* stage_cmd = app.add_subcommand("stage",
+        "Cache NFS genome FASTAs as a local zstd-compressed sequence store (.gstage) for fast rebuilds");
+    stage_cmd->add_option("-i,--input",   stage_input,    "Input TSV")->required();
+    stage_cmd->add_option("-o,--output",  stage_output,   "Output .gstage path")->required();
+    stage_cmd->add_option("-t,--threads", stage_threads,  "Reader threads (default: 48)");
+    stage_cmd->add_option("--block-mb",   stage_block_mb, "Block size in MB (default: 64)");
+    stage_cmd->callback([&]{
+        std::exit(genopack::cmd_stage(stage_input, stage_output, stage_threads, stage_block_mb));
     });
 
     CLI11_PARSE(app, argc, argv);

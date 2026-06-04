@@ -51,6 +51,7 @@ struct GenomeQuality {
     uint16_t n_mix_windows        = 0;
     float    fiedler_value              = NAN;
     float    contamination_contig_outlier = NAN;
+    float    contamination_contig_outlier_adj = NAN; // CCO minus per-genus clean-genome baseline
     float    contamination_spe              = NAN;
     float    contamination_sibling_outlier  = NAN;
     float    contamination_rho_outlier      = NAN;  // ρ* Mahalanobis outlier fraction

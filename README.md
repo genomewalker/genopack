@@ -191,32 +191,38 @@ genopack reindex mydb.gpk --skch --force
 
 ## Distributed build
 
-For collections too large for a single node, use the NFS manifest coordinator:
+For large collections on a **shared NFS filesystem**, partition by genus, build parts in parallel, and query the directory directly — no merge or coordinator needed:
 
 ```bash
-# 1. Start coordinator on any node with NFS access
+# 1. Partition by genus into N balanced parts (LPT bin-packing, genus stays whole)
+genopack taxonomy partition -i genomes.tsv -n 6 -o parts/ -r g
+
+# 2. Build each part on a separate node in parallel
+genopack build -i parts/part_0.tsv -o parts/part_0.gpk -p 16 -t 8
+genopack build -i parts/part_1.tsv -o parts/part_1.gpk -p 8  -t 8
+# ...
+
+# 3. All commands accept the parts directory directly
+genopack check parts/ --genomes query.txt -o quality.tsv -t 16
+genopack stat  parts/
+```
+
+Every CLI command that takes an archive path also accepts a directory containing `part_*.gpk`. Genus-partitioning keeps each genus whole so GSTX is built from complete genus membership per part.
+
+For disconnected nodes with local scratch, use the NFS coordinator instead:
+
+```bash
 genopack coordinator -o /nfs/output.gpk --nfs-dir /nfs/manifest/ --workers 4 \
     --ntdb /path/to/ncbi_taxdump/
-
-# 2. On each worker (sbatch / parallel / pdsh)
 genopack build -i part_N.tsv -o /scratch/part_N.gpk -t 24 -z 6 \
     --coordinator /nfs/manifest/:/nfs/output.gpk
 ```
 
-Each worker builds its slice locally, then transfers sections into the shared output via `pwrite()` at coordinator-allocated offsets. Coordination is done through manifest files (`.pending` / `.alloc` / `.done`) on the shared filesystem; no TCP connections required.
-
-`--ntdb` makes the coordinator embed the NCBI tree as an NTDB section in the final archive, so workers do not each need to parse `nodes.dmp`/`names.dmp`.
-
-Alternatively, build parts independently and merge:
+To produce a single merged archive:
 
 ```bash
-for i in 0 1 2 3; do
-    genopack build -i part_$i.tsv -o parts/part_$i.gpk -t 24 -z 6
-done
 genopack merge -l <(ls parts/*.gpk) -o merged.gpk
 ```
-
-For workflows that prefer reading parts directly without a final merge, every CLI command that takes an archive path also accepts a directory containing `part_*.gpk`.
 
 ## Input TSV format
 

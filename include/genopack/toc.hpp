@@ -40,6 +40,11 @@ public:
                       uint64_t gpk_uuid_lo = 0,
                       uint64_t gpk_uuid_hi = 0);
 
+    // Mutable access to the accumulated descriptors, e.g. to populate per-section
+    // content checksums after the bodies are written but before finalize().
+    std::vector<SectionDesc>&       sections()       { return sections_; }
+    const std::vector<SectionDesc>& sections() const { return sections_; }
+
 private:
     std::vector<SectionDesc> sections_;
 };

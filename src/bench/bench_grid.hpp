@@ -11,6 +11,7 @@ int cmd_bench_grid(
     const std::filesystem::path& output,
     int      threads,
     int      reps,
-    uint32_t seed);
+    uint32_t seed,
+    const std::vector<float>&    completeness_fracs = {1.0f});
 
 } // namespace genopack::bench

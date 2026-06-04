@@ -103,6 +103,7 @@ PassAResult run_pass_a(ICheckReader& pack,
                        int threads,
                        int min_genus_size,
                        float /*leakage_threshold*/,
+                       int min_gstx_members,
                        const std::unordered_map<uint64_t, QualRecord>* qual_cache)
 {
     struct MemberMeta {
@@ -345,18 +346,54 @@ PassAResult run_pass_a(ICheckReader& pack,
     if (have_sketch && n_k > 0) {
         // Build global sorted target gid list, split by GSTX availability
         struct GlobalTarget {
-            GenomeId gid;
-            int      gi;      // index into active_genera / slots / genus_tq
-            int      tq_idx;  // index within genus_tq[gi]
+            GenomeId         gid;
+            int              gi;       // index into active_genera / slots / genus_tq
+            int              tq_idx;   // index within genus_tq[gi]
+            const GstxEntry* gstx_e;  // species-level GSTX (or genus fallback)
         };
         std::vector<GlobalTarget> gstx_targets, nogstx_targets;
 
+        // Build acc→species map for target genomes (for species-level GSTX lookup).
+        std::unordered_map<std::string, std::string> target_species;
+        if (have_sketch) {
+            pack.scan_taxonomy_with_id([&](std::string_view acc, std::string_view tax, GenomeId) {
+                if (!target_set.count(acc)) return;
+                constexpr std::string_view needle = ";s__";
+                std::string_view sv;
+                auto pos = tax.find(needle);
+                if (pos != std::string_view::npos) {
+                    auto s = pos + 1, e = tax.find(';', s);
+                    sv = tax.substr(s, e == std::string_view::npos ? e : e - s);
+                } else if (tax.starts_with("s__")) {
+                    sv = tax.substr(0, tax.find(';', 3));
+                }
+                if (!sv.empty() && sv != "s__")
+                    target_species.emplace(std::string(acc), std::string(sv));
+            });
+        }
+
         for (int gi = 0; gi < n_active; ++gi) {
             const auto& tq = genus_tq[gi];
-            auto& dest = slots[gi].gstx_e ? gstx_targets : nogstx_targets;
-            for (int ti = 0; ti < static_cast<int>(tq.size()); ++ti)
-                if (tq[ti].m->gid > 0)
-                    dest.push_back({tq[ti].m->gid, gi, ti});
+            for (int ti = 0; ti < static_cast<int>(tq.size()); ++ti) {
+                if (tq[ti].m->gid == 0) continue;
+                const GstxEntry* tgt_gstx = nullptr;
+                if (have_sketch) {
+                    // Prefer species-level GSTX with sufficient members; fall back to genus.
+                    auto sit = target_species.find(tq[ti].m->acc);
+                    if (sit != target_species.end()) {
+                        const GstxEntry* sp = pack.gstx_for_genus(sit->second);
+                        if (sp && sp->n_members >= static_cast<uint32_t>(min_gstx_members))
+                            tgt_gstx = sp;
+                    }
+                    if (!tgt_gstx) {
+                        const GstxEntry* ge = slots[gi].gstx_e;
+                        if (ge && ge->n_members >= static_cast<uint32_t>(min_gstx_members))
+                            tgt_gstx = ge;
+                    }
+                }
+                auto& dest = tgt_gstx ? gstx_targets : nogstx_targets;
+                dest.push_back({tq[ti].m->gid, gi, ti, tgt_gstx});
+            }
         }
 
         auto sort_by_gid = [](std::vector<GlobalTarget>& v) {
@@ -380,7 +417,7 @@ PassAResult run_pass_a(ICheckReader& pack,
                 [&](size_t bidx, uint32_t ki, const SketchResult& sk) {
                     if (ki >= static_cast<uint32_t>(n_k)) return;
                     const GlobalTarget& gt  = gstx_targets[bidx];
-                    const GstxEntry*    gst = slots[gt.gi].gstx_e;
+                    const GstxEntry*    gst = gt.gstx_e;
                     const uint16_t* cons    = gst->consensus[ki];
                     uint32_t mismatch = 0;
                     for (uint32_t b = 0; b < sk.sketch_size; ++b)
@@ -392,8 +429,7 @@ PassAResult run_pass_a(ICheckReader& pack,
 
             for (int tidx = 0; tidx < n_tgt; ++tidx) {
                 const GlobalTarget& gt  = gstx_targets[tidx];
-                const GenusSlot&    sl  = slots[gt.gi];
-                const GstxEntry*    gst = sl.gstx_e;
+                const GstxEntry*    gst = gt.gstx_e;
                 const float* tlk        = &lk[static_cast<size_t>(tidx) * GSTX_MAX_K];
                 auto& q = genus_tq[gt.gi][gt.tq_idx].q;
                 apply_leakage_scores(q, tlk, n_k, avail_k.data(), gst->p90_containment[0]);

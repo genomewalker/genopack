@@ -38,6 +38,7 @@
 #include <thread>
 #include <unistd.h>
 #include <fcntl.h>
+#include <genopack/checksum.hpp>
 #include <unordered_map>
 #include <vector>
 
@@ -201,8 +202,11 @@ struct ArchiveBuilder::Impl {
         else
             gpk_path_ = std::filesystem::path(dir.string() + ".gpk");
 
-        // Ensure parent directory exists (for meta.tsv sidecar)
-        std::filesystem::create_directories(gpk_path_.parent_path());
+        // Ensure parent directory exists (for meta.tsv sidecar). A relative
+        // output like "out.gpk" has an empty parent_path() — create_directories("")
+        // throws "Invalid argument", so guard it.
+        if (!gpk_path_.parent_path().empty())
+            std::filesystem::create_directories(gpk_path_.parent_path());
     }
 
     void add(const BuildRecord& rec) {
@@ -230,6 +234,10 @@ struct ArchiveBuilder::Impl {
         // ── Checkpoint paths ──────────────────────────────────────────────────
         std::filesystem::path ckpt_path      = std::filesystem::path(gpk_path_.string() + ".ckpt");
         std::filesystem::path ckpt_meta_path = std::filesystem::path(gpk_path_.string() + ".ckpt_meta.bin");
+        // Build into a .partial sidecar and atomically rename to the final path
+        // only after a durable footer. A crash leaves .partial + checkpoints for
+        // resume; the final .gpk only ever appears fully sealed.
+        std::filesystem::path partial_path   = std::filesystem::path(gpk_path_.string() + ".partial");
 
         AppendWriter app_writer;
         TocWriter    toc;
@@ -283,7 +291,7 @@ struct ArchiveBuilder::Impl {
         bool     resuming      = false;
 
         if (std::filesystem::exists(ckpt_path) && std::filesystem::exists(ckpt_meta_path)
-            && std::filesystem::exists(gpk_path_)) {
+            && std::filesystem::exists(partial_path)) {
 
             size_t   ck_genome_count  = 0;
             uint64_t ck_byte_offset   = 0;
@@ -388,10 +396,10 @@ struct ArchiveBuilder::Impl {
 
                 if (meta_ok && genomes_restored == ck_genome_count) {
                     // Truncate .gpk to the checkpoint byte offset
-                    if (::truncate(gpk_path_.c_str(), static_cast<off_t>(ck_byte_offset)) != 0)
+                    if (::truncate(partial_path.c_str(), static_cast<off_t>(ck_byte_offset)) != 0)
                         throw std::runtime_error("checkpoint resume: truncate failed: " +
                                                  std::string(std::strerror(errno)));
-                    app_writer.open_append(gpk_path_);
+                    app_writer.open_append(partial_path);
                     app_writer.seek_to(ck_byte_offset);
 
                     next_genome_id    = static_cast<GenomeId>(ck_next_gid);
@@ -438,7 +446,7 @@ struct ArchiveBuilder::Impl {
             gpk_path_.parent_path() / (gpk_path_.stem().string() + ".meta.tsv");
 
         if (!resuming) {
-            app_writer.create(gpk_path_);
+            app_writer.create(partial_path);
 
             // Write FileHeader (128B)
             {
@@ -541,13 +549,22 @@ struct ArchiveBuilder::Impl {
             }
             std::fflush(ckpt_meta_file);
 
-            // Update scalar checkpoint (overwrite)
-            std::ofstream ck(ckpt_path);
-            ck << "genome_count="     << (dr.catalog_start + dr.n_genomes) << "\n"
-               << "byte_offset="      << app_writer.current_offset()       << "\n"
-               << "next_genome_id="   << next_genome_id                    << "\n"
-               << "current_shard_id=" << current_shard_id                  << "\n"
-               << "next_section_id="  << next_section_id                   << "\n";
+            // Update scalar checkpoint atomically (tmp + rename) so a crash
+            // mid-write cannot leave a torn checkpoint that forces a full
+            // rebuild (P12).
+            {
+                std::filesystem::path ckpt_tmp =
+                    std::filesystem::path(ckpt_path.string() + ".tmp");
+                {
+                    std::ofstream ck(ckpt_tmp, std::ios::trunc);
+                    ck << "genome_count="     << (dr.catalog_start + dr.n_genomes) << "\n"
+                       << "byte_offset="      << app_writer.current_offset()       << "\n"
+                       << "next_genome_id="   << next_genome_id                    << "\n"
+                       << "current_shard_id=" << current_shard_id                  << "\n"
+                       << "next_section_id="  << next_section_id                   << "\n";
+                }
+                std::filesystem::rename(ckpt_tmp, ckpt_path);
+            }
         };
 
         // ── IO writer thread ──────────────────────────────────────────────────
@@ -566,6 +583,10 @@ struct ArchiveBuilder::Impl {
                 FrozenShard frozen = wt.fut.get();
                 uint64_t shard_start = app_writer.current_offset();
                 app_writer.append(frozen.bytes.data(), frozen.bytes.size());
+                // Make the shard bytes server-durable BEFORE recording the resume
+                // offset in the checkpoint, so a crash cannot leave a checkpoint
+                // pointing past bytes the NFS server never committed (P13).
+                app_writer.flush();
                 SectionDesc sd{};
                 sd.type             = SEC_SHRD;
                 sd.version          = 4;
@@ -577,7 +598,9 @@ struct ArchiveBuilder::Impl {
                 sd.item_count       = wt.n_genomes;
                 sd.aux0             = wt.shard_id;
                 sd.aux1             = 0;
-                std::memset(sd.checksum, 0, sizeof(sd.checksum));
+                // XXH128 content hash of the whole shard section body (P1) —
+                // checked by `genopack verify`.
+                checksum_of(frozen.bytes.data(), frozen.bytes.size(), sd.checksum);
                 toc.add_section(sd);
                 DrainResult dr{wt.shard_id, wt.section_id, shard_start,
                                static_cast<uint64_t>(frozen.bytes.size()),
@@ -905,8 +928,15 @@ struct ArchiveBuilder::Impl {
             if (cfg.build_gstx && cfg.taxonomy_group && multi_k_sketch && buf.size() >= 2
                 && genus_homogeneous) {
                 std::string genus_key;
+                std::string species_key;
                 for (const auto& [k, v] : buf[0].record.extra_fields)
-                    if (k == "taxonomy") { genus_key = extract_taxonomy_bucket(v, 'g'); break; }
+                    if (k == "taxonomy") {
+                        genus_key   = extract_taxonomy_bucket(v, 'g');
+                        species_key = extract_taxonomy_bucket(v, 's');
+                        break;
+                    }
+                const std::string& gstx_key = (!species_key.empty() && species_key != "__unclassified__")
+                                              ? species_key : genus_key;
 
                 const int nk   = std::min((int)buf[0].sketches_mk.size(), (int)GSTX_MAX_K);
                 const int bins = cfg.sketch_size;
@@ -930,17 +960,47 @@ struct ArchiveBuilder::Impl {
                     }
 
                     // Pass 2: containment vs consensus → exact p90 (all data in RAM)
+                    // Compute k=0 containments first to build a completeness-based keep mask:
+                    // exclude members with cont0 < GSTX_P90_COMPLETE_FRAC * max_cont0 so that
+                    // incomplete genomes don't deflate the p90 reference and bias CCR upward.
                     float p90[GSTX_MAX_K] = {};
+                    std::vector<float> cont0_v;
+                    cont0_v.reserve(buf.size());
+                    if (nk > 0) {
+                        for (const auto& item : buf) {
+                            if (item.sketches_mk.empty()) { cont0_v.push_back(0.0f); continue; }
+                            const auto& sk = item.sketches_mk[0];
+                            int match = 0;
+                            for (int b = 0; b < bins; ++b)
+                                if (static_cast<uint16_t>(sk.signature1[b] & 0xFFFF) == cand[0][b]) ++match;
+                            cont0_v.push_back(static_cast<float>(match) / bins);
+                        }
+                    }
+                    const float max_c0 = cont0_v.empty() ? 0.0f
+                        : *std::max_element(cont0_v.begin(), cont0_v.end());
+                    const float keep_thr = GSTX_P90_COMPLETE_FRAC * max_c0;
+
                     for (int ki = 0; ki < nk; ++ki) {
                         std::vector<float> c;
                         c.reserve(buf.size());
-                        for (const auto& item : buf) {
-                            if (ki >= (int)item.sketches_mk.size()) continue;
-                            const auto& sk = item.sketches_mk[ki];
+                        for (size_t ii = 0; ii < buf.size(); ++ii) {
+                            if (ki >= (int)buf[ii].sketches_mk.size()) continue;
+                            if (!cont0_v.empty() && cont0_v[ii] < keep_thr) continue;
+                            const auto& sk = buf[ii].sketches_mk[ki];
                             int match = 0;
                             for (int b = 0; b < bins; ++b)
                                 if (static_cast<uint16_t>(sk.signature1[b] & 0xFFFF) == cand[ki][b]) ++match;
                             c.push_back(static_cast<float>(match) / bins);
+                        }
+                        if (c.empty()) { // fallback: all members if threshold filtered everything
+                            for (const auto& item : buf) {
+                                if (ki >= (int)item.sketches_mk.size()) continue;
+                                const auto& sk = item.sketches_mk[ki];
+                                int match = 0;
+                                for (int b = 0; b < bins; ++b)
+                                    if (static_cast<uint16_t>(sk.signature1[b] & 0xFFFF) == cand[ki][b]) ++match;
+                                c.push_back(static_cast<float>(match) / bins);
+                            }
                         }
                         if (!c.empty()) {
                             size_t idx = static_cast<size_t>(0.9f * c.size());
@@ -978,7 +1038,7 @@ struct ArchiveBuilder::Impl {
                         }
                     }
 
-                    gstx_writer.add_genus(genus_key,
+                    gstx_writer.add_genus(gstx_key,
                                           static_cast<uint32_t>(buf.size()),
                                           static_cast<uint32_t>(nk),
                                           cand, p90,
@@ -1532,6 +1592,53 @@ struct ArchiveBuilder::Impl {
             toc.add_section(qual_sd);
         }
 
+        // Write GCOV/FCOV/FMHR into the SAME metadata block so the archive has
+        // exactly one footer generation (no post-TailLocator NFS rewrites — P11).
+        // Profiles were computed in-memory during flush_staging_buf.
+        if (cfg.build_gcov && cfg.build_gstx && cfg.taxonomy_group) {
+            if (build_gcov_w.n_genera() > 0) {
+                SectionDesc sd = build_gcov_w.finalize(mw, next_section_id++, SEC_GCOV);
+                toc.add_section(sd);
+                spdlog::info("GCOV: {} genera", build_gcov_w.n_genera());
+            }
+            if (build_fcov_w.n_genera() > 0) {
+                SectionDesc sd = build_fcov_w.finalize(mw, next_section_id++, SEC_FCOV);
+                toc.add_section(sd);
+                spdlog::info("FCOV: {} genera", build_fcov_w.n_genera());
+            }
+            if (build_fmhr_w.n_genera() > 0) {
+                SectionDesc sd = build_fmhr_w.finalize(mw, next_section_id++);
+                toc.add_section(sd);
+                spdlog::info("FMHR: {} genera", build_fmhr_w.n_genera());
+            }
+        }
+
+        // Populate per-section content checksums (P1) for the metadata sections.
+        // SHRD sections were hashed at write time; everything else lives in the
+        // local temp file and is hashed here, before the TOC / MetaBundle (which
+        // cover these descriptors) are finalized. Sections larger than the cap are
+        // left unchecksummed (0) to avoid a costly re-read of multi-GB SKCH/KMRX on
+        // huge builds; they travel the safe local-temp + O_SYNC path.
+        mw.flush();
+        {
+            constexpr uint64_t CHECKSUM_MAX_SECTION_BYTES = 512ull << 20;
+            int tfd = ::open(bld_meta_tmp.data(), O_RDONLY);
+            if (tfd >= 0) {
+                std::vector<uint8_t> sbuf;
+                for (auto& sd : toc.sections()) {
+                    if (sd.type == SEC_SHRD) continue;                      // already hashed
+                    if (sd.compressed_size == 0) continue;
+                    if (sd.compressed_size > CHECKSUM_MAX_SECTION_BYTES) continue;
+                    sbuf.resize(static_cast<size_t>(sd.compressed_size));
+                    ssize_t nr = ::pread(tfd, sbuf.data(), sbuf.size(),
+                                         static_cast<off_t>(sd.file_offset));
+                    if (nr == static_cast<ssize_t>(sbuf.size()))
+                        checksum_of(sbuf.data(), sbuf.size(), sd.checksum);
+                }
+                ::close(tfd);
+            }
+        }
+
         // Write TOC + TailLocator to local file
         toc.finalize(mw,
                      /*generation=*/1,
@@ -1548,7 +1655,7 @@ struct ArchiveBuilder::Impl {
             const uint64_t meta_size = mw.current_offset() - meta_base;
             const size_t   CHUNK     = 64 * 1024 * 1024;
             int local_fd = ::open(bld_meta_tmp.data(), O_RDONLY);
-            int nfs_fd   = ::open(gpk_path_.c_str(), O_WRONLY | O_SYNC);
+            int nfs_fd   = ::open(partial_path.c_str(), O_WRONLY | O_SYNC);
             if (local_fd < 0 || nfs_fd < 0) {
                 if (local_fd >= 0) ::close(local_fd);
                 if (nfs_fd   >= 0) ::close(nfs_fd);
@@ -1590,55 +1697,18 @@ struct ArchiveBuilder::Impl {
         }
         ::unlink(bld_meta_tmp.data());
 
-        // Write GCOV/FCOV/FMHR sections from in-memory writers (populated during flush_staging_buf).
-        // No second FASTA pass needed — all profiles were computed alongside AllSignals.
-        if (cfg.build_gcov && cfg.build_gstx && cfg.taxonomy_group) {
-            // Re-usable helper: read TOC, open append writer, write section, update TOC.
-            auto append_gcov_like = [&](auto& writer, uint32_t type, const char* label) {
-                if (writer.n_genera() == 0) return;
-                MmapFileReader mm; mm.open(gpk_path_);
-                auto toc_r = TocReader::read(mm);
-                const auto* tail = mm.ptr_at<TailLocator>(mm.size() - sizeof(TailLocator));
-                const uint64_t prev_toc = tail->toc_offset, gen = toc_r.header.generation + 1;
-                mm.close();
-                AppendWriter aw; aw.open_append(gpk_path_);
-                SectionDesc sd = writer.finalize(aw, toc_r.next_section_id(), type);
-                TocWriter tw;
-                for (const auto& s : toc_r.sections)
-                    if (s.type != type) tw.add_section(s);
-                tw.add_section(sd);
-                tw.finalize(aw, gen,
-                            toc_r.header.live_genome_count, toc_r.header.total_genome_count,
-                            prev_toc,
-                            toc_r.header.catalog_root_section_id,
-                            toc_r.header.accession_root_section_id,
-                            toc_r.header.tombstone_root_section_id);
-                spdlog::info("{}: {} entries written to {}", label, writer.n_genera(), gpk_path_.string());
-            };
-            auto append_fmhr = [&](FmhrWriter& writer) {
-                if (writer.n_genera() == 0) return;
-                MmapFileReader mm; mm.open(gpk_path_);
-                auto toc_r = TocReader::read(mm);
-                const auto* tail = mm.ptr_at<TailLocator>(mm.size() - sizeof(TailLocator));
-                const uint64_t prev_toc = tail->toc_offset, gen = toc_r.header.generation + 1;
-                mm.close();
-                AppendWriter aw; aw.open_append(gpk_path_);
-                SectionDesc sd = writer.finalize(aw, toc_r.next_section_id());
-                TocWriter tw;
-                for (const auto& s : toc_r.sections)
-                    if (s.type != SEC_FMHR) tw.add_section(s);
-                tw.add_section(sd);
-                tw.finalize(aw, gen,
-                            toc_r.header.live_genome_count, toc_r.header.total_genome_count,
-                            prev_toc,
-                            toc_r.header.catalog_root_section_id,
-                            toc_r.header.accession_root_section_id,
-                            toc_r.header.tombstone_root_section_id);
-                spdlog::info("FMHR: {} genera written to {}", writer.n_genera(), gpk_path_.string());
-            };
-            append_gcov_like(build_gcov_w, SEC_GCOV, "GCOV");
-            append_gcov_like(build_fcov_w, SEC_FCOV, "FCOV");
-            append_fmhr(build_fmhr_w);
+        // ── Atomic publish ───────────────────────────────────────────────────
+        // The archive was built into <out>.partial (shards + single-generation
+        // metadata block). Make it durable, then atomically rename to the final
+        // path and fsync the parent directory so the rename itself survives a
+        // crash. A crash before the rename leaves <out>.partial + checkpoints
+        // for resume; the final .gpk only ever appears fully sealed (P19).
+        app_writer.flush();
+        app_writer.close();
+        std::filesystem::rename(partial_path, gpk_path_);
+        {
+            int dfd = ::open(gpk_path_.parent_path().c_str(), O_RDONLY | O_DIRECTORY);
+            if (dfd >= 0) { ::fsync(dfd); ::close(dfd); }
         }
 
         // Remove checkpoint files — build completed successfully
