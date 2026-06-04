@@ -12,7 +12,10 @@ int main() {
     using namespace genopack_test;
     TempDir tmp("genopack_smoke");
 
-    const std::string a1 = make_sequence("ACGT", 140000);
+    // 300 kb: ~75 kb when 2-bit packed → spans several checkpoint_bases-sized
+    // chunks, so the n_checkpoints>1 assertion below genuinely exercises the
+    // multi-chunk random-access path (not a single-chunk degenerate shard).
+    const std::string a1 = make_sequence("ACGT", 300000);
     const std::string a2 = mutate_every(a1, 97);
     const std::string b1 = make_sequence("TTGCAACG", 90000);
     const std::string mc1 = make_sequence("AACCGGTT", 30000);

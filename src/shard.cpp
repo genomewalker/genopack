@@ -140,15 +140,23 @@ struct SequenceBlobLayout {
     std::string headers_flat;
     std::vector<uint8_t> prefix;
     uint32_t blocks_offset = 0;
+    bool     packed_2bit   = false;   // seq holds 2-bit-packed bytes (4 bases/byte)
 };
 
 static std::vector<ChunkBoundary> build_sequence_chunks(size_t seq_len,
-                                                        size_t target_bases)
+                                                        size_t target_bases,
+                                                        bool   packed_2bit)
 {
     std::vector<ChunkBoundary> chunks;
     if (seq_len == 0) return chunks;
 
-    const size_t interval = std::max<size_t>(1, target_bases);
+    // target_bases is a count of SEQUENCE BASES (per the config contract). seq is
+    // indexed in bytes — 4 bases/byte when 2-bit packed — so convert the base
+    // target into the seq's byte stride before chunking. Without this, a packed
+    // genome chunks at 4× the requested base interval (a <262 KB-base genome
+    // would never split, so its single chunk carried no random-access checkpoint).
+    const size_t bases_per_byte = packed_2bit ? 4 : 1;
+    const size_t interval = std::max<size_t>(1, target_bases / bases_per_byte);
     for (size_t start = 0; start < seq_len; start += interval) {
         size_t end = std::min(seq_len, start + interval);
         chunks.push_back(ChunkBoundary{
@@ -252,6 +260,7 @@ static SequenceBlobLayout build_sequence_blob_layout(const char* fasta, size_t l
     // Replace seq with packed bytes so compress_range operates on packed data
     if (packed)
         layout.seq.assign(reinterpret_cast<const char*>(packed_bytes.data()), packed_bytes.size());
+    layout.packed_2bit = packed;
 
     return layout;
 }
@@ -531,7 +540,9 @@ FrozenShard ShardWriter::freeze() {
             out.checkpoints.clear();
             out.data.insert(out.data.end(), blob_layout.prefix.begin(), blob_layout.prefix.end());
 
-            auto ranges = build_sequence_chunks(blob_layout.seq.size(), impl_->cfg.checkpoint_bases);
+            auto ranges = build_sequence_chunks(blob_layout.seq.size(),
+                                                impl_->cfg.checkpoint_bases,
+                                                blob_layout.packed_2bit);
             out.checkpoints.reserve(ranges.size());
 
             uint32_t block_offset = blob_layout.blocks_offset;
@@ -774,7 +785,8 @@ FrozenShard ShardWriter::freeze() {
             }
 
             size_t total = 0;
-            auto ranges = build_sequence_chunks(blob_layout.seq.size(), target_bases);
+            auto ranges = build_sequence_chunks(blob_layout.seq.size(), target_bases,
+                                                blob_layout.packed_2bit);
             auto sampled_ranges = choose_spaced_indices(ranges.size(), std::min<size_t>(3, ranges.size()));
             size_t max_bound = 0;
             for (size_t ridx : sampled_ranges)
@@ -984,7 +996,8 @@ FrozenShard ShardWriter::freeze() {
                                                           impl_->cfg.use_2bit_pack);
             blobs[i].raw_len = pg.raw_len;
 
-            auto ranges = build_sequence_chunks(blob_layout.seq.size(), delta_target_bases);
+            auto ranges = build_sequence_chunks(blob_layout.seq.size(), delta_target_bases,
+                                                blob_layout.packed_2bit);
             blobs[i].checkpoints.clear();
             blobs[i].data.clear();
             blobs[i].checkpoints.reserve(ranges.size());
