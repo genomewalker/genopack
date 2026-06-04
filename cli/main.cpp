@@ -78,7 +78,8 @@ static int cmd_build(const std::string& input_tsv, const std::string& output_dir
                      std::vector<int> sketch_kmers = {},
                      bool no_gstx = false,
                      std::string markers_path = {},
-                     std::string from_gpk = {}) {
+                     std::string from_gpk = {},
+                     uint32_t micro_genus_threshold = 8) {
     ArchiveBuilder::Config cfg;
     const bool explicit_codec = no_dict || ref_dict || delta || mem_delta;
     cfg.io_threads                        = static_cast<size_t>(std::max(1, threads));
@@ -86,6 +87,7 @@ static int cmd_build(const std::string& input_tsv, const std::string& output_dir
     cfg.verbose                           = verbose;
     cfg.build_cidx                        = !no_cidx;
     cfg.build_gstx                        = !no_gstx;
+    cfg.micro_genus_threshold             = micro_genus_threshold;
     cfg.shard_cfg.zstd_level              = zstd_level;
     cfg.shard_cfg.auto_codec              = !explicit_codec;
     cfg.shard_cfg.train_dict              = false;
@@ -2260,6 +2262,11 @@ int main(int argc, char** argv) {
     build->add_flag("--no-cidx,!--cidx",          build_no_cidx,    "Skip CIDX contig index (default: on; --cidx to build it)");
     bool build_no_gstx = false;
     build->add_flag("--no-gstx,!--gstx",         build_no_gstx,    "Skip GSTX genus-stats index (default: on; --no-gstx to disable)");
+    uint32_t build_micro_genus_threshold = 8;
+    build->add_option("--micro-genus-threshold", build_micro_genus_threshold,
+        "Min genomes for a genus to get its own shard + GSTX/GCOV/FMHR consensus model; smaller "
+        "genera are bin-packed and unmodeled. Lower = more genera modeled (better contamination/"
+        "quality coverage), more shards (default: 8)")->default_val(8);
     build->add_flag("--2bit,!--no-2bit",          build_2bit,       "2-bit sequence packing before zstd (default: on; --no-2bit to disable)");
     build->add_flag("--kmer-sort,!--no-kmer-sort",   build_kmer_nn,    "Sort genomes within each shard by kmer4_profile NN chain (default: on; --no-kmer-sort to disable)");
     build->add_flag("--taxon-group,!--no-taxon-group",build_taxon_group,"Group genomes into per-taxon shards (default: on; --no-taxon-group to disable; requires taxonomy column)");
@@ -2312,7 +2319,8 @@ int main(int argc, char** argv) {
                                 build_taxon_group, build_taxon_rank,
                                 build_sketch, build_sketch_kmer, build_sketch_size,
                                 build_sketch_syncmer, build_sketch_kmers,
-                                build_no_gstx, build_markers, build_from_gpk);
+                                build_no_gstx, build_markers, build_from_gpk,
+                                build_micro_genus_threshold);
             if (rc != 0) std::exit(rc);
             std::string hostname = "worker";
             {
@@ -2341,7 +2349,8 @@ int main(int argc, char** argv) {
                              build_taxon_group, build_taxon_rank,
                              build_sketch, build_sketch_kmer, build_sketch_size,
                              build_sketch_syncmer, build_sketch_kmers,
-                             build_no_gstx, build_markers, build_from_gpk));
+                             build_no_gstx, build_markers, build_from_gpk,
+                             build_micro_genus_threshold));
     });
 
     // genopack extract

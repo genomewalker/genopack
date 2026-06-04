@@ -79,6 +79,7 @@ static BprmHeader make_bprm_header_from_cfg(const ArchiveBuilderConfig& cfg) {
     if (cfg.taxonomy_group)        bf |= BPRM_F_TAXGROUP;
     if (!cfg.markers_path.empty()) bf |= BPRM_F_MARKERS;
     bp.build_flags = bf;
+    bp.micro_genus_threshold = cfg.micro_genus_threshold;
     bp.magic       = SEC_BPRM;
     bp.version     = 1;
     bp.header_size = sizeof(BprmHeader);
@@ -1579,7 +1580,7 @@ struct ArchiveBuilder::Impl {
         // Micro-genera (below threshold) are bin-packed together to avoid
         // thousands of tiny shards from singleton-genus inputs.
         if (cfg.taxonomy_group) {
-            const uint32_t micro_genome_threshold = 32;
+            const uint32_t micro_genome_threshold = cfg.micro_genus_threshold;
 
             std::vector<std::pair<std::string, std::vector<ChunkItem>>> micro_queue;
             for (auto& [key, bucket] : taxon_buckets) {
