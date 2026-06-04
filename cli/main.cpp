@@ -1,5 +1,4 @@
 #include "check/run_check.hpp"
-#include <genopack/stage.hpp>
 #include "bench/bench_grid.hpp"
 #include <genopack/sim.hpp>
 #include <genopack/markers_build.hpp>
@@ -3454,20 +3453,6 @@ int main(int argc, char** argv) {
         };
         std::cout << fmtf(completeness) << "\t" << fmtf(redundancy)
                   << "\t" << n_present << "\t" << n_expected << "\n";
-    });
-
-    // ── stage subcommand ──────────────────────────────────────────────────────
-    std::string stage_input, stage_output;
-    int stage_threads = 48;
-    uint64_t stage_block_mb = 64;
-    auto* stage_cmd = app.add_subcommand("stage",
-        "Cache NFS genome FASTAs as a local zstd-compressed sequence store (.gstage) for fast rebuilds");
-    stage_cmd->add_option("-i,--input",   stage_input,    "Input TSV")->required();
-    stage_cmd->add_option("-o,--output",  stage_output,   "Output .gstage path")->required();
-    stage_cmd->add_option("-t,--threads", stage_threads,  "Reader threads (default: 48)");
-    stage_cmd->add_option("--block-mb",   stage_block_mb, "Block size in MB (default: 64)");
-    stage_cmd->callback([&]{
-        std::exit(genopack::cmd_stage(stage_input, stage_output, stage_threads, stage_block_mb));
     });
 
     CLI11_PARSE(app, argc, argv);
