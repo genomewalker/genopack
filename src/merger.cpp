@@ -714,19 +714,12 @@ void merge_archives(const std::vector<std::filesystem::path>& inputs,
     // output and are left as-is.
     mw.flush();
     {
-        constexpr uint64_t CHECKSUM_MAX_SECTION_BYTES = 512ull << 20;
         int tfd = ::open(meta_tmp_path.data(), O_RDONLY);
         if (tfd >= 0) {
-            std::vector<uint8_t> sbuf;
             for (auto& sd : toc_out.sections()) {
                 if (sd.file_offset < meta_start_offset) continue;   // SHRD/HNSW/KMRX in NFS output
                 if (sd.compressed_size == 0) continue;
-                if (sd.compressed_size > CHECKSUM_MAX_SECTION_BYTES) continue;
-                sbuf.resize(static_cast<size_t>(sd.compressed_size));
-                ssize_t nr = ::pread(tfd, sbuf.data(), sbuf.size(),
-                                     static_cast<off_t>(sd.file_offset));
-                if (nr == static_cast<ssize_t>(sbuf.size()))
-                    checksum_of(sbuf.data(), sbuf.size(), sd.checksum);
+                checksum_of_fd(tfd, sd.file_offset, sd.compressed_size, sd.checksum);  // streamed, no cap
             }
             ::close(tfd);
         }

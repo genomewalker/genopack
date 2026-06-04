@@ -17,6 +17,7 @@
 #include <genopack/format.hpp>
 #include <genopack/bprm.hpp>
 #include <genopack/derivation.hpp>
+#include <genopack/section_checksum.hpp>
 #include <genopack/mmap_file.hpp>
 #include <genopack/shard.hpp>
 #include <genopack/toc.hpp>
@@ -1814,29 +1815,10 @@ struct ArchiveBuilder::Impl {
 
         // Populate per-section content checksums (P1) for the metadata sections.
         // SHRD sections were hashed at write time; everything else lives in the
-        // local temp file and is hashed here, before the TOC / MetaBundle (which
-        // cover these descriptors) are finalized. Sections larger than the cap are
-        // left unchecksummed (0) to avoid a costly re-read of multi-GB SKCH/KMRX on
-        // huge builds; they travel the safe local-temp + O_SYNC path.
+        // local temp file and is hashed here (streamed, no size cap), before the
+        // TOC / MetaBundle (which cover these descriptors) are finalized.
         mw.flush();
-        {
-            constexpr uint64_t CHECKSUM_MAX_SECTION_BYTES = 512ull << 20;
-            int tfd = ::open(bld_meta_tmp.data(), O_RDONLY);
-            if (tfd >= 0) {
-                std::vector<uint8_t> sbuf;
-                for (auto& sd : toc.sections()) {
-                    if (sd.type == SEC_SHRD) continue;                      // already hashed
-                    if (sd.compressed_size == 0) continue;
-                    if (sd.compressed_size > CHECKSUM_MAX_SECTION_BYTES) continue;
-                    sbuf.resize(static_cast<size_t>(sd.compressed_size));
-                    ssize_t nr = ::pread(tfd, sbuf.data(), sbuf.size(),
-                                         static_cast<off_t>(sd.file_offset));
-                    if (nr == static_cast<ssize_t>(sbuf.size()))
-                        checksum_of(sbuf.data(), sbuf.size(), sd.checksum);
-                }
-                ::close(tfd);
-            }
-        }
+        stamp_section_checksums(bld_meta_tmp.data(), toc.sections());
 
         // Content-addressed derivation (§5): now that every section's
         // content_xxh128 is populated, fold each non-SOURCE section's params +

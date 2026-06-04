@@ -1564,8 +1564,7 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
     // were appended at absolute offsets; only_if_zero leaves the large
     // pre-existing SHRD/SKCH bodies (already checksummed) untouched.
     writer.flush();
-    stamp_section_checksums(gpk.c_str(), new_toc.sections(), (512ull << 20),
-                            /*only_if_zero=*/true);
+    stamp_section_checksums(gpk.c_str(), new_toc.sections(), /*only_if_zero=*/true);
 
     // Write new TOC + TailLocator
     new_toc.finalize(writer,

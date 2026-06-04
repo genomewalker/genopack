@@ -2,6 +2,9 @@
 #include <cstdint>
 #include <cstring>
 #include <span>
+#include <algorithm>
+#include <vector>
+#include <unistd.h>
 #include <xxhash.h>
 
 namespace genopack {
@@ -42,6 +45,34 @@ inline void checksum_of(const uint8_t* data, size_t size, uint8_t out16[16]) {
     XXH128_canonical_t canon;
     XXH128_canonicalFromHash(&canon, h);
     std::memcpy(out16, canon.digest, 16);
+}
+
+// Streaming XXH3-128 over a file region [offset, offset+size), read in chunks so
+// multi-GB sections are hashed without a full in-RAM copy. Writes the 16-byte
+// canonical digest to out16; returns false on a short/failed read (out16 left
+// untouched). Equivalent to checksum_of() over the same bytes.
+inline bool checksum_of_fd(int fd, uint64_t offset, uint64_t size, uint8_t out16[16]) {
+    XXH3_state_t* st = XXH3_createState();
+    if (!st) return false;
+    XXH3_128bits_reset(st);
+    constexpr size_t CHUNK = 8u << 20;   // 8 MB
+    std::vector<uint8_t> buf(static_cast<size_t>(std::min<uint64_t>(CHUNK, size ? size : 1)));
+    uint64_t done = 0;
+    bool ok = true;
+    while (done < size) {
+        size_t want = static_cast<size_t>(std::min<uint64_t>(buf.size(), size - done));
+        ssize_t nr = ::pread(fd, buf.data(), want, static_cast<off_t>(offset + done));
+        if (nr <= 0) { ok = false; break; }
+        XXH3_128bits_update(st, buf.data(), static_cast<size_t>(nr));
+        done += static_cast<uint64_t>(nr);
+    }
+    if (ok) {
+        XXH128_canonical_t canon;
+        XXH128_canonicalFromHash(&canon, XXH3_128bits_digest(st));
+        std::memcpy(out16, canon.digest, 16);
+    }
+    XXH3_freeState(st);
+    return ok;
 }
 
 // True if XXH128(data,size) equals the 16-byte canonical digest in expect16.
