@@ -7,6 +7,7 @@
 #include <genopack/kmrx.hpp>
 #include <genopack/mmap_file.hpp>
 #include <genopack/qual.hpp>
+#include <genopack/section_checksum.hpp>
 #include <genopack/shard.hpp>
 #include <genopack/taxn.hpp>
 #include <genopack/toc.hpp>
@@ -287,7 +288,7 @@ void subset_archive(const std::filesystem::path& input_gpk,
             sd.item_count        = frozen.n_genomes;
             sd.aux0              = wt.shard_id;
             sd.aux1              = 0;
-            std::memset(sd.checksum, 0, sizeof(sd.checksum));
+            checksum_of(frozen.bytes.data(), frozen.bytes.size(), sd.checksum);
             new_toc.add_section(sd);
         }
     });
@@ -540,6 +541,10 @@ void subset_archive(const std::filesystem::path& input_gpk,
             new_toc.add_section(new_sd);
         }
     }
+
+    // Content-checksum the metadata sections (SHRD hashed inline) before finalize.
+    mw.flush();
+    stamp_section_checksums(meta_tmp.data(), new_toc.sections());
 
     // TOC + TailLocator
     new_toc.finalize(mw,

@@ -1730,6 +1730,8 @@ static size_t patch_gpk_taxn(const std::filesystem::path& gpk_path,
     auto txdb_sd = txdb_writer.finalize(writer, next_sid++);
     new_toc.add_section(txdb_sd);
 
+    writer.flush();
+    stamp_section_checksums(gpk_path.c_str(), new_toc.sections(), /*only_if_zero=*/true);
     new_toc.finalize(writer, prev_gen + 1, live, total, prev_toc,
                      cat_root, acc_root, tomb_root);
     writer.flush();
@@ -3262,6 +3264,8 @@ int main(int argc, char** argv) {
         new_toc.add_section(gcov_sd);
         if (fcov_w.n_genera() > 0) new_toc.add_section(fcov_sd);
         if (fmhr_w.n_genera() > 0) new_toc.add_section(fmhr_sd);
+        aw.flush();
+        stamp_section_checksums(gp.c_str(), new_toc.sections(), /*only_if_zero=*/true);
         new_toc.finalize(aw, gen,
                          toc_r.header.live_genome_count,
                          toc_r.header.total_genome_count,

@@ -5,6 +5,7 @@
 #include <genopack/archive.hpp>
 #include <genopack/qual.hpp>
 #include <genopack/mmap_file.hpp>
+#include <genopack/section_checksum.hpp>
 #include <genopack/toc.hpp>
 #include <spdlog/spdlog.h>
 #include <algorithm>
@@ -149,6 +150,11 @@ void write_qual_to_archive(const std::filesystem::path& gpk_path,
         if (sd.type != SEC_QUAL) new_toc.add_section(sd);
     }
     new_toc.add_section(qual_sd);
+
+    // Content-checksum the appended QUAL (and any still-unstamped section) so
+    // verify can validate it.
+    writer.flush();
+    stamp_section_checksums(gpk_path.c_str(), new_toc.sections(), /*only_if_zero=*/true);
 
     new_toc.finalize(writer,
                      generation,

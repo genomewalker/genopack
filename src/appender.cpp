@@ -8,6 +8,7 @@
 #include <genopack/txdb.hpp>
 #include <genopack/util.hpp>
 #include <genopack/format.hpp>
+#include <genopack/section_checksum.hpp>
 #include <genopack/mmap_file.hpp>
 #include <genopack/toc.hpp>
 #include <genopack/accx.hpp>
@@ -205,6 +206,12 @@ struct ArchiveAppender::Impl {
                 sd.compressed_size = shard_size;
                 sd.item_count      = static_cast<uint64_t>(shard_writer->n_genomes());
                 sd.aux0            = current_shard_id;
+                // Content-checksum the shard inline (SHRD is skipped by the shared
+                // metadata stamp pass, which assumes shards are hashed at write time).
+                writer.flush();
+                { int cfd = ::open(gpk_path_.c_str(), O_RDONLY);
+                  if (cfd >= 0) { checksum_of_fd(cfd, shard_offset, shard_size, sd.checksum);
+                                  ::close(cfd); } }
                 new_toc.add_section(sd);
                 shard_id_to_new_section_id[current_shard_id] = sd.section_id;
                 shard_writer.reset();
@@ -381,6 +388,11 @@ struct ArchiveAppender::Impl {
                     ? new_live_count - n_removed : 0;
             }
         }
+
+        // Content-checksum the appended metadata sections (SHRD hashed inline in
+        // flush_shard) so verify can validate them.
+        writer.flush();
+        stamp_section_checksums(gpk_path_.c_str(), new_toc.sections(), /*only_if_zero=*/true);
 
         // ── Write new TOCB + TailLocator ──────────────────────────────────────
         new_toc.finalize(writer,
