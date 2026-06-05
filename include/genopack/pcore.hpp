@@ -14,8 +14,10 @@
 #include "mmap_file.hpp"
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace genopack {
@@ -79,11 +81,18 @@ inline float pcore_core_coverage(const PcoreView& v, const std::vector<uint64_t>
     return static_cast<float>(inter) / static_cast<float>(core_size);
 }
 
-// ── Writer ────────────────────────────────────────────────────────────────────
+// ── Writer (streaming) ────────────────────────────────────────────────────────
+// Memory-bounded: each genus's dense aamer pool is spilled to a temp file as it is
+// added (only ~40 bytes/genus of metadata stay in RAM), so peak memory is one
+// genus's union regardless of corpus size — no OOM at millions of genomes. The
+// temp dir is $GENOPACK_SPILL_DIR or the system temp dir. The model hash is folded
+// incrementally and order-independently (XOR of per-entry hashes).
 class PcoreWriter {
 public:
-    PcoreWriter(uint32_t k, uint32_t min_seg_aa, float theta = 0.90f)
-        : k_(k), min_seg_aa_(min_seg_aa), theta_(theta) {}
+    PcoreWriter(uint32_t k, uint32_t min_seg_aa, float theta = 0.90f);
+    ~PcoreWriter();
+    PcoreWriter(const PcoreWriter&) = delete;
+    PcoreWriter& operator=(const PcoreWriter&) = delete;
 
     // member_qmers = per-member sorted-unique aamer sets. Stores every aamer present
     // in ≥1 member with prev[i] = member count carrying it (capped at 255). The
@@ -93,22 +102,29 @@ public:
 
     uint64_t model_hash() const;
     SectionDesc finalize(AppendWriter& w, uint64_t section_id, uint64_t frac_max_hash);
-    size_t n_entries() const { return entries_.size(); }
+    size_t n_entries() const { return meta_.size(); }
 
 private:
-    struct Entry {
+    struct EntryMeta {
         uint64_t key_hash;
-        std::vector<uint64_t> aamers;   // sorted
-        std::vector<uint8_t>  prev;     // prevalence percent, parallel
+        uint64_t aamers_off;   // offset within the spilled pool
+        uint64_t prev_off;
+        uint32_t n_aamers;
         uint32_t n_members;
     };
     static uint32_t next_pow2(uint32_t v) noexcept {
         if (v == 0) return 1;
         --v; v |= v>>1; v |= v>>2; v |= v>>4; v |= v>>8; v |= v>>16; return v + 1;
     }
+    void open_spill_();
+
     uint32_t k_, min_seg_aa_;
     float    theta_;
-    std::vector<Entry> entries_;
+    std::vector<EntryMeta> meta_;
+    std::FILE*  spill_       = nullptr;
+    std::string spill_path_;
+    uint64_t    pool_cursor_ = 0;   // bytes written to the spill pool so far
+    uint64_t    hash_fold_   = 0;   // XOR of per-entry hashes (order-independent)
 };
 
 // ── Reader ────────────────────────────────────────────────────────────────────
