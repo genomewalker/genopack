@@ -1504,7 +1504,8 @@ struct ArchiveBuilder::Impl {
                             for (const auto& qr : pending_qrs) member_ids.push_back(qr.genome_id);
                             build_core_w.add_from_members(GcovWriter::hash_genus(genus_key),
                                                           genome_qmers, std::move(member_ids));
-                            build_pcore_w.add_from_members(GcovWriter::hash_genus(genus_key), genome_qmers);
+                            if (cfg.build_pcore)
+                                build_pcore_w.add_from_members(GcovWriter::hash_genus(genus_key), genome_qmers);
                         }
 
                         // Score contigs and populate outlier fields.
@@ -1919,7 +1920,7 @@ struct ArchiveBuilder::Impl {
                 spdlog::info("CORE: {} genera, model_hash={:#018x}",
                              build_core_w.n_genera(), sd.aux0);
             }
-            if (cfg.build_core && build_pcore_w.n_entries() > 0) {
+            if (cfg.build_pcore && build_pcore_w.n_entries() > 0) {
                 SectionDesc sd = build_pcore_w.finalize(mw, next_section_id++, build_mrk_frac_max);
                 toc.add_section(sd);
                 spdlog::info("PCORE: {} genus references (dense), model_hash={:#018x}",
