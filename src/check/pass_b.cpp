@@ -1,7 +1,8 @@
 #include "pass_b.hpp"
 #include "tnf.hpp"
+#include "foreign_contam.hpp"
 #include <genopack/markers.hpp>
-#include <genopack/metamer.hpp>
+#include <genopack/aamer.hpp>
 #include <genopack/score_bin.hpp>
 #include <genopack/gcov.hpp>
 #include <genopack/qual.hpp>
@@ -123,7 +124,7 @@ void run_pass_b(ICheckReader& pack,
         const bool by_tnf         = q.contamination_tnf_excess > cfg.tnf_flag_threshold;
         const bool by_completeness = !std::isnan(q.completeness_cluster_relative) &&
                                      q.completeness_cluster_relative < cfg.completeness_flag_threshold;
-        if (by_leakage || by_tnf || by_completeness) {
+        if (cfg.scan_all || by_leakage || by_tnf || by_completeness) {
             flagged.push_back(acc);
             if (by_leakage || by_completeness)
                 needs_full_set.insert(acc);
@@ -253,6 +254,88 @@ void run_pass_b(ICheckReader& pack,
                      fmhr_host_cache.size(), fmhr_family_candidates.size());
     }
 
+    // ── Foreign-aamer reference sets (per host genus) — the SMALL-contig channel ──
+    // TNF/GCOV composition fails below ~5kb; protein-aamer (k=8, 6-frame) containment
+    // works to ~1-2kb IF the reference is dense. Prefer the DENSE unified PCORE (every
+    // aamer); fall back to the sparse prevalence CORE. Built once here (single-threaded),
+    // read-only in the parallel contig loop. Set = host genus ∪ host family (FCORE, for
+    // the family-conserved exclusion) ∪ same-family siblings ∪ ≤50 background genera.
+    std::unordered_map<std::string, ForeignRefSet> genus_refset;
+    int      foreign_k = 0, foreign_min_seg = 0;
+    uint64_t foreign_frac_max = UINT64_MAX;
+    const bool use_pcore = pack.has_pcore();
+    if (use_pcore || pack.has_core()) {
+        if (use_pcore) {
+            const PcoreReader* pr = pack.pcore_reader();
+            foreign_k = pr->k(); foreign_min_seg = pr->min_seg_aa(); foreign_frac_max = pr->frac_max_hash();
+        } else {
+            const CoreReader* cr = pack.core_reader();
+            foreign_k = cr->k(); foreign_min_seg = cr->min_seg_aa(); foreign_frac_max = cr->frac_max_hash();
+        }
+        // Genus reference span (dense PCORE preferred, else sparse CORE).
+        auto genus_span = [&](const std::string& g) -> AamerSpan {
+            if (use_pcore) { PcoreView v = pack.pcore_for_genus(g); return {v.aamers, v.n_aamers, v.prev, v.n_members}; }
+            CoreView v = pack.core_for_genus(g); return {v.aamers, v.n_aamers, nullptr, 0};
+        };
+        auto genus_span_by_hash = [&](uint64_t h) -> AamerSpan {
+            if (use_pcore) { PcoreView v = pack.pcore_reader()->lookup(h); return {v.aamers, v.n_aamers, v.prev, v.n_members}; }
+            CoreView v = pack.core_reader()->lookup(h); return {v.aamers, v.n_aamers, nullptr, 0};
+        };
+        const uint32_t n_entries = use_pcore ? pack.pcore_reader()->n_entries()
+                                             : pack.core_reader()->n_genera();
+        auto entry_hash_at = [&](uint32_t i) -> uint64_t {
+            return use_pcore ? pack.pcore_reader()->key_hash_at(i) : pack.core_reader()->genus_hash_at(i);
+        };
+
+        std::unordered_map<std::string, std::string> genus_family;
+        for (const auto& acc : to_scan) {
+            auto g = flagged_genus.find(acc);
+            if (g == flagged_genus.end() || genus_refset.count(g->second)) continue;
+            auto f = flagged_family.find(acc);
+            genus_family[g->second] = (f != flagged_family.end()) ? f->second : std::string();
+            genus_refset.emplace(g->second, ForeignRefSet{});
+        }
+        size_t built = 0;
+        for (auto& [genus, rs] : genus_refset) {
+            AamerSpan host = genus_span(genus);
+            if (!host.valid()) { rs.valid = false; continue; }
+            const std::string& family = genus_family[genus];
+            AamerSpan fam_span;
+            if (!family.empty()) {
+                if (use_pcore) { PcoreView fv = pack.pcore_for_family(family);
+                                 if (fv.valid()) fam_span = {fv.aamers, fv.n_aamers, fv.prev, fv.n_members}; }
+                else { CoreView fcv = pack.core_for_family(family);
+                       if (fcv.valid()) fam_span = {fcv.aamers, fcv.n_aamers, nullptr, 0}; }
+            }
+            std::vector<std::pair<uint64_t, AamerSpan>> foreign;
+            std::unordered_set<uint64_t> used;
+            used.insert(GcovWriter::hash_genus(genus));
+            auto fit = pass_a.family_to_genera.find(family);
+            if (fit != pass_a.family_to_genera.end())
+                for (const auto& sib : fit->second) {
+                    if (sib == genus) continue;
+                    uint64_t sh = GcovWriter::hash_genus(sib);
+                    if (!used.insert(sh).second) continue;
+                    AamerSpan sp = genus_span(sib);
+                    if (sp.valid()) foreign.emplace_back(sh, sp);
+                }
+            if (n_entries > 0) {
+                const uint32_t start = static_cast<uint32_t>(GcovWriter::hash_genus(genus) % n_entries);
+                uint32_t bg = 0;
+                for (uint32_t s = 0; s < n_entries && bg < 50; ++s) {
+                    const uint64_t gh = entry_hash_at((start + s) % n_entries);
+                    if (!used.insert(gh).second) continue;
+                    AamerSpan sp = genus_span_by_hash(gh);
+                    if (sp.valid()) { foreign.emplace_back(gh, sp); ++bg; }
+                }
+            }
+            rs = build_foreign_refset(host, fam_span, foreign);
+            if (rs.valid) ++built;
+        }
+        spdlog::info("check pass-B: foreign-aamer refsets built for {} genera ({} reference, k={})",
+                     built, use_pcore ? "PCORE-dense" : "CORE-sparse", foreign_k);
+    }
+
     // Open marker panel (read-only, mmap — safe for concurrent reads across all threads).
     std::unique_ptr<MarkerReader> mrk_rd;
     if (!cfg.markers_path.empty()) {
@@ -327,6 +410,78 @@ void run_pass_b(ICheckReader& pack,
                     if (cit != genus_centroid.end()) centroid = &cit->second;
                     const GcovEntry* ge = pack.gcov_for_genus(git->second);
                     if (ge && (ge->flags & GCOV_FLAG_VALID)) gcov_entry = ge;
+                }
+
+                // Foreign-aamer reference set for this genome's genus (read-only; null if no CORE).
+                const ForeignRefSet* frs = nullptr;
+                if (!genus_refset.empty() && git != flagged_genus.end()) {
+                    auto rit = genus_refset.find(git->second);
+                    if (rit != genus_refset.end() && rit->second.valid) frs = &rit->second;
+                }
+
+                // ── Intrinsic completeness: genus prevalence-core coverage ──────
+                // coverage = |genome aamers ∩ genus core| / |core|, extracting the
+                // query genome's aamers with the exact params the CORE section was
+                // built with (k / min_seg_aa / FracMinHash max). Validated to tie
+                // CheckM2 (RMSE ~5.1%) and ~280x faster than cluster-relative.
+                // Genus-core coverage is the primary signal; family-core coverage is
+                // the fallback for novel/sparse genera (SEC_FCORE). Both are recorded
+                // as DISTINCT columns — the reporting profile prefers genus, falls back
+                // to family, never silently substitutes. The query aamer set is the
+                // same for both (FCORE built with CORE's k/min_seg_aa/frac_max), so it
+                // is extracted once and intersected against each core.
+                float completeness_aamer_core        = NAN;  // genus
+                float completeness_aamer_family_core = NAN;  // family fallback
+                {
+                    auto famit = flagged_family.find(acc);
+                    const std::string* genus_s  = (git   != flagged_genus.end())  ? &git->second   : nullptr;
+                    const std::string* family_s = (famit != flagged_family.end()) ? &famit->second : nullptr;
+                    if (pack.has_pcore()) {
+                        // Unified reference: derive the ≥theta completeness core from PCORE
+                        // (the ≥⌈theta·n⌉-member slice reproduces the old CORE bit-for-bit).
+                        const PcoreReader* pr = pack.pcore_reader();
+                        PcoreView gpv = genus_s  ? pack.pcore_for_genus(*genus_s)   : PcoreView{};
+                        PcoreView fpv = family_s ? pack.pcore_for_family(*family_s) : PcoreView{};
+                        if (gpv.valid() || fpv.valid()) {
+                            thread_local std::vector<uint64_t> core_qmers;
+                            core_qmers.clear();
+                            for (const auto& c : contigs)
+                                extract_aamers_dna_into(c.seq, pr->k(), pr->min_seg_aa(),
+                                                        pr->frac_max_hash(), core_qmers);
+                            std::sort(core_qmers.begin(), core_qmers.end());
+                            core_qmers.erase(std::unique(core_qmers.begin(), core_qmers.end()),
+                                             core_qmers.end());
+                            completeness_aamer_core        = pcore_core_coverage(gpv, core_qmers, pr->theta());
+                            completeness_aamer_family_core = pcore_core_coverage(fpv, core_qmers, pr->theta());
+                        }
+                    } else {
+                        CoreView gcore = (pack.has_core() && genus_s)  ? pack.core_for_genus(*genus_s)   : CoreView{};
+                        CoreView fcore = (pack.has_fcore() && family_s) ? pack.core_for_family(*family_s) : CoreView{};
+                        if (gcore.valid() || fcore.valid()) {
+                            const CoreReader* cr = pack.has_core() ? pack.core_reader() : pack.fcore_reader();
+                            thread_local std::vector<uint64_t> core_qmers;
+                            core_qmers.clear();
+                            for (const auto& c : contigs)
+                                extract_aamers_dna_into(c.seq, cr->k(), cr->min_seg_aa(),
+                                                        cr->frac_max_hash(), core_qmers);
+                            std::sort(core_qmers.begin(), core_qmers.end());
+                            core_qmers.erase(std::unique(core_qmers.begin(), core_qmers.end()),
+                                             core_qmers.end());
+                            auto coverage = [&](const CoreView& cv) -> float {
+                                if (!cv.valid()) return NAN;
+                                uint32_t inter = 0;
+                                size_t qi = 0, kj = 0;
+                                while (qi < core_qmers.size() && kj < cv.n_aamers) {
+                                    if      (core_qmers[qi] < cv.aamers[kj]) ++qi;
+                                    else if (core_qmers[qi] > cv.aamers[kj]) ++kj;
+                                    else { ++inter; ++qi; ++kj; }
+                                }
+                                return static_cast<float>(inter) / static_cast<float>(cv.n_aamers);
+                            };
+                            completeness_aamer_core        = coverage(gcore);
+                            completeness_aamer_family_core = coverage(fcore);
+                        }
+                    }
                 }
 
                 const GcovReader* fcov_rd    = pack.fcov_reader();
@@ -423,6 +578,8 @@ void run_pass_b(ICheckReader& pack,
                                     const float pct     = gcov_rd->percentile(*gcov_entry, dist);
                                     const float spe     = gcov_spe(*gcov_entry, xmu);
                                     const float spe_pct = gcov_rd->spe_percentile(*gcov_entry, spe);
+                                    cf.gcov_t2_pct  = pct;       // persisted into QCONTIG
+                                    cf.gcov_spe_pct = spe_pct;   // the cross-genus / foreign-contig signal
                                     const bool t2_out   = (pct     >= cfg.gcov_outlier_percentile);
                                     const bool spe_flag = (spe_pct >= cfg.gcov_outlier_percentile);
                                     if (t2_out || spe_flag) gcov_out_bp += cf.contig_length;
@@ -472,6 +629,36 @@ void run_pass_b(ICheckReader& pack,
                                             cf.tnf_score < cfg.contig_tnf_threshold;
                         if (contig_clean || std::isnan(cf.tnf_score))
                             clean_len += cf.contig_length;
+
+                        // ── Foreign-aamer containment: the SMALL-contig channel ──
+                        // Composition-independent; runs for every contig >=1kb (where TNF
+                        // abstains). Classifies the contig's 6-frame aamers as host- vs
+                        // foreign-specific against the precomputed reference set.
+                        if (frs && contig.seq.size() >= 1000) {
+                            thread_local std::vector<uint64_t> prot_qm;
+                            prot_qm.clear();
+                            extract_aamers_dna_into(contig.seq, foreign_k, foreign_min_seg,
+                                                    foreign_frac_max, prot_qm);
+                            std::sort(prot_qm.begin(), prot_qm.end());
+                            prot_qm.erase(std::unique(prot_qm.begin(), prot_qm.end()), prot_qm.end());
+                            ForeignScore fs = score_contig_foreign(*frs, prot_qm);
+                            cf.prot_classifiable     = static_cast<uint16_t>(std::min<uint32_t>(fs.classifiable, 65535));
+                            cf.prot_host_specific    = static_cast<uint16_t>(std::min<uint32_t>(fs.host_specific, 65535));
+                            cf.prot_foreign_specific = static_cast<uint16_t>(std::min<uint32_t>(fs.foreign_specific, 65535));
+                            cf.prot_family_hits      = static_cast<uint16_t>(std::min<uint32_t>(fs.family_hits, 65535));
+                            cf.prot_best_genus       = fs.best_genus_tag;
+                            cf.prot_foreign_frac     = fs.foreign_fraction;
+                            cf.prot_loglr            = fs.score;
+                            uint8_t pf = 0;
+                            // Abstain floor = 16 classifiable aamers (validated: 5kb contigs
+                            // carry ~25 against the prevalence core; below 16 the fraction is
+                            // too noisy). 1-2kb contigs fall below this against CORE — they need
+                            // a denser per-genus proteome reference (a v2 reference section).
+                            if (fs.classifiable < 16) pf |= PROT_ABSTAIN_LOW_N;
+                            if (fs.foreign_specific >= 12 && fs.family_hits >= fs.foreign_specific)
+                                pf |= PROT_MOBILE_NATIVE;
+                            cf.prot_flags = pf;
+                        }
 
                         flags.push_back(cf);
                     }
@@ -618,7 +805,7 @@ void run_pass_b(ICheckReader& pack,
                         // min_seg=50 for Dayhoff-6: ORFs <50 AA can never accumulate
                         // min_hits=5 syncmer hits (max ~5 syncmers at 11% rate → needs 100% hit
                         // rate at any divergence — impossible). Skip them with zero sensitivity loss.
-                        const int min_seg = is_d6 ? 50 : METAMER_K;
+                        const int min_seg = is_d6 ? 50 : AAMER_K;
                         const uint32_t min_hits  = static_cast<uint32_t>(cfg.marker_min_hits);
 
                         // contig_votes_native[mi]  = host-origin contigs voting for marker mi.
@@ -666,7 +853,7 @@ void run_pass_b(ICheckReader& pack,
                             } else {
                                 // Full-AA k=8: whole-contig accumulation (legacy).
                                 orf_mers.clear();
-                                extract_metamers_dna_into(contig.seq, METAMER_K, min_seg,
+                                extract_aamers_dna_into(contig.seq, AAMER_K, min_seg,
                                                          mrk_frac_max, orf_mers);
                                 if (!orf_mers.empty()) {
                                     std::sort(orf_mers.begin(), orf_mers.end());
@@ -801,6 +988,8 @@ void run_pass_b(ICheckReader& pack,
                     auto& q = quality.at(acc);
                     q.chromosome_skew_closure    = skew_score;
                     q.completeness_post_decontam = completeness_post;
+                    q.completeness_aamer_core    = completeness_aamer_core;
+                    q.completeness_aamer_family_core = completeness_aamer_family_core;
                     q.self_coherence             = sig.self_coherence;
                     q.chargaff_parity            = sig.chargaff_parity;
                     q.spectral_gap               = sig.spectral_gap;

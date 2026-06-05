@@ -72,6 +72,8 @@ add_library(genopack_lib STATIC
   src/score_bin.cpp
   src/catalog.cpp
   src/shard.cpp
+  src/stage.cpp
+  src/cmd_stage.cpp
   src/builder.cpp
   src/archive.cpp
   src/archive_set_reader.cpp
@@ -95,6 +97,13 @@ add_library(genopack_lib STATIC
   src/fmhr.cpp
   src/markers.cpp
   src/markers_build.cpp
+  src/cladesplit.cpp
+  src/colstore.cpp
+  src/core_section.cpp
+  src/pcore.cpp
+  src/xqual_columns.cpp
+  src/prof.cpp
+  src/qcontig.cpp
   src/build_genus_stats.cpp
   src/meta.cpp
   src/oph_sketch.cpp
@@ -166,6 +175,10 @@ add_executable(genopack
   src/check/pass_a.cpp
   src/check/pass_b.cpp
   src/check/run_check.cpp
+  src/run_ingest.cpp
+  src/run_report.cpp
+  src/run_fcore.cpp
+  src/run_pcore.cpp
   src/bench/bench_grid.cpp
   src/calibrate/calibrate.cpp
 )
@@ -212,6 +225,37 @@ target_link_libraries(genopack_check_roundtrip_test PRIVATE genopack_lib)
 target_compile_definitions(genopack_check_roundtrip_test PRIVATE GENOPACK_BIN="$<TARGET_FILE:genopack>")
 add_test(NAME genopack-check-roundtrip COMMAND genopack_check_roundtrip_test)
 set_tests_properties(genopack-check-roundtrip PROPERTIES LABELS "unit")
+
+add_executable(genopack_colstore_test tests/colstore_test.cpp)
+target_link_libraries(genopack_colstore_test PRIVATE genopack_lib)
+add_test(NAME genopack-colstore COMMAND genopack_colstore_test)
+set_tests_properties(genopack-colstore PROPERTIES LABELS "unit")
+
+add_executable(genopack_core_section_test tests/core_section_test.cpp)
+target_link_libraries(genopack_core_section_test PRIVATE genopack_lib)
+add_test(NAME genopack-core-section COMMAND genopack_core_section_test)
+set_tests_properties(genopack-core-section PROPERTIES LABELS "unit")
+
+add_executable(genopack_xqual_test tests/xqual_test.cpp)
+target_link_libraries(genopack_xqual_test PRIVATE genopack_lib)
+add_test(NAME genopack-xqual COMMAND genopack_xqual_test)
+set_tests_properties(genopack-xqual PROPERTIES LABELS "unit")
+
+add_executable(genopack_prof_test tests/prof_test.cpp)
+target_link_libraries(genopack_prof_test PRIVATE genopack_lib)
+add_test(NAME genopack-prof COMMAND genopack_prof_test)
+set_tests_properties(genopack-prof PROPERTIES LABELS "unit")
+
+add_executable(genopack_qcontig_test tests/qcontig_test.cpp)
+target_link_libraries(genopack_qcontig_test PRIVATE genopack_lib)
+add_test(NAME genopack-qcontig COMMAND genopack_qcontig_test)
+set_tests_properties(genopack-qcontig PROPERTIES LABELS "unit")
+
+add_executable(genopack_pcore_test tests/pcore_test.cpp)
+target_link_libraries(genopack_pcore_test PRIVATE genopack_lib)
+add_test(NAME genopack-pcore COMMAND genopack_pcore_test)
+set_tests_properties(genopack-pcore PROPERTIES LABELS "unit")
+set_tests_properties(genopack-xqual PROPERTIES LABELS "unit")
 
 add_executable(genopack_benchmark tests/benchmark.cpp)
 target_link_libraries(genopack_benchmark PRIVATE genopack_lib)

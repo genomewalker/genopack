@@ -35,7 +35,8 @@ struct BprmHeader {                  // 128 bytes — explicit offsets, no natur
     uint64_t params_hash;            //  88  XXH3_64 of this struct, params_hash field zeroed
     uint32_t build_flags;            //  96  section-set toggles (BprmBuildFlags)
     uint32_t micro_genus_threshold;  // 100  min genus members for a dedicated shard + consensus model
-    uint8_t  _reserved[24];          // 104  pad to 128
+    float    core_theta;             // 104  CORE prevalence threshold (0 = CORE disabled)
+    uint8_t  _reserved[20];          // 108  pad to 128
 };
 static_assert(sizeof(BprmHeader) == 128);
 
@@ -50,8 +51,10 @@ enum BprmBuildFlags : uint32_t {
     BPRM_F_GCOV     = 1u << 3,
     BPRM_F_TAXGROUP = 1u << 4,
     BPRM_F_MARKERS  = 1u << 5,
+    BPRM_F_CORE     = 1u << 6,
 };
 static_assert(offsetof(BprmHeader, sketch_seed) == 56);
+static_assert(offsetof(BprmHeader, core_theta) == 104);
 static_assert(offsetof(BprmHeader, params_hash) == 88);
 static_assert(offsetof(BprmHeader, micro_genus_threshold) == 100);
 

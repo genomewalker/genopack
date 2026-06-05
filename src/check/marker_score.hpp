@@ -1,6 +1,6 @@
 #pragma once
 #include <genopack/markers.hpp>
-#include <genopack/metamer.hpp>
+#include <genopack/aamer.hpp>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -62,11 +62,11 @@ MarkerScoreResult score_markers_for_genome(
         translate_6frame(contig.seq, MRK_MIN_ORF_AA,
             [&](int /*frame*/, const uint8_t* seg, int len, int, int) {
                 orf_mers.clear();
-                for (int i = 0; i + METAMER_K <= len; ++i) {
-                    if (metamer_is_low_complexity(seg + i, METAMER_K)) continue;
+                for (int i = 0; i + AAMER_K <= len; ++i) {
+                    if (aamer_is_low_complexity(seg + i, AAMER_K)) continue;
                     const uint64_t h = mrk_rd.is_murphy10()
-                        ? metamer_hash_murphy10(seg + i)
-                        : metamer_hash(seg + i);
+                        ? aamer_hash_murphy10(seg + i)
+                        : aamer_hash(seg + i);
                     if (h <= mrk_frac_max) orf_mers.push_back(h);
                 }
                 if (orf_mers.empty()) return;

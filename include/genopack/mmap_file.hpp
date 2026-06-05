@@ -39,7 +39,7 @@ public:
     int            fd()   const { return fd_; }
 
     std::span<const uint8_t> view(uint64_t offset, uint64_t len) const {
-        if (offset + len > size_)
+        if (len > size_ || offset > size_ - len)   // overflow-safe vs offset+len wrap
             throw std::out_of_range("MmapFileReader::view out of bounds");
         return {data_ + offset, static_cast<size_t>(len)};
     }
@@ -49,7 +49,7 @@ public:
 
     template<typename T>
     const T* ptr_at(uint64_t offset) const {
-        if (offset + sizeof(T) > size_)
+        if (sizeof(T) > size_ || offset > size_ - sizeof(T))   // overflow-safe vs offset+size wrap
             throw std::out_of_range("MmapFileReader::ptr_at out of bounds");
         return reinterpret_cast<const T*>(data_ + offset);
     }

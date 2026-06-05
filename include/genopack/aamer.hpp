@@ -7,12 +7,12 @@
 
 namespace genopack {
 
-// Amino acid k=8 metamer primitives for SCG completeness/contamination estimation.
-// Build side: protein input from GTDB-Tk MSA (extract_metamers_aa).
-// Check side: DNA input via 6-frame translation (extract_metamers_dna / translate_6frame).
+// Amino acid k=8 aamer primitives for SCG completeness/contamination estimation.
+// Build side: protein input from GTDB-Tk MSA (extract_aamers_aa).
+// Check side: DNA input via 6-frame translation (extract_aamers_dna / translate_6frame).
 // Hash encoding is identical on both sides — required for membership lookup to work.
 
-static constexpr int METAMER_K = 8;
+static constexpr int AAMER_K = 8;
 
 // ── Encoding tables ───────────────────────────────────────────────────────────
 
@@ -103,7 +103,7 @@ static constexpr uint8_t AA_MURPHY10[20] = {
 // Hash one k=8 amino acid k-mer (aa[0..7] in 0-19 encoding).
 // Packs 8 AAs at 5 bits each (40 bits total) then applies splitmix64 mixing.
 // Must be called with identical encoding on build side and check side.
-[[nodiscard]] inline uint64_t metamer_hash(const uint8_t* aa) noexcept {
+[[nodiscard]] inline uint64_t aamer_hash(const uint8_t* aa) noexcept {
     uint64_t v =  (uint64_t)aa[0]
                | ((uint64_t)aa[1] <<  5)
                | ((uint64_t)aa[2] << 10)
@@ -122,7 +122,7 @@ static constexpr uint8_t AA_MURPHY10[20] = {
 
 // Murphy 10-class variant: 10 classes × 4 bits = 32-bit packed input, then splitmix64.
 // 10^8 = 100M k-mer space — large enough to survive without cross-family filtering.
-[[nodiscard]] inline uint64_t metamer_hash_murphy10(const uint8_t* aa) noexcept {
+[[nodiscard]] inline uint64_t aamer_hash_murphy10(const uint8_t* aa) noexcept {
     uint64_t v =  (uint64_t)AA_MURPHY10[aa[0]]
                | ((uint64_t)AA_MURPHY10[aa[1]] <<  4)
                | ((uint64_t)AA_MURPHY10[aa[2]] <<  8)
@@ -140,7 +140,7 @@ static constexpr uint8_t AA_MURPHY10[20] = {
 }
 
 // Returns true if the k-mer contains a run of >= (k+1)/2 identical amino acids.
-[[nodiscard]] inline bool metamer_is_low_complexity(const uint8_t* aa, int k) noexcept {
+[[nodiscard]] inline bool aamer_is_low_complexity(const uint8_t* aa, int k) noexcept {
     int run = 1, max_run = 1;
     for (int i = 1; i < k; ++i) {
         run = (aa[i] == aa[i-1]) ? run + 1 : 1;
@@ -150,11 +150,11 @@ static constexpr uint8_t AA_MURPHY10[20] = {
 }
 
 // Append all k-mers from one inter-stop AA segment to `out`, skipping low-complexity.
-inline void emit_metamers(const uint8_t* seg, int len, int k,
+inline void emit_aamers(const uint8_t* seg, int len, int k,
                           std::vector<uint64_t>& out) {
     for (int i = 0; i + k <= len; ++i) {
-        if (!metamer_is_low_complexity(seg + i, k))
-            out.push_back(metamer_hash(seg + i));
+        if (!aamer_is_low_complexity(seg + i, k))
+            out.push_back(aamer_hash(seg + i));
     }
 }
 
@@ -279,14 +279,14 @@ inline void translate_3frame_fwd(std::string_view seq, int min_aa_len, Cb&& cb) 
 
 // ── Convenience extractors ────────────────────────────────────────────────────
 
-// Extract sorted, deduplicated metamer hashes from a DNA sequence (6-frame translation).
+// Extract sorted, deduplicated aamer hashes from a DNA sequence (6-frame translation).
 // min_seg_aa: minimum inter-stop segment length to emit k-mers from (default = k).
 [[nodiscard]] inline std::vector<uint64_t>
-extract_metamers_dna(std::string_view seq, int k = METAMER_K, int min_seg_aa = METAMER_K) {
+extract_aamers_dna(std::string_view seq, int k = AAMER_K, int min_seg_aa = AAMER_K) {
     std::vector<uint64_t> hashes;
     hashes.reserve(seq.size() / 4);
     translate_6frame(seq, min_seg_aa, [&](int, const uint8_t* seg, int len, int, int) {
-        emit_metamers(seg, len, k, hashes);
+        emit_aamers(seg, len, k, hashes);
     });
     std::sort(hashes.begin(), hashes.end());
     hashes.erase(std::unique(hashes.begin(), hashes.end()), hashes.end());
@@ -295,13 +295,13 @@ extract_metamers_dna(std::string_view seq, int k = METAMER_K, int min_seg_aa = M
 
 // FracMinHash variant: keep only hashes ≤ max_hash during extraction.
 [[nodiscard]] inline std::vector<uint64_t>
-extract_metamers_dna(std::string_view seq, int k, int min_seg_aa, uint64_t max_hash) {
+extract_aamers_dna(std::string_view seq, int k, int min_seg_aa, uint64_t max_hash) {
     std::vector<uint64_t> hashes;
     hashes.reserve(seq.size() / (4 * 32));
     translate_6frame(seq, min_seg_aa, [&](int, const uint8_t* seg, int len, int, int) {
         for (int i = 0; i + k <= len; ++i) {
-            if (!metamer_is_low_complexity(seg + i, k)) {
-                uint64_t h = metamer_hash(seg + i);
+            if (!aamer_is_low_complexity(seg + i, k)) {
+                uint64_t h = aamer_hash(seg + i);
                 if (h <= max_hash) hashes.push_back(h);
             }
         }
@@ -314,22 +314,22 @@ extract_metamers_dna(std::string_view seq, int k, int min_seg_aa, uint64_t max_h
 // In-place append variant: appends unsorted hashes to an existing vector (caller sorts/deduplicates).
 // Use with a thread_local buffer to avoid per-call allocation.
 inline void
-extract_metamers_dna_into(std::string_view seq, int k, int min_seg_aa, uint64_t max_hash,
+extract_aamers_dna_into(std::string_view seq, int k, int min_seg_aa, uint64_t max_hash,
                           std::vector<uint64_t>& out) {
     translate_6frame(seq, min_seg_aa, [&](int, const uint8_t* seg, int len, int, int) {
         for (int i = 0; i + k <= len; ++i) {
-            if (!metamer_is_low_complexity(seg + i, k)) {
-                uint64_t h = metamer_hash(seg + i);
+            if (!aamer_is_low_complexity(seg + i, k)) {
+                uint64_t h = aamer_hash(seg + i);
                 if (h <= max_hash) out.push_back(h);
             }
         }
     });
 }
 
-// Murphy10 variant of extract_metamers_aa: same extraction but uses metamer_hash_murphy10.
+// Murphy10 variant of extract_aamers_aa: same extraction but uses aamer_hash_murphy10.
 // Used for building and querying reduced-alphabet marker pools.
 [[nodiscard]] inline std::vector<uint64_t>
-extract_metamers_aa_murphy10(std::string_view protein, int k = METAMER_K) {
+extract_aamers_aa_murphy10(std::string_view protein, int k = AAMER_K) {
     std::vector<uint64_t> hashes;
     hashes.reserve(protein.size());
     std::vector<uint8_t> seg;
@@ -337,8 +337,8 @@ extract_metamers_aa_murphy10(std::string_view protein, int k = METAMER_K) {
     auto flush = [&] {
         if ((int)seg.size() >= k) {
             for (int i = 0; i + k <= (int)seg.size(); ++i) {
-                if (!metamer_is_low_complexity(seg.data() + i, k))
-                    hashes.push_back(metamer_hash_murphy10(seg.data() + i));
+                if (!aamer_is_low_complexity(seg.data() + i, k))
+                    hashes.push_back(aamer_hash_murphy10(seg.data() + i));
             }
         }
         seg.clear();
@@ -355,11 +355,11 @@ extract_metamers_aa_murphy10(std::string_view protein, int k = METAMER_K) {
     return hashes;
 }
 
-// Extract sorted, deduplicated metamer hashes from a protein sequence.
+// Extract sorted, deduplicated aamer hashes from a protein sequence.
 // Handles uppercase/lowercase, '-' gaps (skip), '*' stops, 'X'/'B'/'Z' (break).
 // Used for building the marker panel from GTDB-Tk MSA sequences.
 [[nodiscard]] inline std::vector<uint64_t>
-extract_metamers_aa(std::string_view protein, int k = METAMER_K) {
+extract_aamers_aa(std::string_view protein, int k = AAMER_K) {
     std::vector<uint64_t> hashes;
     hashes.reserve(protein.size());
 
@@ -368,7 +368,7 @@ extract_metamers_aa(std::string_view protein, int k = METAMER_K) {
 
     auto flush = [&] {
         if ((int)seg.size() >= k) {
-            emit_metamers(seg.data(), (int)seg.size(), k, hashes);
+            emit_aamers(seg.data(), (int)seg.size(), k, hashes);
         }
         seg.clear();
     };
@@ -396,14 +396,14 @@ static constexpr uint8_t AA_DAYHOFF6[20] = {
     1, 0, 2, 2, 5, 1, 3, 4, 3, 4, 4, 2, 1, 2, 3, 1, 1, 4, 5, 5
 };
 
-static constexpr int METAMER_K_D6 = 12; // Dayhoff-6 k-mer length
-static constexpr int METAMER_S_D6 =  4; // syncmer inner s-mer length
+static constexpr int AAMER_K_D6 = 12; // Dayhoff-6 k-mer length
+static constexpr int AAMER_S_D6 =  4; // syncmer inner s-mer length
 
 // Dayhoff-6 k=12 hash: pack 12 groups × 3 bits = 36 bits → splitmix64.
 // d6[0..11] must be AA_DAYHOFF6-encoded (values 0..5).
-[[nodiscard]] inline uint64_t metamer_hash_d6(const uint8_t* d6) noexcept {
+[[nodiscard]] inline uint64_t aamer_hash_d6(const uint8_t* d6) noexcept {
     uint64_t v = 0;
-    for (int i = 0; i < METAMER_K_D6; ++i)
+    for (int i = 0; i < AAMER_K_D6; ++i)
         v |= static_cast<uint64_t>(d6[i]) << (3 * i);
     v ^= v >> 30;
     v *= 0xbf58476d1ce4e5b9ULL;
@@ -416,16 +416,16 @@ static constexpr int METAMER_S_D6 =  4; // syncmer inner s-mer length
 // Closed syncmer (t=0): select k-mer if the minimum s-mer (packed 3×s bits, no mixing)
 // is at position 0. Gives ~1/(k-s+1) = ~11% selection at k=12, s=4.
 // Identical criterion at pool-build and query time → consistent per-ORF sketch density.
-[[nodiscard]] inline bool metamer_is_syncmer_d6(const uint8_t* d6) noexcept {
+[[nodiscard]] inline bool aamer_is_syncmer_d6(const uint8_t* d6) noexcept {
     // Pack each s-mer as s×3-bit integer (12 bits for s=4) — no mixing, just ordering.
     auto smer = [&](int pos) -> uint16_t {
         uint16_t v = 0;
-        for (int i = 0; i < METAMER_S_D6; ++i)
+        for (int i = 0; i < AAMER_S_D6; ++i)
             v |= static_cast<uint16_t>(d6[pos + i]) << (3 * i);
         return v;
     };
     const uint16_t s0 = smer(0);
-    for (int i = 1; i <= METAMER_K_D6 - METAMER_S_D6; ++i)
+    for (int i = 1; i <= AAMER_K_D6 - AAMER_S_D6; ++i)
         if (smer(i) < s0) return false;
     return true;
 }
@@ -436,20 +436,20 @@ static constexpr int METAMER_S_D6 =  4; // syncmer inner s-mer length
 // No FracMinHash subsampling: syncmers provide consistent ~11% density already.
 inline void extract_d6_dna_into(std::string_view seq, int min_seg_aa,
                                 std::vector<uint64_t>& out) {
-    constexpr int k = METAMER_K_D6;
+    constexpr int k = AAMER_K_D6;
     translate_6frame(seq, min_seg_aa, [&](int, const uint8_t* seg, int len, int, int) {
         for (int i = 0; i + k <= len; ++i) {
             // Recode to Dayhoff-6 and check for invalid AA (0xFF from AA_ENC).
-            uint8_t d6[METAMER_K_D6];
+            uint8_t d6[AAMER_K_D6];
             bool valid = true;
             for (int j = 0; j < k; ++j) {
                 if (seg[i + j] >= 20) { valid = false; break; }
                 d6[j] = AA_DAYHOFF6[seg[i + j]];
             }
             if (!valid) continue;
-            if (!metamer_is_syncmer_d6(d6)) continue;
-            if (metamer_is_low_complexity(d6, k)) continue;
-            out.push_back(metamer_hash_d6(d6));
+            if (!aamer_is_syncmer_d6(d6)) continue;
+            if (aamer_is_low_complexity(d6, k)) continue;
+            out.push_back(aamer_hash_d6(d6));
         }
     });
 }
@@ -460,8 +460,8 @@ inline void extract_d6_dna_into(std::string_view seq, int min_seg_aa,
 // Appends to `out` without clearing.
 inline void extract_d6_orf_syncmers(const uint8_t* seg, int len,
                                      std::vector<uint64_t>& out) {
-    constexpr int K = METAMER_K_D6;
-    constexpr int S = METAMER_S_D6;
+    constexpr int K = AAMER_K_D6;
+    constexpr int S = AAMER_S_D6;
     constexpr int W = K - S + 1;  // 9: number of s-mers per k-mer window
     if (len < K) return;
 
@@ -503,8 +503,8 @@ inline void extract_d6_orf_syncmers(const uint8_t* seg, int len,
 
         // Closed syncmer t=0: emit if window minimum is at left edge i.
         if (!dq.empty() && dq.front() == i)
-            if (!metamer_is_low_complexity(d6.data() + i, K))
-                out.push_back(metamer_hash_d6(d6.data() + i));
+            if (!aamer_is_low_complexity(d6.data() + i, K))
+                out.push_back(aamer_hash_d6(d6.data() + i));
 
         // Enqueue next s-mer (right edge of next window).
         const int nx = i + W;
@@ -515,23 +515,23 @@ inline void extract_d6_orf_syncmers(const uint8_t* seg, int len,
     }
 }
 
-// Dayhoff-6 variant of extract_metamers_aa: for pool building from MSA protein strings.
-// Gaps ('-') skip without breaking the segment (same as extract_metamers_aa).
+// Dayhoff-6 variant of extract_aamers_aa: for pool building from MSA protein strings.
+// Gaps ('-') skip without breaking the segment (same as extract_aamers_aa).
 // Only emits syncmer k-mers to keep pool sparse and density-consistent.
 [[nodiscard]] inline std::vector<uint64_t>
-extract_metamers_d6_aa(std::string_view protein) {
+extract_aamers_d6_aa(std::string_view protein) {
     std::vector<uint64_t> hashes;
     hashes.reserve(protein.size() / 8);
-    constexpr int k = METAMER_K_D6;
+    constexpr int k = AAMER_K_D6;
 
     std::vector<uint8_t> seg; // Dayhoff-6 encoded segment
     seg.reserve(protein.size());
 
     auto flush = [&] {
         for (int i = 0; i + k <= (int)seg.size(); ++i) {
-            if (!metamer_is_syncmer_d6(seg.data() + i)) continue;
-            if (metamer_is_low_complexity(seg.data() + i, k)) continue;
-            hashes.push_back(metamer_hash_d6(seg.data() + i));
+            if (!aamer_is_syncmer_d6(seg.data() + i)) continue;
+            if (aamer_is_low_complexity(seg.data() + i, k)) continue;
+            hashes.push_back(aamer_hash_d6(seg.data() + i));
         }
         seg.clear();
     };

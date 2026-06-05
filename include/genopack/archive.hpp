@@ -2,9 +2,14 @@
 #include "types.hpp"
 #include "catalog.hpp"
 #include "fmhr.hpp"
+#include "core_section.hpp"
+#include "colstore.hpp"
 #include "bprm.hpp"
 #include "gcov.hpp"
 #include "gstx.hpp"
+#include "pcore.hpp"
+#include "prof.hpp"
+#include "qcontig.hpp"
 #include "qual.hpp"
 #include "shard.hpp"
 #include "skch.hpp"
@@ -207,6 +212,27 @@ public:
     // Raw reader pointer (nullptr if no FMHR section); valid for archive lifetime.
     const FmhrReader* fmhr_reader() const;
 
+    // SEC_CORE — per-genus prevalence cores (intrinsic completeness reference).
+    bool has_core() const;
+    CoreView core_for_genus(std::string_view genus) const;
+    const CoreReader* core_reader() const;
+
+    // SEC_FCORE — per-family prevalence cores. The genus-core fallback: when a query
+    // genome's genus has no (or too sparse a) CORE, family-core coverage is a coarser
+    // but more universally-available intrinsic completeness reference. Built post-hoc
+    // by `genopack fcore`. core_for_family returns invalid (valid()==false) if absent.
+    bool has_fcore() const;
+    CoreView core_for_family(std::string_view family) const;
+    const CoreReader* fcore_reader() const;
+
+    // SEC_PCORE — unified prevalence-annotated per-genus aamer reference (dense: every
+    // aamer + u8 prevalence). Supersedes CORE/FCORE; dense enough for small-contig
+    // foreign detection. Built by `genopack pcore`. Invalid view if genus absent.
+    bool has_pcore() const;
+    PcoreView pcore_for_genus(std::string_view genus) const;
+    PcoreView pcore_for_family(std::string_view family) const;
+    const PcoreReader* pcore_reader() const;
+
     // BPRM: self-describing build parameters (one per archive).
     bool has_bprm() const;
     // Pointer to the build-params header (nullptr if no BPRM section).
@@ -218,6 +244,32 @@ public:
     // Written during build; enables O(1) quality lookup without re-computing.
     bool has_qual() const;
     void scan_qual(const std::function<void(const QualRecord&)>& cb) const;
+    // QCOL columnar reader (nullptr if only legacy SEC_QUAL or no quality). Lets a
+    // consumer read columns that have no QualRecord field (e.g. AAMER_GENUS_CORE).
+    const ColStoreReader* qcol_reader() const;
+
+    // XQAL: external quality (CheckM2 / anvi'o), columnar, keyed by genome_id.
+    // Ingested via `genopack ingest`; each tool's measurements are distinct columns
+    // (tool != "genopack"). Reader pointer is nullptr if no XQAL section.
+    bool has_xqual() const;
+    const ColStoreReader* xqual_reader() const;
+
+    // CQAL: calibrated / fused quality, columnar, keyed by genome_id. Written by
+    // `genopack calibrate`; columns carry a calibration_hash. nullptr if no section.
+    bool has_cqal() const;
+    const ColStoreReader* cqal_reader() const;
+
+    // PROF: named reporting/fusion profiles (user-authored), each pinning per-axis
+    // column identities. Written by `genopack profile`; consumed by `genopack
+    // report --profile <name>`. Reader pointer is nullptr if no PROF section.
+    bool has_prof() const;
+    const ProfReader* prof_reader() const;
+
+    // QCONTIG: per-contig quality overlay (offset/length/TNF/leakage per contig),
+    // keyed by genome_id. Written by `check`; lets a consumer see which contigs
+    // drive a genome's contamination. Reader pointer is nullptr if no section.
+    bool has_qcontig() const;
+    const QcontigReader* qcontig_reader() const;
 
     // File descriptor for the underlying mmap (for posix_fadvise).
     int fd() const;
@@ -256,6 +308,8 @@ struct ArchiveBuilderConfig {
     bool     build_sketch        = false;  // compute OPH sketches and write SKCH section
     bool     build_gstx          = true;   // build GSTX genus-stats index (needs taxonomy_group + build_sketch)
     bool     build_gcov          = true;   // build GCOV per-genus covariance eigenbasis (needs build_gstx)
+    bool     build_core          = true;   // build SEC_CORE per-genus prevalence cores (needs markers_path)
+    float    core_theta          = 0.90f;  // prevalence threshold for genus-core membership
     uint32_t micro_genus_threshold = 0;    // min genus members for a dedicated shard + GSTX/GCOV/FMHR
                                            // model; smaller genera are bin-packed and unmodeled.
                                            // 0 = auto (scales with corpus: 4 if <=50k genomes, 8 if
@@ -270,7 +324,9 @@ struct ArchiveBuilderConfig {
     int      fmh_c               = 125;    // FracMinHash density (1/c) for FMHR sketches
     std::string markers_path;           // path to .mrk file; empty = skip build-time marker scoring
     int         marker_min_hits  = 5;  // min pool hits to call a marker present (matches check default)
+    std::string contam_panel_path;      // path to .csp contamination panel; empty = skip duplication scoring
     std::filesystem::path from_gpk_source;  // non-empty: rebuild by streaming decoded sequence from this .gpk
+    std::filesystem::path from_stage_source; // non-empty: rebuild by streaming decoded sequence from this .gstage cache
 };
 
 // `build --from-gpk` fast-path: if the source's build params equal what cfg
@@ -294,6 +350,10 @@ public:
     // Rebuild from an existing .gpk: stream decoded sequence from its shards
     // (sequential reads) instead of opening per-genome FASTA files on NFS.
     void add_from_gpk(const std::filesystem::path& source);
+
+    // Rebuild from a .gstage cache: stream decoded sequence sequentially from a
+    // local store produced by `genopack stage` (no per-genome NFS file opens).
+    void add_from_stage(const std::filesystem::path& source);
 
     // Add individual record
     void add(const BuildRecord& rec);

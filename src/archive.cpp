@@ -7,6 +7,7 @@
 #include <genopack/bprm.hpp>
 #include <genopack/gstx.hpp>
 #include <genopack/qual.hpp>
+#include <genopack/qual_columns.hpp>
 #include <genopack/kmrx.hpp>
 #include <genopack/skch.hpp>
 #include <genopack/mmap_file.hpp>
@@ -125,6 +126,14 @@ struct ArchiveReader::Impl {
     // FMHR reader: per-genus FracMinHash reference sketches (k=21, c=125)
     FmhrReader fmhr_;
     bool       has_fmhr_ = false;
+
+    // CORE reader: per-genus prevalence cores (zero-copy into mmap)
+    CoreReader core_;
+    bool       has_core_ = false;
+    CoreReader fcore_;            // per-family prevalence cores (genus-core fallback)
+    bool       has_fcore_ = false;
+    PcoreReader pcore_;           // unified dense per-genus aamer ref (+ prevalence)
+    bool       has_pcore_ = false;
     // BPRM: self-describing build parameters (one per archive)
     BprmReader bprm_;
     bool       has_bprm_ = false;
@@ -133,6 +142,21 @@ struct ArchiveReader::Impl {
     std::vector<uint8_t> qual_buf_;  // pread heap buffer — avoids NFS mmap page faults
     QualReader qual_;
     bool       has_qual_ = false;
+    // QCOL reader: intrinsic quality, columnar (zero-copy into mmap); supersedes QUAL
+    ColStoreReader qcol_;
+    bool           has_qcol_ = false;
+    // XQAL reader: external quality (CheckM2/anvi'o), columnar (zero-copy into mmap)
+    ColStoreReader xqual_;
+    bool           has_xqual_ = false;
+    // CQAL reader: calibrated/fused quality, columnar (zero-copy into mmap)
+    ColStoreReader cqal_;
+    bool           has_cqal_ = false;
+    // PROF reader: named reporting/fusion profiles (zero-copy into mmap)
+    ProfReader     prof_;
+    bool           has_prof_ = false;
+    // QCONTIG reader: per-contig quality overlay (zero-copy into mmap)
+    QcontigReader  qcontig_;
+    bool           has_qcontig_ = false;
 
     // CIDX reader for contig accession -> genome_id lookup
     MergedCidxReader cidx_;
@@ -399,6 +423,57 @@ struct ArchiveReader::Impl {
             }
         }
 
+        // Load CORE section (highest section_id wins; zero-copy — points into mmap)
+        {
+            uint64_t best_id = 0;
+            const SectionDesc* best_sd = nullptr;
+            for (auto* sd : toc_.find_by_type(SEC_CORE)) {
+                if (sd->section_id > best_id) { best_id = sd->section_id; best_sd = sd; }
+            }
+            if (best_sd) {
+                try {
+                    core_.open(mmap_.data(), best_sd->file_offset, best_sd->compressed_size);
+                    has_core_ = true;
+                } catch (const std::exception& ex) {
+                    spdlog::warn("CORE section unreadable ({}); rebuild required", ex.what());
+                }
+            }
+        }
+
+        // Load FCORE section (per-family cores; highest section_id wins, zero-copy).
+        {
+            uint64_t best_id = 0;
+            const SectionDesc* best_sd = nullptr;
+            for (auto* sd : toc_.find_by_type(SEC_FCORE)) {
+                if (sd->section_id > best_id) { best_id = sd->section_id; best_sd = sd; }
+            }
+            if (best_sd) {
+                try {
+                    fcore_.open(mmap_.data(), best_sd->file_offset, best_sd->compressed_size);
+                    has_fcore_ = true;
+                } catch (const std::exception& ex) {
+                    spdlog::warn("FCORE section unreadable ({}); rebuild with `genopack fcore`", ex.what());
+                }
+            }
+        }
+
+        // Load PCORE section (unified dense per-genus aamer ref; highest id wins).
+        {
+            uint64_t best_id = 0;
+            const SectionDesc* best_sd = nullptr;
+            for (auto* sd : toc_.find_by_type(SEC_PCORE)) {
+                if (sd->section_id > best_id) { best_id = sd->section_id; best_sd = sd; }
+            }
+            if (best_sd) {
+                try {
+                    pcore_.open(mmap_.data(), best_sd->file_offset, best_sd->compressed_size);
+                    has_pcore_ = true;
+                } catch (const std::exception& ex) {
+                    spdlog::warn("PCORE section unreadable ({}); rebuild with `genopack pcore`", ex.what());
+                }
+            }
+        }
+
         // Load BPRM section (self-describing build params; highest section_id wins)
         {
             uint64_t best_id = 0;
@@ -435,6 +510,92 @@ struct ArchiveReader::Impl {
                     mmap_.advise(best_sd->file_offset, best_sd->compressed_size, MADV_DONTNEED);
                 } catch (const std::exception& e) {
                     spdlog::warn("QUAL section unreadable ({}); rebuild with reindex", e.what());
+                }
+            }
+        }
+
+        // Load QCOL section (intrinsic quality, columnar; highest section_id wins,
+        // zero-copy into mmap). Supersedes legacy SEC_QUAL when present.
+        {
+            uint64_t best_id = 0;
+            const SectionDesc* best_sd = nullptr;
+            for (auto* sd : toc_.find_by_type(SEC_QCOL)) {
+                if (sd->section_id > best_id) { best_id = sd->section_id; best_sd = sd; }
+            }
+            if (best_sd) {
+                try {
+                    qcol_.open(mmap_.data(), best_sd->file_offset, best_sd->compressed_size);
+                    has_qcol_ = true;
+                } catch (const std::exception& e) {
+                    spdlog::warn("QCOL section unreadable ({}); rebuild with reindex", e.what());
+                }
+            }
+        }
+
+        // Load XQAL section (external quality, columnar; highest section_id wins).
+        {
+            uint64_t best_id = 0;
+            const SectionDesc* best_sd = nullptr;
+            for (auto* sd : toc_.find_by_type(SEC_XQAL)) {
+                if (sd->section_id > best_id) { best_id = sd->section_id; best_sd = sd; }
+            }
+            if (best_sd) {
+                try {
+                    xqual_.open(mmap_.data(), best_sd->file_offset, best_sd->compressed_size);
+                    has_xqual_ = true;
+                } catch (const std::exception& e) {
+                    spdlog::warn("XQAL section unreadable ({}); re-ingest external quality", e.what());
+                }
+            }
+        }
+
+        // Load CQAL section (calibrated/fused quality, columnar; highest id wins).
+        {
+            uint64_t best_id = 0;
+            const SectionDesc* best_sd = nullptr;
+            for (auto* sd : toc_.find_by_type(SEC_CQAL)) {
+                if (sd->section_id > best_id) { best_id = sd->section_id; best_sd = sd; }
+            }
+            if (best_sd) {
+                try {
+                    cqal_.open(mmap_.data(), best_sd->file_offset, best_sd->compressed_size);
+                    has_cqal_ = true;
+                } catch (const std::exception& e) {
+                    spdlog::warn("CQAL section unreadable ({}); re-run calibrate", e.what());
+                }
+            }
+        }
+
+        // Load PROF section (named reporting/fusion profiles; highest id wins).
+        {
+            uint64_t best_id = 0;
+            const SectionDesc* best_sd = nullptr;
+            for (auto* sd : toc_.find_by_type(SEC_PROF)) {
+                if (sd->section_id > best_id) { best_id = sd->section_id; best_sd = sd; }
+            }
+            if (best_sd) {
+                try {
+                    prof_.open(mmap_.data(), best_sd->file_offset, best_sd->compressed_size);
+                    has_prof_ = true;
+                } catch (const std::exception& e) {
+                    spdlog::warn("PROF section unreadable ({}); re-author profiles", e.what());
+                }
+            }
+        }
+
+        // Load QCONTIG section (per-contig quality overlay; highest id wins).
+        {
+            uint64_t best_id = 0;
+            const SectionDesc* best_sd = nullptr;
+            for (auto* sd : toc_.find_by_type(SEC_QCONTIG)) {
+                if (sd->section_id > best_id) { best_id = sd->section_id; best_sd = sd; }
+            }
+            if (best_sd) {
+                try {
+                    qcontig_.open(mmap_.data(), best_sd->file_offset, best_sd->compressed_size);
+                    has_qcontig_ = true;
+                } catch (const std::exception& e) {
+                    spdlog::warn("QCONTIG section unreadable ({}); re-run check", e.what());
                 }
             }
         }
@@ -534,10 +695,26 @@ struct ArchiveReader::Impl {
             fcov_buf_.clear();
             fmhr_                 = FmhrReader{};
             has_fmhr_             = false;
+            core_                 = CoreReader{};
+            has_core_             = false;
+            fcore_                = CoreReader{};
+            has_fcore_            = false;
+            pcore_                = PcoreReader{};
+            has_pcore_            = false;
             bprm_                 = BprmReader{};
             has_bprm_             = false;
             qual_                 = QualReader{};
             has_qual_             = false;
+            qcol_                 = ColStoreReader{};
+            has_qcol_             = false;
+            xqual_                = ColStoreReader{};
+            has_xqual_            = false;
+            cqal_                 = ColStoreReader{};
+            has_cqal_             = false;
+            prof_                 = ProfReader{};
+            has_prof_             = false;
+            qcontig_              = QcontigReader{};
+            has_qcontig_          = false;
             kmrx_readers_.clear();
             has_kmrx_             = false;
             cidx_                 = MergedCidxReader{};
@@ -745,6 +922,16 @@ void ArchiveReader::close() {
     impl_->fcov_buf_.clear();
     impl_->qual_                 = QualReader{};
     impl_->has_qual_             = false;
+    impl_->qcol_                 = ColStoreReader{};
+    impl_->has_qcol_             = false;
+    impl_->xqual_                = ColStoreReader{};
+    impl_->has_xqual_            = false;
+    impl_->cqal_                 = ColStoreReader{};
+    impl_->has_cqal_             = false;
+    impl_->prof_                 = ProfReader{};
+    impl_->has_prof_             = false;
+    impl_->qcontig_              = QcontigReader{};
+    impl_->has_qcontig_          = false;
     impl_->kmrx_readers_.clear();
     impl_->has_kmrx_             = false;
     impl_->cidx_                 = MergedCidxReader{};
@@ -1308,6 +1495,44 @@ const FmhrReader* ArchiveReader::fmhr_reader() const {
     return impl_->has_fmhr_ ? &impl_->fmhr_ : nullptr;
 }
 
+bool ArchiveReader::has_core() const { return impl_->has_core_; }
+
+CoreView ArchiveReader::core_for_genus(std::string_view genus) const {
+    if (!impl_->has_core_) return {};
+    return impl_->core_.lookup(GcovWriter::hash_genus(genus));
+}
+
+const CoreReader* ArchiveReader::core_reader() const {
+    return impl_->has_core_ ? &impl_->core_ : nullptr;
+}
+
+bool ArchiveReader::has_fcore() const { return impl_->has_fcore_; }
+
+CoreView ArchiveReader::core_for_family(std::string_view family) const {
+    if (!impl_->has_fcore_) return {};
+    return impl_->fcore_.lookup(GcovWriter::hash_genus(family));
+}
+
+const CoreReader* ArchiveReader::fcore_reader() const {
+    return impl_->has_fcore_ ? &impl_->fcore_ : nullptr;
+}
+
+bool ArchiveReader::has_pcore() const { return impl_->has_pcore_; }
+
+PcoreView ArchiveReader::pcore_for_genus(std::string_view genus) const {
+    if (!impl_->has_pcore_) return {};
+    return impl_->pcore_.lookup(GcovWriter::hash_genus(genus));
+}
+
+PcoreView ArchiveReader::pcore_for_family(std::string_view family) const {
+    if (!impl_->has_pcore_) return {};
+    return impl_->pcore_.lookup(GcovWriter::hash_genus(family));
+}
+
+const PcoreReader* ArchiveReader::pcore_reader() const {
+    return impl_->has_pcore_ ? &impl_->pcore_ : nullptr;
+}
+
 bool ArchiveReader::has_bprm() const { return impl_->has_bprm_; }
 
 const BprmHeader* ArchiveReader::build_params() const {
@@ -1318,10 +1543,39 @@ uint64_t ArchiveReader::build_params_hash() const {
     return impl_->has_bprm_ ? impl_->bprm_.params_hash() : 0;
 }
 
-bool ArchiveReader::has_qual() const { return impl_->has_qual_; }
+bool ArchiveReader::has_qual() const { return impl_->has_qcol_ || impl_->has_qual_; }
 
 void ArchiveReader::scan_qual(const std::function<void(const QualRecord&)>& cb) const {
+    if (impl_->has_qcol_) { qcol_scan(impl_->qcol_, cb); return; }
     if (impl_->has_qual_) impl_->qual_.scan(cb);
+}
+
+const ColStoreReader* ArchiveReader::qcol_reader() const {
+    return impl_->has_qcol_ ? &impl_->qcol_ : nullptr;
+}
+
+bool ArchiveReader::has_xqual() const { return impl_->has_xqual_; }
+
+const ColStoreReader* ArchiveReader::xqual_reader() const {
+    return impl_->has_xqual_ ? &impl_->xqual_ : nullptr;
+}
+
+bool ArchiveReader::has_cqal() const { return impl_->has_cqal_; }
+
+const ColStoreReader* ArchiveReader::cqal_reader() const {
+    return impl_->has_cqal_ ? &impl_->cqal_ : nullptr;
+}
+
+bool ArchiveReader::has_qcontig() const { return impl_->has_qcontig_; }
+
+const QcontigReader* ArchiveReader::qcontig_reader() const {
+    return impl_->has_qcontig_ ? &impl_->qcontig_ : nullptr;
+}
+
+bool ArchiveReader::has_prof() const { return impl_->has_prof_; }
+
+const ProfReader* ArchiveReader::prof_reader() const {
+    return impl_->has_prof_ ? &impl_->prof_ : nullptr;
 }
 
 std::optional<SketchResult> ArchiveReader::sketch_for(GenomeId genome_id) const {

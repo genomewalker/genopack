@@ -35,6 +35,18 @@ static constexpr uint32_t SEC_GCOV = 0x564F4347u; // "GCOV" - per-genus biologic
 static constexpr uint32_t SEC_FCOV = 0x564F4346u; // "FCOV" - per-family biological covariance (same layout as GCOV, keyed by family hash)
 static constexpr uint32_t SEC_FMHR = 0x52484D46u; // "FMHR" - per-genus FracMinHash reference sketches (k=21,c=125)
 static constexpr uint32_t SEC_BPRM = 0x4D525042u; // "BPRM" - self-describing build parameters (one per archive)
+// ── Provenance-first columnar quality store (replaces flat SEC_QUAL) ──
+// Cell = (genome, axis, source/tool, method). Intrinsic and external measures
+// live in separate sections and are never silently fused; CORE holds the
+// per-genus prevalence models the intrinsic columns reference.
+static constexpr uint32_t SEC_CORE = 0x45524F43u; // "CORE" - per-genus prevalence cores (content-hashed models)
+static constexpr uint32_t SEC_FCORE = 0x524F4346u;// "FCOR" - per-family prevalence cores (genus-core fallback for novel/sparse genera)
+static constexpr uint32_t SEC_PCORE = 0x524F4350u;// "PCOR" - unified per-genus aamer reference: ALL aamers + u8 prevalence (dense; supersedes CORE/FCORE)
+static constexpr uint32_t SEC_QCOL = 0x4C4F4351u; // "QCOL" - intrinsic quality, columnar (genopack-computed)
+static constexpr uint32_t SEC_XQAL = 0x4C415158u; // "XQAL" - external quality, columnar (CheckM2/anvi'o/...)
+static constexpr uint32_t SEC_CQAL = 0x4C415143u; // "CQAL" - calibrated quality, columnar (excluded from derivation)
+static constexpr uint32_t SEC_PROF = 0x464F5250u; // "PROF" - reporting profiles (named, content-hashed fusion policy)
+static constexpr uint32_t SEC_QCONTIG = 0x47544351u; // "QCTG" - per-contig quality overlay (which contigs drive a score)
 
 // Model/pipeline versions folded into BPRM.params_hash (and GPK3 derivation_hash).
 // Bump when a section's computation semantics change in a byte-incompatible way.

@@ -4,6 +4,8 @@
 #include "pack_iface.hpp"
 #include <genopack/archive.hpp>
 #include <genopack/qual.hpp>
+#include <genopack/qual_columns.hpp>
+#include <genopack/qcontig.hpp>
 #include <genopack/mmap_file.hpp>
 #include <genopack/section_checksum.hpp>
 #include <genopack/toc.hpp>
@@ -52,7 +54,9 @@ std::vector<std::filesystem::path> collect_gpk_paths(const std::filesystem::path
 
 void write_qual_to_archive(const std::filesystem::path& gpk_path,
                            const std::unordered_map<std::string, GenomeQuality>& quality,
-                           const std::unordered_map<std::string, GenomeId>& acc_to_id)
+                           const std::unordered_map<std::string, GenomeId>& acc_to_id,
+                           uint64_t core_model_hash,
+                           uint64_t fcore_model_hash)
 {
     int lock_fd = ::open(gpk_path.c_str(), O_RDWR);
     if (lock_fd < 0)
@@ -71,7 +75,7 @@ void write_qual_to_archive(const std::filesystem::path& gpk_path,
     uint64_t generation      = toc.header.generation + 1;
     mmap.close();
 
-    QualWriter qw;
+    std::vector<QualRecord> recs;
     for (const auto& [acc, q] : quality) {
         auto it = acc_to_id.find(acc);
         if (it == acc_to_id.end()) continue;
@@ -136,20 +140,58 @@ void write_qual_to_archive(const std::filesystem::path& gpk_path,
             r.qual_flags |= QualRecord::QUAL_FLAG_FRAG_GATED;
         if (!std::isnan(q.self_coherence) && q.self_coherence < 0.80f)
             r.qual_flags |= QualRecord::QUAL_FLAG_COHERENCE_GATED;
-        qw.add(r);
+        recs.push_back(r);
     }
 
     AppendWriter writer;
     writer.open_append(gpk_path);
 
+    // AAMER_GENUS_CORE intrinsic completeness → its own provenance-carrying column
+    // (references core_model_hash; absent for genomes without a genus core).
+    std::unordered_map<uint64_t, float> aamer_core_cov;
+    for (const auto& [acc, q] : quality) {
+        if (std::isnan(q.completeness_aamer_core)) continue;
+        auto it = acc_to_id.find(acc);
+        if (it == acc_to_id.end()) continue;
+        aamer_core_cov.emplace(it->second, q.completeness_aamer_core);
+    }
+    // AAMER_FAMILY_CORE intrinsic completeness (genus-core fallback) → its own column.
+    std::unordered_map<uint64_t, float> aamer_family_cov;
+    for (const auto& [acc, q] : quality) {
+        if (std::isnan(q.completeness_aamer_family_core)) continue;
+        auto it = acc_to_id.find(acc);
+        if (it == acc_to_id.end()) continue;
+        aamer_family_cov.emplace(it->second, q.completeness_aamer_family_core);
+    }
+    QcolExtraColumns extra;
+    extra.core_model_hash = core_model_hash;
+    if (!aamer_core_cov.empty()) extra.aamer_genus_core = &aamer_core_cov;
+    extra.family_core_model_hash = fcore_model_hash;
+    if (!aamer_family_cov.empty()) extra.aamer_family_core = &aamer_family_cov;
+
+    // SEC_QCONTIG — per-contig overlay: persist pass_b's per-contig flags so a
+    // consumer can see which contigs drive each genome's contamination score.
+    QcontigWriter qcw;
+    std::unordered_set<uint64_t> qcw_seen;   // dedup aliased accessions → one genome_id
+    for (const auto& [acc, q] : quality) {
+        if (q.contig_flags.empty()) continue;
+        auto it = acc_to_id.find(acc);
+        if (it == acc_to_id.end()) continue;
+        if (!qcw_seen.insert(static_cast<uint64_t>(it->second)).second) continue;
+        qcw.add_genome(static_cast<uint64_t>(it->second), q.contig_flags);
+    }
+
     uint64_t section_id = toc.next_section_id();
-    SectionDesc qual_sd = qw.finalize(writer, section_id);
+    SectionDesc qcol_sd = qcol_write(writer, section_id, std::move(recs), extra);
+    SectionDesc qcontig_sd = qcw.finalize(writer, section_id + 1);
 
     TocWriter new_toc;
     for (const auto& sd : toc.sections) {
-        if (sd.type != SEC_QUAL) new_toc.add_section(sd);
+        if (sd.type != SEC_QUAL && sd.type != SEC_QCOL && sd.type != SEC_QCONTIG)
+            new_toc.add_section(sd);
     }
-    new_toc.add_section(qual_sd);
+    new_toc.add_section(qcol_sd);
+    if (qcontig_sd.item_count > 0) new_toc.add_section(qcontig_sd);
 
     // Content-checksum the appended QUAL (and any still-unstamped section) so
     // verify can validate it.
@@ -165,7 +207,8 @@ void write_qual_to_archive(const std::filesystem::path& gpk_path,
                      toc.header.accession_root_section_id,
                      toc.header.tombstone_root_section_id);
 
-    spdlog::info("check: wrote {} QUAL records to {}", qw.size(), gpk_path.string());
+    spdlog::info("check: wrote {} QCOL records + {} QCONTIG rows to {}",
+                 qcol_sd.item_count, qcontig_sd.item_count, gpk_path.string());
 }
 
 } // namespace
@@ -177,7 +220,8 @@ int cmd_check(const std::filesystem::path& pack_path,
               float leakage_threshold,
               const std::filesystem::path& output,
               bool recompute,
-              const std::filesystem::path& markers_path)
+              const std::filesystem::path& markers_path,
+              bool scan_all)
 {
     auto gpk_paths = collect_gpk_paths(pack_path);
     if (gpk_paths.empty())
@@ -235,6 +279,7 @@ int cmd_check(const std::filesystem::path& pack_path,
 
         PassBConfig pb_cfg;
         pb_cfg.markers_path = markers_path.string();   // empty = marker scoring disabled
+        pb_cfg.scan_all     = scan_all;
         const auto* baseline_ptr = qual_cache.empty() ? nullptr : &qual_cache;
         run_pass_b(pack, pass_a, quality, pb_cfg, threads, qual_cache_ptr, baseline_ptr);
 
@@ -328,6 +373,10 @@ int cmd_check(const std::filesystem::path& pack_path,
             acc_to_id.emplace(std::string(acc), gid);
         });
 
+        const uint64_t core_model_hash =
+            ar.core_reader() ? ar.core_reader()->core_model_hash() : 0;
+        const uint64_t fcore_model_hash =
+            ar.fcore_reader() ? ar.fcore_reader()->core_model_hash() : 0;
         ar.close();
 
         // Contamination-axis provenance: when the FMH minority axis is absent
@@ -338,7 +387,7 @@ int cmd_check(const std::filesystem::path& pack_path,
             if (std::isnan(q.fmh_minority_fraction))
                 q.qual_flags |= QualRecord::QUAL_FLAG_FMH_AXIS_ABSENT;
 
-        write_qual_to_archive(gp, quality, acc_to_id);
+        write_qual_to_archive(gp, quality, acc_to_id, core_model_hash, fcore_model_hash);
 
         for (auto& [acc, q] : quality)
             all_quality.emplace(acc, std::move(q));
@@ -354,12 +403,15 @@ int cmd_check(const std::filesystem::path& pack_path,
     if (!tsv) throw std::runtime_error("check: cannot open output: " + output.string());
     tsv << "accession\tquality_tier\tcompleteness_effective\tcompleteness_cluster_relative\tcompleteness_sketch_fill\tcompleteness_fragmentation"
            "\tcompleteness_post_decontam"
+           "\tcompleteness_aamer_core"
+           "\tcompleteness_aamer_family_core"
            "\tfmh_contamination"
            "\tcontamination_leakage\tcontamination_tnf_excess"
            "\tchromosome_skew_closure\tleakage_residual\tself_coherence"
            "\tchargaff_parity\tspectral_gap\tscale_kink\tcontamination_mixture\tmixture_sources"
            "\tn_mix_windows\tcontamination_contig_outlier\tcontamination_spe"
            "\tcontamination_rho_outlier\tcontamination_cross_genus\tcontamination_contig_split"
+           "\tcontamination_duplication"
            "\tqual_flags\tsupport_tier\tinterval_width"
            "\tcontamination_contig_outlier_adj\tmimag_tier\n";
 
@@ -392,6 +444,8 @@ int cmd_check(const std::filesystem::path& pack_path,
             << fmt(q.completeness_sketch_fill) << '\t'
             << fmt(q.completeness_fragmentation) << '\t'
             << fmt(q.completeness_post_decontam) << '\t'
+            << fmt(q.completeness_aamer_core) << '\t'
+            << fmt(q.completeness_aamer_family_core) << '\t'
             << fmt(fmh_cont) << '\t'
             << fmt(q.contamination_leakage) << '\t'
             << fmt(q.contamination_tnf_excess) << '\t'
@@ -408,7 +462,8 @@ int cmd_check(const std::filesystem::path& pack_path,
             << fmt(q.contamination_spe) << '\t'
             << fmt(q.contamination_rho_outlier) << '\t'
             << fmt(q.contamination_cross_genus) << '\t'
-            << fmt(q.contamination_contig_split) << '\t';
+            << fmt(q.contamination_contig_split) << '\t'
+            << fmt(q.contamination_duplication) << '\t';
         // Per-SCG presence bitmask as lowercase hex string (empty when not scored).
         if (!q.marker_present_bits.empty()) {
             static constexpr char hex[] = "0123456789abcdef";

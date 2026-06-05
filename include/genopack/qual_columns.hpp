@@ -1,0 +1,161 @@
+#pragma once
+// ── QCOL: intrinsic quality as a columnar store ───────────────────────────────
+// SEC_QCOL replaces the flat 80-byte SEC_QUAL POD. Each legacy QualRecord field
+// becomes a named, provenance-carrying column (axis/tool=genopack/method/unit)
+// stored byte-for-byte in its original dtype — so materializing a QualRecord back
+// from QCOL is exact (no quantization drift), and check/calibrate/subset that
+// consume QualRecord via ArchiveReader::scan_qual need no change. New columns
+// (e.g. COMPLETENESS/genopack/AAMER_GENUS_CORE, referencing core_model_hash) are
+// added alongside and simply bypass the QualRecord interchange.
+#include "qual.hpp"
+#include "colstore.hpp"
+#include "quality_schema.hpp"
+#include <algorithm>
+#include <cstddef>
+#include <cstring>
+#include <functional>
+#include <unordered_map>
+#include <vector>
+
+namespace genopack {
+
+// One legacy QualRecord field <-> one QCOL column. `offset` is the field's byte
+// offset in QualRecord; the value is copied verbatim (sentinels intact), so the
+// column dtype mirrors the field type and round-trip is byte-exact.
+struct QcolField {
+    const char* axis;
+    const char* method;
+    Unit        unit;
+    ColDType    dtype;
+    size_t      offset;
+};
+
+inline const std::vector<QcolField>& qcol_fields() {
+    static const std::vector<QcolField> F = {
+        {qual_axis::COMPLETENESS,  qual_method::CLUSTER_RELATIVE, Unit::Fraction01, ColDType::F32, offsetof(QualRecord, completeness_cluster_relative)},
+        {qual_axis::COMPLETENESS,  qual_method::FRAGMENTATION,    Unit::Fraction01, ColDType::F32, offsetof(QualRecord, completeness_fragmentation)},
+        {qual_axis::COMPLETENESS,  qual_method::POST_DECONTAM,    Unit::Fraction01, ColDType::F32, offsetof(QualRecord, completeness_post_decontam)},
+        {qual_axis::CONTAMINATION, qual_method::LEAKAGE,          Unit::Fraction01, ColDType::F32, offsetof(QualRecord, contamination_leakage)},
+        {qual_axis::CONTAMINATION, qual_method::TNF_EXCESS,       Unit::Ratio,      ColDType::F32, offsetof(QualRecord, contamination_tnf_excess)},
+        {qual_axis::CHROM_SKEW,    qual_method::SKEW_CLOSURE,     Unit::Fraction01, ColDType::F32, offsetof(QualRecord, chromosome_skew_closure)},
+        {qual_axis::CONTAMINATION, qual_method::LEAKAGE_RESIDUAL, Unit::Ratio,      ColDType::F32, offsetof(QualRecord, leakage_residual)},
+        {qual_axis::SUPPORT,       qual_method::TIER,             Unit::Count,      ColDType::U8,  offsetof(QualRecord, support_tier)},
+        {qual_axis::CONTAMINATION, qual_method::SPE_OUTLIER,      Unit::Fraction01, ColDType::U8,  offsetof(QualRecord, spe_outlier_u8)},
+        {qual_axis::CONTAMINATION, qual_method::SIBLING_OUTLIER,  Unit::Fraction01, ColDType::U8,  offsetof(QualRecord, sibling_outlier_u8)},
+        {qual_axis::CONTAMINATION, qual_method::RHO_OUTLIER,      Unit::Fraction01, ColDType::U8,  offsetof(QualRecord, rho_outlier_u8)},
+        {qual_axis::INTERVAL,      qual_method::WIDTH,            Unit::Fraction01, ColDType::F32, offsetof(QualRecord, interval_width)},
+        {qual_axis::COHERENCE,     qual_method::SELF_COHERENCE,   Unit::Fraction01, ColDType::F32, offsetof(QualRecord, self_coherence)},
+        {qual_axis::CONTAMINATION, qual_method::MIXTURE,          Unit::Fraction01, ColDType::F32, offsetof(QualRecord, contamination_mixture)},
+        {qual_axis::CONTAMINATION, qual_method::MIXTURE_SOURCES,  Unit::Count,      ColDType::I16, offsetof(QualRecord, mixture_sources)},
+        {qual_axis::CONTAMINATION, qual_method::SPECTRAL,         Unit::Fraction01, ColDType::U16, offsetof(QualRecord, fiedler_u16)},
+        {qual_axis::CONTAMINATION, qual_method::MIXTURE_WINDOWS,  Unit::Count,      ColDType::U16, offsetof(QualRecord, n_mix_windows)},
+        {qual_axis::SUPPORT,       qual_method::FLAGS,            Unit::Count,      ColDType::U8,  offsetof(QualRecord, qual_flags)},
+        {qual_axis::CONTAMINATION, qual_method::CONTIG_OUTLIER,   Unit::Fraction01, ColDType::U8,  offsetof(QualRecord, contig_outlier_u8)},
+        {qual_axis::CONTAMINATION, qual_method::FMH_MINORITY,     Unit::Fraction01, ColDType::U8,  offsetof(QualRecord, fmh_minority_u8)},
+        {qual_axis::COMPLETENESS,  qual_method::MARKER_SCG,       Unit::Fraction01, ColDType::U8,  offsetof(QualRecord, marker_completeness_u8)},
+        {qual_axis::CONTAMINATION, qual_method::MARKER_REDUNDANCY,Unit::Ratio,      ColDType::U16, offsetof(QualRecord, marker_redundancy_u16)},
+        {qual_axis::COHERENCE,     qual_method::CHARGAFF_PARITY,  Unit::Fraction01, ColDType::F32, offsetof(QualRecord, chargaff_parity)},
+        {qual_axis::COHERENCE,     qual_method::SPECTRAL_GAP,     Unit::Fraction01, ColDType::F32, offsetof(QualRecord, spectral_gap)},
+        {qual_axis::COHERENCE,     qual_method::SCALE_KINK,       Unit::Bits,       ColDType::F32, offsetof(QualRecord, scale_kink)},
+        {qual_axis::CONTAMINATION, qual_method::CROSS_GENUS,      Unit::Fraction01, ColDType::U8,  offsetof(QualRecord, cross_genus_u8)},
+        {qual_axis::COMPLETENESS,  qual_method::SKETCH_FILL,      Unit::Fraction01, ColDType::U8,  offsetof(QualRecord, sketch_fill_u8)},
+        {qual_axis::CONTAMINATION, qual_method::DUPLICATION,      Unit::Fraction01, ColDType::U16, offsetof(QualRecord, contamination_duplication_u16)},
+    };
+    return F;
+}
+
+inline ColumnKey qcol_legacy_key(const QcolField& f) {
+    return ColumnKey{f.axis, qual_tool::GENOPACK, f.method, f.unit, /*version=*/1};
+}
+
+// New (non-QualRecord) columns to add alongside the legacy transpose.
+struct QcolExtraColumns {
+    uint64_t                                        core_model_hash = 0;
+    const std::unordered_map<uint64_t, float>*      aamer_genus_core = nullptr; // genome_id -> coverage
+    uint64_t                                        family_core_model_hash = 0;
+    const std::unordered_map<uint64_t, float>*      aamer_family_core = nullptr; // genome_id -> coverage (FCORE)
+};
+
+// Build SEC_QCOL from per-genome QualRecords (legacy-field transpose, byte-exact)
+// plus any extra columns. `recs` is sorted by genome_id (the row key).
+inline SectionDesc qcol_write(AppendWriter& w, uint64_t section_id,
+                              std::vector<QualRecord> recs,
+                              const QcolExtraColumns& extra = {}) {
+    std::sort(recs.begin(), recs.end(),
+              [](const QualRecord& a, const QualRecord& b) { return a.genome_id < b.genome_id; });
+    // Deduplicate by genome_id: deduped archives can alias several accessions to one
+    // genome_id, which yields multiple records here. The colstore row key must be
+    // strictly ascending, so collapse to one record per genome_id (keep the first).
+    recs.erase(std::unique(recs.begin(), recs.end(),
+               [](const QualRecord& a, const QualRecord& b) { return a.genome_id == b.genome_id; }),
+               recs.end());
+
+    ColStoreWriter cw(SEC_QCOL);
+    std::vector<uint64_t> rows;
+    rows.reserve(recs.size());
+    for (const auto& r : recs) rows.push_back(r.genome_id);
+    cw.set_rows(rows);
+
+    std::vector<uint8_t> buf;
+    for (const QcolField& f : qcol_fields()) {
+        const uint64_t sz = dtype_size(f.dtype);
+        buf.assign(static_cast<size_t>(recs.size() * sz), 0);
+        for (size_t i = 0; i < recs.size(); ++i)
+            std::memcpy(buf.data() + i * sz,
+                        reinterpret_cast<const uint8_t*>(&recs[i]) + f.offset, sz);
+        cw.add_column_raw(qcol_legacy_key(f), f.dtype, buf.data(), recs.size());
+    }
+
+    if (extra.aamer_genus_core) {
+        std::vector<float>   vals(recs.size(), 0.0f);
+        std::vector<uint8_t> present(recs.size(), 0);
+        for (size_t i = 0; i < recs.size(); ++i) {
+            auto it = extra.aamer_genus_core->find(recs[i].genome_id);
+            if (it != extra.aamer_genus_core->end()) { vals[i] = it->second; present[i] = 1; }
+        }
+        ColumnKey k{qual_axis::COMPLETENESS, qual_tool::GENOPACK, qual_method::AAMER_GENUS_CORE,
+                    Unit::Fraction01, /*version=*/1, /*ref_db=*/0,
+                    /*core_model=*/extra.core_model_hash, /*calib=*/0};
+        cw.add_column<float>(k, vals, present);
+    }
+
+    if (extra.aamer_family_core) {
+        std::vector<float>   vals(recs.size(), 0.0f);
+        std::vector<uint8_t> present(recs.size(), 0);
+        for (size_t i = 0; i < recs.size(); ++i) {
+            auto it = extra.aamer_family_core->find(recs[i].genome_id);
+            if (it != extra.aamer_family_core->end()) { vals[i] = it->second; present[i] = 1; }
+        }
+        ColumnKey k{qual_axis::COMPLETENESS, qual_tool::GENOPACK, qual_method::AAMER_FAMILY_CORE,
+                    Unit::Fraction01, /*version=*/1, /*ref_db=*/0,
+                    /*core_model=*/extra.family_core_model_hash, /*calib=*/0};
+        cw.add_column<float>(k, vals, present);
+    }
+
+    return cw.finalize(w, section_id);
+}
+
+// Materialize each row of a SEC_QCOL store back into a QualRecord (legacy fields
+// only; absent columns keep make_empty defaults). Drop-in for QualReader::scan.
+inline void qcol_scan(const ColStoreReader& r,
+                      const std::function<void(const QualRecord&)>& cb) {
+    const auto& fields = qcol_fields();
+    std::vector<int> idx(fields.size());
+    for (size_t fi = 0; fi < fields.size(); ++fi)
+        idx[fi] = r.find_column(qcol_legacy_key(fields[fi]));
+
+    const uint32_t n = r.n_rows();
+    for (uint32_t row = 0; row < n; ++row) {
+        QualRecord q = QualRecord::make_empty(r.row_key(row));
+        for (size_t fi = 0; fi < fields.size(); ++fi) {
+            if (idx[fi] < 0) continue;
+            auto cv = r.column(static_cast<uint32_t>(idx[fi]));
+            const uint64_t sz = dtype_size(fields[fi].dtype);
+            std::memcpy(reinterpret_cast<uint8_t*>(&q) + fields[fi].offset,
+                        cv.values + static_cast<size_t>(row) * sz, sz);
+        }
+        cb(q);
+    }
+}
+
+} // namespace genopack

@@ -1,9 +1,15 @@
 #include "calibrate.hpp"
 #include <genopack/archive.hpp>
+#include <genopack/xqual_columns.hpp>
+#include <genopack/quality_schema.hpp>
+#include <genopack/mmap_file.hpp>
+#include <genopack/section_checksum.hpp>
+#include <genopack/toc.hpp>
 #include <spdlog/spdlog.h>
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
 #include <numeric>
 #include <sstream>
@@ -11,6 +17,10 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <xxhash.h>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
 
 namespace genopack::calibrate {
 
@@ -234,10 +244,11 @@ std::vector<float> fit_ols(const std::vector<std::vector<float>>& X,
 }
 
 // ── Feature names (must match order used in run_calibrate) ───────────────────
-// Isotonic axis is features[0] — completeness_cluster_relative (always stored
-// in QualRecord). self_coherence added as OLS feature when available.
+// Isotonic axis is features[0] — completeness_aamer_core (genus prevalence-core
+// coverage, the validated intrinsic completeness signal). self_coherence + others
+// are OLS residual features.
 static const std::vector<std::string> k_completeness_features = {
-    "completeness_cluster_relative",   // [0] isotonic axis
+    "completeness_aamer_core",         // [0] isotonic axis
     "self_coherence",
     "contamination_leakage",
     "gc_pct",
@@ -255,6 +266,101 @@ static const std::vector<std::string> k_contamination_features = {
     "bias"
 };
 
+// ── Provenance-first inputs (read columns straight from the archive) ──────────
+
+// genome_id -> intrinsic aamer genus-core coverage ([0,1]) from the QCOL column.
+std::unordered_map<uint64_t, float> read_qcol_aamer_core(const ArchiveReader& ar) {
+    std::unordered_map<uint64_t, float> out;
+    const ColStoreReader* q = ar.qcol_reader();
+    if (!q) return out;
+    for (uint32_t c = 0; c < q->n_columns(); ++c) {
+        auto cv = q->column(c);
+        if (cv.tool == qual_tool::GENOPACK && cv.method == qual_method::AAMER_GENUS_CORE) {
+            for (uint32_t i = 0; i < cv.n_rows; ++i)
+                if (cv.present(i)) out[q->row_key(i)] = static_cast<float>(cv.get_f64(i));
+            break;
+        }
+    }
+    return out;
+}
+
+// genome_id -> CheckM2 ground truth (PERCENT, to match the TSV convention) read
+// from the ingested XQAL completeness/contamination columns (tool=checkm2).
+std::unordered_map<uint64_t, CheckM2Record> read_xqual_checkm2(const ArchiveReader& ar) {
+    std::unordered_map<uint64_t, CheckM2Record> out;
+    const ColStoreReader* x = ar.xqual_reader();
+    if (!x) return out;
+    for (uint32_t c = 0; c < x->n_columns(); ++c) {
+        auto cv = x->column(c);
+        if (cv.tool != qual_tool::CHECKM2) continue;
+        const bool is_comp = (cv.axis == qual_axis::COMPLETENESS);
+        const bool is_cont = (cv.axis == qual_axis::CONTAMINATION);
+        if (!is_comp && !is_cont) continue;
+        for (uint32_t i = 0; i < cv.n_rows; ++i) {
+            if (!cv.present(i)) continue;
+            const float pct = static_cast<float>(cv.get_f64(i)) * 100.0f; // Fraction01 -> percent
+            auto& rec = out[x->row_key(i)];
+            if (is_comp) rec.completeness = pct; else rec.contamination = pct;
+        }
+    }
+    return out;
+}
+
+// Deterministic content hash of a fitted model — referenced by the CQAL column it
+// produces, so two archives calibrated identically share the calibration_hash.
+uint64_t calibration_hash(const std::string& axis_method, const IsotonicModel& iso,
+                          const std::vector<float>& ols_w,
+                          const std::vector<std::string>& feats) {
+    XXH3_state_t* st = XXH3_createState();
+    XXH3_64bits_reset(st);
+    XXH3_64bits_update(st, axis_method.data(), axis_method.size());
+    if (!iso.x.empty()) XXH3_64bits_update(st, iso.x.data(), iso.x.size() * sizeof(float));
+    if (!iso.y.empty()) XXH3_64bits_update(st, iso.y.data(), iso.y.size() * sizeof(float));
+    if (!ols_w.empty()) XXH3_64bits_update(st, ols_w.data(), ols_w.size() * sizeof(float));
+    for (const auto& f : feats) XXH3_64bits_update(st, f.data(), f.size());
+    uint64_t h = XXH3_64bits_digest(st);
+    XXH3_freeState(st);
+    return h;
+}
+
+// Append a fresh SEC_CQAL (dropping any prior one) to a single .gpk. Mirrors the
+// XQAL/QCOL writeback dance (flock + TocReader/TocWriter + stamp + finalize).
+void write_cqal_to_archive(const std::filesystem::path& gpk,
+                           const std::vector<XqualColumn>& columns) {
+    int lock_fd = ::open(gpk.c_str(), O_RDWR);
+    if (lock_fd < 0) throw std::runtime_error("calibrate: cannot open for locking: " + gpk.string());
+    struct LockGuard { int fd; explicit LockGuard(int f):fd(f){::flock(fd,LOCK_EX);}
+                       ~LockGuard(){::flock(fd,LOCK_UN);::close(fd);} } lock(lock_fd);
+
+    MmapFileReader mmap;
+    mmap.open(gpk);
+    auto toc = TocReader::read(mmap);
+    const auto* tail = mmap.ptr_at<TailLocator>(mmap.size() - sizeof(TailLocator));
+    uint64_t prev_toc_offset = tail->toc_offset;
+    uint64_t generation      = toc.header.generation + 1;
+    mmap.close();
+
+    AppendWriter writer;
+    writer.open_append(gpk);
+    uint64_t section_id = toc.next_section_id();
+    SectionDesc cqal_sd = write_named_columns(SEC_CQAL, writer, section_id, columns);
+
+    TocWriter new_toc;
+    for (const auto& sd : toc.sections)
+        if (sd.type != SEC_CQAL) new_toc.add_section(sd);
+    new_toc.add_section(cqal_sd);
+
+    writer.flush();
+    stamp_section_checksums(gpk.c_str(), new_toc.sections(), /*only_if_zero=*/true);
+
+    new_toc.finalize(writer, generation,
+                     toc.header.live_genome_count, toc.header.total_genome_count,
+                     prev_toc_offset, toc.header.catalog_root_section_id,
+                     toc.header.accession_root_section_id, toc.header.tombstone_root_section_id);
+    spdlog::info("calibrate: wrote CQAL section_id={} ({} columns) to {}",
+                 cqal_sd.section_id, columns.size(), gpk.filename().string());
+}
+
 } // namespace
 
 // ── Main calibration entry point ──────────────────────────────────────────────
@@ -264,27 +370,47 @@ int run_calibrate(const std::string& archive_path,
                   const std::string& output_path,
                   int /*threads*/)
 {
-    // 1. Load CheckM2 ground truth
-    auto checkm2 = load_checkm2(checkm2_path);
-    if (checkm2.empty())
-        throw std::runtime_error("calibrate: CheckM2 TSV is empty");
-
-    // 2. Open archive — reads only index, no FASTA decompression
+    // 1. Open archive — reads only index, no FASTA decompression
     ArchiveReader ar;
     ar.open(archive_path);
-
     if (!ar.has_qual())
-        throw std::runtime_error("calibrate: archive has no QUAL section — run 'check' first");
+        throw std::runtime_error("calibrate: archive has no QUAL/QCOL — run 'check' first");
 
-    // 3. Build genome_id → accession map (sequential index scan, O(n))
     std::unordered_map<uint64_t, std::string> id_to_acc;
     id_to_acc.reserve(ar.archive_stats().n_genomes_total);
     ar.scan_genome_accessions([&](std::string_view acc, GenomeId gid) {
-        id_to_acc.emplace(static_cast<uint64_t>(gid), acc);
+        id_to_acc.emplace(static_cast<uint64_t>(gid), std::string(acc));
     });
-    spdlog::info("calibrate: {} genomes in archive", id_to_acc.size());
+    const uint64_t core_model_hash =
+        ar.core_reader() ? ar.core_reader()->core_model_hash() : 0;
 
-    // 4. Scan QUAL section — flat mmapped array, instant
+    // 2. Ground truth keyed by genome_id (PERCENT). Explicit --checkm2 TSV wins;
+    //    otherwise read the ingested XQAL CheckM2 columns (provenance-first).
+    std::unordered_map<uint64_t, CheckM2Record> truth;
+    if (!checkm2_path.empty()) {
+        auto by_acc = load_checkm2(checkm2_path);
+        std::unordered_map<std::string, uint64_t> acc_to_id;
+        for (const auto& [gid, acc] : id_to_acc) acc_to_id.emplace(acc, gid);
+        for (const auto& [acc, rec] : by_acc) {
+            auto it = acc_to_id.find(acc);
+            if (it != acc_to_id.end()) truth.emplace(it->second, rec);
+        }
+        spdlog::info("calibrate: ground truth from CheckM2 TSV — {} genomes matched", truth.size());
+    } else {
+        truth = read_xqual_checkm2(ar);
+        if (truth.empty())
+            throw std::runtime_error("calibrate: no --checkm2 given and no XQAL CheckM2 columns — run 'ingest' first");
+        spdlog::info("calibrate: ground truth from ingested XQAL — {} genomes", truth.size());
+    }
+
+    // 3. Intrinsic aamer genus-core coverage ([0,1]) — the isotonic axis.
+    auto aamer_core = read_qcol_aamer_core(ar);
+    if (aamer_core.empty())
+        throw std::runtime_error("calibrate: no AAMER_GENUS_CORE column in QCOL — run 'check' on an archive with a CORE section");
+    spdlog::info("calibrate: {} genomes have aamer genus-core completeness", aamer_core.size());
+
+    // 4. Scan QUAL: build training samples (truth + intrinsic) AND a feature cache
+    //    over ALL genomes so the fitted model can be applied beyond the truth set.
     const int dc = static_cast<int>(k_completeness_features.size());
     const int dp = static_cast<int>(k_contamination_features.size());
 
@@ -295,61 +421,46 @@ int run_calibrate(const std::string& archive_path,
         std::vector<float> cont_feat;   // dp features
     };
     std::vector<Sample> samples;
-    samples.reserve(checkm2.size());
+    std::unordered_map<uint64_t, std::vector<float>> comp_feat_all, cont_feat_all;
+    comp_feat_all.reserve(aamer_core.size());
 
     ar.scan_qual([&](const QualRecord& r) {
-        auto ait = id_to_acc.find(r.genome_id);
-        if (ait == id_to_acc.end()) return;
-        auto cit = checkm2.find(ait->second);
-        if (cit == checkm2.end()) return;
-
         auto meta = ar.genome_meta(r.genome_id);
         if (!meta) return;
 
-        if (std::isnan(r.completeness_cluster_relative)) return; // need isotonic axis
-
-        const float ccr = r.completeness_cluster_relative / 100.0f;
         const float sc  = (std::isnan(r.self_coherence) || r.self_coherence == 0.0f)
                           ? 0.0f : r.self_coherence;
-        const float cl  = std::isnan(r.contamination_leakage) ? 0.0f
-                          : r.contamination_leakage;
-        const float cte = std::isnan(r.contamination_tnf_excess) ? 0.0f
-                          : r.contamination_tnf_excess;
+        const float cl  = std::isnan(r.contamination_leakage) ? 0.0f : r.contamination_leakage;
+        const float cte = std::isnan(r.contamination_tnf_excess) ? 0.0f : r.contamination_tnf_excess;
         const float gc  = static_cast<float>(meta->gc_pct_x100) / 10000.0f;
         const float lgl = std::log1p(static_cast<float>(meta->genome_length));
         const float lnc = std::log1p(static_cast<float>(meta->n_contigs));
 
-        Sample s;
-        s.completeness  = cit->second.completeness  / 100.0f;
-        s.contamination = cit->second.contamination / 100.0f;
-
-        // completeness features — axis is completeness_cluster_relative [0]
-        s.comp_feat.resize(dc);
-        s.comp_feat[0] = ccr;   // isotonic axis
-        s.comp_feat[1] = sc;
-        s.comp_feat[2] = cl;
-        s.comp_feat[3] = gc;
-        s.comp_feat[4] = lgl;
-        s.comp_feat[5] = lnc;
-        s.comp_feat[6] = 1.0f;
-
-        // contamination features — require contamination_leakage
+        std::vector<float> cf;  // completeness features (axis = aamer_core)
+        auto ac = aamer_core.find(r.genome_id);
+        if (ac != aamer_core.end()) {
+            cf = {ac->second, sc, cl, gc, lgl, lnc, 1.0f};
+            comp_feat_all[r.genome_id] = cf;
+        }
+        std::vector<float> kf;  // contamination features (axis = leakage)
         if (!std::isnan(r.contamination_leakage)) {
-            s.cont_feat.resize(dp);
-            s.cont_feat[0] = cl;
-            s.cont_feat[1] = cte;
-            s.cont_feat[2] = gc;
-            s.cont_feat[3] = lgl;
-            s.cont_feat[4] = lnc;
-            s.cont_feat[5] = 1.0f;
+            kf = {cl, cte, gc, lgl, lnc, 1.0f};
+            cont_feat_all[r.genome_id] = kf;
         }
 
+        auto t = truth.find(r.genome_id);
+        if (t == truth.end()) return;
+        Sample s;
+        s.completeness  = std::isnan(t->second.completeness)  ? NAN : t->second.completeness  / 100.0f;
+        s.contamination = std::isnan(t->second.contamination) ? NAN : t->second.contamination / 100.0f;
+        s.comp_feat = cf;
+        s.cont_feat = kf;
         if (!s.comp_feat.empty() || !s.cont_feat.empty())
             samples.push_back(std::move(s));
     });
 
     ar.close();
-    spdlog::info("calibrate: {} samples matched (QUAL + CheckM2)", samples.size());
+    spdlog::info("calibrate: {} training samples (truth + intrinsic)", samples.size());
 
     // Helper: fit + evaluate one isotonic+OLS model, log results, return {iso, ols_w, rmse}
     auto fit_model = [&](const char* label,
@@ -419,6 +530,52 @@ int run_calibrate(const std::string& archive_path,
     }
     auto [cont_iso, cont_w, cont_rmse] =
         fit_model("contamination", cont_iso_xy, cont_X, cont_y, dp);
+
+    // ── Apply the fitted models → SEC_CQAL calibrated columns ─────────────────
+    // The calibrated estimate is iso(axis) + OLS·features, clamped to [0,1]. Each
+    // column carries the model's calibration_hash so the fusion is explicit and
+    // reproducible — never a silently-overwritten value.
+    const uint64_t comp_calib_h =
+        calibration_hash(qual_method::AAMER_GENUS_CORE, comp_iso, comp_w, k_completeness_features);
+    const uint64_t cont_calib_h =
+        calibration_hash(qual_method::LEAKAGE, cont_iso, cont_w, k_contamination_features);
+
+    auto apply = [](const IsotonicModel& iso, const std::vector<float>& w,
+                    const std::vector<float>& feat, int d) -> float {
+        float p = apply_isotonic(iso, feat[0]);
+        for (int j = 0; j < d; ++j) p += w[j] * feat[j];
+        return std::clamp(p, 0.0f, 1.0f);
+    };
+
+    XqualColumn comp_col;
+    comp_col.key = ColumnKey{qual_axis::COMPLETENESS, qual_tool::GENOPACK, qual_method::AAMER_GENUS_CORE,
+                             Unit::Fraction01, 1, /*ref_db=*/0, /*core_model=*/core_model_hash,
+                             /*calib=*/comp_calib_h, "calibrated completeness"};
+    for (const auto& [gid, feat] : comp_feat_all)
+        comp_col.values[gid] = apply(comp_iso, comp_w, feat, dc);
+
+    XqualColumn cont_col;
+    cont_col.key = ColumnKey{qual_axis::CONTAMINATION, qual_tool::GENOPACK, qual_method::LEAKAGE,
+                             Unit::Fraction01, 1, 0, 0, /*calib=*/cont_calib_h, "calibrated contamination"};
+    for (const auto& [gid, feat] : cont_feat_all)
+        cont_col.values[gid] = apply(cont_iso, cont_w, feat, dp);
+
+    {
+        std::filesystem::path apath(archive_path);
+        std::vector<XqualColumn> cqal_cols;
+        if (!comp_col.values.empty()) cqal_cols.push_back(std::move(comp_col));
+        if (!cont_col.values.empty()) cqal_cols.push_back(std::move(cont_col));
+        if (apath.extension() == ".gpk" && !cqal_cols.empty()) {
+            write_cqal_to_archive(apath, cqal_cols);
+            spdlog::info("calibrate: CQAL — completeness calib={:#x}, contamination calib={:#x}",
+                         comp_calib_h, cont_calib_h);
+        } else if (cqal_cols.empty()) {
+            spdlog::warn("calibrate: no calibrated columns to write (no intrinsic inputs)");
+        } else {
+            spdlog::warn("calibrate: CQAL writeback skipped — archive is a directory of parts; "
+                         "JSON model still written. Re-run on a single .gpk to materialize CQAL.");
+        }
+    }
 
     // ── Write JSON ────────────────────────────────────────────────────────────
     auto write_vec = [](std::ofstream& f, const auto& v) {

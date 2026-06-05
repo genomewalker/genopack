@@ -1,6 +1,6 @@
 #include <genopack/markers_build.hpp>
 #include <genopack/gcov.hpp>     // GcovWriter::hash_genus (FNV-1a)
-#include <genopack/metamer.hpp>
+#include <genopack/aamer.hpp>
 #include <genopack/markers.hpp>  // RedunCalibEntry, REDUN_BORROWED_FLAG
 
 #include <algorithm>
@@ -362,7 +362,7 @@ static PanelResult scan_panel(
             if (g.seq_offset == UINT32_MAX) continue;
             std::string_view cols(seqbuf.data() + g.seq_offset + ranges[mi].col_start,
                                    ranges[mi].col_end - ranges[mi].col_start);
-            auto hashes = extract_metamers_aa(cols);
+            auto hashes = extract_aamers_aa(cols);
             raw.insert(raw.end(), hashes.begin(), hashes.end());
         }
 
@@ -513,15 +513,15 @@ static PanelResult scan_panel_d6(
             }
 
             bool any_hit = false;
-            for (int i = 0; i + METAMER_K_D6 <= (int)d6.size(); ++i) {
-                if (!metamer_is_syncmer_d6(d6.data() + i)) continue;
-                if (metamer_is_low_complexity(d6.data() + i, METAMER_K_D6)) continue;
+            for (int i = 0; i + AAMER_K_D6 <= (int)d6.size(); ++i) {
+                if (!aamer_is_syncmer_d6(d6.data() + i)) continue;
+                if (aamer_is_low_complexity(d6.data() + i, AAMER_K_D6)) continue;
                 // Weakest-link IC over the k-mer's MSA columns.
                 float min_ic = 1.0f;
-                for (int j = 0; j < METAMER_K_D6; ++j)
+                for (int j = 0; j < AAMER_K_D6; ++j)
                     min_ic = std::min(min_ic, col_ic[cpos[i + j]]);
                 if (min_ic < ic_threshold) continue;
-                raw.push_back(metamer_hash_d6(d6.data() + i));
+                raw.push_back(aamer_hash_d6(d6.data() + i));
                 any_hit = true;
             }
             // Track how many reference genomes in this lineage detected marker mi.
@@ -686,7 +686,7 @@ compute_redun_calib(const PanelResult& panel,
         for (int mi = 0; mi < n_m; ++mi) {
             std::string_view cols(row + ranges[mi].col_start,
                                   static_cast<size_t>(ranges[mi].col_end - ranges[mi].col_start));
-            auto hv = extract_metamers_aa(cols);
+            auto hv = extract_aamers_aa(cols);
             for (uint64_t h : hv)
                 if (h <= max_hash) qmers.push_back(h);
         }
@@ -885,7 +885,7 @@ void build_markers_panel(const MarkersBuildConfig& cfg) {
     spdlog::info("markers: {} bac + {} arc lineages, writing {}",
                  bac.lineages.size(), arc.lineages.size(), cfg.output.string());
 
-    const uint8_t  pool_k      = cfg.dayhoff6 ? METAMER_K_D6 : METAMER_K;
+    const uint8_t  pool_k      = cfg.dayhoff6 ? AAMER_K_D6 : AAMER_K;
     const uint16_t pool_scale  = cfg.dayhoff6 ? 1            : cfg.frac_scale;
     const uint8_t  pool_alpha  = cfg.dayhoff6 ? MRKR_ALPHABET_DAYHOFF6 : MRKR_ALPHABET_FULL_AA;
     writer.finalize(cfg.output, 120, 53, pool_k, pool_scale, pool_alpha);

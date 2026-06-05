@@ -7,6 +7,7 @@
 #include <genopack/kmrx.hpp>
 #include <genopack/mmap_file.hpp>
 #include <genopack/qual.hpp>
+#include <genopack/qual_columns.hpp>
 #include <genopack/section_checksum.hpp>
 #include <genopack/shard.hpp>
 #include <genopack/taxn.hpp>
@@ -512,22 +513,25 @@ void subset_archive(const std::filesystem::path& input_gpk,
         }
     }
 
-    // QUAL — only kept genomes
+    // Quality — only kept genomes; re-emitted as QCOL (reads QCOL or legacy QUAL).
     {
-        auto qual_secs = src_toc.find_by_type(SEC_QUAL);
-        if (!qual_secs.empty()) {
-            QualWriter qw;
-            for (auto* sd : qual_secs) {
-                QualReader qr;
-                qr.open(src_mmap.data(), sd->file_offset, sd->compressed_size);
-                qr.scan([&](const QualRecord& rec) {
-                    if (kept_gids.count(static_cast<GenomeId>(rec.genome_id)))
-                        qw.add(rec);
-                });
-            }
-            if (qw.size() > 0)
-                new_toc.add_section(qw.finalize(mw, next_section_id++));
+        std::vector<QualRecord> kept;
+        for (auto* sd : src_toc.find_by_type(SEC_QCOL)) {
+            ColStoreReader cr;
+            cr.open(src_mmap.data(), sd->file_offset, sd->compressed_size);
+            qcol_scan(cr, [&](const QualRecord& rec) {
+                if (kept_gids.count(static_cast<GenomeId>(rec.genome_id))) kept.push_back(rec);
+            });
         }
+        for (auto* sd : src_toc.find_by_type(SEC_QUAL)) {
+            QualReader qr;
+            qr.open(src_mmap.data(), sd->file_offset, sd->compressed_size);
+            qr.scan([&](const QualRecord& rec) {
+                if (kept_gids.count(static_cast<GenomeId>(rec.genome_id))) kept.push_back(rec);
+            });
+        }
+        if (!kept.empty())
+            new_toc.add_section(qcol_write(mw, next_section_id++, std::move(kept)));
     }
 
     // TXDB / CIDX / HNSW — copy raw bytes (genome_id indexed, unaffected by reshard)

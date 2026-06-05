@@ -39,8 +39,19 @@ struct QualRecord {
     float    scale_kink;                 //  4  log₂(W*) dyadic-window scale; NAN = not computed
     uint8_t  cross_genus_u8;             //  1  contamination_cross_genus × 255; 0=clean
     uint8_t  sketch_fill_u8;             //  1  completeness_sketch_fill × 200 (200=100%, >200 allowed up to 255)
-    uint8_t  _pad[2];                    //  2  padding to reach 80 bytes
+    uint16_t contamination_duplication_u16; //  2  redundancy_fraction: 0=not scored, else round(f*65534)+1
     // total = 80
+
+    // contamination_duplication encode/decode (0 reserved as not-scored sentinel,
+    // so a genuinely-clean 0.0 stays distinguishable from an unscored genome).
+    static uint16_t encode_dup(float f) {
+        if (!(f >= 0.0f)) return 0;            // NaN / negative -> not scored
+        if (f > 1.0f) f = 1.0f;
+        return static_cast<uint16_t>(f * 65534.0f + 0.5f) + 1;
+    }
+    static float decode_dup(uint16_t v) {
+        return v == 0 ? NAN : static_cast<float>(v - 1) / 65534.0f;
+    }
 
     // qual_flags bits
     static constexpr uint8_t QUAL_FLAG_MIX_NO_DATA        = 0x01; // mixture model had < min_windows
@@ -83,6 +94,7 @@ struct QualRecord {
         r.qual_flags                  = 0;
         r.fmh_minority_u8             = 0;
         r.marker_completeness_u8      = 0;
+        r.contamination_duplication_u16 = 0; // 0 = not scored
         return r;
     }
 };
@@ -131,6 +143,9 @@ public:
     }
 
     size_t size() const { return records_.size(); }
+
+    const std::vector<QualRecord>& records() const { return records_; }
+    std::vector<QualRecord> take() { return std::move(records_); }
 
 private:
     std::vector<QualRecord> records_;

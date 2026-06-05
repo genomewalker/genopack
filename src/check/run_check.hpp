@@ -11,6 +11,7 @@ int cmd_check(const std::filesystem::path& pack_path,
               float leakage_threshold,
               const std::filesystem::path& output,
               bool recompute = false,
-              const std::filesystem::path& markers_path = {});
+              const std::filesystem::path& markers_path = {},
+              bool scan_all = false);
 
 } // namespace genopack::check

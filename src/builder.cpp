@@ -8,8 +8,11 @@
 #include <genopack/build_genus_stats.hpp>
 #include <genopack/skani.hpp>
 #include <genopack/markers.hpp>
-#include <genopack/metamer.hpp>
+#include <genopack/aamer.hpp>
+#include <genopack/cladesplit.hpp>
+#include <genopack/core_section.hpp>
 #include <genopack/qual.hpp>
+#include <genopack/qual_columns.hpp>
 #include <genopack/kmrx.hpp>
 #include <genopack/taxn.hpp>
 #include <genopack/txdb.hpp>
@@ -19,6 +22,7 @@
 #include <genopack/derivation.hpp>
 #include <genopack/section_checksum.hpp>
 #include <genopack/mmap_file.hpp>
+#include <genopack/stage.hpp>
 #include <genopack/shard.hpp>
 #include <genopack/toc.hpp>
 #include <genopack/util.hpp>
@@ -90,8 +94,10 @@ static BprmHeader make_bprm_header_from_cfg(const ArchiveBuilderConfig& cfg) {
     if (cfg.build_gcov)            bf |= BPRM_F_GCOV;
     if (cfg.taxonomy_group)        bf |= BPRM_F_TAXGROUP;
     if (!cfg.markers_path.empty()) bf |= BPRM_F_MARKERS;
+    if (cfg.build_core)            bf |= BPRM_F_CORE;
     bp.build_flags = bf;
     bp.micro_genus_threshold = cfg.micro_genus_threshold;
+    bp.core_theta            = cfg.build_core ? cfg.core_theta : 0.0f;
     bp.magic       = SEC_BPRM;
     bp.version     = 1;
     bp.header_size = sizeof(BprmHeader);
@@ -326,6 +332,7 @@ struct ArchiveBuilder::Impl {
     std::filesystem::path archive_dir;   // base path (no extension)
     std::filesystem::path gpk_path_;     // output .gpk file
     std::unique_ptr<ArchiveReader> src_reader_;  // from-gpk source (streams decoded sequence)
+    std::unique_ptr<StageReader>   stage_reader_; // from-stage source (streams decoded sequence)
     Config                cfg;
 
     std::vector<BuildRecord> pending;
@@ -379,6 +386,22 @@ struct ArchiveBuilder::Impl {
             add(r);
         });
         spdlog::info("from-gpk: {} genomes from {}", pending.size(), source.string());
+    }
+
+    void add_from_stage(const std::filesystem::path& source) {
+        cfg.from_stage_source = source;
+        stage_reader_ = std::make_unique<StageReader>();
+        stage_reader_->open(source);
+        // One BuildRecord per cached genome (accession + taxonomy); the sequence is
+        // streamed in finalize() from the data blocks. scan_meta() is cheap — it
+        // decompresses only the small (accession, taxonomy) directory.
+        stage_reader_->scan_meta([&](const std::string& acc, const std::string& tax) {
+            BuildRecord r;
+            r.accession = acc;
+            if (!tax.empty()) r.extra_fields.emplace_back("taxonomy", tax);
+            add(r);
+        });
+        spdlog::info("from-stage: {} genomes from {}", pending.size(), source.string());
     }
 
     void add_from_tsv(const std::filesystem::path& tsv_path) {
@@ -904,6 +927,34 @@ struct ArchiveBuilder::Impl {
                             task_cv.notify_one();
                         }
                     });
+            } else if (stage_reader_) {
+                // from-stage: stream decoded FASTA sequentially from the local
+                // .gstage cache. Map each record's accession back to its (genus-
+                // sorted) pending index; the drain loop re-buckets by genus, so
+                // arrival order only needs to be genus-dense, not exact.
+                std::unordered_map<std::string, size_t> acc2idx;
+                acc2idx.reserve(total_records * 2);
+                for (size_t i = 0; i < total_records; ++i)
+                    if (!acc2idx.emplace(pending[i].accession, i).second)
+                        throw std::runtime_error("from-stage: duplicate accession in cache: "
+                                                 + pending[i].accession);
+                stage_reader_->scan([&](StageRecord&& sr) {
+                    auto it = acc2idx.find(sr.accession);
+                    if (it == acc2idx.end()) return; // not in pending (shouldn't happen)
+                    size_t idx = it->second;
+                    auto seq = std::make_shared<std::string>(std::move(sr.sequence));
+                    std::unique_lock lk(task_mx);
+                    task_cv.wait(lk, [&]{ return task_q.size() < task_q_max; });
+                    Task t;
+                    t.record          = &pending[idx];
+                    t.gid             = next_genome_id++;
+                    t.input_row_index = pending_input_rows[idx];
+                    t.fd              = -1;
+                    t.seq             = std::move(seq);
+                    task_q.push(std::move(t));
+                    lk.unlock();
+                    task_cv.notify_one();
+                });
             } else {
                 for (size_t i = 0; i < total_records; ++i) {
                     // Open + fadvise before acquiring the lock so kernel starts NFS
@@ -1007,6 +1058,15 @@ struct ArchiveBuilder::Impl {
         // In-memory GCOV/FCOV/FMHR writers populated during flush_staging_buf (one-pass).
         GcovWriter build_gcov_w, build_fcov_w;
         FmhrWriter build_fmhr_w;
+        // Per-genus prevalence cores (SEC_CORE). Reuses the per-genome marker
+        // aamers (genome_qmers) already extracted below — zero extra FASTA passes.
+        CoreWriter build_core_w(AAMER_K, /*min_seg_aa=*/8, cfg.core_theta);
+        // SEC_PCORE: unified DENSE per-genus aamer reference (every aamer + member
+        // count). The prev>=ceil(theta*n) slice reproduces CORE; the full set is the
+        // dense reference the small-contig foreign-contamination channel needs. Built
+        // inline from the same genome_qmers (zero extra passes); genus tier only here
+        // (the family tier is added post-hoc by `genopack pcore`, like FCORE).
+        PcoreWriter build_pcore_w(AAMER_K, /*min_seg_aa=*/8, cfg.core_theta);
         static constexpr float  kGcovOutlierPct = 0.99f;
         const int               kFmhK           = cfg.fmh_k, kFmhC = cfg.fmh_c;
         static constexpr uint32_t kFmhMinBp     = 1000;
@@ -1026,6 +1086,21 @@ struct ArchiveBuilder::Impl {
             } catch (const std::exception& ex) {
                 spdlog::warn("build: cannot open markers ({}); skipping", ex.what());
                 build_mrk_rd.reset();
+            }
+        }
+
+        // Contamination (intra-genome marker duplication) at build time — own 6-frame
+        // pass per genome via the .csp panel (own subsample; not shareable with markers).
+        std::unique_ptr<CladeSplitPanel> build_contam_panel;
+        if (!cfg.contam_panel_path.empty()) {
+            build_contam_panel = std::make_unique<CladeSplitPanel>();
+            try {
+                build_contam_panel->open(cfg.contam_panel_path);
+                spdlog::info("build: contamination panel {} aamers, {} clades",
+                             build_contam_panel->n_aamers(), build_contam_panel->n_clades());
+            } catch (const std::exception& ex) {
+                spdlog::warn("build: cannot open contamination panel ({}); skipping", ex.what());
+                build_contam_panel.reset();
             }
         }
 
@@ -1363,7 +1438,7 @@ struct ArchiveBuilder::Impl {
                         GenusAccum genus_acc, family_acc;
                         std::vector<uint64_t> fmh_all;
                         const int c_vals[1] = {kFmhC};
-                        // Per-genome metamer accumulators for marker scoring (one per genome).
+                        // Per-genome aamer accumulators for marker scoring (one per genome).
                         const bool do_markers = build_mrk_rd && build_mrk_rd->has_merged_pool();
                         std::vector<std::vector<uint64_t>> genome_qmers(do_markers ? buf.size() : 0);
 
@@ -1372,7 +1447,7 @@ struct ArchiveBuilder::Impl {
                             genus_acc.add_genome(all_profiles[ii]);
                             if (!family_key.empty()) family_acc.add_genome(all_profiles[ii]);
 
-                            // Single FASTA walk: FMH hashes (≥kFmhMinBp) + marker metamers (all contigs).
+                            // Single FASTA walk: FMH hashes (≥kFmhMinBp) + marker aamers (all contigs).
                             const char* p = fasta.data(), *end = p + fasta.size();
                             while (p < end) {
                                 while (p < end && *p != '>') ++p;
@@ -1398,7 +1473,7 @@ struct ArchiveBuilder::Impl {
                                         fmh_all.insert(fmh_all.end(), vecs[0].begin(), vecs[0].end());
                                 }
                                 if (do_markers)
-                                    extract_metamers_dna_into(seq, METAMER_K, 8,
+                                    extract_aamers_dna_into(seq, AAMER_K, 8,
                                                               build_mrk_frac_max, genome_qmers[ii]);
                             }
                             if (do_markers) {
@@ -1419,6 +1494,17 @@ struct ArchiveBuilder::Impl {
                             std::sort(fmh_all.begin(), fmh_all.end());
                             fmh_all.erase(std::unique(fmh_all.begin(), fmh_all.end()), fmh_all.end());
                             build_fmhr_w.add(GcovWriter::hash_genus(genus_key), std::move(fmh_all));
+                        }
+
+                        // Per-genus prevalence core (SEC_CORE) from the per-genome
+                        // marker aamers extracted above — zero extra FASTA passes.
+                        if (cfg.build_core && do_markers) {
+                            std::vector<uint64_t> member_ids;
+                            member_ids.reserve(pending_qrs.size());
+                            for (const auto& qr : pending_qrs) member_ids.push_back(qr.genome_id);
+                            build_core_w.add_from_members(GcovWriter::hash_genus(genus_key),
+                                                          genome_qmers, std::move(member_ids));
+                            build_pcore_w.add_from_members(GcovWriter::hash_genus(genus_key), genome_qmers);
                         }
 
                         // Score contigs and populate outlier fields.
@@ -1465,7 +1551,7 @@ struct ArchiveBuilder::Impl {
                             }
                         }
 
-                        // Marker completeness — reuse metamers collected in FMH loop.
+                        // Marker completeness — reuse aamers collected in FMH loop.
                         if (do_markers) {
                             const uint64_t gh = GcovWriter::hash_genus(genus_key);
                             auto calib = build_mrk_rd->lookup_lineage(gh);
@@ -1524,6 +1610,16 @@ struct ArchiveBuilder::Impl {
                                         qr.qual_flags |= QualRecord::QUAL_FLAG_MARKER_SCORED;
                                     }
                                 }
+                            }
+                        }
+
+                        // Contamination duplication — independent 6-frame pass per genome
+                        // (panel.score is const/thread-safe; runs inside this genus worker).
+                        if (build_contam_panel) {
+                            for (size_t ii = 0; ii < pending_qrs.size(); ++ii) {
+                                const auto sc = build_contam_panel->score(buf[ii].fasta);
+                                pending_qrs[ii].contamination_duplication_u16 =
+                                    QualRecord::encode_dup(sc.redundancy_fraction);
                             }
                         }
                     }
@@ -1789,12 +1885,12 @@ struct ArchiveBuilder::Impl {
             toc.add_section(gstx_sd);
         }
 
-        // Write QUAL section (per-genome quality scores computed during flush_staging_buf)
+        // Write QCOL section (intrinsic quality, columnar — replaces flat QUAL).
         if (cfg.build_gstx && cfg.taxonomy_group && multi_k_sketch
             && qual_writer.size() > 0) {
-            spdlog::info("Writing QUAL: {} genomes", qual_writer.size());
-            SectionDesc qual_sd = qual_writer.finalize(mw, next_section_id++);
-            toc.add_section(qual_sd);
+            spdlog::info("Writing QCOL: {} genomes", qual_writer.size());
+            SectionDesc qcol_sd = qcol_write(mw, next_section_id++, qual_writer.take());
+            toc.add_section(qcol_sd);
         }
 
         // Write GCOV/FCOV/FMHR into the SAME metadata block so the archive has
@@ -1816,6 +1912,18 @@ struct ArchiveBuilder::Impl {
                                                        cfg.fmh_k, cfg.fmh_c);
                 toc.add_section(sd);
                 spdlog::info("FMHR: {} genera", build_fmhr_w.n_genera());
+            }
+            if (cfg.build_core && build_core_w.n_genera() > 0) {
+                SectionDesc sd = build_core_w.finalize(mw, next_section_id++, build_mrk_frac_max);
+                toc.add_section(sd);
+                spdlog::info("CORE: {} genera, model_hash={:#018x}",
+                             build_core_w.n_genera(), sd.aux0);
+            }
+            if (cfg.build_core && build_pcore_w.n_entries() > 0) {
+                SectionDesc sd = build_pcore_w.finalize(mw, next_section_id++, build_mrk_frac_max);
+                toc.add_section(sd);
+                spdlog::info("PCORE: {} genus references (dense), model_hash={:#018x}",
+                             build_pcore_w.n_entries(), sd.aux0);
             }
         }
 
@@ -1938,6 +2046,9 @@ void ArchiveBuilder::add_from_tsv(const std::filesystem::path& tsv_path) {
 }
 void ArchiveBuilder::add_from_gpk(const std::filesystem::path& source) {
     impl_->add_from_gpk(source);
+}
+void ArchiveBuilder::add_from_stage(const std::filesystem::path& source) {
+    impl_->add_from_stage(source);
 }
 void ArchiveBuilder::add(const BuildRecord& rec) { impl_->add(rec); }
 void ArchiveBuilder::finalize() { impl_->finalize(); }

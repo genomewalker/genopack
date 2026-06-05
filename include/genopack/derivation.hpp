@@ -20,7 +20,9 @@ inline SectionClass section_class(uint32_t type) {
     switch (type) {
         case SEC_SHRD: case SEC_CATL:
         case SEC_NTDB: case SEC_TXDB: case SEC_GTAX:
-            return SectionClass::Source;     // ground truth, reusable verbatim
+        case SEC_XQAL:                       // externally ingested quality — ground truth
+        case SEC_PROF:                       // user-authored reporting/fusion policy
+            return SectionClass::Source;     // ground truth / policy, reusable verbatim
         case SEC_ACCX: case SEC_TAXN: case SEC_GIDX: case SEC_CIDX:
             return SectionClass::Index;      // reusable iff rowset + deletions + schema match
         default:
@@ -34,6 +36,14 @@ inline std::vector<uint32_t> upstream_types(uint32_t type) {
         case SEC_SKCH: return {SEC_SHRD};
         case SEC_FMHR: return {SEC_SHRD};
         case SEC_KMRX: return {SEC_SHRD};
+        // CORE per-genus prevalence cores: built from raw sequence (SHRD) keyed
+        // by taxonomy (CATL). The intrinsic columnar quality (QCOL) folds CORE.
+        case SEC_CORE: return {SEC_SHRD, SEC_CATL};
+        // FCORE per-family prevalence cores: same inputs as CORE (raw sequence keyed
+        // by taxonomy), aggregated at family rank instead of genus.
+        case SEC_FCORE: return {SEC_SHRD, SEC_CATL};
+        // PCORE unified dense per-genus aamer reference: same inputs as CORE.
+        case SEC_PCORE: return {SEC_SHRD, SEC_CATL};
         // GSTX/GCOV/FCOV bucket and key by taxonomy (CATL) and are computed from
         // raw sequence (SHRD), not from SKCH alone — fold both so a taxonomy
         // relabel with identical sketches/params still changes derivation_hash.
@@ -41,6 +51,21 @@ inline std::vector<uint32_t> upstream_types(uint32_t type) {
         case SEC_GCOV: return {SEC_SKCH, SEC_SHRD, SEC_CATL};
         case SEC_FCOV: return {SEC_SKCH, SEC_SHRD, SEC_CATL};
         case SEC_QUAL: return {SEC_FMHR, SEC_GSTX, SEC_GCOV, SEC_SHRD, SEC_CATL};
+        // QCOL = intrinsic quality, columnar; supersedes QUAL and additionally folds
+        // the CORE model it references (completeness_aamer_core column).
+        case SEC_QCOL: return {SEC_FMHR, SEC_GSTX, SEC_GCOV, SEC_CORE, SEC_FCORE, SEC_SHRD, SEC_CATL};
+        // XQAL = externally ingested quality (CheckM2/anvi'o): a leaf input with no
+        // section-content upstream (classified Source → derivation_hash 0).
+        case SEC_XQAL: return {};
+        // CQAL = calibrated/fused quality: an explicit function of the intrinsic
+        // (QCOL) and external (XQAL) columns plus the calibration model.
+        case SEC_CQAL: return {SEC_QCOL, SEC_XQAL, SEC_CATL};
+        // PROF = named reporting policy: references columns by content-hash identity,
+        // not by section content (classified Source → derivation_hash 0).
+        case SEC_PROF: return {};
+        // QCONTIG = per-contig quality overlay: same intrinsic inputs as QCOL plus the
+        // CORE/FCORE prevalence cores (the per-contig foreign-aamer containment channel).
+        case SEC_QCONTIG: return {SEC_FMHR, SEC_GSTX, SEC_GCOV, SEC_CORE, SEC_FCORE, SEC_PCORE, SEC_SHRD, SEC_CATL};
         case SEC_ACCX: case SEC_TAXN:
         case SEC_GIDX: case SEC_CIDX: return {SEC_CATL};
         default: return {};

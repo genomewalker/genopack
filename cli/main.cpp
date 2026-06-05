@@ -1,5 +1,9 @@
 #include "check/run_check.hpp"
 #include "check/pass_b.hpp"
+#include "run_ingest.hpp"
+#include "run_report.hpp"
+#include "run_fcore.hpp"
+#include "run_pcore.hpp"
 #include <genopack/score_bin.hpp>
 #include <genopack/fmhr.hpp>
 #include <set>
@@ -7,8 +11,9 @@
 #include <genopack/sim.hpp>
 #include <genopack/markers_build.hpp>
 #include <genopack/markers.hpp>
-#include <genopack/metamer.hpp>
+#include <genopack/aamer.hpp>
 #include <genopack/gcov.hpp>
+#include <genopack/cladesplit.hpp>
 #include <fstream>
 #include <limits>
 #include "calibrate/calibrate.hpp"
@@ -72,6 +77,31 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
                        bool build_qual,
                        bool build_gcov);
 
+namespace genopack {
+int cmd_stage(const std::string& input_tsv, const std::string& output,
+              int threads, int block_mb);
+}
+
+// Resolve a reference data file that ships separately (markers panel, contamination
+// panel). Precedence: explicit path (user override) > $GENOPACK_DATA/<name> >
+// <exe_dir>/../share/genopack/<name>. Returns "" if nothing is found, so the caller
+// silently skips that axis — the reference is never a required build argument.
+static std::string resolve_data_file(const std::string& explicit_path, const char* name) {
+    namespace fs = std::filesystem;
+    if (!explicit_path.empty()) return explicit_path;   // user override wins verbatim
+    std::error_code ec;
+    if (const char* d = std::getenv("GENOPACK_DATA")) {
+        fs::path p = fs::path(d) / name;
+        if (fs::exists(p, ec)) return p.string();
+    }
+    fs::path exe = fs::read_symlink("/proc/self/exe", ec);
+    if (!ec) {
+        fs::path p = exe.parent_path() / ".." / "share" / "genopack" / name;
+        if (fs::exists(p, ec)) return fs::weakly_canonical(p, ec).string();
+    }
+    return {};
+}
+
 // ── genopack build ─────────────────────────────────────────────────────────────
 static int cmd_build(const std::string& input_tsv, const std::string& output_dir,
                      int threads, int zstd_level, bool no_dict, bool ref_dict,
@@ -83,7 +113,9 @@ static int cmd_build(const std::string& input_tsv, const std::string& output_dir
                      bool no_gstx = false,
                      std::string markers_path = {},
                      std::string from_gpk = {},
-                     uint32_t micro_genus_threshold = 0) {
+                     uint32_t micro_genus_threshold = 0,
+                     std::string from_stage = {},
+                     std::string contam_panel = {}) {
     ArchiveBuilder::Config cfg;
     const bool explicit_codec = no_dict || ref_dict || delta || mem_delta;
     cfg.io_threads                        = static_cast<size_t>(std::max(1, threads));
@@ -112,7 +144,23 @@ static int cmd_build(const std::string& input_tsv, const std::string& output_dir
         cfg.sketch_kmer_sizes = sketch_kmers;
         cfg.sketch_kmer_size  = sketch_kmers[0];
     }
-    cfg.markers_path = markers_path;
+    cfg.markers_path      = resolve_data_file(markers_path, "markers.mrk");
+    cfg.contam_panel_path = resolve_data_file(contam_panel, "contamination.csp");
+    if (cfg.markers_path != markers_path && !cfg.markers_path.empty())
+        spdlog::info("build: auto-resolved markers panel → {}", cfg.markers_path);
+    if (!cfg.contam_panel_path.empty())
+        spdlog::info("build: contamination panel → {}", cfg.contam_panel_path);
+
+    if (!from_stage.empty()) {
+        // Rebuild from a local .gstage cache: stream decoded sequence sequentially
+        // (no per-genome NFS opens). Single process — parallelism is in the worker
+        // pool; GSTX/GCOV/FMHR are computed inline over the full corpus, no merge.
+        cfg.from_stage_source = from_stage;
+        ArchiveBuilder builder(output_dir, cfg);
+        builder.add_from_stage(from_stage);
+        builder.finalize();
+        return 0;
+    }
 
     if (!from_gpk.empty()) {
         // Rebuild from an existing .gpk: stream decoded sequence from its shards
@@ -598,6 +646,61 @@ static int cmd_rm(const std::string& archive_dir,
     return 0;
 }
 
+// Rebuild GCOV/FCOV/FMHR from the LIVE (non-tombstoned) genomes and write the three
+// sections back into the archive, replacing any existing ones. Shared by the `gcov`
+// subcommand and the per-iteration ref-cleaning in `decontaminate`. build_gcov_fcov_fmhr
+// is tombstone-aware, so the rebuilt consensus excludes any genomes removed so far.
+// Returns 0 on success, 1 if no genera were produced.
+static int rebuild_gcov_fmhr(const std::filesystem::path& gp, int threads) {
+    using namespace genopack;
+    ArchiveReader ar;
+    ar.open(gp);
+    auto [gcov_w, fcov_w, fmhr_w] = build_gcov_fcov_fmhr(ar, threads > 0 ? threads : 8);
+    ar.close();
+    if (gcov_w.n_genera() == 0) {
+        spdlog::warn("gcov: no genera found (archive has no TAXN section?)");
+        return 1;
+    }
+
+    MmapFileReader mmap;
+    mmap.open(gp);
+    auto toc_r = TocReader::read(mmap);
+    const auto* tail    = mmap.ptr_at<TailLocator>(mmap.size() - sizeof(TailLocator));
+    const uint64_t prev = tail->toc_offset;
+    const uint64_t gen  = toc_r.header.generation + 1;
+    mmap.close();
+
+    AppendWriter aw;
+    aw.open_append(gp);
+    uint64_t next_sid = toc_r.next_section_id();
+    SectionDesc gcov_sd = gcov_w.finalize(aw, next_sid++);
+    SectionDesc fcov_sd = fcov_w.n_genera() > 0
+        ? fcov_w.finalize(aw, next_sid, SEC_FCOV) : SectionDesc{};
+    ++next_sid;
+    SectionDesc fmhr_sd = fmhr_w.n_genera() > 0
+        ? fmhr_w.finalize(aw, next_sid) : SectionDesc{};
+
+    TocWriter new_toc;
+    for (const auto& sd : toc_r.sections)
+        if (sd.type != SEC_GCOV && sd.type != SEC_FCOV && sd.type != SEC_FMHR)
+            new_toc.add_section(sd);
+    new_toc.add_section(gcov_sd);
+    if (fcov_w.n_genera() > 0) new_toc.add_section(fcov_sd);
+    if (fmhr_w.n_genera() > 0) new_toc.add_section(fmhr_sd);
+    aw.flush();
+    stamp_section_checksums(gp.c_str(), new_toc.sections(), /*only_if_zero=*/true);
+    new_toc.finalize(aw, gen,
+                     toc_r.header.live_genome_count,
+                     toc_r.header.total_genome_count,
+                     prev,
+                     toc_r.header.catalog_root_section_id,
+                     toc_r.header.accession_root_section_id,
+                     toc_r.header.tombstone_root_section_id);
+    spdlog::info("gcov: {} genera, {} families, {} fmhr genera rebuilt for {}",
+                 gcov_w.n_genera(), fcov_w.n_genera(), fmhr_w.n_genera(), gp.string());
+    return 0;
+}
+
 // Per-genus FMH null-background contamination scorer — the genus-band signal.
 // Computes fmh_minority for EVERY live genome (per-contig FracMinHash containment
 // vs its own genus FMHR ref + same-family candidate genus refs), then scores the
@@ -690,6 +793,101 @@ static void compute_fmh_minority_z(const std::filesystem::path& gpk,
     }
 }
 
+// Reference-internal CCO contamination scorer — the distant-band signal. For each
+// live genome, computes the per-contig TNF outlier fraction (T²∪SPE Mahalanobis vs
+// the genus GCOV covariance) via score_bin. Unlike FMH-minority it needs NO foreign
+// reference, so it sees family/order/phylum contamination that the same-family FMH
+// candidate set is structurally blind to. Needs contigs ≥20kb (TNF), so it complements
+// FMH-minority (≥10kb sketch) rather than replacing it. Robust to a contaminated
+// minority: the genus covariance centroid is dominated by the clean majority, and the
+// iterative rebuild de-pollutes it further each round. cco_fraction is in [0,1].
+static void compute_cco_fraction(const std::filesystem::path& gpk,
+                                 std::unordered_map<std::string, float>& cco,
+                                 std::unordered_map<std::string, float>& cco_z) {
+    using namespace genopack;
+    ArchiveReader ar;
+    ar.open(gpk);
+    const GcovReader* gcov_rd = ar.gcov_reader();
+    const GcovReader* fcov_rd = ar.fcov_reader();
+    if (!gcov_rd) return;
+
+    std::unordered_map<std::string, GenomeId> acc_gid;
+    ar.scan_genome_accessions([&](std::string_view a, GenomeId g) {
+        if (!ar.is_deleted(g)) acc_gid.emplace(std::string(a), g);
+    });
+    auto rank = [](std::string_view tax, const char* pre) -> std::string {
+        auto p = tax.find(pre);
+        if (p == std::string_view::npos) return {};
+        auto e = tax.find(';', p);
+        std::string s(tax.substr(p, e == std::string_view::npos ? tax.size() - p : e - p));
+        return s == std::string(pre) ? std::string{} : s;
+    };
+    std::unordered_map<std::string, std::string> acc_genus, acc_family;
+    ar.scan_taxonomy([&](std::string_view a, std::string_view tax) {
+        std::string acc(a);
+        if (!acc_gid.count(acc)) return;
+        std::string g = rank(tax, "g__");
+        if (g.empty()) return;
+        acc_genus[acc] = g;
+        std::string f = rank(tax, "f__");
+        if (!f.empty()) acc_family[acc] = f;
+    });
+
+    std::vector<std::string> accs;
+    for (auto& [acc, g] : acc_genus) accs.push_back(acc);
+    std::sort(accs.begin(), accs.end());
+    auto egs = ar.batch_fetch_by_accessions(accs);
+
+    BinScoreConfig cfg;
+    std::unordered_map<std::string, std::vector<float>> by_genus;
+    for (size_t i = 0; i < accs.size(); ++i) {
+        if (!egs[i]) continue;
+        const std::string& acc = accs[i];
+        const GcovEntry* ge = ar.gcov_for_genus(acc_genus[acc]);
+        if (!ge || !(ge->flags & GCOV_FLAG_VALID)) continue;
+        const GcovEntry* fe = nullptr;
+        auto fit = acc_family.find(acc);
+        if (fit != acc_family.end() && fcov_rd) {
+            fe = ar.fcov_for_family(fit->second);
+            if (fe && !(fe->flags & GCOV_FLAG_VALID)) fe = nullptr;
+        }
+        auto contigs = genopack::check::parse_fasta(egs[i]->fasta);
+        std::vector<std::string_view> seqs;
+        seqs.reserve(contigs.size());
+        for (auto& c : contigs) seqs.emplace_back(c.seq);
+        BinScores sc = score_bin(seqs, ge, gcov_rd, fe, fcov_rd, cfg);
+        if (sc.status == BinScores::Status::OK && !std::isnan(sc.cco_fraction)) {
+            cco[acc] = sc.cco_fraction;
+            by_genus[acc_genus[acc]].push_back(sc.cco_fraction);
+        }
+    }
+    // Per-genus robust baseline — the same self-calibration the FMH axis uses, and the
+    // answer to "why a fixed threshold?": a clean genome in a TNF-heterogeneous genus
+    // (E. coli: pangenome, plasmids, prophages) reads a high ABSOLUTE cco, but so do its
+    // genus-mates, so its delta-from-median z stays low. A foreign contaminant sits far
+    // above its genus-mates. z = (cco - median) / (1.4826 * MAD). Note CCO is already
+    // measured against the GENUS covariance, which contains the lineage's native rRNA/
+    // plasmid spread — so native mobile elements are not flagged (they are not outliers
+    // vs a genus that all carries them); only foreign content is.
+    std::unordered_map<std::string, std::pair<float, float>> base;
+    for (auto& [g, vals] : by_genus) {
+        if (vals.size() < 3) continue;
+        std::vector<float> v = vals;
+        std::nth_element(v.begin(), v.begin() + v.size() / 2, v.end());
+        float med = v[v.size() / 2];
+        std::vector<float> dev; dev.reserve(v.size());
+        for (float x : vals) dev.push_back(std::fabs(x - med));
+        std::nth_element(dev.begin(), dev.begin() + dev.size() / 2, dev.end());
+        float mad = std::max(dev[dev.size() / 2], 1e-4f);
+        base[g] = { med, mad };
+    }
+    for (auto& [acc, v] : cco) {
+        auto bit = base.find(acc_genus[acc]);
+        if (bit == base.end()) continue;
+        cco_z[acc] = (v - bit->second.first) / (1.4826f * bit->second.second);
+    }
+}
+
 // ── genopack decontaminate ──────────────────────────────────────────────────────
 // Iteratively remove contaminated genomes so neither the DB nor its consensus
 // models carry contamination. Each round rebuilds the genus/family models from the
@@ -699,8 +897,7 @@ static void compute_fmh_minority_z(const std::filesystem::path& gpk,
 // gate: it is reference-internal, so it flags foreign contigs whether or not the
 // contaminant's genus is in the DB.
 static int cmd_decontaminate(const std::string& archive_path, float max_fmh_z, float min_delta,
-                             int max_iters, int threads, bool dry_run) {
-    (void)threads;
+                             float cco_abs, int max_iters, int threads, bool dry_run) {
     std::filesystem::path gpk = archive_path;
     if (!std::filesystem::exists(gpk) && gpk.extension() != ".gpk")
         gpk = std::filesystem::path(gpk.string() + ".gpk");
@@ -712,45 +909,76 @@ static int cmd_decontaminate(const std::string& archive_path, float max_fmh_z, f
     size_t total_removed = 0;
     bool converged = false;
     for (int it = 1; it <= max_iters; ++it) {
-        // Score against the EXISTING FMHR refs — no per-iteration rebuild. The
-        // per-genus median+MAD baseline is itself robust to a contaminated minority
-        // (the tail does not move the median), so rebuilding refs is unnecessary;
-        // rebuilding from the still-dirty live set would fold contaminant k-mers
-        // into the host ref and mask detection. compute_fmh_minority_z already
-        // excludes tombstoned genomes (live-only).
+        // Score against the CURRENT FMHR refs. Round 1 uses the as-built refs (which
+        // may be polluted if contaminants were in the build); each subsequent round
+        // scores against the refs rebuilt at the end of the previous iteration from
+        // the cleaned live set (see rebuild_gcov_fmhr below). The per-genus median+MAD
+        // baseline is robust to a contaminated minority (the tail does not move the
+        // median), which is what lets round 1 detect the strongest contamination even
+        // against a polluted ref. compute_fmh_minority_z scores live genomes only.
 
-        // Genus-band contamination: per-genus FMH minority, delta-from-baseline z.
+        // Layered detection — a genome is flagged if EITHER axis fires:
+        //   • FMH-minority (genus band): per-contig FracMinHash containment vs same-
+        //     family candidate genus refs. Sees genus-distance contamination where TNF
+        //     is information-theoretically blind, but needs the contaminant's sibling
+        //     genus in the pack, so it is blind to family/order/phylum distance.
+        //   • CCO (distant band): per-contig TNF outlier vs the genus GCOV covariance.
+        //     Reference-internal — needs no foreign ref, so it catches family/order/
+        //     phylum contamination FMH cannot. Needs contigs ≥20kb (TNF).
         std::unordered_map<std::string, float> fmh_raw, fmh_z, gmed;
         compute_fmh_minority_z(gpk, fmh_raw, fmh_z, gmed);
+        std::unordered_map<std::string, float> cco, cco_z;   // raw fraction + per-genus robust z
+        compute_cco_fraction(gpk, cco, cco_z);
 
-        std::vector<std::pair<std::string, float>> flagged;
+        struct Flag { std::string acc; const char* axis; float fz; float cco_pct; };
+        std::vector<Flag> flagged;
+        std::set<std::string> seen;
         for (auto& [acc, z] : fmh_z)
-            if (z > max_fmh_z && (fmh_raw[acc] - gmed[acc]) > min_delta)
-                flagged.push_back({ acc, z });
-        std::sort(flagged.begin(), flagged.end(),
-                  [](auto& a, auto& b) { return a.second > b.second; });
+            if (z > max_fmh_z && (fmh_raw[acc] - gmed[acc]) > min_delta) {
+                flagged.push_back({ acc, "fmh", z, cco.count(acc) ? cco[acc] * 100.f : NAN });
+                seen.insert(acc);
+            }
+        // CCO gate is an ABSOLUTE threshold, not a per-genus z. Empirically the per-genus
+        // baseline poisons when contamination concentrates in a genus (median itself goes
+        // contaminated), and CCO's clean baseline (~0.7%% TNF-outlier bp) is a near-universal
+        // property of genome compositional homogeneity, so the absolute cut is the robust,
+        // self-calibration-free choice here. (cco_z is computed for diagnostics only.)
+        for (auto& [acc, c] : cco) {
+            if (c * 100.f > cco_abs && !seen.count(acc)) {
+                flagged.push_back({ acc, "cco", fmh_z.count(acc) ? fmh_z[acc] : NAN, c * 100.f });
+                seen.insert(acc);
+            }
+        }
 
-        spdlog::info("decontaminate iter {}: scored {} genomes; {} exceed FMH z>{:.1f} & delta>{:.3f}",
-                     it, fmh_z.size(), flagged.size(), max_fmh_z, min_delta);
+        spdlog::info("decontaminate iter {}: FMH-scored {}, CCO-scored {}; {} flagged "
+                     "(FMH z>{:.1f} & delta>{:.3f}  OR  CCO>{:.2f}%)",
+                     it, fmh_z.size(), cco.size(), flagged.size(), max_fmh_z, min_delta, cco_abs);
         if (flagged.empty()) { converged = true; break; }
+        for (auto& f : flagged)
+            spdlog::info("  iter {} {} [{}]: {}  fmh_z={:.1f} cco={:.2f}%",
+                         it, dry_run ? "would-remove" : "remove", f.axis, f.acc, f.fz, f.cco_pct);
         if (dry_run) {
-            for (auto& [acc, z] : flagged)
-                spdlog::info("  would remove: {}  fmh_minority={:.3f} genus_baseline={:.3f} z={:.1f}",
-                             acc, fmh_raw[acc], gmed[acc], z);
             spdlog::info("decontaminate: dry-run — {} genome(s) would be removed; no changes made",
                          flagged.size());
             return 0;
         }
         std::vector<std::string> rm_accs;
         rm_accs.reserve(flagged.size());
-        for (auto& [acc, z] : flagged) rm_accs.push_back(acc);
+        for (auto& f : flagged) rm_accs.push_back(f.acc);
         cmd_rm(gpk.string(), rm_accs);
         total_removed += rm_accs.size();
-    }
 
-    if (!dry_run && total_removed > 0)
-        spdlog::info("decontaminate: run 'genopack gcov {}' to rebuild genus refs from the clean set",
-                     gpk.string());
+        // Iterative reference cleaning: rebuild the genus/family consensus from the
+        // now-cleaner live set so the NEXT round scores against a de-polluted FMHR.
+        // This is the correct order — rebuild AFTER tombstoning, so the contaminants
+        // just removed are excluded (build_gcov_fcov_fmhr is tombstone-aware). It
+        // breaks the circularity (contaminated members inflating the model that
+        // scores them): round 1 catches the strongest contamination even against a
+        // polluted ref because the per-genus median is robust to a minority tail;
+        // each rebuild de-pollutes the ref so the next round reaches closer-relative
+        // contamination the previous ref had masked.
+        rebuild_gcov_fmhr(gpk, threads);
+    }
     spdlog::info("decontaminate: {} — removed {} contaminated genome(s)",
                  converged ? "converged" : "stopped at iteration cap", total_removed);
     return 0;
@@ -2442,19 +2670,32 @@ int main(int argc, char** argv) {
     build->add_flag("-v,--verbose", build_verbose, "Verbose progress");
     std::string build_markers;
     build->add_option("--markers", build_markers,
-        "Path to markers.mrk; enables build-time marker completeness scoring (no check re-scan)");
+        "Path to markers.mrk; build-time marker completeness scoring. If omitted, "
+        "auto-resolved from $GENOPACK_DATA/markers.mrk or the install share dir.");
+    std::string build_contam_panel;
+    build->add_option("--contam-panel", build_contam_panel,
+        "Path to contamination .csp panel; build-time intra-genome duplication scoring. "
+        "If omitted, auto-resolved from $GENOPACK_DATA/contamination.csp or the install "
+        "share dir; absent → axis skipped.");
     std::string build_from_gpk;
     build->add_option("--from-gpk", build_from_gpk,
         "Rebuild from an existing .gpk: stream decoded sequence from its shards "
         "(sequential reads) instead of opening per-genome FASTA files on NFS. -i not required.");
+    std::string build_from_stage;
+    build->add_option("--from-stage", build_from_stage,
+        "Rebuild from a local .gstage cache produced by `genopack stage`: stream "
+        "decoded sequence sequentially (no per-genome NFS opens). -i not required.");
     std::string build_coordinator; // "manifest_dir:output.gpk" or empty
     build->add_option("--coordinator", build_coordinator,
         "NFS manifest coordinator: manifest_dir:/path/to/output.gpk. "
         "Build to a temp file then transfer sections via NFS manifest protocol. "
         "The legacy 'nfs:' prefix is accepted and stripped for backward compatibility.");
     build->callback([&]() {
-        if (build_input.empty() && build_from_gpk.empty())
-            throw std::runtime_error("build: provide -i <TSV> or --from-gpk <source.gpk>");
+        {
+            int build_mode_count = (!build_input.empty()) + (!build_from_gpk.empty()) + (!build_from_stage.empty());
+            if (build_mode_count != 1)
+                throw std::runtime_error("build: provide exactly one of -i <TSV>, --from-gpk <source.gpk>, or --from-stage <cache.gstage>");
+        }
         // Parse --sketch-kmers "16,21,31" into vector<int>
         std::vector<int> build_sketch_kmers;
         if (!build_sketch_kmers_str.empty()) {
@@ -2483,7 +2724,8 @@ int main(int argc, char** argv) {
                                 build_sketch, build_sketch_kmer, build_sketch_size,
                                 build_sketch_syncmer, build_sketch_kmers,
                                 build_no_gstx, build_markers, build_from_gpk,
-                                build_micro_genus_threshold);
+                                build_micro_genus_threshold, build_from_stage,
+                                build_contam_panel);
             if (rc != 0) std::exit(rc);
             std::string hostname = "worker";
             {
@@ -2513,7 +2755,23 @@ int main(int argc, char** argv) {
                              build_sketch, build_sketch_kmer, build_sketch_size,
                              build_sketch_syncmer, build_sketch_kmers,
                              build_no_gstx, build_markers, build_from_gpk,
-                             build_micro_genus_threshold));
+                             build_micro_genus_threshold, build_from_stage,
+                             build_contam_panel));
+    });
+
+    // genopack stage — durable local sequence cache for fast iterative rebuilds
+    auto* stage_cmd = app.add_subcommand("stage",
+        "Cache NFS genome FASTAs as a local zstd sequence store (.gstage) for fast "
+        "rebuilds via `build --from-stage`");
+    std::string stage_input, stage_output;
+    int stage_threads = 48, stage_block_mb = 64;
+    stage_cmd->add_option("-i,--input", stage_input,
+        "Input TSV (accession, file_path, taxonomy, ...)")->required();
+    stage_cmd->add_option("-o,--output", stage_output, "Output .gstage path")->required();
+    stage_cmd->add_option("-t,--threads", stage_threads, "NFS reader threads (default: 48)");
+    stage_cmd->add_option("--block-mb", stage_block_mb, "Uncompressed block size in MB (default: 64)");
+    stage_cmd->callback([&]() {
+        std::exit(genopack::cmd_stage(stage_input, stage_output, stage_threads, stage_block_mb));
     });
 
     // genopack extract
@@ -3366,6 +3624,7 @@ int main(int argc, char** argv) {
     int check_min_genus_size = 3;
     float check_leakage_threshold = 0.05f;
     bool check_recompute = false;
+    bool check_scan_all = false;
     check_cmd->add_option("pack", check_pack, "Path to .gpk archive or directory of parts")->required();
     check_cmd->add_option("-g,--genomes", check_genomes, "Optional accession list (one per line); default: all in pack");
     check_cmd->add_option("-o,--output", check_output, "TSV output path for quality table");
@@ -3373,6 +3632,7 @@ int main(int argc, char** argv) {
     check_cmd->add_option("--min-genus-size", check_min_genus_size, "Min genus members for saturated tier (default: 3)");
     check_cmd->add_option("--leakage-threshold", check_leakage_threshold, "Containment leakage threshold (default: 0.05)");
     check_cmd->add_flag("--recompute", check_recompute, "Ignore existing QUAL section and force full rescan");
+    check_cmd->add_flag("--scan-all", check_scan_all, "Force every genome through FASTA-level analysis (intrinsic completeness for all, not just flagged)");
     std::string check_markers;
     check_cmd->add_option("--markers", check_markers,
         "Path to markers .mrk DB; enables marker-based completeness/redundancy scoring");
@@ -3385,7 +3645,90 @@ int main(int argc, char** argv) {
             check_leakage_threshold,
             check_output.empty() ? std::filesystem::path{} : std::filesystem::path{check_output},
             check_recompute,
-            check_markers.empty() ? std::filesystem::path{} : std::filesystem::path{check_markers}));
+            check_markers.empty() ? std::filesystem::path{} : std::filesystem::path{check_markers},
+            check_scan_all));
+    });
+
+    // genopack ingest — attach external quality (CheckM2 / anvi'o) as SEC_XQAL
+    auto* ingest_cmd = app.add_subcommand("ingest",
+        "Ingest external quality (CheckM2/anvi'o) into the archive as provenance-carrying XQAL columns.");
+    std::string ingest_pack, ingest_checkm2, ingest_anvio;
+    ingest_cmd->add_option("pack", ingest_pack, "Path to .gpk archive or directory of parts")->required();
+    ingest_cmd->add_option("--checkm2", ingest_checkm2, "CheckM2 quality_report.tsv (Name/Completeness/Contamination)");
+    ingest_cmd->add_option("--anvio", ingest_anvio, "anvi'o completeness TSV (bin name/% completion/% redundancy)");
+    ingest_cmd->callback([&]() {
+        std::exit(genopack::cmd_ingest(
+            ingest_pack,
+            ingest_checkm2.empty() ? std::filesystem::path{} : std::filesystem::path{ingest_checkm2},
+            ingest_anvio.empty()   ? std::filesystem::path{} : std::filesystem::path{ingest_anvio}));
+    });
+
+    // genopack report — unified per-genome quality via a named fusion profile
+    auto* report_cmd = app.add_subcommand("report",
+        "Emit a unified per-genome quality table resolved through a named profile. Each axis "
+        "is sourced from exactly one column (built-in rule or stored policy) and the report "
+        "carries that column's provenance (tool/method) — fusion is explicit, never silent.");
+    std::string report_pack, report_profile = "best", report_output;
+    bool report_list = false;
+    report_cmd->add_option("pack", report_pack, "Path to .gpk archive or directory of parts")->required();
+    report_cmd->add_option("-p,--profile", report_profile,
+        "Profile name: built-in {intrinsic,external,calibrated,best} or a stored profile (default: best)");
+    report_cmd->add_option("-o,--output", report_output, "TSV output path (default: stdout)");
+    report_cmd->add_flag("--list", report_list,
+        "List built-in + stored profiles and the available provenance columns, then exit");
+    report_cmd->callback([&]() {
+        std::exit(genopack::cmd_report(
+            report_pack, report_profile,
+            report_output.empty() ? std::filesystem::path{} : std::filesystem::path{report_output},
+            report_list));
+    });
+
+    // genopack profile — author / list stored SEC_PROF fusion policies
+    auto* profile_cmd = app.add_subcommand("profile",
+        "Manage named reporting/fusion profiles stored in the archive (SEC_PROF).");
+    profile_cmd->require_subcommand(1);
+    auto* profile_add = profile_cmd->add_subcommand("add",
+        "Author a named profile pinning each axis to an exact column identity present in the archive.");
+    std::string prof_pack, prof_name, prof_desc;
+    std::vector<std::string> prof_selects;
+    profile_add->add_option("pack", prof_pack, "Path to .gpk archive or directory of parts")->required();
+    profile_add->add_option("--name", prof_name, "Profile name (must not be a built-in name)")->required();
+    profile_add->add_option("--description", prof_desc, "Human-facing description (cosmetic; excluded from policy hash)");
+    profile_add->add_option("-s,--select", prof_selects,
+        "Axis selector axis=tool:method[@cal][/tool:method[@cal]] (repeatable); the optional /… is a fallback")
+        ->required();
+    profile_add->callback([&]() {
+        std::exit(genopack::cmd_profile_add(prof_pack, prof_name, prof_desc, prof_selects));
+    });
+    auto* profile_list = profile_cmd->add_subcommand("list", "List stored profiles and available columns.");
+    std::string prof_list_pack;
+    profile_list->add_option("pack", prof_list_pack, "Path to .gpk archive or directory of parts")->required();
+    profile_list->callback([&]() {
+        std::exit(genopack::cmd_profile_list(prof_list_pack));
+    });
+
+    // genopack qcontig — dump the per-contig quality overlay (SEC_QCONTIG)
+    auto* qcontig_cmd = app.add_subcommand("qcontig",
+        "Dump the per-contig quality overlay: one row per (genome, contig) with offset/length/"
+        "TNF/leakage, so you can see which contigs drive a genome's contamination.");
+    std::string qcontig_pack, qcontig_acc, qcontig_out;
+    float qcontig_min_outlier = 0.0f, qcontig_min_leak = 0.0f;
+    float qcontig_min_foreign = 0.0f, qcontig_min_lr = 0.0f;
+    qcontig_cmd->add_option("pack", qcontig_pack, "Path to .gpk archive or directory of parts")->required();
+    qcontig_cmd->add_option("-a,--accession", qcontig_acc, "Restrict to one genome accession (default: all)");
+    qcontig_cmd->add_option("-o,--output", qcontig_out, "TSV output path (default: stdout)");
+    qcontig_cmd->add_option("--min-outlier", qcontig_min_outlier,
+        "TNF channel (LONG contigs): emit contigs whose GCOV T² or SPE percentile >= this (e.g. 0.99)");
+    qcontig_cmd->add_option("--min-foreign", qcontig_min_foreign,
+        "Protein-aamer channel (SMALL contigs): emit contigs whose foreign_fraction >= this (e.g. 0.30)");
+    qcontig_cmd->add_option("--min-lr", qcontig_min_lr,
+        "Protein-aamer channel: also require foreign log-LR >= this (default 0; pair with --min-foreign, e.g. 3.0)");
+    qcontig_cmd->add_option("--min-leakage", qcontig_min_leak,
+        "Also flag contigs with containment-leakage score >= this");
+    qcontig_cmd->callback([&]() {
+        std::exit(genopack::cmd_qcontig(qcontig_pack, qcontig_acc,
+            qcontig_out.empty() ? std::filesystem::path{} : std::filesystem::path{qcontig_out},
+            qcontig_min_outlier, qcontig_min_leak, qcontig_min_foreign, qcontig_min_lr));
     });
 
     // genopack decontaminate
@@ -3395,6 +3738,7 @@ int main(int argc, char** argv) {
     std::string decon_archive;
     float decon_max_fmh_z = 5.0f;    // robust SDs above the genus FMH baseline
     float decon_min_delta = 0.02f;   // absolute fmh_minority above baseline (guards tight genera)
+    float decon_cco_abs   = 1.5f;    // CCO % absolute threshold (T²∪SPE outlier bp); clean genomes ~0.7%
     int   decon_iters     = 5;
     int   decon_threads   = 8;
     bool  decon_dry       = false;
@@ -3405,13 +3749,19 @@ int main(int argc, char** argv) {
     decon_cmd->add_option("--min-delta", decon_min_delta,
         "Also require fmh_minority to exceed the genus baseline by this absolute amount (guards "
         "tight-baseline genera from z blow-up; default: 0.02)");
+    decon_cmd->add_option("--max-cco", decon_cco_abs,
+        "Remove genomes whose CCO contamination %% (per-contig T²∪SPE TNF-outlier bp vs the genus "
+        "GCOV covariance) exceeds this — the distant-band signal (family/order/phylum), reference-"
+        "internal so native rRNA/plasmids are not flagged (the genus covariance carries them). "
+        "Clean genomes cap ~0.7%%; absolute (a per-genus z poisons when a genus is majority-"
+        "contaminated). Needs contigs ≥20kb (default: 1.5)");
     decon_cmd->add_option("--max-iters", decon_iters, "Max decontamination rounds (default: 5)");
     decon_cmd->add_option("-t,--threads", decon_threads, "Threads (default: 8)");
     decon_cmd->add_flag("--dry-run", decon_dry,
-        "Report what would be removed (with fmh/baseline/z) without modifying the archive");
+        "Report what would be removed (with fmh_z/cco per axis) without modifying the archive");
     decon_cmd->callback([&]() {
         std::exit(cmd_decontaminate(decon_archive, decon_max_fmh_z, decon_min_delta,
-                                    decon_iters, decon_threads, decon_dry));
+                                    decon_cco_abs, decon_iters, decon_threads, decon_dry));
     });
 
     // genopack gcov
@@ -3422,66 +3772,56 @@ int main(int argc, char** argv) {
     gcov_cmd->add_option("archive", gcov_pack, "Path to .gpk archive")->required();
     gcov_cmd->add_option("-t,--threads", gcov_threads, "Parallel shard readers (default: 8)");
     gcov_cmd->callback([&]() {
-        using namespace genopack;
-        const std::filesystem::path gp(gcov_pack);
+        std::exit(rebuild_gcov_fmhr(std::filesystem::path(gcov_pack), gcov_threads));
+    });
 
-        // Single-pass fused build: GCOV + FCOV + FMHR, one shard scan.
-        ArchiveReader ar;
-        ar.open(gp);
-        auto [gcov_w, fcov_w, fmhr_w] = build_gcov_fcov_fmhr(ar, gcov_threads);
-        ar.close();
+    // genopack fcore — build per-family prevalence cores (genus-core fallback)
+    auto* fcore_cmd = app.add_subcommand("fcore",
+        "Build SEC_FCORE per-family prevalence cores: the intrinsic-completeness fallback for "
+        "novel/sparse genera whose genus has no (or too thin a) CORE. Reuses the CORE params so "
+        "family-core coverage is comparable to genus-core coverage; check records both as distinct columns.");
+    std::string fcore_pack, fcore_members;
+    int   fcore_threads = 8;
+    float fcore_theta   = 0.0f;
+    unsigned fcore_min_members = 2;
+    fcore_cmd->add_option("archive", fcore_pack, "Path to .gpk archive or directory of parts")->required();
+    fcore_cmd->add_option("-t,--threads", fcore_threads, "Parallel shard readers (default: 8)");
+    fcore_cmd->add_option("--theta", fcore_theta,
+        "Prevalence threshold override (default: inherit the CORE section's theta)");
+    fcore_cmd->add_option("--min-members", fcore_min_members,
+        "Skip families with fewer than this many genomes (default: 2)");
+    fcore_cmd->add_option("--members", fcore_members,
+        "Reference accession list (one per line); only these genomes build the cores "
+        "(excludes co-resident query/test genomes). Default: all live genomes");
+    fcore_cmd->callback([&]() {
+        std::exit(genopack::cmd_fcore(std::filesystem::path(fcore_pack),
+                                      fcore_threads, fcore_theta, fcore_min_members,
+                                      fcore_members.empty() ? std::filesystem::path{}
+                                                            : std::filesystem::path{fcore_members}));
+    });
 
-        if (gcov_w.n_genera() == 0) {
-            spdlog::warn("gcov: no genera found (archive has no TAXN section?)");
-            std::exit(1);
-        }
-
-        // Append all three sections in one open-write-close cycle.
-        MmapFileReader mmap;
-        mmap.open(gp);
-        auto toc_r = TocReader::read(mmap);
-        const auto* tail    = mmap.ptr_at<TailLocator>(mmap.size() - sizeof(TailLocator));
-        const uint64_t prev = tail->toc_offset;
-        const uint64_t gen  = toc_r.header.generation + 1;
-        mmap.close();
-
-        AppendWriter aw;
-        aw.open_append(gp);
-        uint64_t next_sid = toc_r.next_section_id();
-        SectionDesc gcov_sd = gcov_w.finalize(aw, next_sid++);
-        SectionDesc fcov_sd = fcov_w.n_genera() > 0
-            ? fcov_w.finalize(aw, next_sid, SEC_FCOV) : SectionDesc{};
-        ++next_sid;
-        SectionDesc fmhr_sd = fmhr_w.n_genera() > 0
-            ? fmhr_w.finalize(aw, next_sid) : SectionDesc{};
-
-        TocWriter new_toc;
-        for (const auto& sd : toc_r.sections)
-            if (sd.type != SEC_GCOV && sd.type != SEC_FCOV && sd.type != SEC_FMHR)
-                new_toc.add_section(sd);
-        new_toc.add_section(gcov_sd);
-        if (fcov_w.n_genera() > 0) new_toc.add_section(fcov_sd);
-        if (fmhr_w.n_genera() > 0) new_toc.add_section(fmhr_sd);
-        aw.flush();
-        stamp_section_checksums(gp.c_str(), new_toc.sections(), /*only_if_zero=*/true);
-        new_toc.finalize(aw, gen,
-                         toc_r.header.live_genome_count,
-                         toc_r.header.total_genome_count,
-                         prev,
-                         toc_r.header.catalog_root_section_id,
-                         toc_r.header.accession_root_section_id,
-                         toc_r.header.tombstone_root_section_id);
-
-        spdlog::info("gcov: {} genera, {} families, {} fmhr genera written to {}",
-                     gcov_w.n_genera(), fcov_w.n_genera(), fmhr_w.n_genera(), gcov_pack);
-        std::exit(0);
+    // genopack pcore — unified dense prevalence-annotated per-genus aamer reference
+    auto* pcore_cmd = app.add_subcommand("pcore",
+        "Build SEC_PCORE: the unified dense per-genus aamer reference (every aamer + prevalence). "
+        "Dense enough to detect SMALL foreign contigs (the conserved-only CORE is too sparse for 1-2kb).");
+    std::string pcore_pack, pcore_members;
+    int pcore_threads = 8;
+    pcore_cmd->add_option("archive", pcore_pack, "Path to .gpk archive or directory of parts")->required();
+    pcore_cmd->add_option("-t,--threads", pcore_threads, "Parallel shard readers (default: 8)");
+    pcore_cmd->add_option("--members", pcore_members,
+        "Reference accession list (one per line); only these genomes build the reference. Default: all live");
+    pcore_cmd->callback([&]() {
+        std::exit(genopack::cmd_pcore(std::filesystem::path(pcore_pack), pcore_threads,
+                                      pcore_members.empty() ? std::filesystem::path{}
+                                                            : std::filesystem::path{pcore_members}));
     });
 
 
     // genopack calibrate
     auto* cal_cmd = app.add_subcommand("calibrate",
-        "Fit a completeness calibration model from a genopack archive + CheckM2 ground truth. "
-        "Writes an isotonic+OLS JSON model and prints RMSE and per-decile stats.");
+        "Calibrate intrinsic completeness (aamer genus-core) against ground truth and write a "
+        "CQAL section of calibrated per-genome columns. Ground truth: --checkm2 TSV, or the "
+        "ingested XQAL if omitted. Also writes an isotonic+OLS JSON model and prints RMSE.");
     std::string cal_archive;
     std::string cal_checkm2;
     std::string cal_output  = "calibration.json";
@@ -3489,7 +3829,7 @@ int main(int argc, char** argv) {
     cal_cmd->add_option("archive", cal_archive,
         "Path to .gpk archive or directory of parts")->required();
     cal_cmd->add_option("--checkm2", cal_checkm2,
-        "CheckM2 TSV with completeness/contamination ground truth")->required();
+        "CheckM2 TSV ground truth (optional; falls back to ingested XQAL CheckM2 columns)");
     cal_cmd->add_option("-o,--output", cal_output,
         "Output JSON path for calibration model (default: calibration.json)");
     cal_cmd->add_option("-t,--threads", cal_threads,
@@ -3497,6 +3837,60 @@ int main(int argc, char** argv) {
     cal_cmd->callback([&]() {
         std::exit(genopack::calibrate::run_calibrate(
             cal_archive, cal_checkm2, cal_output, cal_threads));
+    });
+
+    // genopack cladesplit — protein-aamer clade-split contamination tier
+    auto* cs_cmd = app.add_subcommand("cladesplit",
+        "Protein-aamer clade-split contamination tier (GUNC-style, fast). Build a panel "
+        "of genus-diagnostic aamers from clean genomes, then score genomes by lineage-split.");
+    auto* cs_build = cs_cmd->add_subcommand("build", "Build a .csp panel from clean reference genomes");
+    std::string cs_b_tsv, cs_b_out, cs_b_mode = "aa"; int cs_b_c = 30, cs_b_minaa = 8, cs_b_threads = 0;
+    cs_build->add_option("-i,--input", cs_b_tsv, "TSV (accession, file_path, taxonomy)")->required();
+    cs_build->add_option("-o,--output", cs_b_out, "Output .csp panel")->required();
+    cs_build->add_option("-t,--threads", cs_b_threads, "Worker threads (default: all cores)");
+    cs_build->add_option("--frac-c", cs_b_c, "FracMinHash density 1/c on aamers (default: 30)");
+    cs_build->add_option("--min-aa", cs_b_minaa, "Min inter-stop AA segment length (default: 8)");
+    cs_build->add_option("--primitive", cs_b_mode, "Protein k-mer primitive: aamer | metamer | strobemer (default: aamer)");
+    cs_build->callback([&]() {
+        genopack::CladeSplitConfig cfg; cfg.frac_c = cs_b_c; cfg.min_aa = cs_b_minaa;
+        cfg.mode = (cs_b_mode == "metamer" || cs_b_mode == "aadna")  ? 1
+                 : (cs_b_mode == "strobemer" || cs_b_mode == "strobe") ? 2 : 0;
+        genopack::cladesplit_build(cs_b_tsv, cs_b_out, cfg, cs_b_threads);
+        std::exit(0);
+    });
+    auto* cs_score = cs_cmd->add_subcommand("score", "Score genomes against a .csp panel (per-genome minority_fraction)");
+    std::string cs_s_tsv, cs_s_gpk, cs_s_panel, cs_s_out, cs_s_mode = "aa"; int cs_s_c = 30, cs_s_minaa = 8, cs_s_threads = 0;
+    cs_score->add_option("-i,--input", cs_s_tsv, "TSV (accession, file_path) — or use --gpk");
+    cs_score->add_option("--gpk", cs_s_gpk, "Score live genomes inside a .gpk archive directly (flag contamination in a genopack file)");
+    cs_score->add_option("--panel", cs_s_panel, "Panel .csp")->required();
+    cs_score->add_option("-o,--output", cs_s_out, "Output per-genome TSV (incl. redundancy_fraction)")->required();
+    cs_score->add_option("-t,--threads", cs_s_threads, "Worker threads (default: all cores)");
+    cs_score->add_option("--frac-c", cs_s_c, "FracMinHash density 1/c (must match build; default: 30)");
+    cs_score->add_option("--min-aa", cs_s_minaa, "Min AA segment (must match build; default: 8)");
+    cs_score->add_option("--primitive", cs_s_mode, "Protein k-mer primitive (must match build): aamer | metamer | strobemer");
+    cs_score->callback([&]() {
+        genopack::CladeSplitConfig cfg; cfg.frac_c = cs_s_c; cfg.min_aa = cs_s_minaa;
+        cfg.mode = (cs_s_mode == "metamer" || cs_s_mode == "aadna")  ? 1
+                 : (cs_s_mode == "strobemer" || cs_s_mode == "strobe") ? 2 : 0;
+        if (!cs_s_gpk.empty())      genopack::cladesplit_score_gpk(cs_s_gpk, cs_s_panel, cs_s_out, cfg, cs_s_threads);
+        else if (!cs_s_tsv.empty()) genopack::cladesplit_score_tsv(cs_s_tsv, cs_s_panel, cs_s_out, cfg, cs_s_threads);
+        else throw std::runtime_error("cladesplit score: provide -i <TSV> or --gpk <archive.gpk>");
+        std::exit(0);
+    });
+    auto* cs_dump = cs_cmd->add_subcommand("aamers", "Dump per-genome sorted-unique aamer sets (binary) for core/completeness R&D");
+    std::string cs_d_tsv, cs_d_out, cs_d_mode = "aa"; int cs_d_c = 30, cs_d_minaa = 8, cs_d_threads = 0;
+    cs_dump->add_option("-i,--input", cs_d_tsv, "TSV (accession, file_path)")->required();
+    cs_dump->add_option("-o,--output", cs_d_out, "Output binary aamer dump")->required();
+    cs_dump->add_option("-t,--threads", cs_d_threads, "Worker threads (default: all cores)");
+    cs_dump->add_option("--frac-c", cs_d_c, "FracMinHash density 1/c (default: 30)");
+    cs_dump->add_option("--min-aa", cs_d_minaa, "Min AA segment (default: 8)");
+    cs_dump->add_option("--primitive", cs_d_mode, "Protein k-mer primitive: aamer | metamer | strobemer (default: aamer)");
+    cs_dump->callback([&]() {
+        genopack::CladeSplitConfig cfg; cfg.frac_c = cs_d_c; cfg.min_aa = cs_d_minaa;
+        cfg.mode = (cs_d_mode == "metamer" || cs_d_mode == "aadna")  ? 1
+                 : (cs_d_mode == "strobemer" || cs_d_mode == "strobe") ? 2 : 0;
+        genopack::cladesplit_dump_aamers(cs_d_tsv, cs_d_out, cfg, cs_d_threads);
+        std::exit(0);
     });
 
     // genopack bench-grid
@@ -3618,7 +4012,7 @@ int main(int argc, char** argv) {
 
     // genopack markers
     auto* markers_cmd = app.add_subcommand("markers",
-        "Build or manage the SCG marker metamer panel (.mrk sidecar)");
+        "Build or manage the SCG marker aamer panel (.mrk sidecar)");
     markers_cmd->require_subcommand(1);
 
     auto* markers_build_cmd = markers_cmd->add_subcommand("build",
@@ -3687,7 +4081,7 @@ int main(int argc, char** argv) {
         // Dispatches to Dayhoff-6 k=12 syncmers or full-AA k=8 FracMinHash.
         const bool is_d6      = mr.is_dayhoff6();
         const uint64_t frac_max = mr.frac_max_hash();
-        const int min_seg     = is_d6 ? 50 : genopack::METAMER_K;
+        const int min_seg     = is_d6 ? 50 : genopack::AAMER_K;
         const uint32_t min_hits = static_cast<uint32_t>(ms_min_hits);
 
         const bool is_arc = (calib.header->domain == genopack::MRKR_DOMAIN_ARC);
@@ -3731,7 +4125,7 @@ int main(int argc, char** argv) {
                         });
                 } else {
                     orf_mers.clear();
-                    genopack::extract_metamers_dna_into(seq, genopack::METAMER_K, min_seg,
+                    genopack::extract_aamers_dna_into(seq, genopack::AAMER_K, min_seg,
                                                         frac_max, orf_mers);
                     if (!orf_mers.empty()) {
                         std::sort(orf_mers.begin(), orf_mers.end());

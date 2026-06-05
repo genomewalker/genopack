@@ -24,6 +24,7 @@ struct PassBConfig {
     float contamination_flag_threshold = 0.02f;
     float tnf_flag_threshold           = 0.0f;   // 0 = always run GCOV scan; genus-level contamination doesn't shift aggregate TNF
     float completeness_flag_threshold  = 0.70f;
+    bool  scan_all                     = false; // force every genome through FASTA-level analysis (quality audit / intrinsic completeness for all)
     float contig_tnf_threshold         = 3.0f;
     float contig_leakage_threshold     = 0.20f;
     float gcov_outlier_percentile      = 0.99f; // GCOV-based outlier threshold (percentile of calibration dist)

@@ -1,5 +1,5 @@
 #pragma once
-#include "metamer.hpp"
+#include "aamer.hpp"
 #include "mmap_file.hpp"
 #include <algorithm>
 #include <cmath>
@@ -17,7 +17,7 @@
 
 namespace genopack {
 
-// SEC_MRKR sidecar (.mrk file): global deduplicated marker metamer pool +
+// SEC_MRKR sidecar (.mrk file): global deduplicated marker aamer pool +
 // per-lineage calibration. Built once per GTDB release by `genopack markers build`.
 // Read at check time via mmap; the pool (sorted uint64 arrays) supports O(log n)
 // membership test; a per-genome in-RAM hash map is built for pass-B scoring.
@@ -36,7 +36,7 @@ static constexpr uint8_t  MRKR_ALPHABET_DAYHOFF6  = 2; // Dayhoff-6 groups, k=12
 struct MarkerHeader {         // 40 bytes (v2+; v1 was 32 bytes)
     uint32_t magic;           // MRKR_MAGIC
     uint16_t version;         // MRKR_VERSION
-    uint8_t  k;               // metamer k
+    uint8_t  k;               // aamer k
     uint8_t  alphabet;        // MRKR_ALPHABET_*
     uint32_t n_lineages;      // entries in lookup table
     uint8_t  n_bac_markers;   // 120 for GTDB bac120
@@ -217,7 +217,7 @@ public:
 
     // Write the complete .mrk file. n_bac/n_arc are the schema sizes (e.g., 120, 53).
     void finalize(const std::filesystem::path& path,
-                  uint8_t n_bac, uint8_t n_arc, uint8_t k = METAMER_K,
+                  uint8_t n_bac, uint8_t n_arc, uint8_t k = AAMER_K,
                   uint16_t frac_scale = 1,
                   uint8_t alphabet = MRKR_ALPHABET_FULL_AA) const;
 
@@ -304,7 +304,7 @@ public:
         return std::binary_search(sp.begin(), sp.end(), hash);
     }
 
-    // Build an in-RAM metamer→marker_idx map for the expected markers of one lineage.
+    // Build an in-RAM aamer→marker_idx map for the expected markers of one lineage.
     // marker_idx is local (0..n_markers-1 within the domain schema).
     // For bac domain: pool_id = marker_idx; for arc domain: pool_id = n_bac + marker_idx.
     // Returns empty map if calib is invalid.
@@ -462,8 +462,8 @@ private:
             throw std::runtime_error("markers.mrk: bad magic");
         if (hdr_->version < MRKR_VERSION_MIN || hdr_->version > MRKR_VERSION)
             throw std::runtime_error("markers.mrk: unsupported version — rebuild required");
-        const bool k_ok = (hdr_->k == METAMER_K) ||
-                          (hdr_->k == METAMER_K_D6 &&
+        const bool k_ok = (hdr_->k == AAMER_K) ||
+                          (hdr_->k == AAMER_K_D6 &&
                            hdr_->alphabet == MRKR_ALPHABET_DAYHOFF6);
         if (!k_ok)
             throw std::runtime_error("markers.mrk: k mismatch — rebuild required");
