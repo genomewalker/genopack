@@ -115,7 +115,8 @@ static int cmd_build(const std::string& input_tsv, const std::string& output_dir
                      std::string from_gpk = {},
                      uint32_t micro_genus_threshold = 0,
                      std::string from_stage = {},
-                     std::string contam_panel = {}) {
+                     std::string contam_panel = {},
+                     bool build_pcore = false) {
     ArchiveBuilder::Config cfg;
     const bool explicit_codec = no_dict || ref_dict || delta || mem_delta;
     cfg.io_threads                        = static_cast<size_t>(std::max(1, threads));
@@ -123,6 +124,7 @@ static int cmd_build(const std::string& input_tsv, const std::string& output_dir
     cfg.verbose                           = verbose;
     cfg.build_cidx                        = !no_cidx;
     cfg.build_gstx                        = !no_gstx;
+    cfg.build_pcore                       = build_pcore;   // dense small-contig reference (opt-in)
     cfg.micro_genus_threshold             = micro_genus_threshold;
     cfg.shard_cfg.zstd_level              = zstd_level;
     cfg.shard_cfg.auto_codec              = !explicit_codec;
@@ -2636,7 +2638,7 @@ int main(int argc, char** argv) {
     bool build_no_dict = false, build_ref_dict = false, build_delta = false;
     bool build_mem_delta = true, build_verbose = false, build_no_cidx = true;
     bool build_2bit = true, build_kmer_nn = true, build_taxon_group = true;
-    bool build_sketch = true;
+    bool build_sketch = true, build_pcore = false;
     int build_sketch_kmer = 16, build_sketch_size = 10000, build_sketch_syncmer = -1;
     std::string build_taxon_rank = "g";
     std::string build_sketch_kmers_str = "16,21,31";
@@ -2663,6 +2665,9 @@ int main(int argc, char** argv) {
     build->add_flag("--taxon-group,!--no-taxon-group",build_taxon_group,"Group genomes into per-taxon shards (default: on; --no-taxon-group to disable; requires taxonomy column)");
     build->add_option("--taxon-rank",build_taxon_rank,"Taxonomy rank for grouping: g=genus (default), f=family");
     build->add_flag("--sketch,!--no-sketch", build_sketch, "Compute OPH sketches (default: on; use --no-sketch to disable)");
+    build->add_flag("--pcore", build_pcore, "Also build the dense PCORE small-contig reference inline "
+        "(default: off). WARNING: the dense per-genus union is ~10-50x CORE and is the dominant cost; "
+        "memory is bounded (spilled to $GENOPACK_SPILL_DIR) but on-disk size is large.");
     build->add_option("--sketch-kmer", build_sketch_kmer, "OPH sketch k-mer size (default: 16)");
     build->add_option("--sketch-kmers", build_sketch_kmers_str, "Comma-separated k-mer sizes for multi-k SKCH (default: 16,21,31)");
     build->add_option("--sketch-size", build_sketch_size, "Number of OPH bins (default: 10000)");
@@ -2725,7 +2730,7 @@ int main(int argc, char** argv) {
                                 build_sketch_syncmer, build_sketch_kmers,
                                 build_no_gstx, build_markers, build_from_gpk,
                                 build_micro_genus_threshold, build_from_stage,
-                                build_contam_panel);
+                                build_contam_panel, build_pcore);
             if (rc != 0) std::exit(rc);
             std::string hostname = "worker";
             {
@@ -2756,7 +2761,7 @@ int main(int argc, char** argv) {
                              build_sketch_syncmer, build_sketch_kmers,
                              build_no_gstx, build_markers, build_from_gpk,
                              build_micro_genus_threshold, build_from_stage,
-                             build_contam_panel));
+                             build_contam_panel, build_pcore));
     });
 
     // genopack stage — durable local sequence cache for fast iterative rebuilds
