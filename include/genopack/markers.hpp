@@ -5,7 +5,9 @@
 #include <cmath>
 #include <cassert>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
+#include <sys/mman.h>
 #include <numeric>
 #include <queue>
 #include <span>
@@ -353,25 +355,41 @@ public:
         const uint8_t n_arc = hdr_->n_arc_markers;
 
         if (hdr_->merged_bac_off != 0) {
-            // Fast path: pre-merged pool stored in file — just mmap pointers, no copy/merge.
-            const auto load_pre = [&](uint32_t sec_off, uint8_t base, uint8_t count,
-                                      std::vector<uint64_t>& out_h,
-                                      std::vector<uint8_t>&  out_id) {
+            // Fast path: the pre-merged pool is in the file. Point spans straight at the
+            // mmap (zero-copy — saves ~450MB of private anon memory per worker). Only if
+            // the hash array is 8-byte aligned and in bounds; else fall back to a copy.
+            const auto set_view = [&](uint32_t sec_off, uint8_t base, uint8_t count,
+                                      std::span<const uint64_t>& vh, std::span<const uint8_t>& vid,
+                                      std::vector<uint64_t>& own_h, std::vector<uint8_t>& own_id) {
                 size_t total = 0;
                 for (uint8_t i = 0; i < count; ++i) total += pool_idx_[base + i].n_hashes;
-                if (total == 0) return;
-                const auto* h_ptr  = reinterpret_cast<const uint64_t*>(data_ + sec_off);
-                const auto* id_ptr = reinterpret_cast<const uint8_t*>(h_ptr + total);
-                out_h.assign(h_ptr,  h_ptr  + total);
-                out_id.assign(id_ptr, id_ptr + total);
+                if (total == 0) { vh = {}; vid = {}; return; }
+                const uint8_t* hp = data_ + sec_off;
+                const size_t   need = total * sizeof(uint64_t) + total;   // hashes + ids
+                if ((reinterpret_cast<uintptr_t>(hp) & 7u) == 0 &&
+                    static_cast<uint64_t>(sec_off) + need <= mmap_.size()) {
+                    const auto* h_ptr  = reinterpret_cast<const uint64_t*>(hp);
+                    const auto* id_ptr = hp + total * sizeof(uint64_t);
+                    vh  = std::span<const uint64_t>(h_ptr, total);
+                    vid = std::span<const uint8_t>(id_ptr, total);
+                    // Scattered binary search over this range: drop NFS/disk read-ahead.
+                    ::madvise(const_cast<uint8_t*>(hp), need, MADV_RANDOM);
+                } else {                          // misaligned/legacy → copy (rare)
+                    own_h.resize(total);
+                    std::memcpy(own_h.data(), hp, total * sizeof(uint64_t));
+                    own_id.assign(hp + total * sizeof(uint64_t), hp + total * sizeof(uint64_t) + total);
+                    vh = own_h; vid = own_id;
+                }
             };
-            load_pre(hdr_->merged_bac_off, 0,     n_bac, merged_hashes_bac_, merged_ids_bac_);
+            set_view(hdr_->merged_bac_off, 0, n_bac, merged_hashes_bac_, merged_ids_bac_, own_h_bac_, own_id_bac_);
             if (hdr_->merged_arc_off != 0)
-                load_pre(hdr_->merged_arc_off, n_bac, n_arc, merged_hashes_arc_, merged_ids_arc_);
+                set_view(hdr_->merged_arc_off, n_bac, n_arc, merged_hashes_arc_, merged_ids_arc_, own_h_arc_, own_id_arc_);
         } else {
-            // Fallback: k-way merge for old pools without pre-merged section.
-            build_merged(0,     n_bac, merged_hashes_bac_, merged_ids_bac_);
-            build_merged(n_bac, n_arc, merged_hashes_arc_, merged_ids_arc_);
+            // Fallback: k-way merge for old pools without pre-merged section (owns its result).
+            build_merged(0,     n_bac, own_h_bac_, own_id_bac_);
+            build_merged(n_bac, n_arc, own_h_arc_, own_id_arc_);
+            merged_hashes_bac_ = own_h_bac_; merged_ids_bac_ = own_id_bac_;
+            merged_hashes_arc_ = own_h_arc_; merged_ids_arc_ = own_id_arc_;
         }
 
         merged_bloom_bac_.build_from_hashes(merged_hashes_bac_.data(),
@@ -414,10 +432,15 @@ private:
     const MarkerPoolEntry*   pool_idx_    = nullptr;
     const RedunCalibEntry*   redun_calib_ = nullptr;
 
-    std::vector<uint64_t> merged_hashes_bac_;
-    std::vector<uint8_t>  merged_ids_bac_;
-    std::vector<uint64_t> merged_hashes_arc_;
-    std::vector<uint8_t>  merged_ids_arc_;
+    // Views over the merged pools. On the pre-merged fast path they point straight
+    // into the mmap (zero-copy — saves ~450MB on a GTDB panel); the legacy k-way
+    // merge owns its result in own_* below and the views point at that.
+    std::span<const uint64_t> merged_hashes_bac_;
+    std::span<const uint8_t>  merged_ids_bac_;
+    std::span<const uint64_t> merged_hashes_arc_;
+    std::span<const uint8_t>  merged_ids_arc_;
+    std::vector<uint64_t> own_h_bac_, own_h_arc_;   // only populated by the k-way-merge fallback
+    std::vector<uint8_t>  own_id_bac_, own_id_arc_;
     BlockedBloom          merged_bloom_bac_;
     BlockedBloom          merged_bloom_arc_;
 
