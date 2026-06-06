@@ -309,9 +309,11 @@ struct ArchiveBuilderConfig {
     bool     build_gstx          = true;   // build GSTX genus-stats index (needs taxonomy_group + build_sketch)
     bool     build_gcov          = true;   // build GCOV per-genus covariance eigenbasis (needs build_gstx)
     bool     build_core          = true;   // build SEC_CORE per-genus prevalence cores (needs markers_path)
-    bool     build_pcore         = false;  // also build SEC_PCORE dense per-genus reference (small-contig
-                                           // contamination). OFF by default: the dense union is ~10-50x CORE
-                                           // and held in memory until finalize — opt in per build (--pcore).
+    bool     build_pcore         = true;   // build SEC_PCORE dense per-genus reference (small-contig
+                                           // contamination). ON by default: most contamination lives in
+                                           // small contigs and only the dense per-genus union resolves it.
+                                           // Memory is bounded (spilled to $GENOPACK_SPILL_DIR); on-disk
+                                           // size is large (~10-50x CORE). Disable with --no-pcore.
     float    core_theta          = 0.90f;  // prevalence threshold for genus-core membership
     uint32_t micro_genus_threshold = 0;    // min genus members for a dedicated shard + GSTX/GCOV/FMHR
                                            // model; smaller genera are bin-packed and unmodeled.

@@ -39,37 +39,74 @@ void PcoreWriter::add_from_members(uint64_t key_hash,
     for (const auto& q : member_qmers) est += q.size();
     cnt.reserve(est);
     for (const auto& q : member_qmers)
-        for (uint64_t h : q) ++cnt[h];
+        for (uint64_t h : q) ++cnt[h];                 // member sets are sorted-unique → counts members
+    add_from_counts(key_hash, cnt, n_mem);
+}
 
-    std::vector<uint64_t> aamers;
-    aamers.reserve(cnt.size());
-    for (const auto& [h, _] : cnt) aamers.push_back(h);
-    if (aamers.empty()) return;
-    std::sort(aamers.begin(), aamers.end());
-    std::vector<uint8_t> prev(aamers.size());
-    for (size_t i = 0; i < aamers.size(); ++i) {
-        const uint32_t c = cnt[aamers[i]];
-        prev[i] = static_cast<uint8_t>(c > 255u ? 255u : c);   // member count (cap 255)
+void PcoreWriter::add_from_counts(uint64_t key_hash,
+                                  const std::unordered_map<uint64_t, uint32_t>& cnt,
+                                  uint32_t n_mem) {
+    if (n_mem == 0 || cnt.empty()) return;
+
+    const uint32_t C = pcore_core_threshold(n_mem, theta_);   // ⌈θ·n⌉
+
+    // Stratify by TRUE count: core (c≥C) | singleton (c==1, c<C) | multi (otherwise).
+    std::vector<uint64_t> single;
+    std::vector<std::pair<uint64_t, uint8_t>> multi, core;
+    single.reserve(cnt.size());
+    for (const auto& [h, c] : cnt) {
+        if (c >= C)        core.emplace_back(h, pcore_quant_prev(c, n_mem));
+        else if (c <= 1)   single.push_back(h);
+        else               multi.emplace_back(h, pcore_quant_prev(c, n_mem));
     }
-    const uint32_t na = static_cast<uint32_t>(aamers.size());
+    auto by_hash = [](const auto& a, const auto& b) { return a.first < b.first; };
+    std::sort(single.begin(), single.end());
+    std::sort(multi.begin(),  multi.end(),  by_hash);
+    std::sort(core.begin(),   core.end(),   by_hash);
 
-    // Spill this genus's pool (8-aligned aamers, then prev). Only metadata stays in RAM.
+    std::vector<uint64_t> multi_h(multi.size()), core_h(core.size());
+    std::vector<uint8_t>  multi_q(multi.size()), core_q(core.size());
+    for (size_t i = 0; i < multi.size(); ++i) { multi_h[i] = multi[i].first; multi_q[i] = multi[i].second; }
+    for (size_t i = 0; i < core.size();  ++i) { core_h[i]  = core[i].first;  core_q[i]  = core[i].second; }
+
+    const std::vector<uint8_t> es = pfor::encode_sorted(single);
+    const std::vector<uint8_t> em = pfor::encode_sorted(multi_h);
+    const std::vector<uint8_t> ec = pfor::encode_sorted(core_h);
+
     open_spill_();
     static const char zeros[8] = {0};
     while (pool_cursor_ & 7u) { std::fwrite(zeros, 1, 1, spill_); ++pool_cursor_; }
-    const uint64_t aoff = pool_cursor_;
-    std::fwrite(aamers.data(), sizeof(uint64_t), na, spill_); pool_cursor_ += static_cast<uint64_t>(na) * 8;
-    const uint64_t poff = pool_cursor_;
-    std::fwrite(prev.data(), 1, na, spill_);                  pool_cursor_ += na;
-    meta_.push_back({key_hash, aoff, poff, na, n_mem});
+    const uint64_t run_off = pool_cursor_;
+    auto spill = [&](const void* p, size_t n) { if (n) std::fwrite(p, 1, n, spill_); pool_cursor_ += n; };
+    spill(es.data(), es.size());
+    spill(em.data(), em.size());
+    spill(ec.data(), ec.size());
+    spill(multi_q.data(), multi_q.size());
+    spill(core_q.data(),  core_q.size());
 
-    // Order-independent incremental model hash: XOR of per-entry digests.
+    EntryMeta m{};
+    m.key_hash      = key_hash;
+    m.run_off       = run_off;
+    m.n_singleton   = static_cast<uint32_t>(single.size());
+    m.n_multi       = static_cast<uint32_t>(multi_h.size());
+    m.n_core        = static_cast<uint32_t>(core_h.size());
+    m.n_members     = n_mem;
+    m.enc_singleton = static_cast<uint32_t>(es.size());
+    m.enc_multi     = static_cast<uint32_t>(em.size());
+    m.enc_core      = static_cast<uint32_t>(ec.size());
+    meta_.push_back(m);
+
+    // Order-independent incremental model hash (XOR of per-entry digests).
     XXH3_state_t* st = XXH3_createState();
     XXH3_64bits_reset(st);
     XXH3_64bits_update(st, &key_hash, sizeof(key_hash));
-    XXH3_64bits_update(st, &na, sizeof(na));
-    XXH3_64bits_update(st, aamers.data(), static_cast<size_t>(na) * sizeof(uint64_t));
-    XXH3_64bits_update(st, prev.data(), na);
+    const uint32_t cnts[4] = { m.n_singleton, m.n_multi, m.n_core, m.n_members };
+    XXH3_64bits_update(st, cnts, sizeof(cnts));
+    if (!es.empty()) XXH3_64bits_update(st, es.data(), es.size());
+    if (!em.empty()) XXH3_64bits_update(st, em.data(), em.size());
+    if (!ec.empty()) XXH3_64bits_update(st, ec.data(), ec.size());
+    if (!multi_q.empty()) XXH3_64bits_update(st, multi_q.data(), multi_q.size());
+    if (!core_q.empty())  XXH3_64bits_update(st, core_q.data(),  core_q.size());
     hash_fold_ ^= XXH3_64bits_digest(st);
     XXH3_freeState(st);
 }
@@ -77,7 +114,8 @@ void PcoreWriter::add_from_members(uint64_t key_hash,
 uint64_t PcoreWriter::model_hash() const {
     uint32_t theta_bits;
     std::memcpy(&theta_bits, &theta_, 4);
-    uint64_t buf[3] = { (static_cast<uint64_t>(k_) << 32) | min_seg_aa_, theta_bits, 0 };
+    uint64_t buf[4] = { (static_cast<uint64_t>(k_) << 32) | min_seg_aa_, theta_bits,
+                        fmh_seed_, taxonomy_hash_ };
     return XXH3_64bits(buf, sizeof(buf)) ^ hash_fold_;
 }
 
@@ -96,19 +134,24 @@ SectionDesc PcoreWriter::finalize(AppendWriter& w, uint64_t section_id, uint64_t
         buckets[slot] = i;
     }
 
-    const uint64_t entries_off = sizeof(PcoreHeader);
-    const uint64_t buckets_off = entries_off + static_cast<uint64_t>(n) * sizeof(PcoreEntry);
+    const uint64_t entries_off = sizeof(PcoreHeader) + sizeof(PcoreHeaderExtV1);   // 128
+    const uint64_t buckets_off = entries_off + static_cast<uint64_t>(n) * sizeof(PcoreEntryV1);
     uint64_t pool_off = buckets_off + static_cast<uint64_t>(n_buckets) * sizeof(uint32_t);
     pool_off = (pool_off + 7) & ~uint64_t{7};
 
-    // Section-relative offsets = pool_off + spilled-pool-relative offset (both 8-aligned).
-    std::vector<PcoreEntry> ents(n);
+    std::vector<PcoreEntryV1> ents(n);
     for (uint32_t i = 0; i < n; ++i) {
-        ents[i].key_hash      = meta_[i].key_hash;
-        ents[i].aamers_offset = pool_off + meta_[i].aamers_off;
-        ents[i].prev_offset   = pool_off + meta_[i].prev_off;
-        ents[i].n_aamers      = meta_[i].n_aamers;
-        ents[i].n_members     = meta_[i].n_members;
+        const auto& m = meta_[i];
+        ents[i].key_hash     = m.key_hash;
+        ents[i].run_offset   = pool_off + m.run_off;
+        ents[i].n_singleton  = m.n_singleton;
+        ents[i].n_multi      = m.n_multi;
+        ents[i].n_core       = m.n_core;
+        ents[i].n_members    = m.n_members;
+        ents[i].enc_singleton= m.enc_singleton;
+        ents[i].enc_multi    = m.enc_multi;
+        ents[i].enc_core     = m.enc_core;
+        ents[i]._pad         = 0;
     }
 
     w.align(8);
@@ -125,13 +168,22 @@ SectionDesc PcoreWriter::finalize(AppendWriter& w, uint64_t section_id, uint64_t
     hdr.model_hash     = model_hash();
     hdr.entries_offset = entries_off;
     hdr.buckets_offset = buckets_off;
+    hdr.codec          = PCORE_CODEC_V1;
+    hdr.prev_quant     = PCORE_PREVQ_LOGN;
+    hdr.frame_table_id = frame_table_id_;
+    hdr.header_bytes   = 128;
+
+    PcoreHeaderExtV1 ext{};
+    ext.fmh_seed      = fmh_seed_;
+    ext.taxonomy_hash = taxonomy_hash_;
+    ext.k_frame_pin   = (static_cast<uint64_t>(k_) << 8) | frame_table_id_;
 
     w.append(&hdr, sizeof(hdr));
-    if (n) w.append(ents.data(), static_cast<uint64_t>(n) * sizeof(PcoreEntry));
+    w.append(&ext, sizeof(ext));
+    if (n) w.append(ents.data(), static_cast<uint64_t>(n) * sizeof(PcoreEntryV1));
     w.append(buckets.data(), static_cast<uint64_t>(n_buckets) * sizeof(uint32_t));
-    w.align(8);   // reach pool_off (section_start is 8-aligned)
+    w.align(8);
 
-    // Stream the spilled pool verbatim into the section (bounded memory).
     if (spill_ && pool_cursor_ > 0) {
         std::rewind(spill_);
         std::vector<char> buf(1u << 20);
@@ -146,7 +198,7 @@ SectionDesc PcoreWriter::finalize(AppendWriter& w, uint64_t section_id, uint64_t
     const uint64_t section_end = w.current_offset();
     SectionDesc sd{};
     sd.type              = SEC_PCORE;
-    sd.version           = 1;
+    sd.version           = 2;                          // v1 stratified-PFOR codec
     sd.section_id        = section_id;
     sd.file_offset       = section_start;
     sd.compressed_size   = section_end - section_start;

@@ -28,13 +28,22 @@ namespace genopack::check {
 // A reference aamer span. `prev`/`n_members` carry PCORE member counts (per-aamer
 // prevalence); for the sparse CORE fallback they are null → prevalence defaults 1.0.
 struct AamerSpan {
-    const uint64_t* aamers    = nullptr;
-    uint32_t        n         = 0;
-    const uint8_t*  prev      = nullptr;   // member counts, parallel to aamers (optional)
-    uint32_t        n_members = 0;
+    const uint64_t* aamers = nullptr;
+    uint32_t        n      = 0;
+    const float*    prevf  = nullptr;   // dequantized prevalence in (0,1], parallel; null => 1.0
     bool  valid() const noexcept { return aamers != nullptr && n > 0; }
-    float prevalence(uint32_t i) const noexcept {
-        return (prev && n_members) ? static_cast<float>(prev[i]) / static_cast<float>(n_members) : 1.0f;
+    float prevalence(uint32_t i) const noexcept { return prevf ? prevf[i] : 1.0f; }
+};
+
+// Owns a decoded per-genus union (PCORE v1 runs decode here; legacy/CORE copy here)
+// so an AamerSpan view stays valid for the lifetime of the refset build.
+struct OwnedSpan {
+    std::vector<uint64_t> aamers;
+    std::vector<float>    prevf;
+    bool valid() const noexcept { return !aamers.empty(); }
+    AamerSpan view() const noexcept {
+        return { aamers.data(), static_cast<uint32_t>(aamers.size()),
+                 prevf.empty() ? nullptr : prevf.data() };
     }
 };
 

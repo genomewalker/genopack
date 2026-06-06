@@ -272,14 +272,26 @@ void run_pass_b(ICheckReader& pack,
             const CoreReader* cr = pack.core_reader();
             foreign_k = cr->k(); foreign_min_seg = cr->min_seg_aa(); foreign_frac_max = cr->frac_max_hash();
         }
-        // Genus reference span (dense PCORE preferred, else sparse CORE).
-        auto genus_span = [&](const std::string& g) -> AamerSpan {
-            if (use_pcore) { PcoreView v = pack.pcore_for_genus(g); return {v.aamers, v.n_aamers, v.prev, v.n_members}; }
-            CoreView v = pack.core_for_genus(g); return {v.aamers, v.n_aamers, nullptr, 0};
+        // Genus reference span (dense PCORE preferred, else sparse CORE). PCORE v1
+        // runs are PFOR-encoded, so the union is decoded into an OwnedSpan whose
+        // backing vectors must outlive the refset build below.
+        auto materialize_genus = [&](const std::string& g) -> OwnedSpan {
+            OwnedSpan o;
+            if (use_pcore) { PcoreView v = pack.pcore_for_genus(g); if (v.valid()) v.materialize(o.aamers, o.prevf); }
+            else { CoreView v = pack.core_for_genus(g); if (v.valid()) o.aamers.assign(v.aamers, v.aamers + v.n_aamers); }
+            return o;
         };
-        auto genus_span_by_hash = [&](uint64_t h) -> AamerSpan {
-            if (use_pcore) { PcoreView v = pack.pcore_reader()->lookup(h); return {v.aamers, v.n_aamers, v.prev, v.n_members}; }
-            CoreView v = pack.core_reader()->lookup(h); return {v.aamers, v.n_aamers, nullptr, 0};
+        auto materialize_by_hash = [&](uint64_t h) -> OwnedSpan {
+            OwnedSpan o;
+            if (use_pcore) { PcoreView v = pack.pcore_reader()->lookup(h); if (v.valid()) v.materialize(o.aamers, o.prevf); }
+            else { CoreView v = pack.core_reader()->lookup(h); if (v.valid()) o.aamers.assign(v.aamers, v.aamers + v.n_aamers); }
+            return o;
+        };
+        auto materialize_family = [&](const std::string& f) -> OwnedSpan {
+            OwnedSpan o;
+            if (use_pcore) { PcoreView v = pack.pcore_for_family(f); if (v.valid()) v.materialize(o.aamers, o.prevf); }
+            else { CoreView v = pack.core_for_family(f); if (v.valid()) o.aamers.assign(v.aamers, v.aamers + v.n_aamers); }
+            return o;
         };
         const uint32_t n_entries = use_pcore ? pack.pcore_reader()->n_entries()
                                              : pack.core_reader()->n_genera();
@@ -297,27 +309,25 @@ void run_pass_b(ICheckReader& pack,
         }
         size_t built = 0;
         for (auto& [genus, rs] : genus_refset) {
-            AamerSpan host = genus_span(genus);
+            OwnedSpan host = materialize_genus(genus);
             if (!host.valid()) { rs.valid = false; continue; }
             const std::string& family = genus_family[genus];
-            AamerSpan fam_span;
-            if (!family.empty()) {
-                if (use_pcore) { PcoreView fv = pack.pcore_for_family(family);
-                                 if (fv.valid()) fam_span = {fv.aamers, fv.n_aamers, fv.prev, fv.n_members}; }
-                else { CoreView fcv = pack.core_for_family(family);
-                       if (fcv.valid()) fam_span = {fcv.aamers, fcv.n_aamers, nullptr, 0}; }
-            }
+            OwnedSpan fam;
+            if (!family.empty()) fam = materialize_family(family);
+            std::vector<OwnedSpan> fstore;                 // owns decoded foreign unions
             std::vector<std::pair<uint64_t, AamerSpan>> foreign;
             std::unordered_set<uint64_t> used;
             used.insert(GcovWriter::hash_genus(genus));
             auto fit = pass_a.family_to_genera.find(family);
+            if (fit != pass_a.family_to_genera.end()) fstore.reserve(fit->second.size() + 64);
+            else fstore.reserve(64);
             if (fit != pass_a.family_to_genera.end())
                 for (const auto& sib : fit->second) {
                     if (sib == genus) continue;
                     uint64_t sh = GcovWriter::hash_genus(sib);
                     if (!used.insert(sh).second) continue;
-                    AamerSpan sp = genus_span(sib);
-                    if (sp.valid()) foreign.emplace_back(sh, sp);
+                    OwnedSpan sp = materialize_genus(sib);
+                    if (sp.valid()) { fstore.push_back(std::move(sp)); foreign.emplace_back(sh, fstore.back().view()); }
                 }
             if (n_entries > 0) {
                 const uint32_t start = static_cast<uint32_t>(GcovWriter::hash_genus(genus) % n_entries);
@@ -325,11 +335,11 @@ void run_pass_b(ICheckReader& pack,
                 for (uint32_t s = 0; s < n_entries && bg < 50; ++s) {
                     const uint64_t gh = entry_hash_at((start + s) % n_entries);
                     if (!used.insert(gh).second) continue;
-                    AamerSpan sp = genus_span_by_hash(gh);
-                    if (sp.valid()) { foreign.emplace_back(gh, sp); ++bg; }
+                    OwnedSpan sp = materialize_by_hash(gh);
+                    if (sp.valid()) { fstore.push_back(std::move(sp)); foreign.emplace_back(gh, fstore.back().view()); ++bg; }
                 }
             }
-            rs = build_foreign_refset(host, fam_span, foreign);
+            rs = build_foreign_refset(host.view(), fam.view(), foreign);
             if (rs.valid) ++built;
         }
         spdlog::info("check pass-B: foreign-aamer refsets built for {} genera ({} reference, k={})",

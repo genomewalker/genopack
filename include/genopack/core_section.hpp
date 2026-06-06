@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <span>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 namespace genopack {
@@ -69,6 +70,11 @@ public:
     void add_from_members(uint64_t genus_hash,
                           const std::vector<std::vector<uint64_t>>& member_qmers,
                           std::vector<uint64_t> member_ids);
+
+    // Streaming hash-aggregation entry point: caller supplies the per-genus aamer→
+    // member-count map; identical core to add_from_members (same theta) → same hash.
+    void add_from_counts(uint64_t genus_hash, const std::unordered_map<uint64_t, uint32_t>& cnt,
+                         uint32_t n_members, std::vector<uint64_t> member_ids);
 
     // Direct add of an already-computed sorted-unique core.
     void add(uint64_t genus_hash, std::vector<uint64_t> core_aamers,

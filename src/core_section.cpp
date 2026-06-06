@@ -36,6 +36,19 @@ void CoreWriter::add_from_members(uint64_t genus_hash,
     add(genus_hash, std::move(core), std::move(member_ids));
 }
 
+void CoreWriter::add_from_counts(uint64_t genus_hash,
+                                 const std::unordered_map<uint64_t, uint32_t>& cnt,
+                                 uint32_t n_members, std::vector<uint64_t> member_ids) {
+    if (n_members == 0 || cnt.empty()) return;
+    const auto thr = static_cast<uint32_t>(std::ceil(static_cast<double>(theta_) * n_members));
+    std::vector<uint64_t> core;
+    core.reserve(cnt.size());
+    for (const auto& [h, c] : cnt)
+        if (c >= thr) core.push_back(h);
+    std::sort(core.begin(), core.end());
+    add(genus_hash, std::move(core), std::move(member_ids));
+}
+
 uint64_t CoreWriter::core_model_hash() const {
     std::vector<const Entry*> ord;
     ord.reserve(entries_.size());
