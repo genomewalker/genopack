@@ -315,6 +315,11 @@ struct ArchiveBuilderConfig {
                                            // Memory is bounded (spilled to $GENOPACK_SPILL_DIR); on-disk
                                            // size is large (~10-50x CORE). Disable with --no-pcore.
     float    core_theta          = 0.90f;  // prevalence threshold for genus-core membership
+    uint32_t genus_member_cap    = 2000;   // max members folded into the CORE/PCORE aamer union per
+                                           // genus. The union saturates ~here, so density (small-
+                                           // contig recall) is preserved while keep-all counting
+                                           // stays tractable (all 600k Escherichia members ≈ 10^13
+                                           // hashmap ops). 0 = unlimited (keep-all, infeasible).
     uint32_t micro_genus_threshold = 0;    // min genus members for a dedicated shard + GSTX/GCOV/FMHR
                                            // model; smaller genera are bin-packed and unmodeled.
                                            // 0 = auto (scales with corpus: 4 if <=50k genomes, 8 if

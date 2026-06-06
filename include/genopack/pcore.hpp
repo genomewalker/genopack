@@ -197,6 +197,10 @@ public:
     // memory is a single genus's union — bounded even for 600k-member genera.
     void add_from_counts(uint64_t key_hash, const std::unordered_map<uint64_t, uint32_t>& cnt,
                          uint32_t n_members);
+    // Fast path: caller supplies the genus union as globally-sorted (aamer, count)
+    // arrays (from GenusAamerCounter::finalize_sorted) — no internal re-sort.
+    void add_sorted(uint64_t key_hash, const std::vector<uint64_t>& aamers,
+                    const std::vector<uint32_t>& counts, uint32_t n_members);
 
     uint64_t model_hash() const;
     SectionDesc finalize(AppendWriter& w, uint64_t section_id, uint64_t frac_max_hash);

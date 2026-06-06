@@ -1,4 +1,5 @@
 #include <genopack/archive.hpp>
+#include <genopack/aamer_counter.hpp>
 #include <genopack/accx.hpp>
 #include <genopack/oph_sketch.hpp>
 #include <genopack/skch.hpp>
@@ -1064,7 +1065,7 @@ struct ArchiveBuilder::Impl {
             // Cross-chunk CORE/PCORE aggregation: a mega-genus splits across many
             // 512MB shard-chunks; fold each chunk's aamer counts here and emit one
             // full-density CORE/PCORE once all the genus's members have arrived.
-            std::unordered_map<uint64_t, uint32_t> genus_counts;
+            std::unique_ptr<GenusAamerCounter> genus_counter;   // lazily allocated on first fold
             std::vector<uint64_t> member_ids;
             uint32_t arrived = 0;
             bool model_emitted = false;
@@ -1098,6 +1099,14 @@ struct ArchiveBuilder::Impl {
         // Marker scoring at build time — same FASTA pass as GCOV/FMH.
         std::unique_ptr<MarkerReader> build_mrk_rd;
         uint64_t build_mrk_frac_max = UINT64_MAX;
+        {   // GENOPACK_AAMER_FRAC=N → keep 1/N of protein aamers for CORE/PCORE. Keep-all
+            // (N=1) is computationally infeasible at 9.2M (~6.5M aamers/genome → ~10^13
+            // hashmap counts/part); subsample so per-genus counting stays tractable.
+            const char* af = std::getenv("GENOPACK_AAMER_FRAC");
+            const uint64_t div = (af && *af) ? std::strtoull(af, nullptr, 10) : 1;
+            if (div > 1) { build_mrk_frac_max = UINT64_MAX / div;
+                spdlog::info("build: aamer subsample 1/{} (CORE/PCORE)", div); }
+        }
         if (!cfg.markers_path.empty()) {
             build_mrk_rd = std::make_unique<MarkerReader>();
             try {
@@ -1129,7 +1138,7 @@ struct ArchiveBuilder::Impl {
         }
 
         auto flush_staging_buf = [&](std::vector<ChunkItem>& buf,
-                                     std::unordered_map<uint64_t, uint32_t>* accum_counts = nullptr,
+                                     std::unique_ptr<GenusAamerCounter>* accum_holder = nullptr,
                                      std::vector<uint64_t>* accum_member_ids = nullptr) {
             if (buf.empty()) return;
             // Sort by kmer NN chain (if enabled) or oph_fingerprint
@@ -1474,8 +1483,22 @@ struct ArchiveBuilder::Impl {
                         // aggregated counts, so stream members through one combiner (bounded RAM
                         // even for 600k-member genera) and keep per-member sets only for SCG.
                         std::vector<std::vector<uint64_t>> genome_qmers(do_markers ? buf.size() : 0);
-                        std::unordered_map<uint64_t, uint32_t> genus_counts;
                         std::vector<uint64_t> qtmp;
+                        // Hash-partitioned cache-resident EXACT prevalence counter (replaces the
+                        // DRAM-bound unordered_map, ~1000×): cross-chunk genera accumulate in the
+                        // bucket's persistent counter; a chunk-local genus uses a local one.
+                        GenusAamerCounter local_counter;
+                        if (accum_holder && !*accum_holder) *accum_holder = std::make_unique<GenusAamerCounter>();
+                        GenusAamerCounter* const ctr = accum_holder ? accum_holder->get() : &local_counter;
+                        const bool cross_chunk = (accum_holder != nullptr);
+                        // Member cap: a genus's aamer UNION saturates, so once ~cap members
+                        // have been folded we stop counting more — this keeps CORE/PCORE
+                        // density while making keep-all aggregation tractable at 600k-member
+                        // scale (counting all members is ~10^13 hashmap ops/part). The SCG
+                        // path (opt-in) still extracts every member for per-genome scoring.
+                        const bool aamers_capped = (cfg.genus_member_cap > 0) && accum_member_ids
+                            && accum_member_ids->size() >= cfg.genus_member_cap;
+                        const bool do_extract = need_aamers && (do_markers || !aamers_capped);
 
                         for (size_t ii = 0; ii < buf.size(); ++ii) {
                             const auto& fasta = buf[ii].fasta;
@@ -1510,14 +1533,17 @@ struct ArchiveBuilder::Impl {
                                     if (!vecs.empty())
                                         fmh_all.insert(fmh_all.end(), vecs[0].begin(), vecs[0].end());
                                 }
-                                if (need_aamers)
+                                if (do_extract)
                                     extract_aamers_dna_into(seq, AAMER_K, 8,
                                                               build_mrk_frac_max, qref);
                             }
-                            if (need_aamers) {
+                            if (do_extract) {
                                 std::sort(qref.begin(), qref.end());
                                 qref.erase(std::unique(qref.begin(), qref.end()), qref.end());
-                                for (uint64_t h : qref) ++genus_counts[h];   // streaming aggregate
+                                if (!aamers_capped) {
+                                    ctr->add_sorted(qref);                       // exact partitioned count
+                                    if (accum_member_ids) accum_member_ids->push_back(buf[ii].genome_id);
+                                }
                             }
                         }
 
@@ -1536,25 +1562,18 @@ struct ArchiveBuilder::Impl {
 
                         // Per-genus prevalence core (SEC_CORE) from the per-genome
                         // marker aamers extracted above — zero extra FASTA passes.
-                        if (need_aamers && (cfg.build_core || cfg.build_pcore) && !genus_counts.empty()) {
-                            if (accum_counts) {
-                                // Cross-chunk: fold this chunk's per-aamer member counts into
-                                // the persistent per-genus accumulator; CORE/PCORE are emitted
-                                // once, on genus completion (a genome is in exactly one chunk,
-                                // so summed chunk-counts == true genus member counts).
-                                for (const auto& [h, c] : genus_counts) (*accum_counts)[h] += c;
-                                if (accum_member_ids)
-                                    for (const auto& qr : pending_qrs) accum_member_ids->push_back(qr.genome_id);
-                            } else {
-                                const uint64_t gkh = GcovWriter::hash_genus(genus_key);
-                                std::vector<uint64_t> member_ids;
-                                member_ids.reserve(pending_qrs.size());
-                                for (const auto& qr : pending_qrs) member_ids.push_back(qr.genome_id);
-                                if (cfg.build_core)
-                                    build_core_w.add_from_counts(gkh, genus_counts, n_mem, member_ids);
-                                if (cfg.build_pcore)
-                                    build_pcore_w.add_from_counts(gkh, genus_counts, n_mem);
-                            }
+                        // CORE/PCORE: a chunk-local genus emits now from its counter; cross-chunk
+                        // genera are emitted once on completion (emit_core_pcore) from the bucket
+                        // counter. (Members were folded into `ctr` in the loop above.)
+                        if (!cross_chunk && (cfg.build_core || cfg.build_pcore) && !local_counter.empty()) {
+                            std::vector<uint64_t> aamers; std::vector<uint32_t> counts;
+                            local_counter.finalize_sorted(aamers, counts);
+                            const uint64_t gkh = GcovWriter::hash_genus(genus_key);
+                            std::vector<uint64_t> member_ids;
+                            member_ids.reserve(pending_qrs.size());
+                            for (const auto& qr : pending_qrs) member_ids.push_back(qr.genome_id);
+                            if (cfg.build_core)  build_core_w.add_sorted(gkh, aamers, counts, n_mem, member_ids);
+                            if (cfg.build_pcore) build_pcore_w.add_sorted(gkh, aamers, counts, n_mem);
                         }
 
                         // Score contigs and populate outlier fields.
@@ -1684,17 +1703,19 @@ struct ArchiveBuilder::Impl {
         };
 
         // Emit one full-density CORE/PCORE for a genus once all its members have been
-        // folded into bucket.genus_counts (the cross-chunk aggregation), then free it.
+        // folded into bucket.genus_counter (the cross-chunk aggregation), then free it.
         auto emit_core_pcore = [&](const std::string& key, TaxonBucket& b) {
-            if (b.model_emitted || b.genus_counts.empty()) return;
+            if (b.model_emitted || !b.genus_counter || b.genus_counter->empty()) return;
+            std::vector<uint64_t> aamers; std::vector<uint32_t> counts;
+            b.genus_counter->finalize_sorted(aamers, counts);
             const uint64_t gkh = GcovWriter::hash_genus(key);
-            const uint32_t n_mem = genus_total.count(key) ? genus_total[key] : b.arrived;
-            if (cfg.build_core)
-                build_core_w.add_from_counts(gkh, b.genus_counts, n_mem, b.member_ids);
-            if (cfg.build_pcore)
-                build_pcore_w.add_from_counts(gkh, b.genus_counts, n_mem);
+            // n_mem = members actually FOLDED (the count basis; capped) so the ceil(theta*n)
+            // core slice and the prevalences are relative to the sampled members.
+            const uint32_t n_mem = static_cast<uint32_t>(b.member_ids.size());
+            if (cfg.build_core)  build_core_w.add_sorted(gkh, aamers, counts, n_mem, b.member_ids);
+            if (cfg.build_pcore) build_pcore_w.add_sorted(gkh, aamers, counts, n_mem);
             b.model_emitted = true;
-            std::unordered_map<uint64_t, uint32_t>().swap(b.genus_counts);  // free union RAM
+            b.genus_counter.reset();                       // free union RAM
             std::vector<uint64_t>().swap(b.member_ids);
         };
 
@@ -1730,19 +1751,19 @@ struct ArchiveBuilder::Impl {
                         // All members of a modeled genus have arrived → flush the
                         // remainder (folds it in) and emit one full-density CORE/PCORE.
                         taxon_total_bytes -= bucket.raw_bytes;
-                        flush_staging_buf(bucket.items, &bucket.genus_counts, &bucket.member_ids);
+                        flush_staging_buf(bucket.items, &bucket.genus_counter, &bucket.member_ids);
                         bucket.raw_bytes = 0;
                         emit_core_pcore(key, bucket);
                     } else if (bucket.raw_bytes >= cfg.shard_cfg.max_shard_size_bytes) {
                         taxon_total_bytes -= bucket.raw_bytes;
-                        flush_staging_buf(bucket.items, &bucket.genus_counts, &bucket.member_ids);
+                        flush_staging_buf(bucket.items, &bucket.genus_counter, &bucket.member_ids);
                         bucket.raw_bytes = 0;
                     } else if (taxon_total_bytes >= taxon_global_cap) {
                         // Find and flush the largest bucket to stay under cap
                         auto it = std::max_element(taxon_buckets.begin(), taxon_buckets.end(),
                             [](const auto& a, const auto& b){ return a.second.raw_bytes < b.second.raw_bytes; });
                         taxon_total_bytes -= it->second.raw_bytes;
-                        flush_staging_buf(it->second.items, &it->second.genus_counts, &it->second.member_ids);
+                        flush_staging_buf(it->second.items, &it->second.genus_counter, &it->second.member_ids);
                         it->second.raw_bytes = 0;
                     }
                 } else {
@@ -1777,7 +1798,7 @@ struct ArchiveBuilder::Impl {
                     micro_queue.push_back({key, std::move(bucket.items)});
                 } else {
                     taxon_total_bytes -= bucket.raw_bytes;
-                    flush_staging_buf(bucket.items, &bucket.genus_counts, &bucket.member_ids);
+                    flush_staging_buf(bucket.items, &bucket.genus_counter, &bucket.member_ids);
                     bucket.raw_bytes = 0;
                     emit_core_pcore(key, bucket);
                 }

@@ -23,6 +23,7 @@ void PcoreWriter::open_spill_() {
     const char* env = std::getenv("GENOPACK_SPILL_DIR");
     std::filesystem::path dir = (env && *env) ? std::filesystem::path(env)
                                               : std::filesystem::temp_directory_path();
+    std::error_code ec; std::filesystem::create_directories(dir, ec);
     static std::atomic<uint64_t> ctr{0};
     spill_path_ = (dir / ("pcore_spill_" + std::to_string(::getpid()) + "_" +
                           std::to_string(ctr.fetch_add(1)) + ".tmp")).string();
@@ -47,27 +48,32 @@ void PcoreWriter::add_from_counts(uint64_t key_hash,
                                   const std::unordered_map<uint64_t, uint32_t>& cnt,
                                   uint32_t n_mem) {
     if (n_mem == 0 || cnt.empty()) return;
+    std::vector<uint64_t> aamers; aamers.reserve(cnt.size());
+    for (const auto& [h, c] : cnt) { (void)c; aamers.push_back(h); }
+    std::sort(aamers.begin(), aamers.end());
+    std::vector<uint32_t> counts(aamers.size());
+    for (size_t i = 0; i < aamers.size(); ++i) counts[i] = cnt.at(aamers[i]);
+    add_sorted(key_hash, aamers, counts, n_mem);
+}
+
+void PcoreWriter::add_sorted(uint64_t key_hash,
+                             const std::vector<uint64_t>& aamers,
+                             const std::vector<uint32_t>& counts,
+                             uint32_t n_mem) {
+    if (n_mem == 0 || aamers.empty()) return;
 
     const uint32_t C = pcore_core_threshold(n_mem, theta_);   // ⌈θ·n⌉
 
-    // Stratify by TRUE count: core (c≥C) | singleton (c==1, c<C) | multi (otherwise).
-    std::vector<uint64_t> single;
-    std::vector<std::pair<uint64_t, uint8_t>> multi, core;
-    single.reserve(cnt.size());
-    for (const auto& [h, c] : cnt) {
-        if (c >= C)        core.emplace_back(h, pcore_quant_prev(c, n_mem));
-        else if (c <= 1)   single.push_back(h);
-        else               multi.emplace_back(h, pcore_quant_prev(c, n_mem));
+    // aamers is globally sorted ascending → each run is a sorted subsequence, so no
+    // per-run re-sort. Stratify by TRUE count: core (c≥C) | singleton (c==1) | multi.
+    std::vector<uint64_t> single, multi_h, core_h;
+    std::vector<uint8_t>  multi_q, core_q;
+    for (size_t i = 0; i < aamers.size(); ++i) {
+        const uint64_t h = aamers[i]; const uint32_t c = counts[i];
+        if (c >= C)      { core_h.push_back(h);  core_q.push_back(pcore_quant_prev(c, n_mem)); }
+        else if (c <= 1) { single.push_back(h); }
+        else             { multi_h.push_back(h); multi_q.push_back(pcore_quant_prev(c, n_mem)); }
     }
-    auto by_hash = [](const auto& a, const auto& b) { return a.first < b.first; };
-    std::sort(single.begin(), single.end());
-    std::sort(multi.begin(),  multi.end(),  by_hash);
-    std::sort(core.begin(),   core.end(),   by_hash);
-
-    std::vector<uint64_t> multi_h(multi.size()), core_h(core.size());
-    std::vector<uint8_t>  multi_q(multi.size()), core_q(core.size());
-    for (size_t i = 0; i < multi.size(); ++i) { multi_h[i] = multi[i].first; multi_q[i] = multi[i].second; }
-    for (size_t i = 0; i < core.size();  ++i) { core_h[i]  = core[i].first;  core_q[i]  = core[i].second; }
 
     const std::vector<uint8_t> es = pfor::encode_sorted(single);
     const std::vector<uint8_t> em = pfor::encode_sorted(multi_h);

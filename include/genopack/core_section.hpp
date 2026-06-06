@@ -75,6 +75,11 @@ public:
     // member-count map; identical core to add_from_members (same theta) → same hash.
     void add_from_counts(uint64_t genus_hash, const std::unordered_map<uint64_t, uint32_t>& cnt,
                          uint32_t n_members, std::vector<uint64_t> member_ids);
+    // Fast path: globally-sorted (aamer, count) arrays (from GenusAamerCounter); the
+    // core (count ≥ ⌈θ·n⌉) is a sorted subsequence — no re-sort.
+    void add_sorted(uint64_t genus_hash, const std::vector<uint64_t>& aamers,
+                    const std::vector<uint32_t>& counts, uint32_t n_members,
+                    std::vector<uint64_t> member_ids);
 
     // Direct add of an already-computed sorted-unique core.
     void add(uint64_t genus_hash, std::vector<uint64_t> core_aamers,
