@@ -4061,6 +4061,18 @@ int main(int argc, char** argv) {
     });
 
     // genopack markers score
+    auto* markers_remerge_cmd = markers_cmd->add_subcommand("remerge",
+        "Append the pre-merged pool to an existing .mrk panel (in place) so MarkerReader uses its "
+        "zero-copy mmap fast-path instead of copying ~450MB per worker. No source genomes needed.");
+    std::string mr_panel;
+    markers_remerge_cmd->add_option("panel", mr_panel, "Path to .mrk panel")->required();
+    markers_remerge_cmd->callback([&]() {
+        bool did = genopack::markers_add_premerged(mr_panel);
+        spdlog::info("markers remerge: {} {}", mr_panel,
+                     did ? "-> pre-merged section appended" : "already present (no-op)");
+        std::exit(0);
+    });
+
     auto* markers_score_cmd = markers_cmd->add_subcommand("score",
         "Score a FASTA file for SCG marker completeness");
     std::string ms_fasta, ms_mrk, ms_genus;

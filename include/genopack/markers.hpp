@@ -194,6 +194,12 @@ struct BlockedBloom {
 
 // ── Writer ────────────────────────────────────────────────────────────────────
 
+// Append the pre-merged pool section (k-way merge of the per-marker pools) to an
+// existing .mrk that lacks it, and patch merged_bac_off/merged_arc_off in the header.
+// Activates MarkerReader's zero-copy mmap fast-path. No source genomes needed.
+// No-op if the panel already has the section. Returns true if the panel was rewritten.
+bool markers_add_premerged(const std::filesystem::path& path);
+
 class MarkerWriter {
 public:
     // Register a marker family's global hash set (sorted, deduplicated).
@@ -399,6 +405,8 @@ public:
     }
 
     bool has_merged_pool() const { return !merged_hashes_bac_.empty(); }
+    bool has_premerged()   const { return hdr_ && hdr_->merged_bac_off != 0; }
+    uint64_t file_size()   const { return mmap_.size(); }
     uint32_t pool_n_hashes(uint8_t mi) const {
         return pool_idx_ ? pool_idx_[mi].n_hashes : 0;
     }

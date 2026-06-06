@@ -1,4 +1,5 @@
 #include <genopack/markers.hpp>
+#include <cstddef>
 #include <cstring>
 #include <fstream>
 #include <numeric>
@@ -184,6 +185,53 @@ void MarkerWriter::finalize(const std::filesystem::path& path,
     }
 
     if (!f) throw std::runtime_error("markers: write failed: " + path.string());
+}
+
+// Append the pre-merged pool to an existing panel + patch the header offsets so
+// MarkerReader takes its zero-copy mmap fast-path. No source genomes needed.
+bool markers_add_premerged(const std::filesystem::path& path) {
+    std::vector<uint64_t> bh, ah;
+    std::vector<uint8_t>  bi, ai;
+    uint64_t fsz = 0;
+    {
+        MarkerReader mr;
+        mr.open(path);
+        if (mr.has_premerged()) return false;          // already has it
+        mr.build_merged_pool();                        // k-way merge into owned arrays
+        const auto bhs = mr.merged_hashes_bac(); const auto bis = mr.merged_ids_bac();
+        const auto ahs = mr.merged_hashes_arc(); const auto ais = mr.merged_ids_arc();
+        bh.assign(bhs.begin(), bhs.end()); bi.assign(bis.begin(), bis.end());
+        ah.assign(ahs.begin(), ahs.end()); ai.assign(ais.begin(), ais.end());
+        fsz = mr.file_size();
+    }
+
+    const uint64_t mbac = (fsz + 7) & ~uint64_t{7};
+    const uint64_t bac_bytes = bh.size() * sizeof(uint64_t) + bi.size();
+    const uint64_t marc = ah.empty() ? 0 : ((mbac + bac_bytes + 7) & ~uint64_t{7});
+    if (mbac > UINT32_MAX || marc > UINT32_MAX)
+        throw std::runtime_error("markers remerge: panel too large for 32-bit offsets");
+
+    std::fstream f(path, std::ios::in | std::ios::out | std::ios::binary);
+    if (!f) throw std::runtime_error("markers remerge: cannot open " + path.string());
+    auto wr = [&](const void* p, size_t n) { f.write(reinterpret_cast<const char*>(p),
+                                                     static_cast<std::streamsize>(n)); };
+    auto pad_to = [&](uint64_t target) {
+        const uint64_t cur = static_cast<uint64_t>(f.tellp());
+        if (target > cur) { std::vector<char> z(target - cur, 0); wr(z.data(), z.size()); }
+    };
+    f.seekp(0, std::ios::end);
+    pad_to(mbac);
+    wr(bh.data(), bh.size() * sizeof(uint64_t)); wr(bi.data(), bi.size());
+    if (!ah.empty()) {
+        pad_to(marc);
+        wr(ah.data(), ah.size() * sizeof(uint64_t)); wr(ai.data(), ai.size());
+    }
+    const uint32_t mb = static_cast<uint32_t>(mbac), ma = static_cast<uint32_t>(marc);
+    f.seekp(offsetof(MarkerHeader, merged_bac_off), std::ios::beg); wr(&mb, 4);
+    f.seekp(offsetof(MarkerHeader, merged_arc_off), std::ios::beg); wr(&ma, 4);
+    f.flush();
+    if (!f) throw std::runtime_error("markers remerge: write failed: " + path.string());
+    return true;
 }
 
 } // namespace genopack
