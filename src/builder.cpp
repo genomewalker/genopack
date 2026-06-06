@@ -1114,7 +1114,9 @@ struct ArchiveBuilder::Impl {
         // When disabled: single flat buffer (same as before, but sorted by kmer NN chain or oph).
         struct TaxonBucket {
             std::vector<ChunkItem> items;
-            uint64_t raw_bytes = 0;
+            uint64_t raw_bytes = 0;        // FASTA bytes (drives 512MB shard sizing)
+            uint64_t aamer_bytes = 0;      // worker aamer arrays — ~10x the FASTA at keep-all,
+                                           // so they, not the FASTA, dominate buffered RAM
             // Cross-chunk CORE/PCORE aggregation: a mega-genus splits across many
             // 512MB shard-chunks; fold each chunk's aamer counts here and emit one
             // full-density CORE/PCORE once all the genus's members have arrived.
@@ -1124,11 +1126,17 @@ struct ArchiveBuilder::Impl {
             bool model_emitted = false;
         };
         std::unordered_map<std::string, TaxonBucket> taxon_buckets;
-        uint64_t taxon_total_bytes = 0; // sum of raw_bytes across all buckets
+        uint64_t taxon_total_bytes = 0; // sum of bucket FASTA bytes
+        uint64_t taxon_total_aamer = 0; // sum of bucket aamer-array bytes (the RAM driver)
         // Global cap: flush the largest bucket whenever total in-memory genome
         // data exceeds this limit. Prevents unbounded accumulation across many
         // small-genus buckets that never individually hit max_shard_size_bytes.
-        const uint64_t taxon_global_cap = 16ULL << 30; // 16 GB
+        const uint64_t taxon_global_cap = 16ULL << 30; // 16 GB FASTA buffered
+        // The worker-extracted keep-all aamer arrays (~52MB/large genome) dominate RAM
+        // and are NOT counted by the FASTA cap, so bound them separately: flush the
+        // RAM-heaviest bucket once buffered aamers exceed this. Keeps steady-state RAM
+        // ~aamer_cap + FASTA buffer + queue (~30GB) instead of hundreds of GB.
+        const uint64_t taxon_aamer_cap  = 8ULL << 30;  // 8 GB aamer arrays buffered
         std::vector<ChunkItem> staging_buffer; // used when !cfg.taxonomy_group
         staging_buffer.reserve(sort_buf * 4);
         uint64_t staging_raw_bytes = 0;
@@ -1763,31 +1771,36 @@ struct ArchiveBuilder::Impl {
                                                               ? 'g' : cfg.taxonomy_rank[0]);
                     auto& bucket = taxon_buckets[key];
                     const uint64_t genome_bytes = d.item->fasta.size();
-                    bucket.raw_bytes += genome_bytes;
-                    taxon_total_bytes += genome_bytes;
+                    const uint64_t aamer_b      = d.item->aamers.size() * sizeof(uint64_t);
+                    bucket.raw_bytes   += genome_bytes;
+                    bucket.aamer_bytes += aamer_b;
+                    taxon_total_bytes  += genome_bytes;
+                    taxon_total_aamer  += aamer_b;
                     bucket.items.push_back(std::move(*d.item));
                     ++bucket.arrived;
+                    auto drop = [&](TaxonBucket& b) {            // flush a bucket + clear its byte accounting
+                        taxon_total_bytes -= b.raw_bytes; taxon_total_aamer -= b.aamer_bytes;
+                        flush_staging_buf(b.items, &b.genus_counter, &b.member_ids);
+                        b.raw_bytes = 0; b.aamer_bytes = 0;
+                    };
                     const bool genus_done = (cfg.build_core || cfg.build_pcore)
                         && genus_total.count(key) && bucket.arrived >= genus_total[key]
                         && genus_total[key] >= cc_micro_threshold;
                     if (genus_done) {
                         // All members of a modeled genus have arrived → flush the
                         // remainder (folds it in) and emit one full-density CORE/PCORE.
-                        taxon_total_bytes -= bucket.raw_bytes;
-                        flush_staging_buf(bucket.items, &bucket.genus_counter, &bucket.member_ids);
-                        bucket.raw_bytes = 0;
+                        drop(bucket);
                         emit_core_pcore(key, bucket);
                     } else if (bucket.raw_bytes >= cfg.shard_cfg.max_shard_size_bytes) {
-                        taxon_total_bytes -= bucket.raw_bytes;
-                        flush_staging_buf(bucket.items, &bucket.genus_counter, &bucket.member_ids);
-                        bucket.raw_bytes = 0;
-                    } else if (taxon_total_bytes >= taxon_global_cap) {
-                        // Find and flush the largest bucket to stay under cap
+                        drop(bucket);
+                    } else if (taxon_total_aamer >= taxon_aamer_cap || taxon_total_bytes >= taxon_global_cap) {
+                        // Over a RAM cap → flush the bucket holding the most RAM (aamers
+                        // dominate, so weight by aamer_bytes) to free it.
                         auto it = std::max_element(taxon_buckets.begin(), taxon_buckets.end(),
-                            [](const auto& a, const auto& b){ return a.second.raw_bytes < b.second.raw_bytes; });
-                        taxon_total_bytes -= it->second.raw_bytes;
-                        flush_staging_buf(it->second.items, &it->second.genus_counter, &it->second.member_ids);
-                        it->second.raw_bytes = 0;
+                            [](const auto& a, const auto& b){
+                                return (a.second.aamer_bytes + a.second.raw_bytes)
+                                     < (b.second.aamer_bytes + b.second.raw_bytes); });
+                        drop(it->second);
                     }
                 } else {
                     staging_raw_bytes += d.item->fasta.size();
@@ -1820,9 +1833,9 @@ struct ArchiveBuilder::Impl {
                 if (static_cast<uint32_t>(bucket.items.size()) < micro_genome_threshold) {
                     micro_queue.push_back({key, std::move(bucket.items)});
                 } else {
-                    taxon_total_bytes -= bucket.raw_bytes;
+                    taxon_total_bytes -= bucket.raw_bytes; taxon_total_aamer -= bucket.aamer_bytes;
                     flush_staging_buf(bucket.items, &bucket.genus_counter, &bucket.member_ids);
-                    bucket.raw_bytes = 0;
+                    bucket.raw_bytes = 0; bucket.aamer_bytes = 0;
                     emit_core_pcore(key, bucket);
                 }
             }
