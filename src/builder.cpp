@@ -867,6 +867,7 @@ struct ArchiveBuilder::Impl {
             AllSignals signals;                            // intrinsic per-genome signals (worker-computed)
             std::vector<ContigProfile> long_profiles;      // long-contig TNF profiles for GCOV (worker-computed)
             std::vector<uint64_t> aamers;                  // sorted-unique k=8 protein aamers (worker-computed)
+            std::vector<uint64_t> fmh;                     // FracMinHash hashes, ≥1kb contigs (worker-computed)
         };
 
         // Task queue (all tasks submitted upfront; poison-pill sentinel at end)
@@ -1047,15 +1048,20 @@ struct ArchiveBuilder::Impl {
                         AllSignals signals = compute_all_signals(fasta);
                         std::vector<ContigProfile> lprof =
                             compute_long_contig_profiles(fasta, GCOV_MIN_LONG_BP);
-                        // Protein-aamer extraction + sort+unique (~6.5M/genome) — the dominant
-                        // serial-drain cost (introsort) — also moves to the parallel worker.
-                        std::vector<uint64_t> aamers;
-                        if (cfg.build_core || cfg.build_pcore) {
-                            const char* af = std::getenv("GENOPACK_AAMER_FRAC");
-                            const uint64_t div = (af && *af) ? std::strtoull(af, nullptr, 10) : 1;
-                            const uint64_t fmax = (div > 1) ? (UINT64_MAX / div) : UINT64_MAX;
-                            // Per-contig dewrap (must match the prior in-drain per-contig
-                            // extraction exactly for CORE/PCORE model-hash parity).
+                        // One per-contig dewrap walk → aamers (sort+unique) + FMH hashes. Both
+                        // consensus-INDEPENDENT, so computed HERE in the parallel worker (these
+                        // were the last per-genome FASTA walks in the serial drain). The dewrap
+                        // must match the prior in-drain walks exactly for model-hash parity.
+                        std::vector<uint64_t> aamers, fmh;
+                        {
+                            const bool want_aamers = cfg.build_core || cfg.build_pcore;
+                            uint64_t fmax = UINT64_MAX;
+                            if (want_aamers) {
+                                const char* af = std::getenv("GENOPACK_AAMER_FRAC");
+                                const uint64_t div = (af && *af) ? std::strtoull(af, nullptr, 10) : 1;
+                                if (div > 1) fmax = UINT64_MAX / div;
+                            }
+                            const int fmh_c_vals[1] = { cfg.fmh_c };
                             const char* wp = fasta.data(), *we = wp + fasta.size();
                             std::string wseq;
                             while (wp < we) {
@@ -1072,14 +1078,21 @@ struct ArchiveBuilder::Impl {
                                 wseq.clear(); wseq.reserve(wl);
                                 for (const char* sp = ws; sp < wp; ++sp)
                                     if (*sp != '\n' && *sp != '\r') wseq.push_back(*sp);
-                                extract_aamers_dna_into(wseq, AAMER_K, 8, fmax, aamers);
+                                if (want_aamers) extract_aamers_dna_into(wseq, AAMER_K, 8, fmax, aamers);
+                                if (wl >= 1000) {   // kFmhMinBp: FMH on ≥1kb contigs
+                                    auto vecs = fmh_multi_c(wseq, cfg.fmh_k, fmh_c_vals, 1);
+                                    if (!vecs.empty()) fmh.insert(fmh.end(), vecs[0].begin(), vecs[0].end());
+                                }
                             }
-                            std::sort(aamers.begin(), aamers.end());
-                            aamers.erase(std::unique(aamers.begin(), aamers.end()), aamers.end());
+                            if (want_aamers) {
+                                std::sort(aamers.begin(), aamers.end());
+                                aamers.erase(std::unique(aamers.begin(), aamers.end()), aamers.end());
+                            }
                         }
                         d.item = ChunkItem{*t.record, t.gid, t.input_row_index,
                                            stats, std::move(fasta), std::move(sk), std::move(sks_mk),
-                                           std::move(signals), std::move(lprof), std::move(aamers)};
+                                           std::move(signals), std::move(lprof),
+                                           std::move(aamers), std::move(fmh)};
                     } catch (const std::exception& ex) {
                         spdlog::warn("Skipping {}: {}", t.record->accession, ex.what());
                     }
@@ -1536,33 +1549,12 @@ struct ArchiveBuilder::Impl {
                         (void)need_aamers;
 
                         for (size_t ii = 0; ii < buf.size(); ++ii) {
-                            const auto& fasta = buf[ii].fasta;
                             genus_acc.add_genome(all_profiles[ii]);
                             if (!family_key.empty()) family_acc.add_genome(all_profiles[ii]);
-
-                            // FASTA walk for FMH hashes only (aamers were extracted+sorted in the
-                            // parallel worker → buf[ii].aamers).
-                            const char* p = fasta.data(), *end = p + fasta.size();
-                            while (p < end) {
-                                while (p < end && *p != '>') ++p;
-                                if (p >= end) break;
-                                while (p < end && *p != '\n') ++p;
-                                if (p < end) ++p;
-                                const char* ss = p;
-                                size_t slen = 0;
-                                while (p < end && *p != '>') {
-                                    while (p < end && *p != '\n' && *p != '\r') { ++slen; ++p; }
-                                    while (p < end && (*p == '\n' || *p == '\r')) ++p;
-                                }
-                                if (slen < kFmhMinBp) continue;       // FMH only keeps ≥1kb contigs
-                                std::string seq; seq.reserve(slen);
-                                for (const char* sp = ss; sp < p; ++sp)
-                                    if (*sp != '\n' && *sp != '\r') seq.push_back(*sp);
-                                auto vecs = fmh_multi_c(seq, kFmhK, c_vals, 1);
-                                if (!vecs.empty())
-                                    fmh_all.insert(fmh_all.end(), vecs[0].begin(), vecs[0].end());
-                            }
+                            // FMH hashes were computed in the parallel worker; just aggregate.
+                            fmh_all.insert(fmh_all.end(), buf[ii].fmh.begin(), buf[ii].fmh.end());
                         }
+                        (void)c_vals;
 
                         // Cache-resident PARALLEL count of the whole chunk at once (partition-
                         // outer / members-inner, OpenMP across partitions). Worker-extracted

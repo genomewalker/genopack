@@ -75,18 +75,21 @@ public:
     // concatenating per-partition-sorted runs is globally sorted ascending.
     void finalize_sorted(std::vector<uint64_t>& aamers, std::vector<uint32_t>& counts) const {
         aamers.clear(); counts.clear();
-        const size_t nd = distinct();
-        aamers.reserve(nd); counts.reserve(nd);
-        std::vector<std::pair<uint64_t, uint32_t>> tmp;
-        for (const auto& p : parts_) {
-            if (p.occ == 0) continue;
-            tmp.clear(); tmp.reserve(p.occ);
-            for (uint32_t s = 0; s < p.size; ++s)
-                if (p.counts[s]) tmp.emplace_back(p.keys[s], p.counts[s]);
-            std::sort(tmp.begin(), tmp.end(),
-                      [](const auto& x, const auto& y) { return x.first < y.first; });
-            for (const auto& [k, c] : tmp) { aamers.push_back(k); counts.push_back(c); }
+        // Sort each partition independently (parallel); concatenate in partition order
+        // (== hash-high-bit order) for a globally-sorted result.
+        std::vector<std::vector<std::pair<uint64_t, uint32_t>>> per(NP);
+        #pragma omp parallel for schedule(dynamic, 8)
+        for (int p = 0; p < static_cast<int>(NP); ++p) {
+            const auto& part = parts_[static_cast<uint32_t>(p)];
+            if (part.occ == 0) continue;
+            auto& v = per[static_cast<uint32_t>(p)]; v.reserve(part.occ);
+            for (uint32_t s = 0; s < part.size; ++s)
+                if (part.counts[s]) v.emplace_back(part.keys[s], part.counts[s]);
+            std::sort(v.begin(), v.end(), [](const auto& x, const auto& y) { return x.first < y.first; });
         }
+        size_t nd = 0; for (const auto& v : per) nd += v.size();
+        aamers.reserve(nd); counts.reserve(nd);
+        for (const auto& v : per) for (const auto& [k, c] : v) { aamers.push_back(k); counts.push_back(c); }
     }
 
 private:
