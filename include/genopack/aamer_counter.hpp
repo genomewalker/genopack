@@ -35,6 +35,39 @@ public:
     }
     void add_sorted(const std::vector<uint64_t>& a) { add_sorted(a.data(), a.size()); }
 
+    // Cache-resident PARALLEL batch fold of a chunk's member arrays. Processes
+    // PARTITION-by-partition (outer) — each partition's flat table stays hot in L2
+    // while every member's slice for that partition streams through it — and the
+    // partitions are independent so OpenMP parallelises across them with zero locks
+    // (thread t writes only the partitions it owns). This is the ~1000× path; doing
+    // it per-genome (touching all 2048 tables per genome) defeats cache residency.
+    void add_chunk(const std::vector<const std::vector<uint64_t>*>& members) {
+        const size_t M = members.size();
+        if (M == 0) return;
+        // Per-member partition boundaries: off[m][p] = first index of partition p in
+        // members[m] (sorted on hash, so each partition is a contiguous slice).
+        std::vector<std::vector<uint32_t>> off(M);
+        for (size_t m = 0; m < M; ++m) {
+            const auto& a = *members[m];
+            auto& o = off[m]; o.resize(NP + 1);
+            size_t i = 0;
+            for (uint32_t p = 0; p < NP; ++p) {
+                o[p] = static_cast<uint32_t>(i);
+                while (i < a.size() && static_cast<uint32_t>(a[i] >> (64 - PBITS)) == p) ++i;
+            }
+            o[NP] = static_cast<uint32_t>(a.size());
+        }
+        #pragma omp parallel for schedule(dynamic, 8)
+        for (int p = 0; p < static_cast<int>(NP); ++p) {
+            Part& part = parts_[static_cast<uint32_t>(p)];
+            for (size_t m = 0; m < M; ++m) {
+                const uint64_t* a = members[m]->data();
+                const uint32_t e = off[m][p + 1];
+                for (uint32_t i = off[m][p]; i < e; ++i) part.add(a[i]);
+            }
+        }
+    }
+
     size_t distinct() const { size_t s = 0; for (const auto& p : parts_) s += p.occ; return s; }
     bool   empty()    const { for (const auto& p : parts_) if (p.occ) return false; return true; }
 

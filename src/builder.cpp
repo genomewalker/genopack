@@ -864,6 +864,9 @@ struct ArchiveBuilder::Impl {
             std::string fasta;
             OPHDualSketchResult sketch;                    // populated when build_sketch (single-k)
             std::vector<OPHDualSketchResult> sketches_mk;  // populated when multi_k_sketch
+            AllSignals signals;                            // intrinsic per-genome signals (worker-computed)
+            std::vector<ContigProfile> long_profiles;      // long-contig TNF profiles for GCOV (worker-computed)
+            std::vector<uint64_t> aamers;                  // sorted-unique k=8 protein aamers (worker-computed)
         };
 
         // Task queue (all tasks submitted upfront; poison-pill sentinel at end)
@@ -1038,8 +1041,45 @@ struct ArchiveBuilder::Impl {
                                     seed1, seed2);
                             }
                         }
+                        // Per-genome intrinsic quality (Fiedler/spectral) + long-contig TNF
+                        // profiles are consensus-INDEPENDENT — compute them HERE in the parallel
+                        // worker (this was the single-threaded drain bottleneck, ~5 genomes/s).
+                        AllSignals signals = compute_all_signals(fasta);
+                        std::vector<ContigProfile> lprof =
+                            compute_long_contig_profiles(fasta, GCOV_MIN_LONG_BP);
+                        // Protein-aamer extraction + sort+unique (~6.5M/genome) — the dominant
+                        // serial-drain cost (introsort) — also moves to the parallel worker.
+                        std::vector<uint64_t> aamers;
+                        if (cfg.build_core || cfg.build_pcore) {
+                            const char* af = std::getenv("GENOPACK_AAMER_FRAC");
+                            const uint64_t div = (af && *af) ? std::strtoull(af, nullptr, 10) : 1;
+                            const uint64_t fmax = (div > 1) ? (UINT64_MAX / div) : UINT64_MAX;
+                            // Per-contig dewrap (must match the prior in-drain per-contig
+                            // extraction exactly for CORE/PCORE model-hash parity).
+                            const char* wp = fasta.data(), *we = wp + fasta.size();
+                            std::string wseq;
+                            while (wp < we) {
+                                while (wp < we && *wp != '>') ++wp;
+                                if (wp >= we) break;
+                                while (wp < we && *wp != '\n') ++wp;
+                                if (wp < we) ++wp;
+                                const char* ws = wp; size_t wl = 0;
+                                while (wp < we && *wp != '>') {
+                                    while (wp < we && *wp != '\n' && *wp != '\r') { ++wl; ++wp; }
+                                    while (wp < we && (*wp == '\n' || *wp == '\r')) ++wp;
+                                }
+                                if (wl == 0) continue;
+                                wseq.clear(); wseq.reserve(wl);
+                                for (const char* sp = ws; sp < wp; ++sp)
+                                    if (*sp != '\n' && *sp != '\r') wseq.push_back(*sp);
+                                extract_aamers_dna_into(wseq, AAMER_K, 8, fmax, aamers);
+                            }
+                            std::sort(aamers.begin(), aamers.end());
+                            aamers.erase(std::unique(aamers.begin(), aamers.end()), aamers.end());
+                        }
                         d.item = ChunkItem{*t.record, t.gid, t.input_row_index,
-                                           stats, std::move(fasta), std::move(sk), std::move(sks_mk)};
+                                           stats, std::move(fasta), std::move(sk), std::move(sks_mk),
+                                           std::move(signals), std::move(lprof), std::move(aamers)};
                     } catch (const std::exception& ex) {
                         spdlog::warn("Skipping {}: {}", t.record->accession, ex.what());
                     }
@@ -1084,12 +1124,12 @@ struct ArchiveBuilder::Impl {
         GcovWriter build_gcov_w, build_fcov_w;
         FmhrWriter build_fmhr_w;
         // Per-genus prevalence cores (SEC_CORE). Reuses the per-genome marker
-        // aamers (genome_qmers) already extracted below — zero extra FASTA passes.
+        // aamers (chunk_aamers) already extracted below — zero extra FASTA passes.
         CoreWriter build_core_w(AAMER_K, /*min_seg_aa=*/8, cfg.core_theta);
         // SEC_PCORE: unified DENSE per-genus aamer reference (every aamer + member
         // count). The prev>=ceil(theta*n) slice reproduces CORE; the full set is the
         // dense reference the small-contig foreign-contamination channel needs. Built
-        // inline from the same genome_qmers (zero extra passes); genus tier only here
+        // inline from the same chunk_aamers (zero extra passes); genus tier only here
         // (the family tier is added post-hoc by `genopack pcore`, like FCORE).
         PcoreWriter build_pcore_w(AAMER_K, /*min_seg_aa=*/8, cfg.core_theta);
         static constexpr float  kGcovOutlierPct = 0.99f;
@@ -1433,7 +1473,7 @@ struct ArchiveBuilder::Impl {
                         }
 
                         {
-                            AllSignals sig = compute_all_signals(item.fasta);
+                            const AllSignals& sig = item.signals;   // computed in the worker
                             qr.self_coherence        = sig.self_coherence;
                             qr.chargaff_parity        = sig.chargaff_parity;
                             qr.spectral_gap           = sig.spectral_gap;
@@ -1448,9 +1488,8 @@ struct ArchiveBuilder::Impl {
                             qr.qual_flags |= QualRecord::QUAL_FLAG_BUILD_SIGNALS;
                         }
 
-                        // Collect long-contig profiles for GCOV (same FASTA already in RAM).
-                        all_profiles.push_back(
-                            compute_long_contig_profiles(item.fasta, GCOV_MIN_LONG_BP));
+                        // Long-contig profiles for GCOV — computed in the worker (parallel).
+                        all_profiles.push_back(std::move(item.long_profiles));
                         pending_qrs.push_back(std::move(qr));
                     }
 
@@ -1482,33 +1521,27 @@ struct ArchiveBuilder::Impl {
                         // SCG scoring (opt-in) needs per-member sets; CORE/PCORE only need the
                         // aggregated counts, so stream members through one combiner (bounded RAM
                         // even for 600k-member genera) and keep per-member sets only for SCG.
-                        std::vector<std::vector<uint64_t>> genome_qmers(do_markers ? buf.size() : 0);
-                        std::vector<uint64_t> qtmp;
                         // Hash-partitioned cache-resident EXACT prevalence counter (replaces the
-                        // DRAM-bound unordered_map, ~1000×): cross-chunk genera accumulate in the
-                        // bucket's persistent counter; a chunk-local genus uses a local one.
+                        // DRAM-bound unordered_map): cross-chunk genera accumulate in the bucket's
+                        // persistent counter; a chunk-local genus uses a local one. Aamer arrays
+                        // are worker-computed (buf[ii].aamers, sorted-unique).
                         GenusAamerCounter local_counter;
                         if (accum_holder && !*accum_holder) *accum_holder = std::make_unique<GenusAamerCounter>();
                         GenusAamerCounter* const ctr = accum_holder ? accum_holder->get() : &local_counter;
                         const bool cross_chunk = (accum_holder != nullptr);
-                        // Member cap: a genus's aamer UNION saturates, so once ~cap members
-                        // have been folded we stop counting more — this keeps CORE/PCORE
-                        // density while making keep-all aggregation tractable at 600k-member
-                        // scale (counting all members is ~10^13 hashmap ops/part). The SCG
-                        // path (opt-in) still extracts every member for per-genome scoring.
+                        // Member cap: a genus's aamer UNION saturates, so once ~cap members have
+                        // been counted we stop folding more (keeps density, bounds wall time).
                         const bool aamers_capped = (cfg.genus_member_cap > 0) && accum_member_ids
                             && accum_member_ids->size() >= cfg.genus_member_cap;
-                        const bool do_extract = need_aamers && (do_markers || !aamers_capped);
+                        (void)need_aamers;
 
                         for (size_t ii = 0; ii < buf.size(); ++ii) {
                             const auto& fasta = buf[ii].fasta;
                             genus_acc.add_genome(all_profiles[ii]);
                             if (!family_key.empty()) family_acc.add_genome(all_profiles[ii]);
-                            // Aamers go to the per-member set when SCG needs them, else a reused temp.
-                            std::vector<uint64_t>& qref = do_markers ? genome_qmers[ii] : qtmp;
-                            if (!do_markers) qref.clear();
 
-                            // Single FASTA walk: FMH hashes (≥kFmhMinBp) + marker aamers (all contigs).
+                            // FASTA walk for FMH hashes only (aamers were extracted+sorted in the
+                            // parallel worker → buf[ii].aamers).
                             const char* p = fasta.data(), *end = p + fasta.size();
                             while (p < end) {
                                 while (p < end && *p != '>') ++p;
@@ -1521,30 +1554,28 @@ struct ArchiveBuilder::Impl {
                                     while (p < end && *p != '\n' && *p != '\r') { ++slen; ++p; }
                                     while (p < end && (*p == '\n' || *p == '\r')) ++p;
                                 }
-                                // De-wrap contig if needed for FMH or markers.
-                                if (slen == 0) continue;
-                                const bool need_fmh = (slen >= kFmhMinBp);
-                                if (!need_fmh && !need_aamers) continue;
+                                if (slen < kFmhMinBp) continue;       // FMH only keeps ≥1kb contigs
                                 std::string seq; seq.reserve(slen);
                                 for (const char* sp = ss; sp < p; ++sp)
                                     if (*sp != '\n' && *sp != '\r') seq.push_back(*sp);
-                                if (need_fmh) {
-                                    auto vecs = fmh_multi_c(seq, kFmhK, c_vals, 1);
-                                    if (!vecs.empty())
-                                        fmh_all.insert(fmh_all.end(), vecs[0].begin(), vecs[0].end());
-                                }
-                                if (do_extract)
-                                    extract_aamers_dna_into(seq, AAMER_K, 8,
-                                                              build_mrk_frac_max, qref);
+                                auto vecs = fmh_multi_c(seq, kFmhK, c_vals, 1);
+                                if (!vecs.empty())
+                                    fmh_all.insert(fmh_all.end(), vecs[0].begin(), vecs[0].end());
                             }
-                            if (do_extract) {
-                                std::sort(qref.begin(), qref.end());
-                                qref.erase(std::unique(qref.begin(), qref.end()), qref.end());
-                                if (!aamers_capped) {
-                                    ctr->add_sorted(qref);                       // exact partitioned count
+                        }
+
+                        // Cache-resident PARALLEL count of the whole chunk at once (partition-
+                        // outer / members-inner, OpenMP across partitions). Worker-extracted
+                        // sorted arrays feed straight in — no per-genome sort in the drain.
+                        if (!aamers_capped && (cfg.build_core || cfg.build_pcore)) {
+                            std::vector<const std::vector<uint64_t>*> ptrs;
+                            ptrs.reserve(buf.size());
+                            for (size_t ii = 0; ii < buf.size(); ++ii)
+                                if (!buf[ii].aamers.empty()) {
+                                    ptrs.push_back(&buf[ii].aamers);
                                     if (accum_member_ids) accum_member_ids->push_back(buf[ii].genome_id);
                                 }
-                            }
+                            if (!ptrs.empty()) ctr->add_chunk(ptrs);
                         }
 
                         const uint32_t n_mem = static_cast<uint32_t>(buf.size());
@@ -1632,7 +1663,7 @@ struct ArchiveBuilder::Impl {
                                                   : build_mrk_rd->merged_ids_bac();
                                 const uint8_t n_markers = calib.header->n_markers;
                                 for (size_t ii = 0; ii < pending_qrs.size(); ++ii) {
-                                    const auto& qv = genome_qmers[ii];
+                                    const auto& qv = buf[ii].aamers;
                                     if (qv.empty()) continue;
                                     uint32_t hits[173] = {};
                                     const uint64_t *qp=qv.data(), *qpe=qp+qv.size();
