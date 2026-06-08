@@ -72,8 +72,7 @@ add_library(genopack_lib STATIC
   src/score_bin.cpp
   src/catalog.cpp
   src/shard.cpp
-  src/stage.cpp
-  src/cmd_stage.cpp
+
   src/builder.cpp
   src/archive.cpp
   src/archive_set_reader.cpp
@@ -179,6 +178,7 @@ add_executable(genopack
   src/run_report.cpp
   src/run_fcore.cpp
   src/run_pcore.cpp
+  src/run_tier.cpp
   src/bench/bench_grid.cpp
   src/calibrate/calibrate.cpp
 )

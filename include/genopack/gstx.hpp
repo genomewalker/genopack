@@ -84,6 +84,7 @@ private:
     static uint32_t next_pow2(uint32_t v) noexcept;
 
     std::vector<GstxEntry>   entries_;
+    std::vector<uint32_t>    entry_order_; // arrival indices — sort by these in finalize() for reproducibility
     std::vector<uint32_t>    kmer_sizes_hdr_{0, 0, 0, 0};
     uint32_t                 n_k_hdr_ = 0;
 };

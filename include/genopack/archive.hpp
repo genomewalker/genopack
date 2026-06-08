@@ -301,6 +301,8 @@ struct ArchiveBuilderConfig {
     size_t batch_size = 1000;   // genomes buffered before shard flush
     GenomeId starting_genome_id = 1;  // first genome_id assigned; set per-part in parallel builds
     bool     build_cidx = true;       // build CIDX contig index; disable with --no-cidx for large archives
+    bool     thin_archive = false;    // written into header; consumers warn when required sections absent
+    std::string tmpdir;              // spill/temp directory for PCORE/SKCH; overrides GENOPACK_SPILL_DIR and /scratch fallback
     bool     kmer_nn_sort        = true;   // sort genomes within each shard by kmer4_profile NN chain
                                            // instead of oph_fingerprint; improves zstd compression
     bool     taxonomy_group      = true;   // bucket genomes by taxonomy before shard formation
@@ -314,6 +316,14 @@ struct ArchiveBuilderConfig {
                                            // small contigs and only the dense per-genus union resolves it.
                                            // Memory is bounded (spilled to $GENOPACK_SPILL_DIR); on-disk
                                            // size is large (~10-50x CORE). Disable with --no-pcore.
+    bool     build_tier          = false;  // emit a .ptier side-channel file alongside the .gpk;
+                                           // used post-build by `genopack tier merge` to compute the
+                                           // global IDF tier table. Enabled with --tier.
+    uint32_t pcore_frac          = 100;   // FMH 1/N subsampling for CORE/PCORE aamer extraction
+                                           // when no marker panel is set and GENOPACK_AAMER_FRAC is
+                                           // unset. 1 = keep all (infeasible at 9.2M); 100 = keep 1%.
+                                           // Override with --pcore-frac <N> or GENOPACK_AAMER_FRAC.
+    uint32_t foreign_K           = 3;      // max genus-count for an aamer to be "taxon-specific foreign"
     float    core_theta          = 0.90f;  // prevalence threshold for genus-core membership
     uint32_t genus_member_cap    = 2000;   // max members folded into the CORE/PCORE aamer union per
                                            // genus. The union saturates ~here, so density (small-
@@ -336,7 +346,6 @@ struct ArchiveBuilderConfig {
     int         marker_min_hits  = 5;  // min pool hits to call a marker present (matches check default)
     std::string contam_panel_path;      // path to .csp contamination panel; empty = skip duplication scoring
     std::filesystem::path from_gpk_source;  // non-empty: rebuild by streaming decoded sequence from this .gpk
-    std::filesystem::path from_stage_source; // non-empty: rebuild by streaming decoded sequence from this .gstage cache
 };
 
 // `build --from-gpk` fast-path: if the source's build params equal what cfg
@@ -360,10 +369,6 @@ public:
     // Rebuild from an existing .gpk: stream decoded sequence from its shards
     // (sequential reads) instead of opening per-genome FASTA files on NFS.
     void add_from_gpk(const std::filesystem::path& source);
-
-    // Rebuild from a .gstage cache: stream decoded sequence sequentially from a
-    // local store produced by `genopack stage` (no per-genome NFS file opens).
-    void add_from_stage(const std::filesystem::path& source);
 
     // Add individual record
     void add(const BuildRecord& rec);

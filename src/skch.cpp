@@ -17,27 +17,24 @@
 namespace genopack {
 
 // ── Spill dir resolution ─────────────────────────────────────────────────────
-// Priority: explicit arg > GENOPACK_SKETCH_SPILL_DIR > GENOPACK_SPILL_DIR > std::tmpfile
+// Priority: explicit arg > GENOPACK_SKETCH_SPILL_DIR > GENOPACK_SPILL_DIR > /scratch > /tmp
 static std::string resolve_spill_dir(std::string spill_dir) {
     if (!spill_dir.empty()) return spill_dir;
     if (const char* env = std::getenv("GENOPACK_SKETCH_SPILL_DIR"); env && *env) return env;
     if (const char* env = std::getenv("GENOPACK_SPILL_DIR");        env && *env) return env;
-    return {};
+    std::error_code ec;
+    if (std::filesystem::exists("/scratch", ec) && !ec) return "/scratch";
+    return std::filesystem::temp_directory_path().string();
 }
 
 static FILE* open_spill(const std::string& spill_dir, const char* tag) {
-    if (!spill_dir.empty()) {
-        char path[4096];
-        std::snprintf(path, sizeof(path), "%s/genopack_%s_XXXXXX", spill_dir.c_str(), tag);
-        int fd = ::mkstemp(path);
-        if (fd < 0) throw std::runtime_error(std::string("SkchWriter: mkstemp failed: ") + path);
-        ::unlink(path);
-        FILE* fp = ::fdopen(fd, "w+b");
-        if (!fp) { ::close(fd); throw std::runtime_error("SkchWriter: fdopen failed"); }
-        return fp;
-    }
-    FILE* fp = std::tmpfile();
-    if (!fp) throw std::runtime_error("SkchWriter: cannot create spill tmpfile");
+    char path[4096];
+    std::snprintf(path, sizeof(path), "%s/genopack_%s_XXXXXX", spill_dir.c_str(), tag);
+    int fd = ::mkstemp(path);
+    if (fd < 0) throw std::runtime_error(std::string("SkchWriter: mkstemp failed: ") + path);
+    ::unlink(path);
+    FILE* fp = ::fdopen(fd, "w+b");
+    if (!fp) { ::close(fd); throw std::runtime_error("SkchWriter: fdopen failed"); }
     return fp;
 }
 

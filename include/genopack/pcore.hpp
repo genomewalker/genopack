@@ -31,6 +31,7 @@ namespace genopack {
 
 static constexpr uint8_t PCORE_CODEC_LEGACY = 0;   // dense u64 + u8 member count
 static constexpr uint8_t PCORE_CODEC_V1     = 1;   // 3-run stratified PFOR + quant prev
+static constexpr uint8_t PCORE_CODEC_V2     = 2;   // v1 + per-aamer IDF tier bytes
 static constexpr uint8_t PCORE_PREVQ_NONE   = 0;   // raw count (legacy)
 static constexpr uint8_t PCORE_PREVQ_LOGN   = 1;   // q = round(255·log(c)/log(n))
 
@@ -58,7 +59,9 @@ struct PcoreHeaderExtV1 {        // 64 bytes
     uint64_t fmh_seed;           //  0
     uint64_t taxonomy_hash;      //  8
     uint64_t k_frame_pin;        // 16  (k<<8)|frame_table_id — redundant guard
-    uint64_t _reserved[5];       // 24..64
+    uint64_t total_genera_G = 0; // 24  total genus count across the corpus (for IDF weighting)
+    uint64_t tier_table_hash = 0;// 32  XXH3 of the global tier table (zero if not stamped)
+    uint64_t _reserved[3];       // 40..64
 };
 static_assert(sizeof(PcoreHeaderExtV1) == 64);
 
@@ -104,6 +107,24 @@ inline float pcore_dequant_prev(uint8_t q, uint32_t n_members) noexcept {
     return static_cast<float>(std::pow(static_cast<double>(n_members), q / 255.0 - 1.0));
 }
 
+// IDF tier: tier4 = floor(log2(genus_count)), capped at 15.
+// genus_count == 0 or 1 → tier 0 (ubiquitous within one genus → not informative inter-genus).
+inline uint8_t pcore_tier_from_count(uint32_t genus_count) noexcept {
+    if (genus_count <= 1) return 0;
+    uint32_t t = 0, c = genus_count;
+    while (c > 1 && t < 15) { c >>= 1; ++t; }
+    return static_cast<uint8_t>(t);
+}
+
+// IDF weight from a 4-bit tier and corpus genus count G.
+// w = 1 - tier4/log2(G), clamped to [0,1]. Returns 1 if G<=1 (single-genus corpus).
+inline float pcore_idf_weight(uint8_t tier4, uint32_t G) noexcept {
+    if (G <= 1) return 1.0f;
+    const float denom = std::log2(static_cast<float>(G));
+    const float w = 1.0f - static_cast<float>(tier4 & 0x0Fu) / denom;
+    return w > 0.0f ? w : 0.0f;
+}
+
 struct PcoreView {
     uint64_t key_hash  = 0;
     uint32_t n_members = 0;
@@ -117,6 +138,12 @@ struct PcoreView {
     const uint8_t* enc_s = nullptr; uint32_t n_singleton = 0; uint32_t enc_s_bytes = 0;
     const uint8_t* enc_m = nullptr; uint32_t n_multi     = 0; uint32_t enc_m_bytes = 0; const uint8_t* prevq_m = nullptr;
     const uint8_t* enc_c = nullptr; uint32_t n_core      = 0; uint32_t enc_c_bytes = 0; const uint8_t* prevq_c = nullptr;
+    // v2 (codec 2): per-aamer IDF tier bytes (parallel to run order: singleton|multi|core)
+    const uint8_t* tier_s = nullptr;   // tier byte per singleton aamer
+    const uint8_t* tier_m = nullptr;   // tier byte per multi aamer
+    const uint8_t* tier_c = nullptr;   // tier byte per core aamer
+    bool     has_tier           = false;
+    uint32_t total_genera_G     = 0;    // corpus-wide genus count (from ext header)
 
     uint32_t total() const noexcept { return is_v1 ? (n_singleton + n_multi + n_core) : n_aamers; }
     bool valid() const noexcept { return total() > 0; }
@@ -178,7 +205,8 @@ inline float pcore_core_coverage(const PcoreView& v, const std::vector<uint64_t>
 // Model hash folded incrementally and order-independently (XOR of per-entry hashes).
 class PcoreWriter {
 public:
-    PcoreWriter(uint32_t k, uint32_t min_seg_aa, float theta = 0.90f);
+    PcoreWriter(uint32_t k, uint32_t min_seg_aa, float theta = 0.90f,
+                std::string spill_dir = {});
     ~PcoreWriter();
     PcoreWriter(const PcoreWriter&) = delete;
     PcoreWriter& operator=(const PcoreWriter&) = delete;
@@ -187,6 +215,11 @@ public:
     void set_pins(uint64_t fmh_seed, uint64_t taxonomy_hash, uint8_t frame_table_id) {
         fmh_seed_ = fmh_seed; taxonomy_hash_ = taxonomy_hash; frame_table_id_ = frame_table_id;
     }
+
+    // Open a side-channel .ptier file that records (aamer_hash, genus_hash) pairs
+    // for every aamer in every genus. Used post-build by `genopack tier merge`.
+    // Call before add_sorted/add_from_members/add_from_counts; no-op if path is empty.
+    void set_tier_sidechannel(const std::string& path);
 
     // member_qmers = per-member sorted-unique aamer sets. Builds the dense union with
     // true u32 member counts, stratifies into singleton/multi/core runs, PFOR-encodes.
@@ -225,9 +258,14 @@ private:
     uint8_t  frame_table_id_ = 0;
     std::vector<EntryMeta> meta_;
     std::FILE*  spill_       = nullptr;
+    std::string spill_dir_;   // explicit override; empty = use env/auto-detect
     std::string spill_path_;
     uint64_t    pool_cursor_ = 0;
     uint64_t    hash_fold_   = 0;
+    // Side-channel .ptier file state
+    std::FILE*  tier_sc_      = nullptr;
+    std::string tier_sc_path_;
+    uint64_t    tier_sc_n_pairs_ = 0;  // running count of emitted (aamer, genus) pairs
 };
 
 // ── Reader ────────────────────────────────────────────────────────────────────
@@ -282,7 +320,7 @@ private:
     PcoreView view_at(uint32_t idx) const noexcept {
         PcoreView v;
         v.theta = header_->theta;
-        if (codec_ == PCORE_CODEC_V1) {
+        if (codec_ == PCORE_CODEC_V1 || codec_ == PCORE_CODEC_V2) {
             const auto& e = entries1_[idx];
             v.is_v1 = true; v.key_hash = e.key_hash; v.n_members = e.n_members;
             v.n_singleton = e.n_singleton; v.n_multi = e.n_multi; v.n_core = e.n_core;
@@ -292,7 +330,15 @@ private:
             v.enc_m = p;                       p += e.enc_multi;
             v.enc_c = p;                       p += e.enc_core;
             v.prevq_m = p;                     p += e.n_multi;
-            v.prevq_c = p;
+            v.prevq_c = p;                     p += e.n_core;
+            if (codec_ == PCORE_CODEC_V2) {
+                // tier bytes appended after prevq_c in run order: singleton|multi|core
+                v.tier_s = p;                  p += e.n_singleton;
+                v.tier_m = p;                  p += e.n_multi;
+                v.tier_c = p;
+                v.has_tier = true;
+                v.total_genera_G = ext_ ? static_cast<uint32_t>(ext_->total_genera_G) : 0;
+            }
         } else {
             const auto& e = entries0_[idx];
             v.is_v1 = false; v.key_hash = e.key_hash; v.n_members = e.n_members; v.n_aamers = e.n_aamers;

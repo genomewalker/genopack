@@ -124,6 +124,7 @@ public:
             e.log_det_cached = ld;
             e.flags |= GCOV_FLAG_HAS_LOG_DET;
         }
+        entry_order_.push_back(static_cast<uint32_t>(entries_.size()));
         entries_.push_back(e);
     }
 
@@ -146,6 +147,7 @@ private:
         return v + 1;
     }
     std::vector<GcovEntry> entries_;
+    std::vector<uint32_t>  entry_order_; // arrival indices — sort by these in finalize() for reproducibility
 };
 
 // ── Reader ────────────────────────────────────────────────────────────────────

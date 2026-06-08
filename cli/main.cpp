@@ -4,6 +4,7 @@
 #include "run_report.hpp"
 #include "run_fcore.hpp"
 #include "run_pcore.hpp"
+#include "run_tier.hpp"
 #include <genopack/score_bin.hpp>
 #include <genopack/fmhr.hpp>
 #include <set>
@@ -77,11 +78,6 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
                        bool build_qual,
                        bool build_gcov);
 
-namespace genopack {
-int cmd_stage(const std::string& input_tsv, const std::string& output,
-              int threads, int block_mb);
-}
-
 // Resolve a reference data file that ships separately (markers panel, contamination
 // panel). Precedence: explicit path (user override) > $GENOPACK_DATA/<name> >
 // <exe_dir>/../share/genopack/<name>. Returns "" if nothing is found, so the caller
@@ -114,17 +110,35 @@ static int cmd_build(const std::string& input_tsv, const std::string& output_dir
                      std::string markers_path = {},
                      std::string from_gpk = {},
                      uint32_t micro_genus_threshold = 0,
-                     std::string from_stage = {},
                      std::string contam_panel = {},
-                     bool build_pcore = true) {
+                     bool build_pcore = true,
+                     bool thin        = false,
+                     std::string tmpdir = {},
+                     bool build_tier  = false,
+                     uint32_t pcore_frac = 100) {
     ArchiveBuilder::Config cfg;
     const bool explicit_codec = no_dict || ref_dict || delta || mem_delta;
     cfg.io_threads                        = static_cast<size_t>(std::max(1, threads));
     cfg.shard_cfg.compress_threads        = static_cast<size_t>(std::max(1, threads));
     cfg.verbose                           = verbose;
     cfg.build_cidx                        = !no_cidx;
+    // --thin: ingest-only preset — sequences + sketches + PCORE/GAMI, no GSTX/GCOV.
+    // PCORE is computed inline during the NFS pass (hash-aggregation works without
+    // taxon_group — genus accumulators stay open until end). GSTX/GCOV are deferred
+    // to `enrich` which reads locally, enabling shard flushes by size during thin
+    // and reducing enrich to pure TNF/eigenbasis work (no aamer re-extraction).
+    if (thin) {
+        no_gstx          = true;    // GSTX deferred to enrich
+        cfg.build_gcov   = false;   // GCOV deferred to enrich
+        cfg.build_core   = false;
+        cfg.thin_archive = true;
+        // PCORE + GAMI stay enabled — computed once during NFS pass
+    }
     cfg.build_gstx                        = !no_gstx;
-    cfg.build_pcore                       = build_pcore;   // dense small-contig reference (on by default)
+    cfg.build_pcore                       = build_pcore;
+    cfg.build_tier                        = build_tier && build_pcore;
+    cfg.pcore_frac                        = pcore_frac > 0 ? pcore_frac : 100u;
+    cfg.tmpdir                            = tmpdir;
     cfg.micro_genus_threshold             = micro_genus_threshold;
     cfg.shard_cfg.zstd_level              = zstd_level;
     cfg.shard_cfg.auto_codec              = !explicit_codec;
@@ -152,17 +166,6 @@ static int cmd_build(const std::string& input_tsv, const std::string& output_dir
         spdlog::info("build: auto-resolved markers panel → {}", cfg.markers_path);
     if (!cfg.contam_panel_path.empty())
         spdlog::info("build: contamination panel → {}", cfg.contam_panel_path);
-
-    if (!from_stage.empty()) {
-        // Rebuild from a local .gstage cache: stream decoded sequence sequentially
-        // (no per-genome NFS opens). Single process — parallelism is in the worker
-        // pool; GSTX/GCOV/FMHR are computed inline over the full corpus, no merge.
-        cfg.from_stage_source = from_stage;
-        ArchiveBuilder builder(output_dir, cfg);
-        builder.add_from_stage(from_stage);
-        builder.finalize();
-        return 0;
-    }
 
     if (!from_gpk.empty()) {
         // Rebuild from an existing .gpk: stream decoded sequence from its shards
@@ -2638,7 +2641,8 @@ int main(int argc, char** argv) {
     bool build_no_dict = false, build_ref_dict = false, build_delta = false;
     bool build_mem_delta = true, build_verbose = false, build_no_cidx = true;
     bool build_2bit = true, build_kmer_nn = true, build_taxon_group = true;
-    bool build_sketch = true, build_pcore = true;
+    bool build_sketch = true, build_pcore = true, build_tier = false;
+    uint32_t build_pcore_frac = 100;
     int build_sketch_kmer = 16, build_sketch_size = 10000, build_sketch_syncmer = -1;
     std::string build_taxon_rank = "g";
     std::string build_sketch_kmers_str = "16,21,31";
@@ -2665,6 +2669,15 @@ int main(int argc, char** argv) {
     build->add_flag("--taxon-group,!--no-taxon-group",build_taxon_group,"Group genomes into per-taxon shards (default: on; --no-taxon-group to disable; requires taxonomy column)");
     build->add_option("--taxon-rank",build_taxon_rank,"Taxonomy rank for grouping: g=genus (default), f=family");
     build->add_flag("--sketch,!--no-sketch", build_sketch, "Compute OPH sketches (default: on; use --no-sketch to disable)");
+    build->add_flag("--tier", build_tier,
+        "Emit a .ptier side-channel file alongside the .gpk for later use by "
+        "`genopack tier merge`. Records every (aamer_hash, genus_hash) pair so "
+        "a global IDF tier table can be computed across all parts. Implies --pcore.");
+    build->add_option("--pcore-frac", build_pcore_frac,
+        "FMH subsampling factor N for PCORE aamer extraction (keep 1/N aamers). "
+        "Default: 100. Overridden by GENOPACK_AAMER_FRAC env var or a --markers panel. "
+        "Lower = denser reference (better recall, more disk/RAM). 1 = keep all.")
+        ->default_val(100);
     build->add_flag("--pcore,!--no-pcore", build_pcore, "Build the dense PCORE small-contig reference inline "
         "(default: ON — small-contig contamination needs the dense per-genus union). The union is ~10-50x CORE "
         "and is the dominant cost; memory is bounded (spilled to $GENOPACK_SPILL_DIR) but on-disk size is large. "
@@ -2687,10 +2700,16 @@ int main(int argc, char** argv) {
     build->add_option("--from-gpk", build_from_gpk,
         "Rebuild from an existing .gpk: stream decoded sequence from its shards "
         "(sequential reads) instead of opening per-genome FASTA files on NFS. -i not required.");
-    std::string build_from_stage;
-    build->add_option("--from-stage", build_from_stage,
-        "Rebuild from a local .gstage cache produced by `genopack stage`: stream "
-        "decoded sequence sequentially (no per-genome NFS opens). -i not required.");
+    std::string build_tmpdir;
+    build->add_option("--tmpdir", build_tmpdir,
+        "Directory for PCORE/SKCH spill files (default: /scratch if present, else /tmp). "
+        "Use a fast local NVMe path to avoid filling /tmp.");
+    bool build_thin = false;
+    build->add_flag("--thin", build_thin,
+        "Ingest-only preset: write sequences, sketches, TAXN/GIDX/CIDX only. "
+        "Skip all compute sections (GSTX/GCOV/CORE/PCORE/GAMI). "
+        "Produces a thin archive for later enrichment with `genopack enrich`. "
+        "Do NOT pass --taxon-group in thin mode — shards flush by size, not genus.");
     std::string build_coordinator; // "manifest_dir:output.gpk" or empty
     build->add_option("--coordinator", build_coordinator,
         "NFS manifest coordinator: manifest_dir:/path/to/output.gpk. "
@@ -2698,9 +2717,9 @@ int main(int argc, char** argv) {
         "The legacy 'nfs:' prefix is accepted and stripped for backward compatibility.");
     build->callback([&]() {
         {
-            int build_mode_count = (!build_input.empty()) + (!build_from_gpk.empty()) + (!build_from_stage.empty());
+            int build_mode_count = (!build_input.empty()) + (!build_from_gpk.empty());
             if (build_mode_count != 1)
-                throw std::runtime_error("build: provide exactly one of -i <TSV>, --from-gpk <source.gpk>, or --from-stage <cache.gstage>");
+                throw std::runtime_error("build: provide exactly one of -i <TSV> or --from-gpk <source.gpk>");
         }
         // Parse --sketch-kmers "16,21,31" into vector<int>
         std::vector<int> build_sketch_kmers;
@@ -2730,8 +2749,9 @@ int main(int argc, char** argv) {
                                 build_sketch, build_sketch_kmer, build_sketch_size,
                                 build_sketch_syncmer, build_sketch_kmers,
                                 build_no_gstx, build_markers, build_from_gpk,
-                                build_micro_genus_threshold, build_from_stage,
-                                build_contam_panel, build_pcore);
+                                build_micro_genus_threshold,
+                                build_contam_panel, build_pcore, build_thin, build_tmpdir,
+                                build_tier, build_pcore_frac);
             if (rc != 0) std::exit(rc);
             std::string hostname = "worker";
             {
@@ -2761,23 +2781,80 @@ int main(int argc, char** argv) {
                              build_sketch, build_sketch_kmer, build_sketch_size,
                              build_sketch_syncmer, build_sketch_kmers,
                              build_no_gstx, build_markers, build_from_gpk,
-                             build_micro_genus_threshold, build_from_stage,
-                             build_contam_panel, build_pcore));
+                             build_micro_genus_threshold,
+                             build_contam_panel, build_pcore, build_thin, build_tmpdir,
+                             build_tier, build_pcore_frac));
     });
 
-    // genopack stage — durable local sequence cache for fast iterative rebuilds
-    auto* stage_cmd = app.add_subcommand("stage",
-        "Cache NFS genome FASTAs as a local zstd sequence store (.gstage) for fast "
-        "rebuilds via `build --from-stage`");
-    std::string stage_input, stage_output;
-    int stage_threads = 48, stage_block_mb = 64;
-    stage_cmd->add_option("-i,--input", stage_input,
-        "Input TSV (accession, file_path, taxonomy, ...)")->required();
-    stage_cmd->add_option("-o,--output", stage_output, "Output .gstage path")->required();
-    stage_cmd->add_option("-t,--threads", stage_threads, "NFS reader threads (default: 48)");
-    stage_cmd->add_option("--block-mb", stage_block_mb, "Uncompressed block size in MB (default: 64)");
-    stage_cmd->callback([&]() {
-        std::exit(genopack::cmd_stage(stage_input, stage_output, stage_threads, stage_block_mb));
+    // genopack enrich — compute GSTX/GCOV/CORE/PCORE/GAMI from a thin archive
+    auto* enrich_cmd = app.add_subcommand("enrich",
+        "Add compute sections (GSTX/GCOV/CORE/PCORE/GAMI) to a thin archive produced by "
+        "`build --thin`. Reads sequences locally from the thin .gpk (no NFS opens). "
+        "Pass --taxon-group and --markers as for a full build.");
+    std::string enrich_input, enrich_output, enrich_markers, enrich_contam_panel;
+    int enrich_threads = 16;
+    bool enrich_taxon_group = false;
+    std::string enrich_taxon_rank = "g";
+    int enrich_sketch_kmer = 16, enrich_sketch_size = 10000, enrich_sketch_syncmer = -1;
+    std::string enrich_sketch_kmers_str;
+    bool enrich_pcore = false;  // thin already built PCORE by default
+    enrich_cmd->add_option("-i,--input",  enrich_input,  "Thin source archive (.gpk)")->required();
+    enrich_cmd->add_option("-o,--output", enrich_output, "Output enriched archive (.gpk)")->required();
+    enrich_cmd->add_option("-t,--threads", enrich_threads, "Worker threads (default: 16)");
+    enrich_cmd->add_flag("--taxon-group", enrich_taxon_group,
+        "Group genomes by genus for GSTX/GCOV computation (required for GCOV)");
+    enrich_cmd->add_option("--taxon-rank", enrich_taxon_rank,
+        "Taxonomy rank for grouping: g=genus (default), f=family");
+    enrich_cmd->add_option("--markers", enrich_markers,
+        "Marker panel (.mrk) for CORE/PCORE/GAMI sections");
+    enrich_cmd->add_option("--contam-panel", enrich_contam_panel,
+        "Contamination panel (.csp) for duplication scoring");
+    enrich_cmd->add_option("--sketch-kmers", enrich_sketch_kmers_str,
+        "Comma-separated k-mer sizes for multi-k SKCH (default: 16,21,31)");
+    enrich_cmd->add_option("--sketch-size",  enrich_sketch_size,  "OPH bins (default: 10000)");
+    enrich_cmd->add_option("--sketch-syncmer", enrich_sketch_syncmer, "Syncmer s (default: auto)");
+    enrich_cmd->add_flag("--pcore", enrich_pcore,
+        "Also build PCORE/GAMI (use for thin archives built without --markers)");
+    std::string enrich_tmpdir;
+    enrich_cmd->add_option("--tmpdir", enrich_tmpdir,
+        "Directory for PCORE/SKCH spill files (default: /scratch if present, else /tmp)");
+    enrich_cmd->callback([&]() {
+        std::vector<int> eks;
+        if (!enrich_sketch_kmers_str.empty()) {
+            std::istringstream ss(enrich_sketch_kmers_str);
+            std::string tok;
+            while (std::getline(ss, tok, ','))
+                if (!tok.empty()) eks.push_back(std::stoi(tok));
+        }
+        if (enrich_sketch_syncmer == -1) {
+            int ref_k = eks.empty() ? enrich_sketch_kmer
+                : *std::min_element(eks.begin(), eks.end());
+            enrich_sketch_syncmer = std::max(2, ref_k / 3);
+        }
+        std::exit(cmd_build(
+            /*input_tsv*/     {},
+            /*output_dir*/    enrich_output,
+            /*threads*/       enrich_threads,
+            /*zstd_level*/    3,
+            /*no_dict*/       false, /*ref_dict*/ false, /*delta*/ false, /*mem_delta*/ false,
+            /*verbose*/       true,
+            /*n_parallel*/    1,
+            /*no_cidx*/       false, /*use_2bit*/ false, /*kmer_nn_sort*/ false,
+            /*taxonomy_group*/enrich_taxon_group,
+            /*taxonomy_rank*/ enrich_taxon_rank,
+            /*sketch*/        true,
+            /*sketch_kmer*/   enrich_sketch_kmer,
+            /*sketch_size*/   enrich_sketch_size,
+            /*sketch_syncmer*/enrich_sketch_syncmer,
+            /*sketch_kmers*/  eks,
+            /*no_gstx*/       false,
+            /*markers_path*/  enrich_markers,
+            /*from_gpk*/      enrich_input,
+            /*micro_genus*/   0u,
+            /*contam_panel*/  enrich_contam_panel,
+            /*build_pcore*/   enrich_pcore,
+            /*thin*/          false,
+            /*tmpdir*/        enrich_tmpdir));
     });
 
     // genopack extract
@@ -3822,6 +3899,39 @@ int main(int argc, char** argv) {
                                                             : std::filesystem::path{pcore_members}));
     });
 
+    // genopack tier — IDF tier table build tools
+    auto* tier_cmd = app.add_subcommand("tier",
+        "IDF tier table tools: merge per-part .ptier files into a global .gtier, "
+        "then stamp tier bytes into PCORE sections producing PCORE v2.");
+    tier_cmd->require_subcommand(1);
+
+    // genopack tier merge
+    auto* tier_merge_cmd = tier_cmd->add_subcommand("merge",
+        "Merge .ptier side-channel files from multi-part builds into a global .gtier IDF table.");
+    std::vector<std::string> tier_merge_inputs;
+    std::string tier_merge_output;
+    tier_merge_cmd->add_option("-i,--input", tier_merge_inputs,
+        "Input .ptier files (one per build part)")->required();
+    tier_merge_cmd->add_option("-o,--output", tier_merge_output,
+        "Output global .gtier table")->required();
+    tier_merge_cmd->callback([&]() {
+        std::exit(genopack::cmd_tier_merge(tier_merge_inputs, tier_merge_output));
+    });
+
+    // genopack tier stamp
+    auto* tier_stamp_cmd = tier_cmd->add_subcommand("stamp",
+        "Stamp per-aamer tier bytes from a global .gtier into a PCORE section, "
+        "rewriting PCORE v1 → v2 in-place.");
+    std::string tier_stamp_gpk, tier_stamp_table, tier_stamp_out;
+    tier_stamp_cmd->add_option("-i,--input", tier_stamp_gpk,
+        "Input .gpk archive")->required();
+    tier_stamp_cmd->add_option("--table", tier_stamp_table,
+        "Global .gtier table from `genopack tier merge`")->required();
+    tier_stamp_cmd->add_option("-o,--output", tier_stamp_out,
+        "Output .gpk (default: <input>.tier.gpk)");
+    tier_stamp_cmd->callback([&]() {
+        std::exit(genopack::cmd_tier_stamp(tier_stamp_gpk, tier_stamp_table, tier_stamp_out));
+    });
 
     // genopack calibrate
     auto* cal_cmd = app.add_subcommand("calibrate",

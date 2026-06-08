@@ -52,6 +52,7 @@ enum BprmBuildFlags : uint32_t {
     BPRM_F_TAXGROUP = 1u << 4,
     BPRM_F_MARKERS  = 1u << 5,
     BPRM_F_CORE     = 1u << 6,
+    BPRM_F_THIN     = 1u << 7,  // ingest-only archive: compute sections absent, enrich before use
 };
 static_assert(offsetof(BprmHeader, sketch_seed) == 56);
 static_assert(offsetof(BprmHeader, core_theta) == 104);

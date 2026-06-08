@@ -11,18 +11,57 @@
 
 namespace genopack {
 
-PcoreWriter::PcoreWriter(uint32_t k, uint32_t min_seg_aa, float theta)
-    : k_(k), min_seg_aa_(min_seg_aa), theta_(theta) {}
+// ── .ptier side-channel binary format ─────────────────────────────────────────
+// magic  = 0x5054494552000001ULL  ("PTIER\0\0\1")
+// header: { uint64 magic; uint64 n_pairs; uint64 fmh_seed; uint64 frac_max_hash;
+//           uint32 k; uint32 _pad; }   — 48 bytes total
+// body:   { uint64 aamer_hash; uint64 genus_hash; }[] — n_pairs records, unsorted
+
+struct PtierFileHeader {
+    uint64_t magic         = 0x5054494552000001ULL;
+    uint64_t n_pairs       = 0;
+    uint64_t fmh_seed      = 0;
+    uint64_t frac_max_hash = 0;
+    uint32_t k             = 0;
+    uint32_t _pad0         = 0;
+    uint64_t _pad1         = 0;   // reserved — pad to 48 bytes
+};
+static_assert(sizeof(PtierFileHeader) == 48);
+
+PcoreWriter::PcoreWriter(uint32_t k, uint32_t min_seg_aa, float theta, std::string spill_dir)
+    : k_(k), min_seg_aa_(min_seg_aa), theta_(theta), spill_dir_(std::move(spill_dir)) {}
 
 PcoreWriter::~PcoreWriter() {
     if (spill_) { std::fclose(spill_); std::remove(spill_path_.c_str()); }
+    if (tier_sc_) { std::fclose(tier_sc_); tier_sc_ = nullptr; }
+}
+
+void PcoreWriter::set_tier_sidechannel(const std::string& path) {
+    if (path.empty()) return;
+    tier_sc_path_ = path;
+    tier_sc_ = std::fopen(path.c_str(), "w+b");
+    if (!tier_sc_) throw std::runtime_error("PcoreWriter: cannot open tier sidechannel " + path);
+    // Write placeholder header — n_pairs and frac_max_hash filled in finalize().
+    PtierFileHeader hdr{};
+    hdr.fmh_seed = fmh_seed_;
+    hdr.k        = k_;
+    std::fwrite(&hdr, sizeof(hdr), 1, tier_sc_);
+    tier_sc_n_pairs_ = 0;
 }
 
 void PcoreWriter::open_spill_() {
     if (spill_) return;
-    const char* env = std::getenv("GENOPACK_SPILL_DIR");
-    std::filesystem::path dir = (env && *env) ? std::filesystem::path(env)
-                                              : std::filesystem::temp_directory_path();
+    std::filesystem::path dir;
+    if (!spill_dir_.empty()) {
+        dir = std::filesystem::path(spill_dir_);
+    } else if (const char* env = std::getenv("GENOPACK_SPILL_DIR"); env && *env) {
+        dir = std::filesystem::path(env);
+    } else {
+        std::error_code ec;
+        dir = std::filesystem::exists("/scratch", ec) && !ec
+            ? std::filesystem::path("/scratch")
+            : std::filesystem::temp_directory_path();
+    }
     std::error_code ec; std::filesystem::create_directories(dir, ec);
     static std::atomic<uint64_t> ctr{0};
     spill_path_ = (dir / ("pcore_spill_" + std::to_string(::getpid()) + "_" +
@@ -90,6 +129,16 @@ void PcoreWriter::add_sorted(uint64_t key_hash,
     spill(multi_q.data(), multi_q.size());
     spill(core_q.data(),  core_q.size());
 
+    // Emit (aamer_hash, genus_hash) pairs to side-channel if open.
+    if (tier_sc_) {
+        struct PtierPair { uint64_t aamer; uint64_t genus; };
+        for (uint64_t h : aamers) {
+            PtierPair p{h, key_hash};
+            std::fwrite(&p, sizeof(p), 1, tier_sc_);
+        }
+        tier_sc_n_pairs_ += static_cast<uint64_t>(aamers.size());
+    }
+
     EntryMeta m{};
     m.key_hash      = key_hash;
     m.run_off       = run_off;
@@ -126,6 +175,19 @@ uint64_t PcoreWriter::model_hash() const {
 }
 
 SectionDesc PcoreWriter::finalize(AppendWriter& w, uint64_t section_id, uint64_t frac_max_hash) {
+    // Finalise the .ptier side-channel: rewrite the header with actual n_pairs + frac_max.
+    if (tier_sc_) {
+        std::fflush(tier_sc_);
+        std::rewind(tier_sc_);
+        PtierFileHeader hdr{};
+        hdr.fmh_seed      = fmh_seed_;
+        hdr.n_pairs       = tier_sc_n_pairs_;
+        hdr.frac_max_hash = frac_max_hash;
+        hdr.k             = k_;
+        std::fwrite(&hdr, sizeof(hdr), 1, tier_sc_);
+        std::fclose(tier_sc_);
+        tier_sc_ = nullptr;
+    }
     if (spill_) std::fflush(spill_);
     const auto n = static_cast<uint32_t>(meta_.size());
     const uint32_t min_buckets = (n == 0) ? 1

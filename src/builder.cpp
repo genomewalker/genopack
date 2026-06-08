@@ -23,7 +23,7 @@
 #include <genopack/derivation.hpp>
 #include <genopack/section_checksum.hpp>
 #include <genopack/mmap_file.hpp>
-#include <genopack/stage.hpp>
+
 #include <genopack/shard.hpp>
 #include <genopack/toc.hpp>
 #include <genopack/util.hpp>
@@ -96,6 +96,7 @@ static BprmHeader make_bprm_header_from_cfg(const ArchiveBuilderConfig& cfg) {
     if (cfg.taxonomy_group)        bf |= BPRM_F_TAXGROUP;
     if (!cfg.markers_path.empty()) bf |= BPRM_F_MARKERS;
     if (cfg.build_core)            bf |= BPRM_F_CORE;
+    if (cfg.thin_archive)          bf |= BPRM_F_THIN;
     bp.build_flags = bf;
     bp.micro_genus_threshold = cfg.micro_genus_threshold;
     bp.core_theta            = cfg.build_core ? cfg.core_theta : 0.0f;
@@ -333,7 +334,6 @@ struct ArchiveBuilder::Impl {
     std::filesystem::path archive_dir;   // base path (no extension)
     std::filesystem::path gpk_path_;     // output .gpk file
     std::unique_ptr<ArchiveReader> src_reader_;  // from-gpk source (streams decoded sequence)
-    std::unique_ptr<StageReader>   stage_reader_; // from-stage source (streams decoded sequence)
     Config                cfg;
 
     std::vector<BuildRecord> pending;
@@ -387,22 +387,6 @@ struct ArchiveBuilder::Impl {
             add(r);
         });
         spdlog::info("from-gpk: {} genomes from {}", pending.size(), source.string());
-    }
-
-    void add_from_stage(const std::filesystem::path& source) {
-        cfg.from_stage_source = source;
-        stage_reader_ = std::make_unique<StageReader>();
-        stage_reader_->open(source);
-        // One BuildRecord per cached genome (accession + taxonomy); the sequence is
-        // streamed in finalize() from the data blocks. scan_meta() is cheap — it
-        // decompresses only the small (accession, taxonomy) directory.
-        stage_reader_->scan_meta([&](const std::string& acc, const std::string& tax) {
-            BuildRecord r;
-            r.accession = acc;
-            if (!tax.empty()) r.extra_fields.emplace_back("taxonomy", tax);
-            add(r);
-        });
-        spdlog::info("from-stage: {} genomes from {}", pending.size(), source.string());
     }
 
     void add_from_tsv(const std::filesystem::path& tsv_path) {
@@ -470,14 +454,14 @@ struct ArchiveBuilder::Impl {
                     ks, static_cast<uint32_t>(cfg.sketch_size),
                     static_cast<uint32_t>(cfg.sketch_syncmer_s),
                     cfg.sketch_seed, cfg.sketch_seed + 1,
-                    gpk_path_.parent_path().string());
+                    cfg.tmpdir.empty() ? gpk_path_.parent_path().string() : cfg.tmpdir);
             } else {
                 skch_writer = std::make_unique<SkchWriter>(
                     static_cast<uint32_t>(cfg.sketch_size),
                     static_cast<uint32_t>(cfg.sketch_kmer_size),
                     static_cast<uint32_t>(cfg.sketch_syncmer_s),
                     cfg.sketch_seed, cfg.sketch_seed + 1,
-                    gpk_path_.parent_path().string());
+                    cfg.tmpdir.empty() ? gpk_path_.parent_path().string() : cfg.tmpdir);
             }
         }
 
@@ -946,34 +930,6 @@ struct ArchiveBuilder::Impl {
                             task_cv.notify_one();
                         }
                     });
-            } else if (stage_reader_) {
-                // from-stage: stream decoded FASTA sequentially from the local
-                // .gstage cache. Map each record's accession back to its (genus-
-                // sorted) pending index; the drain loop re-buckets by genus, so
-                // arrival order only needs to be genus-dense, not exact.
-                std::unordered_map<std::string, size_t> acc2idx;
-                acc2idx.reserve(total_records * 2);
-                for (size_t i = 0; i < total_records; ++i)
-                    if (!acc2idx.emplace(pending[i].accession, i).second)
-                        throw std::runtime_error("from-stage: duplicate accession in cache: "
-                                                 + pending[i].accession);
-                stage_reader_->scan([&](StageRecord&& sr) {
-                    auto it = acc2idx.find(sr.accession);
-                    if (it == acc2idx.end()) return; // not in pending (shouldn't happen)
-                    size_t idx = it->second;
-                    auto seq = std::make_shared<std::string>(std::move(sr.sequence));
-                    std::unique_lock lk(task_mx);
-                    task_cv.wait(lk, [&]{ return task_q.size() < task_q_max; });
-                    Task t;
-                    t.record          = &pending[idx];
-                    t.gid             = next_genome_id++;
-                    t.input_row_index = pending_input_rows[idx];
-                    t.fd              = -1;
-                    t.seq             = std::move(seq);
-                    task_q.push(std::move(t));
-                    lk.unlock();
-                    task_cv.notify_one();
-                });
             } else {
                 for (size_t i = 0; i < total_records; ++i) {
                     // Open + fadvise before acquiring the lock so kernel starts NFS
@@ -1058,7 +1014,8 @@ struct ArchiveBuilder::Impl {
                             uint64_t fmax = UINT64_MAX;
                             if (want_aamers) {
                                 const char* af = std::getenv("GENOPACK_AAMER_FRAC");
-                                const uint64_t div = (af && *af) ? std::strtoull(af, nullptr, 10) : 1;
+                                const uint64_t div = (af && *af) ? std::strtoull(af, nullptr, 10)
+                                    : static_cast<uint64_t>(cfg.pcore_frac > 0 ? cfg.pcore_frac : 1u);
                                 if (div > 1) fmax = UINT64_MAX / div;
                             }
                             const int fmh_c_vals[1] = { cfg.fmh_c };
@@ -1144,6 +1101,24 @@ struct ArchiveBuilder::Impl {
         // In-memory GCOV/FCOV/FMHR writers populated during flush_staging_buf (one-pass).
         GcovWriter build_gcov_w, build_fcov_w;
         FmhrWriter build_fmhr_w;
+
+        // ── Genus-finalization futures (Steps 4-5) ─────────────────────────────
+        // Each genus's GSTX/GCOV/QUAL block is dispatched to the thread pool so
+        // all n_workers threads stay busy while the main thread drains the queue.
+        std::vector<std::future<void>> genus_futs;
+        genus_futs.reserve(256);
+        auto reap_futs = [&]() {
+            genus_futs.erase(
+                std::remove_if(genus_futs.begin(), genus_futs.end(),
+                    [](std::future<void>& f) {
+                        return f.wait_for(std::chrono::seconds(0))
+                               == std::future_status::ready;
+                    }),
+                genus_futs.end());
+        };
+        // Mutexes protecting each writer from concurrent finalize_genus calls.
+        std::mutex gstx_writer_mx, gcov_writer_mx, fmhr_writer_mx,
+                   core_writer_mx, qual_writer_mx;
         // Per-genus prevalence cores (SEC_CORE). Reuses the per-genome marker
         // aamers (chunk_aamers) already extracted below — zero extra FASTA passes.
         CoreWriter build_core_w(AAMER_K, /*min_seg_aa=*/8, cfg.core_theta);
@@ -1152,22 +1127,32 @@ struct ArchiveBuilder::Impl {
         // dense reference the small-contig foreign-contamination channel needs. Built
         // inline from the same chunk_aamers (zero extra passes); genus tier only here
         // (the family tier is added post-hoc by `genopack pcore`, like FCORE).
-        PcoreWriter build_pcore_w(AAMER_K, /*min_seg_aa=*/8, cfg.core_theta);
+        PcoreWriter build_pcore_w(AAMER_K, /*min_seg_aa=*/8, cfg.core_theta, cfg.tmpdir);
+        if (cfg.build_tier && cfg.build_pcore) {
+            const std::string tier_path = gpk_path_.string() + ".ptier";
+            build_pcore_w.set_tier_sidechannel(tier_path);
+            spdlog::info("build: tier side-channel → {}", tier_path);
+        }
         static constexpr float  kGcovOutlierPct = 0.99f;
         const int               kFmhK           = cfg.fmh_k, kFmhC = cfg.fmh_c;
         static constexpr uint32_t kFmhMinBp     = 1000;
 
         // Marker scoring at build time — same FASTA pass as GCOV/FMH.
         std::unique_ptr<MarkerReader> build_mrk_rd;
-        uint64_t build_mrk_frac_max = UINT64_MAX;
-        {   // GENOPACK_AAMER_FRAC=N → keep 1/N of protein aamers for CORE/PCORE. Keep-all
-            // (N=1) is computationally infeasible at 9.2M (~6.5M aamers/genome → ~10^13
-            // hashmap counts/part); subsample so per-genus counting stays tractable.
+        // build_pcore_frac_max: FMH threshold for PCORE/CORE aamer extraction.
+        // NOT overridden by the marker panel — PCORE and markers may use different rates.
+        // Priority: GENOPACK_AAMER_FRAC env > cfg.pcore_frac (default 100) > 1.
+        uint64_t build_pcore_frac_max = UINT64_MAX;
+        {
             const char* af = std::getenv("GENOPACK_AAMER_FRAC");
-            const uint64_t div = (af && *af) ? std::strtoull(af, nullptr, 10) : 1;
-            if (div > 1) { build_mrk_frac_max = UINT64_MAX / div;
+            const uint64_t div = (af && *af) ? std::strtoull(af, nullptr, 10)
+                                             : static_cast<uint64_t>(cfg.pcore_frac > 0 ? cfg.pcore_frac : 1u);
+            if (div > 1) { build_pcore_frac_max = UINT64_MAX / div;
                 spdlog::info("build: aamer subsample 1/{} (CORE/PCORE)", div); }
         }
+        // build_mrk_frac_max: FMH threshold for marker scoring only.
+        // Overridden by the marker panel's own frac_max when --markers is used.
+        uint64_t build_mrk_frac_max = build_pcore_frac_max;
         if (!cfg.markers_path.empty()) {
             build_mrk_rd = std::make_unique<MarkerReader>();
             try {
@@ -1197,6 +1182,432 @@ struct ArchiveBuilder::Impl {
                 build_contam_panel.reset();
             }
         }
+
+        // ── finalize_genus ──────────────────────────────────────────────────────
+        // Computes GSTX consensus, GCOV covariance, QUAL records, CORE/PCORE for
+        // one homogeneous genus chunk. Designed to run off the main thread: all
+        // reads of `buf` are local, all writer calls are mutex-guarded.
+        // `buf` is taken by value so callers can std::move it in (Step 5).
+        auto finalize_genus = [&](std::vector<ChunkItem> buf,
+                                  std::unique_ptr<GenusAamerCounter>* accum_holder,
+                                  std::vector<uint64_t>* accum_member_ids) {
+            if (buf.size() < 2) return;
+
+            // genus_homogeneous check (same logic as flush_staging_buf)
+            {
+                std::string g0;
+                for (const auto& [k, v] : buf[0].record.extra_fields)
+                    if (k == "taxonomy") { g0 = extract_taxonomy_bucket(v, 'g'); break; }
+                for (size_t gi = 1; gi < buf.size(); ++gi)
+                    for (const auto& [k, v] : buf[gi].record.extra_fields)
+                        if (k == "taxonomy") {
+                            if (extract_taxonomy_bucket(v, 'g') != g0) return;
+                            break;
+                        }
+            }
+
+            if (!cfg.build_gstx || !cfg.taxonomy_group || !multi_k_sketch) return;
+
+            std::string genus_key;
+            std::string species_key;
+            for (const auto& [k, v] : buf[0].record.extra_fields)
+                if (k == "taxonomy") {
+                    genus_key   = extract_taxonomy_bucket(v, 'g');
+                    species_key = extract_taxonomy_bucket(v, 's');
+                    break;
+                }
+            const std::string& gstx_key = (!species_key.empty() && species_key != "__unclassified__")
+                                          ? species_key : genus_key;
+
+            const int nk   = std::min((int)buf[0].sketches_mk.size(), (int)GSTX_MAX_K);
+            const int bins = cfg.sketch_size;
+
+            if (nk <= 0 || genus_key.empty() || genus_key == "__unclassified__"
+                || bins != static_cast<int>(GSTX_BINS)) return;
+
+            // Pass 1: Boyer-Moore majority vote → consensus signature per k
+            std::vector<std::vector<uint16_t>> cand(nk, std::vector<uint16_t>(bins, 0));
+            std::vector<std::vector<int32_t>>  vote(nk, std::vector<int32_t>(bins, 0));
+            for (const auto& item : buf) {
+                for (int ki = 0; ki < nk && ki < (int)item.sketches_mk.size(); ++ki) {
+                    const auto& sk = item.sketches_mk[ki];
+                    for (int b = 0; b < bins; ++b) {
+                        uint16_t v = static_cast<uint16_t>(sk.signature1[b] & 0xFFFF);
+                        if      (vote[ki][b] == 0) { cand[ki][b] = v; vote[ki][b] = 1; }
+                        else if (v == cand[ki][b]) { ++vote[ki][b]; }
+                        else                       { --vote[ki][b]; }
+                    }
+                }
+            }
+
+            // Pass 2: containment vs consensus → exact p90 (all data in RAM)
+            float p90[GSTX_MAX_K] = {};
+            std::vector<float> cont0_v;
+            cont0_v.reserve(buf.size());
+            if (nk > 0) {
+                for (const auto& item : buf) {
+                    if (item.sketches_mk.empty()) { cont0_v.push_back(0.0f); continue; }
+                    const auto& sk = item.sketches_mk[0];
+                    int match = 0;
+                    for (int b = 0; b < bins; ++b)
+                        if (static_cast<uint16_t>(sk.signature1[b] & 0xFFFF) == cand[0][b]) ++match;
+                    cont0_v.push_back(static_cast<float>(match) / bins);
+                }
+            }
+            const float max_c0 = cont0_v.empty() ? 0.0f
+                : *std::max_element(cont0_v.begin(), cont0_v.end());
+            const float keep_thr = GSTX_P90_COMPLETE_FRAC * max_c0;
+
+            for (int ki = 0; ki < nk; ++ki) {
+                std::vector<float> c;
+                c.reserve(buf.size());
+                for (size_t ii = 0; ii < buf.size(); ++ii) {
+                    if (ki >= (int)buf[ii].sketches_mk.size()) continue;
+                    if (!cont0_v.empty() && cont0_v[ii] < keep_thr) continue;
+                    const auto& sk = buf[ii].sketches_mk[ki];
+                    int match = 0;
+                    for (int b = 0; b < bins; ++b)
+                        if (static_cast<uint16_t>(sk.signature1[b] & 0xFFFF) == cand[ki][b]) ++match;
+                    c.push_back(static_cast<float>(match) / bins);
+                }
+                if (c.empty()) {
+                    for (const auto& item : buf) {
+                        if (ki >= (int)item.sketches_mk.size()) continue;
+                        const auto& sk = item.sketches_mk[ki];
+                        int match = 0;
+                        for (int b = 0; b < bins; ++b)
+                            if (static_cast<uint16_t>(sk.signature1[b] & 0xFFFF) == cand[ki][b]) ++match;
+                        c.push_back(static_cast<float>(match) / bins);
+                    }
+                }
+                if (!c.empty()) {
+                    size_t idx = static_cast<size_t>(0.9f * c.size());
+                    if (idx >= c.size()) idx = c.size() - 1;
+                    std::nth_element(c.begin(), c.begin() + idx, c.end());
+                    p90[ki] = c[idx];
+                }
+            }
+
+            // TNF centroid
+            float tnf_mu[136] = {};
+            for (const auto& item : buf)
+                for (int d = 0; d < 136; ++d) tnf_mu[d] += item.stats.kmer4_profile[d];
+            const bool has_tnf = buf.size() >= 2;
+            if (has_tnf)
+                for (int d = 0; d < 136; ++d) tnf_mu[d] /= static_cast<float>(buf.size());
+
+            uint32_t ksizes[GSTX_MAX_K] = {};
+            for (int ki = 0; ki < nk; ++ki)
+                ksizes[ki] = static_cast<uint32_t>(cfg.sketch_kmer_sizes[ki]);
+
+            // nrb_p90: p90 of n_real_bins at k=0 — used for sketch-fill completeness
+            float nrb_p90_gstx = 0.0f;
+            if (nk > 0) {
+                std::vector<float> nrb_v;
+                nrb_v.reserve(buf.size());
+                for (const auto& item : buf)
+                    if (!item.sketches_mk.empty())
+                        nrb_v.push_back(static_cast<float>(item.sketches_mk[0].n_real_bins));
+                if (!nrb_v.empty()) {
+                    size_t idx = static_cast<size_t>(0.9f * static_cast<float>(nrb_v.size()));
+                    if (idx >= nrb_v.size()) idx = nrb_v.size() - 1;
+                    std::nth_element(nrb_v.begin(), nrb_v.begin() + static_cast<ptrdiff_t>(idx), nrb_v.end());
+                    nrb_p90_gstx = nrb_v[idx];
+                }
+            }
+
+            {
+                std::lock_guard<std::mutex> lk(gstx_writer_mx);
+                gstx_writer.add_genus(gstx_key,
+                                      static_cast<uint32_t>(buf.size()),
+                                      static_cast<uint32_t>(nk),
+                                      cand, p90,
+                                      has_tnf ? tnf_mu : nullptr,
+                                      ksizes,
+                                      nrb_p90_gstx);
+            }
+
+            // Per-genome quality records + long-contig profiles for GCOV scoring.
+            const float k0 = nk >= 1 ? static_cast<float>(cfg.sketch_kmer_sizes[0]) : 0.0f;
+            const float k1 = nk >= 2 ? static_cast<float>(cfg.sketch_kmer_sizes[1]) : 0.0f;
+            const float k2 = nk >= 3 ? static_cast<float>(cfg.sketch_kmer_sizes[2]) : 0.0f;
+
+            std::vector<QualRecord>                 pending_qrs;
+            std::vector<std::vector<ContigProfile>> all_profiles;
+            pending_qrs.reserve(buf.size());
+            all_profiles.reserve(buf.size());
+
+            for (const auto& item : buf) {
+                auto qr               = QualRecord::make_empty(item.genome_id);
+                qr.support_tier       = 0; // GenusSaturated
+                qr.interval_width     = 0.05f;
+                qr.chromosome_skew_closure    = item.stats.gc_skew_closure;
+                qr.completeness_fragmentation =
+                    item.stats.n_contigs <= 1 ? 1.0f
+                    : 1.0f / (1.0f + 0.333f * std::log2f(
+                        static_cast<float>(item.stats.n_contigs)));
+
+                float cont[GSTX_MAX_K] = {};
+                for (int ki = 0; ki < nk && ki < (int)item.sketches_mk.size(); ++ki) {
+                    const auto& sk = item.sketches_mk[ki];
+                    int match = 0;
+                    for (int b = 0; b < bins; ++b)
+                        if (static_cast<uint16_t>(sk.signature1[b] & 0xFFFF) == cand[ki][b])
+                            ++match;
+                    cont[ki] = static_cast<float>(match) / bins;
+                }
+
+                if (p90[0] > 0.01f)
+                    qr.completeness_cluster_relative =
+                        std::clamp(cont[0] / p90[0], 0.0f, 1.5f);
+
+                if (nk >= 3 && cont[0] >= 0.01f && cont[1] >= 0.01f && cont[2] >= 0.01f) {
+                    const float lc0 = std::log(cont[0]), lc1 = std::log(cont[1]), lc2 = std::log(cont[2]);
+                    const float beta = (k0*lc0 + k1*lc1 + k2*lc2) / (k0*k0 + k1*k1 + k2*k2);
+                    const float c2_pred = std::exp(beta * k2);
+                    qr.contamination_leakage =
+                        std::max(0.0f, c2_pred - cont[2]) / std::max(c2_pred, 0.01f);
+                    const float r0=lc0-beta*k0, r1=lc1-beta*k1, r2=lc2-beta*k2;
+                    qr.leakage_residual = std::sqrt((r0*r0 + r1*r1 + r2*r2) / 2.0f);
+                } else if (nk >= 2 && cont[0] >= 0.01f && cont[1] >= 0.01f) {
+                    const float beta = (k0*std::log(cont[0]) + k1*std::log(cont[1])) / (k0*k0 + k1*k1);
+                    const float c1_pred = std::exp(beta * k1);
+                    qr.contamination_leakage =
+                        std::max(0.0f, c1_pred - cont[1]) / std::max(c1_pred, 0.01f);
+                }
+
+                if (has_tnf) {
+                    float d2 = 0.0f, norm2 = 0.0f;
+                    for (int di = 0; di < 136; ++di) {
+                        float diff = item.stats.kmer4_profile[di] - tnf_mu[di];
+                        d2    += diff * diff;
+                        norm2 += tnf_mu[di] * tnf_mu[di];
+                    }
+                    const float dist = std::sqrt(d2);
+                    const float ref  = std::sqrt(norm2);
+                    if (ref > 1e-6f)
+                        qr.contamination_tnf_excess = std::max(0.0f, dist / ref - 1.0f);
+
+                    qr.completeness_post_decontam =
+                        compute_completeness_post_decontam(item.fasta, tnf_mu);
+                }
+
+                {
+                    const AllSignals& sig = item.signals;
+                    qr.self_coherence        = sig.self_coherence;
+                    qr.chargaff_parity        = sig.chargaff_parity;
+                    qr.spectral_gap           = sig.spectral_gap;
+                    qr.scale_kink             = sig.scale_kink;
+                    qr.contamination_mixture  = sig.contamination_mixture;
+                    qr.mixture_sources        = static_cast<int16_t>(sig.mixture_sources);
+                    qr.n_mix_windows          = sig.n_mix_windows;
+                    qr.fiedler_u16            = static_cast<uint16_t>(
+                        std::min(1.0f, std::isnan(sig.fiedler_value) ? 0.0f : sig.fiedler_value) * 65535.0f);
+                    if (sig.mix_no_data)
+                        qr.qual_flags |= QualRecord::QUAL_FLAG_MIX_NO_DATA;
+                    qr.qual_flags |= QualRecord::QUAL_FLAG_BUILD_SIGNALS;
+                }
+
+                all_profiles.push_back(std::move(item.long_profiles));
+                pending_qrs.push_back(std::move(qr));
+            }
+
+            // ── One-pass GCOV/FCOV/FMHR ──────────────────────────────────────
+            if (cfg.build_gcov) {
+                std::string family_key;
+                for (const auto& [k, v] : buf[0].record.extra_fields)
+                    if (k == "taxonomy") {
+                        auto fp = v.find("f__");
+                        if (fp != std::string::npos) {
+                            auto fe = v.find(';', fp + 3);
+                            family_key = v.substr(fp, fe == std::string::npos
+                                                       ? v.size() - fp : fe - fp);
+                            if (family_key == "f__") family_key.clear();
+                        }
+                        break;
+                    }
+
+                GenusAccum genus_acc, family_acc;
+                std::vector<uint64_t> fmh_all;
+                const bool do_markers = build_mrk_rd && build_mrk_rd->has_merged_pool();
+                const bool need_aamers = do_markers || cfg.build_core || cfg.build_pcore;
+                GenusAamerCounter local_counter;
+                if (accum_holder && !*accum_holder) *accum_holder = std::make_unique<GenusAamerCounter>();
+                GenusAamerCounter* const ctr = accum_holder ? accum_holder->get() : &local_counter;
+                const bool cross_chunk = (accum_holder != nullptr);
+                const bool aamers_capped = (cfg.genus_member_cap > 0) && accum_member_ids
+                    && accum_member_ids->size() >= cfg.genus_member_cap;
+                (void)need_aamers;
+
+                for (size_t ii = 0; ii < buf.size(); ++ii) {
+                    genus_acc.add_genome(all_profiles[ii]);
+                    if (!family_key.empty()) family_acc.add_genome(all_profiles[ii]);
+                    fmh_all.insert(fmh_all.end(), buf[ii].fmh.begin(), buf[ii].fmh.end());
+                }
+
+                if (!aamers_capped && (cfg.build_core || cfg.build_pcore)) {
+                    std::vector<const std::vector<uint64_t>*> ptrs;
+                    ptrs.reserve(buf.size());
+                    for (size_t ii = 0; ii < buf.size(); ++ii)
+                        if (!buf[ii].aamers.empty()) {
+                            ptrs.push_back(&buf[ii].aamers);
+                            if (accum_member_ids) accum_member_ids->push_back(buf[ii].genome_id);
+                        }
+                    if (!ptrs.empty()) ctr->add_chunk(ptrs);
+                }
+
+                const uint32_t n_mem = static_cast<uint32_t>(buf.size());
+                GcovEntry ge{}, fe{};
+                bool fcov_ok = false;
+                {
+                    std::lock_guard<std::mutex> lk(gcov_writer_mx);
+                    ge = finalize_and_add_genus(genus_key, n_mem, genus_acc, build_gcov_w);
+                    if (!family_key.empty()) {
+                        fe = finalize_and_add_genus(family_key, n_mem, family_acc, build_fcov_w);
+                        fcov_ok = (fe.flags & GCOV_FLAG_VALID) != 0;
+                    }
+                }
+
+                if (!fmh_all.empty()) {
+                    std::sort(fmh_all.begin(), fmh_all.end());
+                    fmh_all.erase(std::unique(fmh_all.begin(), fmh_all.end()), fmh_all.end());
+                    std::lock_guard<std::mutex> lk(fmhr_writer_mx);
+                    build_fmhr_w.add(GcovWriter::hash_genus(genus_key), std::move(fmh_all));
+                }
+
+                if (!cross_chunk && (cfg.build_core || cfg.build_pcore) && !local_counter.empty()) {
+                    std::vector<uint64_t> aamers; std::vector<uint32_t> counts;
+                    local_counter.finalize_sorted(aamers, counts);
+                    const uint64_t gkh = GcovWriter::hash_genus(genus_key);
+                    std::vector<uint64_t> member_ids;
+                    member_ids.reserve(pending_qrs.size());
+                    for (const auto& qr : pending_qrs) member_ids.push_back(qr.genome_id);
+                    std::lock_guard<std::mutex> lk(core_writer_mx);
+                    if (cfg.build_core)  build_core_w.add_sorted(gkh, aamers, counts, n_mem, member_ids);
+                    if (cfg.build_pcore) build_pcore_w.add_sorted(gkh, aamers, counts, n_mem);
+                }
+
+                // Score contigs and populate outlier fields.
+                const bool genus_ok = (ge.flags & GCOV_FLAG_VALID) != 0;
+                for (size_t ii = 0; ii < pending_qrs.size(); ++ii) {
+                    auto& qr        = pending_qrs[ii];
+                    const auto& cps = all_profiles[ii];
+                    qr.qual_flags  |= QualRecord::QUAL_FLAG_GCOV_SCORED;
+                    if (!genus_ok || cps.empty()) continue;
+
+                    uint32_t cco_bp=0, spe_bp=0, rho_bp=0, sib_bp=0, scored_bp=0;
+                    for (const auto& cp : cps) {
+                        scored_bp += cp.bp;
+                        float xmu[136];
+                        for (int d=0;d<136;++d) xmu[d] = cp.p[d] - ge.mu[d];
+                        const float pct  = gcov_percentile(ge, gcov_mahalanobis(ge, xmu));
+                        const float spct = gcov_spe_percentile(ge, gcov_spe(ge, xmu));
+                        const bool t2  = pct  >= kGcovOutlierPct;
+                        const bool spe = spct >= kGcovOutlierPct;
+                        if (t2 || spe) cco_bp += cp.bp;
+                        if (spe)       spe_bp += cp.bp;
+                        float rhod[16];
+                        for (int i=0;i<16;++i) rhod[i] = cp.rho[i] - ge.rho_mean[i];
+                        if (gcov_rho_percentile(ge, gcov_rho_distance(ge, rhod)) >= kGcovOutlierPct)
+                            rho_bp += cp.bp;
+                        if ((t2||spe) && fcov_ok) {
+                            float xmuf[136];
+                            for (int d=0;d<136;++d) xmuf[d] = cp.p[d] - fe.mu[d];
+                            const float fp  = gcov_percentile(fe, gcov_mahalanobis(fe, xmuf));
+                            const float fsp = gcov_spe_percentile(fe, gcov_spe(fe, xmuf));
+                            if (!(fp >= kGcovOutlierPct || fsp >= kGcovOutlierPct))
+                                sib_bp += cp.bp;
+                        }
+                    }
+                    if (scored_bp > 0) {
+                        auto enc = [&](uint32_t bp) {
+                            return static_cast<uint8_t>(
+                                std::min(255u, (bp * 255u) / scored_bp));
+                        };
+                        qr.contig_outlier_u8  = enc(cco_bp);
+                        qr.spe_outlier_u8     = enc(spe_bp);
+                        qr.rho_outlier_u8     = enc(rho_bp);
+                        qr.sibling_outlier_u8 = enc(sib_bp);
+                    }
+                }
+
+                // Marker completeness — reuse aamers collected in FMH loop.
+                if (do_markers) {
+                    const uint64_t gh = GcovWriter::hash_genus(genus_key);
+                    auto calib = build_mrk_rd->lookup_lineage(gh);
+                    if (calib.valid()) {
+                        const bool is_arc = (calib.header->domain == MRKR_DOMAIN_ARC);
+                        auto mh  = is_arc ? build_mrk_rd->merged_hashes_arc()
+                                          : build_mrk_rd->merged_hashes_bac();
+                        auto mid = is_arc ? build_mrk_rd->merged_ids_arc()
+                                          : build_mrk_rd->merged_ids_bac();
+                        const uint8_t n_markers = calib.header->n_markers;
+                        for (size_t ii = 0; ii < pending_qrs.size(); ++ii) {
+                            const auto& qv = buf[ii].aamers;
+                            if (qv.empty()) continue;
+                            uint32_t hits[173] = {};
+                            const uint64_t *qp=qv.data(), *qpe=qp+qv.size();
+                            const uint64_t *mhp=mh.data(), *mhe=mhp+mh.size();
+                            const uint8_t  *mip=mid.data();
+                            while (qp!=qpe && mhp!=mhe) {
+                                if      (*qp < *mhp) ++qp;
+                                else if (*mhp < *qp) { ++mhp; ++mip; }
+                                else                 { hits[*mip]++; ++qp; ++mhp; ++mip; }
+                            }
+                            int n_present=0, n_expected=0;
+                            float redun_sum=0.0f; int redun_n=0;
+                            for (uint8_t mi=0; mi<n_markers; ++mi) {
+                                if (!calib.marker_expected(mi)) continue;
+                                ++n_expected;
+                                const uint32_t thr = static_cast<uint32_t>(
+                                    calib.slots[mi].null_floor_u16)
+                                    + static_cast<uint32_t>(cfg.marker_min_hits);
+                                if (hits[mi] >= thr) {
+                                    ++n_present;
+                                    const uint8_t pool_mi = is_arc
+                                        ? static_cast<uint8_t>(build_mrk_rd->n_bac()+mi)
+                                        : mi;
+                                    const uint32_t psz = build_mrk_rd->pool_n_hashes(pool_mi);
+                                    if (psz > 0) {
+                                        redun_sum += static_cast<float>(hits[mi])
+                                                   / static_cast<float>(psz);
+                                        ++redun_n;
+                                    }
+                                }
+                            }
+                            auto& qr = pending_qrs[ii];
+                            if (n_expected > 0) {
+                                const float comp = static_cast<float>(n_present)
+                                                 / static_cast<float>(n_expected);
+                                qr.marker_completeness_u8 = static_cast<uint8_t>(
+                                    std::clamp(comp, 0.0f, 1.0f) * 254.0f + 1.0f);
+                            }
+                            if (redun_n > 0) {
+                                const float redun = redun_sum / static_cast<float>(redun_n);
+                                const float clamped = std::min(0.09999f, redun);
+                                qr.marker_redundancy_u16 = static_cast<uint16_t>(
+                                    clamped / 0.1f * 65534.0f);
+                                qr.qual_flags |= QualRecord::QUAL_FLAG_MARKER_SCORED;
+                            }
+                        }
+                    }
+                }
+
+                // Contamination duplication — panel.score is const/thread-safe.
+                if (build_contam_panel) {
+                    for (size_t ii = 0; ii < pending_qrs.size(); ++ii) {
+                        const auto sc = build_contam_panel->score(buf[ii].fasta);
+                        pending_qrs[ii].contamination_duplication_u16 =
+                            QualRecord::encode_dup(sc.redundancy_fraction);
+                    }
+                }
+            }
+
+            {
+                std::lock_guard<std::mutex> lk(qual_writer_mx);
+                for (auto& qr : pending_qrs) qual_writer.add(qr);
+            }
+        }; // end finalize_genus
 
         auto flush_staging_buf = [&](std::vector<ChunkItem>& buf,
                                      std::unique_ptr<GenusAamerCounter>* accum_holder = nullptr,
@@ -1281,452 +1692,28 @@ struct ArchiveBuilder::Impl {
                 for (const auto& [k, v] : item.record.extra_fields) meta_out << "\t" << v;
                 meta_out << "\n";
             }
-            // GSTX: accumulate genus sketch stats while all genus members are in memory.
-            // Requires taxonomy_group (genus-bounded shards) + multi-k sketches.
-            // Skip for combined micro-genus shards (mixed genera).
-            const bool genus_homogeneous = [&] {
-                if (buf.size() < 2) return true;
-                std::string g0;
-                for (const auto& [k, v] : buf[0].record.extra_fields)
-                    if (k == "taxonomy") { g0 = extract_taxonomy_bucket(v, 'g'); break; }
-                for (size_t gi = 1; gi < buf.size(); ++gi)
-                    for (const auto& [k, v] : buf[gi].record.extra_fields)
-                        if (k == "taxonomy") {
-                            if (extract_taxonomy_bucket(v, 'g') != g0) return false;
-                            break;
-                        }
-                return true;
-            }();
-            if (cfg.build_gstx && cfg.taxonomy_group && multi_k_sketch && buf.size() >= 2
-                && genus_homogeneous) {
-                std::string genus_key;
-                std::string species_key;
-                for (const auto& [k, v] : buf[0].record.extra_fields)
-                    if (k == "taxonomy") {
-                        genus_key   = extract_taxonomy_bucket(v, 'g');
-                        species_key = extract_taxonomy_bucket(v, 's');
-                        break;
-                    }
-                const std::string& gstx_key = (!species_key.empty() && species_key != "__unclassified__")
-                                              ? species_key : genus_key;
-
-                const int nk   = std::min((int)buf[0].sketches_mk.size(), (int)GSTX_MAX_K);
-                const int bins = cfg.sketch_size;
-
-                if (nk > 0 && !genus_key.empty() && genus_key != "__unclassified__"
-                    && bins == static_cast<int>(GSTX_BINS)) {
-
-                    // Pass 1: Boyer-Moore majority vote → consensus signature per k
-                    std::vector<std::vector<uint16_t>> cand(nk, std::vector<uint16_t>(bins, 0));
-                    std::vector<std::vector<int32_t>>  vote(nk, std::vector<int32_t>(bins, 0));
-                    for (const auto& item : buf) {
-                        for (int ki = 0; ki < nk && ki < (int)item.sketches_mk.size(); ++ki) {
-                            const auto& sk = item.sketches_mk[ki];
-                            for (int b = 0; b < bins; ++b) {
-                                uint16_t v = static_cast<uint16_t>(sk.signature1[b] & 0xFFFF);
-                                if      (vote[ki][b] == 0) { cand[ki][b] = v; vote[ki][b] = 1; }
-                                else if (v == cand[ki][b]) { ++vote[ki][b]; }
-                                else                       { --vote[ki][b]; }
-                            }
-                        }
-                    }
-
-                    // Pass 2: containment vs consensus → exact p90 (all data in RAM)
-                    // Compute k=0 containments first to build a completeness-based keep mask:
-                    // exclude members with cont0 < GSTX_P90_COMPLETE_FRAC * max_cont0 so that
-                    // incomplete genomes don't deflate the p90 reference and bias CCR upward.
-                    float p90[GSTX_MAX_K] = {};
-                    std::vector<float> cont0_v;
-                    cont0_v.reserve(buf.size());
-                    if (nk > 0) {
-                        for (const auto& item : buf) {
-                            if (item.sketches_mk.empty()) { cont0_v.push_back(0.0f); continue; }
-                            const auto& sk = item.sketches_mk[0];
-                            int match = 0;
-                            for (int b = 0; b < bins; ++b)
-                                if (static_cast<uint16_t>(sk.signature1[b] & 0xFFFF) == cand[0][b]) ++match;
-                            cont0_v.push_back(static_cast<float>(match) / bins);
-                        }
-                    }
-                    const float max_c0 = cont0_v.empty() ? 0.0f
-                        : *std::max_element(cont0_v.begin(), cont0_v.end());
-                    const float keep_thr = GSTX_P90_COMPLETE_FRAC * max_c0;
-
-                    for (int ki = 0; ki < nk; ++ki) {
-                        std::vector<float> c;
-                        c.reserve(buf.size());
-                        for (size_t ii = 0; ii < buf.size(); ++ii) {
-                            if (ki >= (int)buf[ii].sketches_mk.size()) continue;
-                            if (!cont0_v.empty() && cont0_v[ii] < keep_thr) continue;
-                            const auto& sk = buf[ii].sketches_mk[ki];
-                            int match = 0;
-                            for (int b = 0; b < bins; ++b)
-                                if (static_cast<uint16_t>(sk.signature1[b] & 0xFFFF) == cand[ki][b]) ++match;
-                            c.push_back(static_cast<float>(match) / bins);
-                        }
-                        if (c.empty()) { // fallback: all members if threshold filtered everything
-                            for (const auto& item : buf) {
-                                if (ki >= (int)item.sketches_mk.size()) continue;
-                                const auto& sk = item.sketches_mk[ki];
-                                int match = 0;
-                                for (int b = 0; b < bins; ++b)
-                                    if (static_cast<uint16_t>(sk.signature1[b] & 0xFFFF) == cand[ki][b]) ++match;
-                                c.push_back(static_cast<float>(match) / bins);
-                            }
-                        }
-                        if (!c.empty()) {
-                            size_t idx = static_cast<size_t>(0.9f * c.size());
-                            if (idx >= c.size()) idx = c.size() - 1;
-                            std::nth_element(c.begin(), c.begin() + idx, c.end());
-                            p90[ki] = c[idx];
-                        }
-                    }
-
-                    // TNF centroid
-                    float tnf_mu[136] = {};
-                    for (const auto& item : buf)
-                        for (int d = 0; d < 136; ++d) tnf_mu[d] += item.stats.kmer4_profile[d];
-                    const bool has_tnf = buf.size() >= 2;
-                    if (has_tnf)
-                        for (int d = 0; d < 136; ++d) tnf_mu[d] /= static_cast<float>(buf.size());
-
-                    uint32_t ksizes[GSTX_MAX_K] = {};
-                    for (int ki = 0; ki < nk; ++ki)
-                        ksizes[ki] = static_cast<uint32_t>(cfg.sketch_kmer_sizes[ki]);
-
-                    // nrb_p90: p90 of n_real_bins at k=0 — used for sketch-fill completeness
-                    float nrb_p90_gstx = 0.0f;
-                    if (nk > 0) {
-                        std::vector<float> nrb_v;
-                        nrb_v.reserve(buf.size());
-                        for (const auto& item : buf)
-                            if (!item.sketches_mk.empty())
-                                nrb_v.push_back(static_cast<float>(item.sketches_mk[0].n_real_bins));
-                        if (!nrb_v.empty()) {
-                            size_t idx = static_cast<size_t>(0.9f * static_cast<float>(nrb_v.size()));
-                            if (idx >= nrb_v.size()) idx = nrb_v.size() - 1;
-                            std::nth_element(nrb_v.begin(), nrb_v.begin() + static_cast<ptrdiff_t>(idx), nrb_v.end());
-                            nrb_p90_gstx = nrb_v[idx];
-                        }
-                    }
-
-                    gstx_writer.add_genus(gstx_key,
-                                          static_cast<uint32_t>(buf.size()),
-                                          static_cast<uint32_t>(nk),
-                                          cand, p90,
-                                          has_tnf ? tnf_mu : nullptr,
-                                          ksizes,
-                                          nrb_p90_gstx);
-
-                    // Per-genome quality: apply genus stats to each member while in RAM.
-                    // contamination_leakage: power-law residual of sketch vs consensus.
-                    // completeness_cluster_relative: containment@k[0] / p90[0].
-                    // Absolute k values for slope-only OLS log-linear fit (α=1 forced).
-                    const float k0 = nk >= 1 ? static_cast<float>(cfg.sketch_kmer_sizes[0]) : 0.0f;
-                    const float k1 = nk >= 2 ? static_cast<float>(cfg.sketch_kmer_sizes[1]) : 0.0f;
-                    const float k2 = nk >= 3 ? static_cast<float>(cfg.sketch_kmer_sizes[2]) : 0.0f;
-
-                    // Deferred qual records + long-contig profiles for one-pass GCOV scoring.
-                    std::vector<QualRecord>                  pending_qrs;
-                    std::vector<std::vector<ContigProfile>>  all_profiles;
-                    pending_qrs.reserve(buf.size());
-                    all_profiles.reserve(buf.size());
-
-                    for (const auto& item : buf) {
-                        auto qr               = QualRecord::make_empty(item.genome_id);
-                        qr.support_tier       = 0; // GenusSaturated
-                        qr.interval_width     = 0.05f;
-                        qr.chromosome_skew_closure    = item.stats.gc_skew_closure;
-                        qr.completeness_fragmentation =
-                            item.stats.n_contigs <= 1 ? 1.0f
-                            : 1.0f / (1.0f + 0.333f * std::log2f(
-                                static_cast<float>(item.stats.n_contigs)));
-
-                        // Containment at each k vs genus consensus
-                        float cont[GSTX_MAX_K] = {};
-                        for (int ki = 0; ki < nk && ki < (int)item.sketches_mk.size(); ++ki) {
-                            const auto& sk = item.sketches_mk[ki];
-                            int match = 0;
-                            for (int b = 0; b < bins; ++b)
-                                if (static_cast<uint16_t>(sk.signature1[b] & 0xFFFF) == cand[ki][b])
-                                    ++match;
-                            cont[ki] = static_cast<float>(match) / bins;
-                        }
-
-                        if (p90[0] > 0.01f)
-                            qr.completeness_cluster_relative =
-                                std::clamp(cont[0] / p90[0], 0.0f, 1.5f);
-
-                        // Slope-only OLS: log(C_k) = k * β, no free intercept (α=1).
-                        // β = Σ(k_i * log(c_i)) / Σ(k_i^2); leakage = over-prediction at k2.
-                        // leakage_residual = per-DoF RMSE of the fit.
-                        if (nk >= 3 && cont[0] >= 0.01f && cont[1] >= 0.01f && cont[2] >= 0.01f) {
-                            const float lc0 = std::log(cont[0]), lc1 = std::log(cont[1]), lc2 = std::log(cont[2]);
-                            const float beta = (k0*lc0 + k1*lc1 + k2*lc2) / (k0*k0 + k1*k1 + k2*k2);
-                            const float c2_pred = std::exp(beta * k2);
-                            qr.contamination_leakage =
-                                std::max(0.0f, c2_pred - cont[2]) / std::max(c2_pred, 0.01f);
-                            const float r0=lc0-beta*k0, r1=lc1-beta*k1, r2=lc2-beta*k2;
-                            qr.leakage_residual = std::sqrt((r0*r0 + r1*r1 + r2*r2) / 2.0f);
-                            // sketch_breadth field repurposed → fmh_minority_u8/marker_completeness_u8 (check-time only)
-                        } else if (nk >= 2 && cont[0] >= 0.01f && cont[1] >= 0.01f) {
-                            const float beta = (k0*std::log(cont[0]) + k1*std::log(cont[1])) / (k0*k0 + k1*k1);
-                            const float c1_pred = std::exp(beta * k1);
-                            qr.contamination_leakage =
-                                std::max(0.0f, c1_pred - cont[1]) / std::max(c1_pred, 0.01f);
-                        }
-
-                        // TNF: simple L2 distance to centroid (normalised by centroid norm)
-                        if (has_tnf) {
-                            float d2 = 0.0f, norm2 = 0.0f;
-                            for (int di = 0; di < 136; ++di) {
-                                float diff = item.stats.kmer4_profile[di] - tnf_mu[di];
-                                d2    += diff * diff;
-                                norm2 += tnf_mu[di] * tnf_mu[di];
-                            }
-                            const float dist = std::sqrt(d2);
-                            const float ref  = std::sqrt(norm2);
-                            if (ref > 1e-6f)
-                                qr.contamination_tnf_excess = std::max(0.0f, dist / ref - 1.0f);
-
-                            qr.completeness_post_decontam =
-                                compute_completeness_post_decontam(item.fasta, tnf_mu);
-                        }
-
-                        {
-                            const AllSignals& sig = item.signals;   // computed in the worker
-                            qr.self_coherence        = sig.self_coherence;
-                            qr.chargaff_parity        = sig.chargaff_parity;
-                            qr.spectral_gap           = sig.spectral_gap;
-                            qr.scale_kink             = sig.scale_kink;
-                            qr.contamination_mixture  = sig.contamination_mixture;
-                            qr.mixture_sources        = static_cast<int16_t>(sig.mixture_sources);
-                            qr.n_mix_windows          = sig.n_mix_windows;
-                            qr.fiedler_u16            = static_cast<uint16_t>(
-                                std::min(1.0f, std::isnan(sig.fiedler_value) ? 0.0f : sig.fiedler_value) * 65535.0f);
-                            if (sig.mix_no_data)
-                                qr.qual_flags |= QualRecord::QUAL_FLAG_MIX_NO_DATA;
-                            qr.qual_flags |= QualRecord::QUAL_FLAG_BUILD_SIGNALS;
-                        }
-
-                        // Long-contig profiles for GCOV — computed in the worker (parallel).
-                        all_profiles.push_back(std::move(item.long_profiles));
-                        pending_qrs.push_back(std::move(qr));
-                    }
-
-                    // ── One-pass GCOV/FCOV/FMHR ────────────────────────────────
-                    if (cfg.build_gcov && genus_homogeneous) {
-                        // Extract family from first genome taxonomy.
-                        std::string family_key;
-                        for (const auto& [k, v] : buf[0].record.extra_fields)
-                            if (k == "taxonomy") {
-                                auto fp = v.find("f__");
-                                if (fp != std::string::npos) {
-                                    auto fe = v.find(';', fp + 3);
-                                    family_key = v.substr(fp, fe == std::string::npos
-                                                               ? v.size() - fp : fe - fp);
-                                    if (family_key == "f__") family_key.clear();
-                                }
-                                break;
-                            }
-
-                        GenusAccum genus_acc, family_acc;
-                        std::vector<uint64_t> fmh_all;
-                        const int c_vals[1] = {kFmhC};
-                        // Per-genome aamer accumulators for marker scoring (one per genome).
-                        const bool do_markers = build_mrk_rd && build_mrk_rd->has_merged_pool();
-                        // Protein aamers (k=8, 6-frame) feed CORE/PCORE and — only when a panel
-                        // is loaded — SCG marker scoring. Decoupled so CORE/PCORE build with NO
-                        // panel; frac_max defaults to UINT64_MAX (keep-all) when no panel pins it.
-                        const bool need_aamers = do_markers || cfg.build_core || cfg.build_pcore;
-                        // SCG scoring (opt-in) needs per-member sets; CORE/PCORE only need the
-                        // aggregated counts, so stream members through one combiner (bounded RAM
-                        // even for 600k-member genera) and keep per-member sets only for SCG.
-                        // Hash-partitioned cache-resident EXACT prevalence counter (replaces the
-                        // DRAM-bound unordered_map): cross-chunk genera accumulate in the bucket's
-                        // persistent counter; a chunk-local genus uses a local one. Aamer arrays
-                        // are worker-computed (buf[ii].aamers, sorted-unique).
-                        GenusAamerCounter local_counter;
-                        if (accum_holder && !*accum_holder) *accum_holder = std::make_unique<GenusAamerCounter>();
-                        GenusAamerCounter* const ctr = accum_holder ? accum_holder->get() : &local_counter;
-                        const bool cross_chunk = (accum_holder != nullptr);
-                        // Member cap: a genus's aamer UNION saturates, so once ~cap members have
-                        // been counted we stop folding more (keeps density, bounds wall time).
-                        const bool aamers_capped = (cfg.genus_member_cap > 0) && accum_member_ids
-                            && accum_member_ids->size() >= cfg.genus_member_cap;
-                        (void)need_aamers;
-
-                        for (size_t ii = 0; ii < buf.size(); ++ii) {
-                            genus_acc.add_genome(all_profiles[ii]);
-                            if (!family_key.empty()) family_acc.add_genome(all_profiles[ii]);
-                            // FMH hashes were computed in the parallel worker; just aggregate.
-                            fmh_all.insert(fmh_all.end(), buf[ii].fmh.begin(), buf[ii].fmh.end());
-                        }
-                        (void)c_vals;
-
-                        // Cache-resident PARALLEL count of the whole chunk at once (partition-
-                        // outer / members-inner, OpenMP across partitions). Worker-extracted
-                        // sorted arrays feed straight in — no per-genome sort in the drain.
-                        if (!aamers_capped && (cfg.build_core || cfg.build_pcore)) {
-                            std::vector<const std::vector<uint64_t>*> ptrs;
-                            ptrs.reserve(buf.size());
-                            for (size_t ii = 0; ii < buf.size(); ++ii)
-                                if (!buf[ii].aamers.empty()) {
-                                    ptrs.push_back(&buf[ii].aamers);
-                                    if (accum_member_ids) accum_member_ids->push_back(buf[ii].genome_id);
-                                }
-                            if (!ptrs.empty()) ctr->add_chunk(ptrs);
-                        }
-
-                        const uint32_t n_mem = static_cast<uint32_t>(buf.size());
-                        GcovEntry ge = finalize_and_add_genus(genus_key, n_mem, genus_acc, build_gcov_w);
-                        GcovEntry fe{};
-                        const bool fcov_ok = !family_key.empty() &&
-                            (fe = finalize_and_add_genus(family_key, n_mem, family_acc, build_fcov_w),
-                             (fe.flags & GCOV_FLAG_VALID) != 0);
-
-                        if (!fmh_all.empty()) {
-                            std::sort(fmh_all.begin(), fmh_all.end());
-                            fmh_all.erase(std::unique(fmh_all.begin(), fmh_all.end()), fmh_all.end());
-                            build_fmhr_w.add(GcovWriter::hash_genus(genus_key), std::move(fmh_all));
-                        }
-
-                        // Per-genus prevalence core (SEC_CORE) from the per-genome
-                        // marker aamers extracted above — zero extra FASTA passes.
-                        // CORE/PCORE: a chunk-local genus emits now from its counter; cross-chunk
-                        // genera are emitted once on completion (emit_core_pcore) from the bucket
-                        // counter. (Members were folded into `ctr` in the loop above.)
-                        if (!cross_chunk && (cfg.build_core || cfg.build_pcore) && !local_counter.empty()) {
-                            std::vector<uint64_t> aamers; std::vector<uint32_t> counts;
-                            local_counter.finalize_sorted(aamers, counts);
-                            const uint64_t gkh = GcovWriter::hash_genus(genus_key);
-                            std::vector<uint64_t> member_ids;
-                            member_ids.reserve(pending_qrs.size());
-                            for (const auto& qr : pending_qrs) member_ids.push_back(qr.genome_id);
-                            if (cfg.build_core)  build_core_w.add_sorted(gkh, aamers, counts, n_mem, member_ids);
-                            if (cfg.build_pcore) build_pcore_w.add_sorted(gkh, aamers, counts, n_mem);
-                        }
-
-                        // Score contigs and populate outlier fields.
-                        const bool genus_ok = (ge.flags & GCOV_FLAG_VALID) != 0;
-                        for (size_t ii = 0; ii < pending_qrs.size(); ++ii) {
-                            auto& qr        = pending_qrs[ii];
-                            const auto& cps = all_profiles[ii];
-                            qr.qual_flags  |= QualRecord::QUAL_FLAG_GCOV_SCORED;
-                            if (!genus_ok || cps.empty()) continue;
-
-                            uint32_t cco_bp=0, spe_bp=0, rho_bp=0, sib_bp=0, scored_bp=0;
-                            for (const auto& cp : cps) {
-                                scored_bp += cp.bp;
-                                float xmu[136];
-                                for (int d=0;d<136;++d) xmu[d] = cp.p[d] - ge.mu[d];
-                                const float pct  = gcov_percentile(ge, gcov_mahalanobis(ge, xmu));
-                                const float spct = gcov_spe_percentile(ge, gcov_spe(ge, xmu));
-                                const bool t2  = pct  >= kGcovOutlierPct;
-                                const bool spe = spct >= kGcovOutlierPct;
-                                if (t2 || spe) cco_bp += cp.bp;
-                                if (spe)       spe_bp += cp.bp;
-                                float rhod[16];
-                                for (int i=0;i<16;++i) rhod[i] = cp.rho[i] - ge.rho_mean[i];
-                                if (gcov_rho_percentile(ge, gcov_rho_distance(ge, rhod)) >= kGcovOutlierPct)
-                                    rho_bp += cp.bp;
-                                if ((t2||spe) && fcov_ok) {
-                                    float xmuf[136];
-                                    for (int d=0;d<136;++d) xmuf[d] = cp.p[d] - fe.mu[d];
-                                    const float fp  = gcov_percentile(fe, gcov_mahalanobis(fe, xmuf));
-                                    const float fsp = gcov_spe_percentile(fe, gcov_spe(fe, xmuf));
-                                    if (!(fp >= kGcovOutlierPct || fsp >= kGcovOutlierPct))
-                                        sib_bp += cp.bp;
-                                }
-                            }
-                            if (scored_bp > 0) {
-                                auto enc = [&](uint32_t bp) {
-                                    return static_cast<uint8_t>(
-                                        std::min(255u, (bp * 255u) / scored_bp));
-                                };
-                                qr.contig_outlier_u8  = enc(cco_bp);
-                                qr.spe_outlier_u8     = enc(spe_bp);
-                                qr.rho_outlier_u8     = enc(rho_bp);
-                                qr.sibling_outlier_u8 = enc(sib_bp);
-                            }
-                        }
-
-                        // Marker completeness — reuse aamers collected in FMH loop.
-                        if (do_markers) {
-                            const uint64_t gh = GcovWriter::hash_genus(genus_key);
-                            auto calib = build_mrk_rd->lookup_lineage(gh);
-                            if (calib.valid()) {
-                                const bool is_arc = (calib.header->domain == MRKR_DOMAIN_ARC);
-                                auto mh  = is_arc ? build_mrk_rd->merged_hashes_arc()
-                                                  : build_mrk_rd->merged_hashes_bac();
-                                auto mid = is_arc ? build_mrk_rd->merged_ids_arc()
-                                                  : build_mrk_rd->merged_ids_bac();
-                                const uint8_t n_markers = calib.header->n_markers;
-                                for (size_t ii = 0; ii < pending_qrs.size(); ++ii) {
-                                    const auto& qv = buf[ii].aamers;
-                                    if (qv.empty()) continue;
-                                    uint32_t hits[173] = {};
-                                    const uint64_t *qp=qv.data(), *qpe=qp+qv.size();
-                                    const uint64_t *mhp=mh.data(), *mhe=mhp+mh.size();
-                                    const uint8_t  *mip=mid.data();
-                                    while (qp!=qpe && mhp!=mhe) {
-                                        if      (*qp < *mhp) ++qp;
-                                        else if (*mhp < *qp) { ++mhp; ++mip; }
-                                        else                 { hits[*mip]++; ++qp; ++mhp; ++mip; }
-                                    }
-                                    int n_present=0, n_expected=0;
-                                    float redun_sum=0.0f; int redun_n=0;
-                                    for (uint8_t mi=0; mi<n_markers; ++mi) {
-                                        if (!calib.marker_expected(mi)) continue;
-                                        ++n_expected;
-                                        const uint32_t thr = static_cast<uint32_t>(
-                                            calib.slots[mi].null_floor_u16)
-                                            + static_cast<uint32_t>(cfg.marker_min_hits);
-                                        if (hits[mi] >= thr) {
-                                            ++n_present;
-                                            const uint8_t pool_mi = is_arc
-                                                ? static_cast<uint8_t>(build_mrk_rd->n_bac()+mi)
-                                                : mi;
-                                            const uint32_t psz = build_mrk_rd->pool_n_hashes(pool_mi);
-                                            if (psz > 0) {
-                                                redun_sum += static_cast<float>(hits[mi])
-                                                           / static_cast<float>(psz);
-                                                ++redun_n;
-                                            }
-                                        }
-                                    }
-                                    auto& qr = pending_qrs[ii];
-                                    if (n_expected > 0) {
-                                        const float comp = static_cast<float>(n_present)
-                                                         / static_cast<float>(n_expected);
-                                        qr.marker_completeness_u8 = static_cast<uint8_t>(
-                                            std::clamp(comp, 0.0f, 1.0f) * 254.0f + 1.0f);
-                                    }
-                                    if (redun_n > 0) {
-                                        const float redun = redun_sum / static_cast<float>(redun_n);
-                                        const float clamped = std::min(0.09999f, redun);
-                                        qr.marker_redundancy_u16 = static_cast<uint16_t>(
-                                            clamped / 0.1f * 65534.0f);
-                                        qr.qual_flags |= QualRecord::QUAL_FLAG_MARKER_SCORED;
-                                    }
-                                }
-                            }
-                        }
-
-                        // Contamination duplication — independent 6-frame pass per genome
-                        // (panel.score is const/thread-safe; runs inside this genus worker).
-                        if (build_contam_panel) {
-                            for (size_t ii = 0; ii < pending_qrs.size(); ++ii) {
-                                const auto sc = build_contam_panel->score(buf[ii].fasta);
-                                pending_qrs[ii].contamination_duplication_u16 =
-                                    QualRecord::encode_dup(sc.redundancy_fraction);
-                            }
-                        }
-                    }
-
-                    for (auto& qr : pending_qrs) qual_writer.add(qr);
+            // GSTX/GCOV/QUAL: dispatch off the main thread so worker threads stay busy.
+            // Cross-chunk genera share mutable state (accum_holder/accum_member_ids) across
+            // consecutive flushes of the same bucket, so run those synchronously to avoid
+            // races. Chunk-local genera (accum_holder==nullptr) are fully independent and
+            // safe to parallelize.
+            if (accum_holder != nullptr) {
+                // Cross-chunk: run inline so the counter accumulation is serialized.
+                finalize_genus(std::move(buf), accum_holder, accum_member_ids);
+            } else {
+                // Chunk-local: cap in-flight tasks at 2×n_workers, then dispatch async.
+                reap_futs();
+                while (genus_futs.size() >= static_cast<size_t>(n_workers * 2)) {
+                    genus_futs.front().wait();
+                    reap_futs();
                 }
+                auto buf_moved = std::move(buf);
+                genus_futs.push_back(std::async(std::launch::async,
+                    [buf_moved = std::move(buf_moved), &finalize_genus]() mutable {
+                        finalize_genus(std::move(buf_moved), nullptr, nullptr);
+                    }));
             }
+
 
             launch_shard_freeze();
             buf.clear();
@@ -1745,6 +1732,7 @@ struct ArchiveBuilder::Impl {
             const uint32_t n_mem = static_cast<uint32_t>(b.member_ids.size());
             if (cfg.build_core)  build_core_w.add_sorted(gkh, aamers, counts, n_mem, b.member_ids);
             if (cfg.build_pcore) build_pcore_w.add_sorted(gkh, aamers, counts, n_mem);
+
             b.model_emitted = true;
             b.genus_counter.reset();                       // free union RAM
             std::vector<uint64_t>().swap(b.member_ids);
@@ -1877,6 +1865,10 @@ struct ArchiveBuilder::Impl {
         }
         write_q_cv.notify_one();
         io_writer.join();
+
+        // Drain all in-flight genus-finalization tasks before writing metadata sections.
+        for (auto& f : genus_futs) f.wait();
+        genus_futs.clear();
 
         std::fclose(ckpt_meta_file);
         ckpt_meta_file = nullptr;
@@ -2014,16 +2006,14 @@ struct ArchiveBuilder::Impl {
         }
 
         // Write GSTX section (genus sketch stats — enables O(1) check queries)
-        if (cfg.build_gstx && cfg.taxonomy_group && multi_k_sketch
-            && gstx_writer.n_genera() > 0) {
+        if (cfg.build_gstx && multi_k_sketch && gstx_writer.n_genera() > 0) {
             spdlog::info("Writing GSTX: {} genera", gstx_writer.n_genera());
             SectionDesc gstx_sd = gstx_writer.finalize(mw, next_section_id++);
             toc.add_section(gstx_sd);
         }
 
         // Write QCOL section (intrinsic quality, columnar — replaces flat QUAL).
-        if (cfg.build_gstx && cfg.taxonomy_group && multi_k_sketch
-            && qual_writer.size() > 0) {
+        if (cfg.build_gstx && qual_writer.size() > 0) {
             spdlog::info("Writing QCOL: {} genomes", qual_writer.size());
             SectionDesc qcol_sd = qcol_write(mw, next_section_id++, qual_writer.take());
             toc.add_section(qcol_sd);
@@ -2032,7 +2022,7 @@ struct ArchiveBuilder::Impl {
         // Write GCOV/FCOV/FMHR into the SAME metadata block so the archive has
         // exactly one footer generation (no post-TailLocator NFS rewrites — P11).
         // Profiles were computed in-memory during flush_staging_buf.
-        if (cfg.build_gcov && cfg.build_gstx && cfg.taxonomy_group) {
+        if (cfg.build_gcov && cfg.build_gstx) {
             if (build_gcov_w.n_genera() > 0) {
                 SectionDesc sd = build_gcov_w.finalize(mw, next_section_id++, SEC_GCOV);
                 toc.add_section(sd);
@@ -2050,17 +2040,18 @@ struct ArchiveBuilder::Impl {
                 spdlog::info("FMHR: {} genera", build_fmhr_w.n_genera());
             }
             if (cfg.build_core && build_core_w.n_genera() > 0) {
-                SectionDesc sd = build_core_w.finalize(mw, next_section_id++, build_mrk_frac_max);
+                SectionDesc sd = build_core_w.finalize(mw, next_section_id++, build_pcore_frac_max);
                 toc.add_section(sd);
                 spdlog::info("CORE: {} genera, model_hash={:#018x}",
                              build_core_w.n_genera(), sd.aux0);
             }
             if (cfg.build_pcore && build_pcore_w.n_entries() > 0) {
-                SectionDesc sd = build_pcore_w.finalize(mw, next_section_id++, build_mrk_frac_max);
+                SectionDesc sd = build_pcore_w.finalize(mw, next_section_id++, build_pcore_frac_max);
                 toc.add_section(sd);
                 spdlog::info("PCORE: {} genus references (dense), model_hash={:#018x}",
                              build_pcore_w.n_entries(), sd.aux0);
             }
+
         }
 
         // BPRM — self-describing build parameters (mandatory, one per archive).
@@ -2182,9 +2173,6 @@ void ArchiveBuilder::add_from_tsv(const std::filesystem::path& tsv_path) {
 }
 void ArchiveBuilder::add_from_gpk(const std::filesystem::path& source) {
     impl_->add_from_gpk(source);
-}
-void ArchiveBuilder::add_from_stage(const std::filesystem::path& source) {
-    impl_->add_from_stage(source);
 }
 void ArchiveBuilder::add(const BuildRecord& rec) { impl_->add(rec); }
 void ArchiveBuilder::finalize() { impl_->finalize(); }

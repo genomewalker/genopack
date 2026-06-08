@@ -1,11 +1,26 @@
 #include <genopack/gcov.hpp>
+#include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <numeric>
 #include <stdexcept>
 
 namespace genopack {
 
 SectionDesc GcovWriter::finalize(AppendWriter& w, uint64_t section_id, uint32_t section_type) {
+    // Sort entries by arrival index so parallel builds produce byte-identical output
+    // to sequential builds (entry_order_ is 0,1,2,... when sequential).
+    if (!entry_order_.empty()) {
+        std::vector<size_t> idx(entries_.size());
+        std::iota(idx.begin(), idx.end(), 0);
+        std::sort(idx.begin(), idx.end(),
+            [&](size_t a, size_t b){ return entry_order_[a] < entry_order_[b]; });
+        std::vector<GcovEntry> sorted;
+        sorted.reserve(entries_.size());
+        for (size_t i : idx) sorted.push_back(entries_[i]);
+        entries_ = std::move(sorted);
+        entry_order_.clear();
+    }
     const uint32_t n = static_cast<uint32_t>(entries_.size());
     const uint32_t min_buckets = (n == 0) ? 1
         : static_cast<uint32_t>(static_cast<double>(n) / 0.7 + 1.0);

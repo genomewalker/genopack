@@ -254,96 +254,111 @@ void run_pass_b(ICheckReader& pack,
                      fmhr_host_cache.size(), fmhr_family_candidates.size());
     }
 
-    // ── Foreign-aamer reference sets (per host genus) — the SMALL-contig channel ──
-    // TNF/GCOV composition fails below ~5kb; protein-aamer (k=8, 6-frame) containment
-    // works to ~1-2kb IF the reference is dense. Prefer the DENSE unified PCORE (every
-    // aamer); fall back to the sparse prevalence CORE. Built once here (single-threaded),
-    // read-only in the parallel contig loop. Set = host genus ∪ host family (FCORE, for
-    // the family-conserved exclusion) ∪ same-family siblings ∪ ≤50 background genera.
-    std::unordered_map<std::string, ForeignRefSet> genus_refset;
+    // ── Foreign-aamer containment via Global Multiplicity Index ─────────────
+    // Build a global aamer→genus_count map once, then score with only the host
+    // genus union per genome. Avoids the 523GB per-genus refset blowup: peak
+    // memory is GMI (~5–15 GB) + host/family unions for flagged genera (~20 GB).
     int      foreign_k = 0, foreign_min_seg = 0;
     uint64_t foreign_frac_max = UINT64_MAX;
     const bool use_pcore = pack.has_pcore();
-    if (use_pcore || pack.has_core()) {
-        if (use_pcore) {
-            const PcoreReader* pr = pack.pcore_reader();
-            foreign_k = pr->k(); foreign_min_seg = pr->min_seg_aa(); foreign_frac_max = pr->frac_max_hash();
-        } else {
-            const CoreReader* cr = pack.core_reader();
-            foreign_k = cr->k(); foreign_min_seg = cr->min_seg_aa(); foreign_frac_max = cr->frac_max_hash();
-        }
-        // Genus reference span (dense PCORE preferred, else sparse CORE). PCORE v1
-        // runs are PFOR-encoded, so the union is decoded into an OwnedSpan whose
-        // backing vectors must outlive the refset build below.
-        auto materialize_genus = [&](const std::string& g) -> OwnedSpan {
-            OwnedSpan o;
-            if (use_pcore) { PcoreView v = pack.pcore_for_genus(g); if (v.valid()) v.materialize(o.aamers, o.prevf); }
-            else { CoreView v = pack.core_for_genus(g); if (v.valid()) o.aamers.assign(v.aamers, v.aamers + v.n_aamers); }
-            return o;
-        };
-        auto materialize_by_hash = [&](uint64_t h) -> OwnedSpan {
-            OwnedSpan o;
-            if (use_pcore) { PcoreView v = pack.pcore_reader()->lookup(h); if (v.valid()) v.materialize(o.aamers, o.prevf); }
-            else { CoreView v = pack.core_reader()->lookup(h); if (v.valid()) o.aamers.assign(v.aamers, v.aamers + v.n_aamers); }
-            return o;
-        };
-        auto materialize_family = [&](const std::string& f) -> OwnedSpan {
-            OwnedSpan o;
-            if (use_pcore) { PcoreView v = pack.pcore_for_family(f); if (v.valid()) v.materialize(o.aamers, o.prevf); }
-            else { CoreView v = pack.core_for_family(f); if (v.valid()) o.aamers.assign(v.aamers, v.aamers + v.n_aamers); }
-            return o;
-        };
-        const uint32_t n_entries = use_pcore ? pack.pcore_reader()->n_entries()
-                                             : pack.core_reader()->n_genera();
-        auto entry_hash_at = [&](uint32_t i) -> uint64_t {
-            return use_pcore ? pack.pcore_reader()->key_hash_at(i) : pack.core_reader()->genus_hash_at(i);
-        };
+    if (use_pcore) {
+        const PcoreReader* pr = pack.pcore_reader();
+        foreign_k = pr->k(); foreign_min_seg = pr->min_seg_aa(); foreign_frac_max = pr->frac_max_hash();
+    } else if (pack.has_core()) {
+        const CoreReader* cr = pack.core_reader();
+        foreign_k = cr->k(); foreign_min_seg = cr->min_seg_aa(); foreign_frac_max = cr->frac_max_hash();
+    }
 
-        std::unordered_map<std::string, std::string> genus_family;
-        for (const auto& acc : to_scan) {
-            auto g = flagged_genus.find(acc);
-            if (g == flagged_genus.end() || genus_refset.count(g->second)) continue;
-            auto f = flagged_family.find(acc);
-            genus_family[g->second] = (f != flagged_family.end()) ? f->second : std::string();
-            genus_refset.emplace(g->second, ForeignRefSet{});
+    // Materialize helpers — defined outside the CORE/PCORE guard so both the
+    // per-genus refset build loop and the scan callback can capture them via [&].
+    // Return an empty OwnedSpan (valid()==false) when no section is present.
+    auto materialize_genus = [&](const std::string& g) -> OwnedSpan {
+        OwnedSpan o;
+        if (use_pcore) { PcoreView v = pack.pcore_for_genus(g); if (v.valid()) v.materialize(o.aamers, o.prevf); }
+        else if (pack.has_core()) { CoreView v = pack.core_for_genus(g); if (v.valid()) o.aamers.assign(v.aamers, v.aamers + v.n_aamers); }
+        return o;
+    };
+    auto materialize_family = [&](const std::string& f) -> OwnedSpan {
+        OwnedSpan o;
+        if (use_pcore) { PcoreView v = pack.pcore_for_family(f); if (v.valid()) v.materialize(o.aamers, o.prevf); }
+        else if (pack.has_core()) { CoreView v = pack.core_for_family(f); if (v.valid()) o.aamers.assign(v.aamers, v.aamers + v.n_aamers); }
+        return o;
+    };
+    const uint32_t n_entries = use_pcore ? pack.pcore_reader()->n_entries()
+                             : (pack.has_core() ? pack.core_reader()->n_genera() : 0u);
+    auto entry_hash_at = [&](uint32_t i) -> uint64_t {
+        if (use_pcore) return pack.pcore_reader()->key_hash_at(i);
+        if (pack.has_core()) return pack.core_reader()->genus_hash_at(i);
+        return 0u;
+    };
+
+    // GMI: the multiplicity index that drives foreign-aamer scoring.
+    // Runtime GMI build (~10-30 min) from PCORE/CORE union when present.
+    const genopack::GamiView gami_view{};   // GAMI section removed; keep variable for call-site compat
+    GlobalMultiplicityIndex gmi;
+    std::unordered_map<std::string, OwnedSpan>   genus_host_union;
+    std::unordered_map<std::string, OwnedSpan>   family_union_map;
+    std::unordered_map<std::string, IndexedSpan> genus_host_index;
+    std::unordered_map<std::string, IndexedSpan> family_index_map;
+    const uint8_t foreign_K = [&]() -> uint8_t {
+        if (const char* e = std::getenv("GENOPACK_FOREIGN_K")) {
+            int v = std::atoi(e); if (v > 0 && v < 256) return static_cast<uint8_t>(v);
         }
-        size_t built = 0;
-        for (auto& [genus, rs] : genus_refset) {
-            OwnedSpan host = materialize_genus(genus);
-            if (!host.valid()) { rs.valid = false; continue; }
-            const std::string& family = genus_family[genus];
-            OwnedSpan fam;
-            if (!family.empty()) fam = materialize_family(family);
-            std::vector<OwnedSpan> fstore;                 // owns decoded foreign unions
-            std::vector<std::pair<uint64_t, AamerSpan>> foreign;
-            std::unordered_set<uint64_t> used;
-            used.insert(GcovWriter::hash_genus(genus));
-            auto fit = pass_a.family_to_genera.find(family);
-            if (fit != pass_a.family_to_genera.end()) fstore.reserve(fit->second.size() + 64);
-            else fstore.reserve(64);
-            if (fit != pass_a.family_to_genera.end())
-                for (const auto& sib : fit->second) {
-                    if (sib == genus) continue;
-                    uint64_t sh = GcovWriter::hash_genus(sib);
-                    if (!used.insert(sh).second) continue;
-                    OwnedSpan sp = materialize_genus(sib);
-                    if (sp.valid()) { fstore.push_back(std::move(sp)); foreign.emplace_back(sh, fstore.back().view()); }
-                }
-            if (n_entries > 0) {
-                const uint32_t start = static_cast<uint32_t>(GcovWriter::hash_genus(genus) % n_entries);
-                uint32_t bg = 0;
-                for (uint32_t s = 0; s < n_entries && bg < 50; ++s) {
-                    const uint64_t gh = entry_hash_at((start + s) % n_entries);
-                    if (!used.insert(gh).second) continue;
-                    OwnedSpan sp = materialize_by_hash(gh);
-                    if (sp.valid()) { fstore.push_back(std::move(sp)); foreign.emplace_back(gh, fstore.back().view()); ++bg; }
-                }
+        return 3;
+    }();
+    if (use_pcore || pack.has_core()) {
+        const int gmi_par = std::min(threads, 8);
+        // Start small; maybe_resize() rehashes to 4× when load > 50%.
+        gmi.reserve(64'000'000ULL);
+        // Batched parallel decode → sequential insert avoids atomic/mutex on GMI.
+        std::vector<OwnedSpan> buf(gmi_par);
+        for (uint32_t bs = 0; bs < n_entries; bs += static_cast<uint32_t>(gmi_par)) {
+            const uint32_t be = std::min(bs + static_cast<uint32_t>(gmi_par), n_entries);
+            const int bsz = static_cast<int>(be - bs);
+            #pragma omp parallel for schedule(static) num_threads(bsz)
+            for (int bi = 0; bi < bsz; ++bi) {
+                buf[bi] = OwnedSpan{};
+                const uint64_t gh = entry_hash_at(bs + static_cast<uint32_t>(bi));
+                if (use_pcore) { PcoreView v = pack.pcore_reader()->lookup(gh); if (v.valid()) v.materialize(buf[bi].aamers, buf[bi].prevf); }
+                else if (pack.has_core()) { CoreView v = pack.core_reader()->lookup(gh); if (v.valid()) buf[bi].aamers.assign(v.aamers, v.aamers + v.n_aamers); }
             }
-            rs = build_foreign_refset(host.view(), fam.view(), foreign);
-            if (rs.valid) ++built;
+            for (int bi = 0; bi < bsz; ++bi) {
+                for (uint64_t h : buf[bi].aamers) gmi.increment(h);
+                buf[bi].aamers.clear(); buf[bi].aamers.shrink_to_fit();
+                gmi.maybe_resize();
+            }
         }
-        spdlog::info("check pass-B: foreign-aamer refsets built for {} genera ({} reference, k={})",
-                     built, use_pcore ? "PCORE-dense" : "CORE-sparse", foreign_k);
+        spdlog::info("check pass-B: GMI built: {} M unique aamers, {} entries, {:.1f} GB",
+                     gmi.count() / 1'000'000, n_entries, gmi.bytes() / 1e9);
+    }
+    // Host and family unions: always built when PCORE/CORE present, regardless of GAMI/GMI.
+    // Required for host-specific aamer classification in score_contig_foreign_indexed.
+    if (use_pcore || pack.has_core()) {
+        const int gmi_par = std::min(threads, 8);
+        std::unordered_set<std::string> unique_genera, unique_families;
+        for (const auto& acc : to_scan) {
+            auto git = flagged_genus.find(acc);  if (git != flagged_genus.end()) unique_genera.insert(git->second);
+            auto fit = flagged_family.find(acc);  if (fit != flagged_family.end()) unique_families.insert(fit->second);
+        }
+        std::vector<std::string> gvec(unique_genera.begin(), unique_genera.end());
+        std::vector<std::string> fvec(unique_families.begin(), unique_families.end());
+        for (const auto& g : gvec) genus_host_union[g];
+        for (const auto& f : fvec) family_union_map[f];
+        #pragma omp parallel for schedule(dynamic, 1) num_threads(gmi_par)
+        for (size_t i = 0; i < gvec.size(); ++i) genus_host_union[gvec[i]] = materialize_genus(gvec[i]);
+        #pragma omp parallel for schedule(dynamic, 1) num_threads(gmi_par)
+        for (size_t i = 0; i < fvec.size(); ++i) family_union_map[fvec[i]] = materialize_family(fvec[i]);
+        spdlog::info("check pass-B: host/family unions: {} genera + {} families, K={}",
+                     genus_host_union.size(), family_union_map.size(), foreign_K);
+        // Build 16-bit prefix indexes — replaces O(10M) merge-scan with O(~153) binary search.
+        genus_host_index.reserve(genus_host_union.size());
+        for (const auto& [g, os] : genus_host_union)
+            if (os.valid()) genus_host_index.emplace(g, build_index(os));
+        family_index_map.reserve(family_union_map.size());
+        for (const auto& [f, os] : family_union_map)
+            if (os.valid()) family_index_map.emplace(f, build_index(os));
+        spdlog::info("check pass-B: host index: {} genera, {} families built",
+                     genus_host_index.size(), family_index_map.size());
     }
 
     // Open marker panel (read-only, mmap — safe for concurrent reads across all threads).
@@ -368,9 +383,64 @@ void run_pass_b(ICheckReader& pack,
 
     const uint64_t mrk_frac_max = mrk_rd ? mrk_rd->frac_max_hash() : UINT64_MAX;
 
+    // Pre-build per-genus GCOV candidate lists (family siblings + ≤50 background).
+    // Replaces the O(n_all_genera) scan_early per contig with O(50) direct iteration —
+    // critical for 9.2M+ archives where n_genera can be in the thousands.
+    std::unordered_map<std::string, std::vector<const GcovEntry*>> genus_gcov_cands;
+    {
+        const GcovReader* gr = pack.gcov_reader();
+        if (gr && gr->is_open() && gr->n_genera() > 0) {
+            // Collect all valid entries once for background sampling
+            std::vector<const GcovEntry*> all_valid;
+            all_valid.reserve(gr->n_genera());
+            gr->scan([&](const GcovEntry& fe) { if (fe.flags & GCOV_FLAG_VALID) all_valid.push_back(&fe); });
+
+            std::unordered_map<std::string, std::string> genus_to_family;
+            for (const auto& acc : to_scan) {
+                auto git = flagged_genus.find(acc); if (git == flagged_genus.end()) continue;
+                auto fit = flagged_family.find(acc);
+                genus_to_family.emplace(git->second, fit != flagged_family.end() ? fit->second : std::string{});
+            }
+
+            for (const auto& [genus, family] : genus_to_family) {
+                auto& cands = genus_gcov_cands[genus];
+                std::unordered_set<uint64_t> used;
+                const uint64_t self_h = GcovWriter::hash_genus(genus);
+                used.insert(self_h);
+                // Family siblings
+                auto fmit = pass_a.family_to_genera.find(family);
+                if (fmit != pass_a.family_to_genera.end())
+                    for (const auto& sib : fmit->second) {
+                        const uint64_t sh = GcovWriter::hash_genus(sib);
+                        if (!used.insert(sh).second) continue;
+                        const GcovEntry* ge = gr->lookup(sh);
+                        if (ge && (ge->flags & GCOV_FLAG_VALID)) cands.push_back(ge);
+                    }
+                // Background: deterministic sample from all_valid
+                if (!all_valid.empty()) {
+                    const size_t n = all_valid.size();
+                    const size_t start = self_h % n;
+                    uint32_t added = 0;
+                    for (size_t s = 0; s < n && added < 50; ++s) {
+                        const GcovEntry* fe = all_valid[(start + s) % n];
+                        if (used.insert(fe->genus_hash).second) { cands.push_back(fe); ++added; }
+                    }
+                }
+            }
+            size_t total_cands = 0;
+            for (auto& kv : genus_gcov_cands) total_cands += kv.second.size();
+            if (!genus_gcov_cands.empty())
+                spdlog::info("check pass-B: bounded GCOV scan: {} genera, avg {:.0f} candidates (vs {} total)",
+                             genus_gcov_cands.size(),
+                             static_cast<double>(total_cands) / genus_gcov_cands.size(),
+                             gr->n_genera());
+        }
+    }
+
     // N parallel reader threads each own an independent fd and sequential shard band.
     // Callback is invoked concurrently; quality_mtx guards shared state.
-    constexpr int k_shard_readers = 8;
+    // Scale shard readers with thread count — more readers = higher I/O concurrency.
+    const int k_shard_readers = std::min(16, std::max(4, threads / 2));
     const int inner_threads = std::max(1, threads / k_shard_readers);
     std::mutex quality_mtx;
     size_t n_done = 0;
@@ -422,11 +492,16 @@ void run_pass_b(ICheckReader& pack,
                     if (ge && (ge->flags & GCOV_FLAG_VALID)) gcov_entry = ge;
                 }
 
-                // Foreign-aamer reference set for this genome's genus (read-only; null if no CORE).
-                const ForeignRefSet* frs = nullptr;
-                if (!genus_refset.empty() && git != flagged_genus.end()) {
-                    auto rit = genus_refset.find(git->second);
-                    if (rit != genus_refset.end() && rit->second.valid) frs = &rit->second;
+                // Indexed host/family spans for foreign-aamer scoring (read-only, zero-copy).
+                IndexedSpan host_ix, fam_ix;
+                if (!genus_host_index.empty() && git != flagged_genus.end()) {
+                    auto hit = genus_host_index.find(git->second);
+                    if (hit != genus_host_index.end()) host_ix = hit->second;
+                    auto famit = flagged_family.find(acc);
+                    if (famit != flagged_family.end()) {
+                        auto fit = family_index_map.find(famit->second);
+                        if (fit != family_index_map.end()) fam_ix = fit->second;
+                    }
                 }
 
                 // ── Intrinsic completeness: genus prevalence-core coverage ──────
@@ -644,14 +719,15 @@ void run_pass_b(ICheckReader& pack,
                         // Composition-independent; runs for every contig >=1kb (where TNF
                         // abstains). Classifies the contig's 6-frame aamers as host- vs
                         // foreign-specific against the precomputed reference set.
-                        if (frs && contig.seq.size() >= 1000) {
+                        if (host_ix.valid() && contig.seq.size() >= 1000) {
                             thread_local std::vector<uint64_t> prot_qm;
                             prot_qm.clear();
                             extract_aamers_dna_into(contig.seq, foreign_k, foreign_min_seg,
                                                     foreign_frac_max, prot_qm);
                             std::sort(prot_qm.begin(), prot_qm.end());
                             prot_qm.erase(std::unique(prot_qm.begin(), prot_qm.end()), prot_qm.end());
-                            ForeignScore fs = score_contig_foreign(*frs, prot_qm);
+                            ForeignScore fs = score_contig_foreign_indexed(
+                                host_ix, fam_ix, gmi, gami_view, foreign_K, prot_qm);
                             cf.prot_classifiable     = static_cast<uint16_t>(std::min<uint32_t>(fs.classifiable, 65535));
                             cf.prot_host_specific    = static_cast<uint16_t>(std::min<uint32_t>(fs.host_specific, 65535));
                             cf.prot_foreign_specific = static_cast<uint16_t>(std::min<uint32_t>(fs.foreign_specific, 65535));
@@ -690,24 +766,21 @@ void run_pass_b(ICheckReader& pack,
                     uint32_t n_unfound = static_cast<uint32_t>(qual_contigs.size());
                     constexpr int K = static_cast<int>(GCOV_N_EIGVECS);
 
-                    gcov_rd->scan_early([&](const GcovEntry& fe) -> bool {
+                    // score_entry: evaluate one foreign genus GCOV entry against all pending
+                    // qual_contigs using the progressive admissible-bound early-exit.
+                    // Returns false when all contigs are accounted for (stop signal).
+                    auto score_entry = [&](const GcovEntry& fe) -> bool {
                         if (&fe == gcov_entry || !(fe.flags & GCOV_FLAG_VALID)) return true;
-
-                        const float ld  = gcov_log_det(fe);
+                        const float ld   = gcov_log_det(fe);
                         const float vmax = std::max(fe.eigenvalues[0], fe.sigma2_resid);
-
                         for (auto& qc : qual_contigs) {
                             if (qc.found) continue;
-
-                            // j=−1: L2/λ_max admissible upper bound (136 multiply-adds)
                             float xf[136], l2 = 0.f;
                             for (int d = 0; d < 136; ++d) {
                                 const float v = qc.tnf[d] - fe.mu[d];
                                 xf[d] = v; l2 += v * v;
                             }
                             if (-0.5f * (l2 / vmax + ld) <= qc.tau) continue;
-
-                            // j=0..K−1: tighten bound one eigenvector at a time
                             float sum_p2 = 0.f, d2 = 0.f;
                             bool pruned = false;
                             for (int k = 0; k < K; ++k) {
@@ -718,22 +791,33 @@ void run_pass_b(ICheckReader& pack,
                                 const float vsub = (k + 1 < K)
                                     ? std::max(fe.eigenvalues[k + 1], fe.sigma2_resid)
                                     : std::max(fe.sigma2_resid, 1e-12f);
-                                const float spe_lb = std::max(0.f, l2 - sum_p2);
-                                if (-0.5f * (d2 + spe_lb / vsub + ld) <= qc.tau) {
+                                if (-0.5f * (d2 + std::max(0.f, l2 - sum_p2) / vsub + ld) <= qc.tau) {
                                     pruned = true; break;
                                 }
                             }
                             if (pruned) continue;
-
-                            // Survived all K projections → LL > τ (bound is exact at j=K−1)
                             qc.found = true;
-                            cross_genus_bp      += qc.length;
-                            ctg_cross_genus[qc.ci] = true;
+                            cross_genus_bp         += qc.length;
+                            ctg_cross_genus[qc.ci]  = true;
                             if (qc.family_inlier) sibling_out_bp += qc.length;
-                            if (--n_unfound == 0) return false; // stop scan
+                            if (--n_unfound == 0) return false;
                         }
-                        return true; // continue scan
-                    });
+                        return true;
+                    };
+
+                    // Use pre-built candidate list (O(50)) if present; fall back to
+                    // scan_early over all genera for archives without candidate data.
+                    const std::vector<const GcovEntry*>* gcov_cands = nullptr;
+                    if (git != flagged_genus.end()) {
+                        auto cit = genus_gcov_cands.find(git->second);
+                        if (cit != genus_gcov_cands.end()) gcov_cands = &cit->second;
+                    }
+                    if (gcov_cands) {
+                        for (const GcovEntry* fe : *gcov_cands)
+                            if (!score_entry(*fe)) break;
+                    } else {
+                        gcov_rd->scan_early(score_entry);
+                    }
                 }
 
                 float completeness_post = total_len > 0
@@ -1038,27 +1122,23 @@ void run_pass_b(ICheckReader& pack,
 
     spdlog::info("check pass-B: complete ({} genomes)", n_flagged);
 
-    // ── CCO baseline subtraction ─────────────────────────────────────────────
-    // Per-genus 20th-percentile CCO of reference genomes (from qual_cache) gives
-    // the natural genomic-heterogeneity floor. Subtract it from target CCO and
-    // clamp to [0,1] to produce contamination_contig_outlier_adj.
     // ── CCO self-calibrating baseline ───────────────────────────────────────
-    // Use the 20th percentile of ALL non-NaN CCO values across current targets as
-    // the natural-heterogeneity floor. Under the assumption that most genomes in the
-    // query set are clean, the low percentile captures the background noise level.
-    // This avoids dependency on cached reference QUAL records (which are overwritten
-    // by each check run) while still removing the systematic 6% FP offset.
+    // Use the 20th percentile of CCO values per genus as the natural-heterogeneity
+    // floor; subtract from target CCO and clamp to [0,1].
+    // Build acc→genus once (O(n)) to avoid the prior O(n²) nested-loop.
     {
+        std::unordered_map<std::string, const std::string*> acc_to_genus;
+        acc_to_genus.reserve(quality.size() * 2);
+        for (const auto& [genus, members] : pass_a.genus_members)
+            for (const auto& m : members)
+                acc_to_genus.emplace(m, &genus);
+
         std::unordered_map<std::string, std::vector<float>> genus_cco;
         for (const auto& [acc, q] : quality) {
             if (std::isnan(q.contamination_contig_outlier)) continue;
-            for (const auto& [genus, members] : pass_a.genus_members) {
-                bool found = false;
-                for (const auto& m : members) { if (m == acc) { found = true; break; } }
-                if (!found) continue;
-                genus_cco[genus].push_back(q.contamination_contig_outlier);
-                break;
-            }
+            auto it = acc_to_genus.find(acc);
+            if (it == acc_to_genus.end()) continue;
+            genus_cco[*it->second].push_back(q.contamination_contig_outlier);
         }
 
         std::unordered_map<std::string, float> genus_baseline;
@@ -1074,18 +1154,12 @@ void run_pass_b(ICheckReader& pack,
             spdlog::info("CCO baseline: {} genera with self-calibrated floor", genus_baseline.size());
             for (auto& [acc, q] : quality) {
                 if (std::isnan(q.contamination_contig_outlier)) continue;
-                for (const auto& [genus, members] : pass_a.genus_members) {
-                    auto bit = genus_baseline.find(genus);
-                    if (bit == genus_baseline.end()) continue;
-                    for (const auto& m : members) {
-                        if (m == acc) {
-                            q.contamination_contig_outlier_adj = std::max(
-                                0.0f, q.contamination_contig_outlier - bit->second);
-                            goto next_acc;
-                        }
-                    }
-                }
-                next_acc:;
+                auto it = acc_to_genus.find(acc);
+                if (it == acc_to_genus.end()) continue;
+                auto bit = genus_baseline.find(*it->second);
+                if (bit == genus_baseline.end()) continue;
+                q.contamination_contig_outlier_adj = std::max(
+                    0.0f, q.contamination_contig_outlier - bit->second);
             }
         }
     }
