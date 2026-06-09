@@ -1088,12 +1088,8 @@ struct ArchiveBuilder::Impl {
         // Global cap: flush the largest bucket whenever total in-memory genome
         // data exceeds this limit. Prevents unbounded accumulation across many
         // small-genus buckets that never individually hit max_shard_size_bytes.
-        const uint64_t taxon_global_cap = 16ULL << 30; // 16 GB FASTA buffered
-        // The worker-extracted keep-all aamer arrays (~52MB/large genome) dominate RAM
-        // and are NOT counted by the FASTA cap, so bound them separately: flush the
-        // RAM-heaviest bucket once buffered aamers exceed this. Keeps steady-state RAM
-        // ~aamer_cap + FASTA buffer + queue (~30GB) instead of hundreds of GB.
-        const uint64_t taxon_aamer_cap  = 8ULL << 30;  // 8 GB aamer arrays buffered
+        const uint64_t taxon_global_cap = 8ULL << 30;   // 8 GB FASTA buffered
+        const uint64_t taxon_aamer_cap  = 2ULL << 30;  // 2 GB aamer arrays buffered (FMH-subsampled)
         std::vector<ChunkItem> staging_buffer; // used when !cfg.taxonomy_group
         staging_buffer.reserve(sort_buf * 4);
         uint64_t staging_raw_bytes = 0;
@@ -1688,6 +1684,7 @@ struct ArchiveBuilder::Impl {
                 parse_fasta_contig_accessions(item.fasta, [&](std::string_view contig_acc) {
                     cidx_writer.add(contig_acc, static_cast<uint32_t>(item.genome_id));
                 });
+                std::string().swap(item.fasta);  // free ~4 MB FASTA — last use
                 meta_out << item.record.accession << "\t" << item.genome_id;
                 for (const auto& [k, v] : item.record.extra_fields) meta_out << "\t" << v;
                 meta_out << "\n";
@@ -1703,7 +1700,7 @@ struct ArchiveBuilder::Impl {
             } else {
                 // Chunk-local: cap in-flight tasks at 2×n_workers, then dispatch async.
                 reap_futs();
-                while (genus_futs.size() >= static_cast<size_t>(n_workers * 2)) {
+                while (genus_futs.size() >= static_cast<size_t>(std::max(4ul, static_cast<size_t>(n_workers) / 4))) {
                     genus_futs.front().wait();
                     reap_futs();
                 }
