@@ -977,8 +977,12 @@ FrozenShard ShardWriter::freeze() {
     }
 
     auto compress_range = [&](size_t start, size_t end) {
-        ZSTD_CCtx* cctx = ZSTD_createCCtx();
+        // Thread-local CCtx reused across ranges and across freeze() calls.
+        static thread_local std::unique_ptr<ZSTD_CCtx, decltype(&ZSTD_freeCCtx)>
+            tl_cctx(ZSTD_createCCtx(), &ZSTD_freeCCtx);
+        ZSTD_CCtx* cctx = tl_cctx.get();
         if (!cctx) throw std::runtime_error("ZSTD_createCCtx failed");
+        ZSTD_CCtx_reset(cctx, ZSTD_reset_session_and_parameters);
         ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel, impl_->cfg.zstd_level);
         if (impl_->cfg.use_long_match) {
             ZSTD_CCtx_setParameter(cctx, ZSTD_c_enableLongDistanceMatching, 1);
@@ -1032,7 +1036,6 @@ FrozenShard ShardWriter::freeze() {
                                               blob_layout.seq.data() + range.byte_start,
                                               range.byte_len);
                 if (ZSTD_isError(csize)) {
-                    ZSTD_freeCCtx(cctx);
                     throw std::runtime_error(std::string("ZSTD_compress2: ") + ZSTD_getErrorName(csize));
                 }
                 blobs[i].data.resize(old_size + csize);
@@ -1044,7 +1047,6 @@ FrozenShard ShardWriter::freeze() {
                 block_offset += static_cast<uint32_t>(csize);
             }
         }
-        ZSTD_freeCCtx(cctx);
     };
 
     if (actual_threads == 1) {

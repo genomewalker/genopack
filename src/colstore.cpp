@@ -2,17 +2,20 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <memory>
 
 namespace genopack {
 
 // ── checksum helper ───────────────────────────────────────────────────────────
 static uint32_t checksum32(const uint8_t* a, size_t na, const uint8_t* b, size_t nb) {
-    XXH3_state_t* st = XXH3_createState();
+    // Reused per-thread state avoids a malloc/free pair on every column.
+    static thread_local std::unique_ptr<XXH3_state_t, decltype(&XXH3_freeState)>
+        tl_st(XXH3_createState(), &XXH3_freeState);
+    XXH3_state_t* st = tl_st.get();
     XXH3_64bits_reset(st);
     if (na) XXH3_64bits_update(st, a, na);
     if (nb) XXH3_64bits_update(st, b, nb);
     uint64_t h = XXH3_64bits_digest(st);
-    XXH3_freeState(st);
     return static_cast<uint32_t>(h);
 }
 

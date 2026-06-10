@@ -1735,9 +1735,9 @@ std::vector<uint32_t> ArchiveReader::available_sketch_kmer_sizes() const {
     std::vector<uint32_t> all;
     for (const auto& desc : impl_->skch_descs_)
         for (uint32_t k : desc.kmer_sizes)
-            if (std::find(all.begin(), all.end(), k) == all.end())
-                all.push_back(k);
+            all.push_back(k);
     std::sort(all.begin(), all.end());
+    all.erase(std::unique(all.begin(), all.end()), all.end());
     return all;
 }
 

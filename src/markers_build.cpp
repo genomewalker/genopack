@@ -448,6 +448,14 @@ static PanelResult scan_panel_d6(
                  n_valid, n_skipped, res.lineages.size());
 
     // ── Pass 2: per-marker Dayhoff-6 profile extraction with IC filter ────────
+    // One representative genome per genus — identical for every marker, so build
+    // it once here instead of rebuilding it inside each marker's loop body.
+    std::unordered_map<uint64_t, uint32_t> genus_rep; // genus_hash → ginfo index
+    genus_rep.reserve(res.lineages.size());
+    for (uint32_t gi = 0; gi < static_cast<uint32_t>(ginfo.size()); ++gi)
+        if (ginfo[gi].seq_offset != UINT32_MAX)
+            genus_rep.emplace(ginfo[gi].genus_hash, gi); // first-seen wins
+
     std::atomic<int> done_count{0};
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic) num_threads(threads)
@@ -463,14 +471,7 @@ static PanelResult scan_panel_d6(
         // reflect cross-clade conservation rather than within-clade redundancy.
         std::vector<float> col_ic(col_len, 0.0f);
         {
-            // Collect one representative genome index per genus.
-            std::unordered_map<uint64_t, uint32_t> genus_rep; // genus_hash → ginfo index
-            genus_rep.reserve(res.lineages.size());
-            for (uint32_t gi = 0; gi < static_cast<uint32_t>(ginfo.size()); ++gi) {
-                if (ginfo[gi].seq_offset != UINT32_MAX)
-                    genus_rep.emplace(ginfo[gi].genus_hash, gi); // first-seen wins
-            }
-
+            // genus_rep built once above the parallel region; read-only here.
             for (int j = 0; j < col_len; ++j) {
                 int cnt[6] = {};
                 int n_obs  = 0;
@@ -500,8 +501,10 @@ static PanelResult scan_panel_d6(
             if (g.seq_offset == UINT32_MAX) continue;
 
             // Build gap-skipped Dayhoff-6 segment + MSA column index mapping.
-            std::vector<uint8_t> d6;
-            std::vector<int>     cpos;
+            static thread_local std::vector<uint8_t> d6;
+            static thread_local std::vector<int>     cpos;
+            d6.clear();
+            cpos.clear();
             d6.reserve(col_len);
             cpos.reserve(col_len);
             for (int j = 0; j < col_len; ++j) {
@@ -558,6 +561,12 @@ static void cross_family_filter(std::vector<std::vector<uint64_t>>& pool_hashes,
     // Partitions write to their own slot — no contention.
     std::vector<std::vector<uint64_t>> shared_per_part(N_PARTS);
 
+    // Hash top-byte selects the partition, so each partition sees ~1/N_PARTS of
+    // the total hashes — reserve up front to avoid repeated rehashing.
+    size_t total_hashes = 0;
+    for (const auto& ph : pool_hashes) total_hashes += ph.size();
+    const size_t est_per_part = total_hashes / N_PARTS + 1;
+
 #ifdef _OPENMP
 #pragma omp parallel for schedule(dynamic) num_threads(threads)
 #endif
@@ -567,6 +576,7 @@ static void cross_family_filter(std::vector<std::vector<uint64_t>>& pool_hashes,
                                                   : UINT64_MAX;
 
         std::unordered_map<uint64_t, int> seen;
+        seen.reserve(est_per_part);
         for (int mi = 0; mi < (int)pool_hashes.size(); ++mi) {
             auto beg = std::lower_bound(pool_hashes[mi].begin(), pool_hashes[mi].end(), lo);
             auto end = std::upper_bound(pool_hashes[mi].begin(), pool_hashes[mi].end(), hi);

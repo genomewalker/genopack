@@ -120,6 +120,10 @@ SectionDesc SkchWriter::finalize(AppendWriter& writer, uint64_t section_id) {
     std::vector<uint8_t> out_buf(OUT_BUF);
     std::vector<uint8_t> rec(record_size_);
 
+    // One CStream reused for all frames (re-init per frame).
+    ZSTD_CStream* cs = ZSTD_createCStream();
+    if (!cs) throw std::runtime_error("SkchWriter V4: ZSTD_createCStream failed");
+
     for (uint32_t fi = 0; fi < n_frames; ++fi) {
         const uint32_t row_start = fi * SKCH_V4_FRAME_SIZE;
         const uint32_t row_end   = std::min(n, row_start + SKCH_V4_FRAME_SIZE);
@@ -134,7 +138,6 @@ SectionDesc SkchWriter::finalize(AppendWriter& writer, uint64_t section_id) {
         frame_descs[fi].data_offset  = frame_start - section_start;
         frame_descs[fi].n_genomes    = frame_n;
 
-        ZSTD_CStream* cs = ZSTD_createCStream();
         ZSTD_initCStream(cs, 3);
         ZSTD_CCtx_setPledgedSrcSize(cs, frame_raw_sz);
 
@@ -189,10 +192,10 @@ SectionDesc SkchWriter::finalize(AppendWriter& writer, uint64_t section_id) {
                 throw std::runtime_error(std::string("SkchWriter V4 end: ") + ZSTD_getErrorName(remaining));
             if (zo.pos) writer.append(out_buf.data(), zo.pos);
         }
-        ZSTD_freeCStream(cs);
 
         frame_descs[fi].compressed_size = static_cast<uint32_t>(writer.current_offset() - frame_start);
     }
+    ZSTD_freeCStream(cs);
 
     std::fclose(spill_fp_); spill_fp_ = nullptr;
 
@@ -317,6 +320,10 @@ SectionDesc SkchWriterMultiK::finalize(AppendWriter& writer, uint64_t section_id
     std::vector<uint8_t> out_buf(OUT_BUF);
     std::vector<uint8_t> rec(spill_record_size_);
 
+    // One CStream reused for all frames (re-init per frame).
+    ZSTD_CStream* cs = ZSTD_createCStream();
+    if (!cs) throw std::runtime_error("SkchWriterMultiK V4: ZSTD_createCStream failed");
+
     for (uint32_t fi = 0; fi < n_frames; ++fi) {
         const uint32_t row_start = fi * SKCH_V4_FRAME_SIZE;
         const uint32_t row_end   = std::min(n, row_start + SKCH_V4_FRAME_SIZE);
@@ -331,7 +338,6 @@ SectionDesc SkchWriterMultiK::finalize(AppendWriter& writer, uint64_t section_id
         frame_descs[fi].data_offset  = frame_start - section_start;
         frame_descs[fi].n_genomes    = frame_n;
 
-        ZSTD_CStream* cs = ZSTD_createCStream();
         ZSTD_initCStream(cs, 3);
         ZSTD_CCtx_setPledgedSrcSize(cs, frame_raw_sz);
 
@@ -396,10 +402,10 @@ SectionDesc SkchWriterMultiK::finalize(AppendWriter& writer, uint64_t section_id
                 throw std::runtime_error(std::string("SkchWriterMultiK V4 end: ") + ZSTD_getErrorName(remaining));
             if (zo.pos) writer.append(out_buf.data(), zo.pos);
         }
-        ZSTD_freeCStream(cs);
 
         frame_descs[fi].compressed_size = static_cast<uint32_t>(writer.current_offset() - frame_start);
     }
+    ZSTD_freeCStream(cs);
 
     std::fclose(spill_fp_); spill_fp_ = nullptr;
 

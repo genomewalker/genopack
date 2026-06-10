@@ -845,18 +845,21 @@ void run_pass_b(ICheckReader& pack,
                         contamination_sibling_outlier =
                             static_cast<float>(sibling_out_bp) / static_cast<float>(gcov_scored_bp);
                 } else if (centroid) {
-                    std::vector<std::pair<float,uint32_t>> scored;
+                    static thread_local std::vector<std::pair<float,uint32_t>> scored;
+                    scored.clear();
                     for (const auto& cf : flags) {
                         if (!std::isnan(cf.tnf_score) && cf.contig_length >= 5000)
                             scored.emplace_back(cf.tnf_score, cf.contig_length);
                     }
                     if (scored.size() >= 3) {
-                        std::vector<float> sv;
+                        static thread_local std::vector<float> sv;
+                        sv.clear();
                         sv.reserve(scored.size());
                         for (const auto& [s, l] : scored) sv.push_back(s);
                         std::sort(sv.begin(), sv.end());
                         const float null_med = sv[sv.size() / 2];
-                        std::vector<float> dv;
+                        static thread_local std::vector<float> dv;
+                        dv.clear();
                         dv.reserve(sv.size());
                         for (float s : sv) dv.push_back(std::abs(s - null_med));
                         std::sort(dv.begin(), dv.end());

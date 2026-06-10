@@ -63,7 +63,8 @@ GmmResult fit_gmm2(
     }
     float piA = 0.5f, piB = 0.5f;
 
-    std::vector<float> rA(N);
+    static thread_local std::vector<float> rA;
+    rA.resize(N);  // fully overwritten each E-step before use
     float prev_ll2 = -1e30f;
 
     // ── EM iterations ──────────────────────────────────────────────────────────
