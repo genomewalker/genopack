@@ -35,8 +35,10 @@ inline uint8_t encode_base(char c) {
     }
 }
 
-inline uint64_t rol64(uint64_t v, int n) { return (v << n) | (v >> (64 - n)); }
-inline uint64_t ror64(uint64_t v, int n) { return (v >> n) | (v << (64 - n)); }
+// Mask the complementary shift so n==0 does not invoke shift-by-64 (UB).
+// Identical result to the naive form for n in [1,63]; correct rotate for n==0.
+inline uint64_t rol64(uint64_t v, int n) { n &= 63; return (v << n) | (v >> ((64 - n) & 63)); }
+inline uint64_t ror64(uint64_t v, int n) { n &= 63; return (v >> n) | (v << ((64 - n) & 63)); }
 
 } // anonymous namespace
 
