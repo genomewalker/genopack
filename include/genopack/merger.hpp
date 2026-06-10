@@ -16,6 +16,7 @@ namespace genopack {
 void merge_archives(const std::vector<std::filesystem::path>& inputs,
                     const std::filesystem::path& output,
                     bool remap_genome_ids = true,
-                    bool merge_cidx = true);
+                    bool merge_cidx = true,
+                    const std::string& spill_dir = {});
 
 } // namespace genopack

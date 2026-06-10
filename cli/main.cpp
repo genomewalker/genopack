@@ -318,7 +318,8 @@ static int cmd_build(const std::string& input_tsv, const std::string& output_dir
 // ── genopack merge ─────────────────────────────────────────────────────────────
 static int cmd_merge(const std::vector<std::string>& inputs,
                      const std::string& list_file,
-                     const std::string& output) {
+                     const std::string& output,
+                     const std::string& tmpdir) {
     std::vector<std::filesystem::path> paths;
     for (const auto& s : inputs) paths.emplace_back(s);
     if (!list_file.empty()) {
@@ -331,7 +332,7 @@ static int cmd_merge(const std::vector<std::string>& inputs,
     }
     if (paths.size() < 2)
         throw std::runtime_error("merge: need at least 2 input archives");
-    merge_archives(paths, output);
+    merge_archives(paths, output, /*remap_genome_ids=*/true, /*merge_cidx=*/true, tmpdir);
     return 0;
 }
 
@@ -2918,8 +2919,12 @@ int main(int argc, char** argv) {
     merge_cmd->add_option("inputs", merge_inputs, "Input .gpk archives")->expected(0, -1);
     merge_cmd->add_option("-l,--list", merge_list, "File with one .gpk path per line");
     merge_cmd->add_option("-o,--output", merge_output, "Output .gpk archive")->required();
+    std::string merge_tmpdir;
+    merge_cmd->add_option("--tmpdir", merge_tmpdir,
+        "Directory for SKCH spill files during merge "
+        "(default: $GENOPACK_SKETCH_SPILL_DIR / $GENOPACK_SPILL_DIR / /scratch / /tmp).");
     merge_cmd->callback([&]() {
-        std::exit(cmd_merge(merge_inputs, merge_list, merge_output));
+        std::exit(cmd_merge(merge_inputs, merge_list, merge_output, merge_tmpdir));
     });
 
     // genopack add

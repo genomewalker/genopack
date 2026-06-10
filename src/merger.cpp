@@ -39,7 +39,8 @@ namespace genopack {
 void merge_archives(const std::vector<std::filesystem::path>& inputs,
                     const std::filesystem::path& output,
                     bool remap_genome_ids,
-                    bool merge_cidx)
+                    bool merge_cidx,
+                    const std::string& spill_dir)
 {
     if (inputs.empty())
         throw std::runtime_error("merge_archives: no inputs");
@@ -611,10 +612,12 @@ void merge_archives(const std::vector<std::filesystem::path>& inputs,
             std::unique_ptr<SkchWriterMultiK> skch_out_mk;
             if (multi_k)
                 skch_out_mk = std::make_unique<SkchWriterMultiK>(
-                    skch_kmer_sizes, skch_sketch_size, skch_syncmer_s, skch_seed1, skch_seed2);
+                    skch_kmer_sizes, skch_sketch_size, skch_syncmer_s, skch_seed1, skch_seed2,
+                    spill_dir);
             else
                 skch_out_1k = std::make_unique<SkchWriter>(
-                    skch_sketch_size, skch_kmer_sizes[0], skch_syncmer_s, skch_seed1, skch_seed2);
+                    skch_sketch_size, skch_kmer_sizes[0], skch_syncmer_s, skch_seed1, skch_seed2,
+                    spill_dir);
 
             for (size_t ai = 0; ai < archives.size(); ++ai) {
                 GenomeId gid_off = gid_offsets[ai];
