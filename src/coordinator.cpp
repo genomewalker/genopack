@@ -15,6 +15,7 @@
 #include <ctime>
 #include <fstream>
 #include <map>
+#include <unordered_set>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -167,7 +168,7 @@ void CoordinatorServer::run_nfs(
 
     // Phase 1: watch for .pending files, allocate contiguous ranges
     std::vector<std::string> worker_names;
-    std::map<std::string, bool> allocated;
+    std::unordered_set<std::string> allocated;
 
     while ((int)worker_names.size() < expected_workers) {
         for (auto& entry : std::filesystem::directory_iterator(manifest_dir)) {
@@ -184,7 +185,7 @@ void CoordinatorServer::run_nfs(
 
             uint64_t alloc_start = next_offset;
             next_offset += total_bytes;
-            allocated[wname] = true;
+            allocated.insert(wname);
             worker_names.push_back(wname);
 
             auto alloc_tmp  = manifest_dir / (wname + ".alloc.tmp");
@@ -212,7 +213,7 @@ void CoordinatorServer::run_nfs(
 
     // Phase 2: watch for .done files, collect SectionDescs
     std::vector<SectionDesc> all_sections;
-    std::map<std::string, bool> collected;
+    std::unordered_set<std::string> collected;
 
     while ((int)collected.size() < expected_workers) {
         for (auto& wname : worker_names) {
@@ -225,7 +226,7 @@ void CoordinatorServer::run_nfs(
             while (std::getline(f, line)) {
                 if (!line.empty()) all_sections.push_back(decode_section(line));
             }
-            collected[wname] = true;
+            collected.insert(wname);
             if (on_progress) on_progress(all_sections.size());
             spdlog::info("coordinator-nfs: worker {} done ({} total sections)",
                          wname, all_sections.size());
