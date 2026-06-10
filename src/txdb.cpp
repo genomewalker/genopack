@@ -166,21 +166,26 @@ static BuiltTree build_internal(
         for (auto& [anchor, accs] : anchor_to_accs) {
             std::vector<int> rep_idx(accs.size(), -1);
             std::vector<size_t> reps;
+            // Cache each representative's profile pointer so the inner comparison
+            // loop doesn't re-hash the rep accession on every candidate (the dot
+            // products and chosen reps are unchanged).
+            std::vector<const float*> rep_profiles;
 
             for (size_t i = 0; i < accs.size(); ++i) {
                 auto it_i = kmer_profiles->find(accs[i]);
                 if (it_i == kmer_profiles->end()) {
                     rep_idx[i] = static_cast<int>(i);
                     reps.push_back(i);
+                    rep_profiles.push_back(nullptr);
                     continue;
                 }
                 const float* pi = it_i->second.data();
                 bool found = false;
-                for (size_t r : reps) {
-                    auto it_r = kmer_profiles->find(accs[r]);
-                    if (it_r == kmer_profiles->end()) continue;
-                    if (dot136(pi, it_r->second.data()) >= similarity_threshold) {
-                        rep_idx[i] = static_cast<int>(r);
+                for (size_t k = 0; k < reps.size(); ++k) {
+                    const float* pr = rep_profiles[k];
+                    if (!pr) continue;
+                    if (dot136(pi, pr) >= similarity_threshold) {
+                        rep_idx[i] = static_cast<int>(reps[k]);
                         found = true;
                         break;
                     }
@@ -188,6 +193,7 @@ static BuiltTree build_internal(
                 if (!found) {
                     rep_idx[i] = static_cast<int>(i);
                     reps.push_back(i);
+                    rep_profiles.push_back(pi);
                 }
             }
 
