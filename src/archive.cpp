@@ -25,6 +25,7 @@
 #include <cstring>
 #include <future>
 #include <mutex>
+#include <shared_mutex>
 #include <stdexcept>
 #ifdef __unix__
 #include <sys/mman.h>
@@ -84,7 +85,7 @@ struct ArchiveReader::Impl {
     // lazily-opened shard readers keyed by logical shard_id
     mutable std::unordered_map<uint32_t, ShardBox> shards_;
     std::unordered_map<uint64_t, uint32_t> shard_section_to_id_;
-    mutable std::mutex shard_open_mx_;
+    mutable std::shared_mutex shard_open_mx_;
 
     // ACCX readers kept alive so accession lookups are zero-copy into the mmap.
     // genome_accession_map_ stores const char* into the ACCX string area (valid
@@ -744,8 +745,16 @@ struct ArchiveReader::Impl {
         auto desc_it = shard_descs_.find(shard_id);
         if (desc_it == shard_descs_.end())
             throw std::runtime_error("Shard " + std::to_string(shard_id) + " not found");
-        std::lock_guard<std::mutex> lk(shard_open_mx_);
-        auto it = shards_.find(shard_id);
+        // Fast path: shard already open — shared lock lets concurrent fetches run.
+        // unordered_map keeps references to existing elements stable across inserts,
+        // so the returned reference stays valid while other threads open new shards.
+        {
+            std::shared_lock<std::shared_mutex> rl(shard_open_mx_);
+            auto it = shards_.find(shard_id);
+            if (it != shards_.end()) return it->second.reader();
+        }
+        std::unique_lock<std::shared_mutex> wl(shard_open_mx_);
+        auto it = shards_.find(shard_id);  // re-check under exclusive lock
         if (it == shards_.end()) {
             auto [inserted, _] = shards_.emplace(
                 std::piecewise_construct,
@@ -1583,7 +1592,7 @@ std::optional<SketchResult> ArchiveReader::sketch_for(GenomeId genome_id) const 
 
     // Lazy-load SKCH sections on first call (thread-safe)
     if (!impl_->skch_loaded_) {
-        std::lock_guard<std::mutex> lk(impl_->shard_open_mx_);
+        std::lock_guard<std::shared_mutex> lk(impl_->shard_open_mx_);
         if (!impl_->skch_loaded_) {
             impl_->skch_readers_.reserve(impl_->skch_descs_.size());
             for (const auto& desc : impl_->skch_descs_) {
@@ -1639,7 +1648,7 @@ std::optional<SketchResult> ArchiveReader::sketch_for(GenomeId genome_id,
 
     // Trigger lazy load (reuses same lock and readers as the unparameterised overload).
     if (!impl_->skch_loaded_) {
-        std::lock_guard<std::mutex> lk(impl_->shard_open_mx_);
+        std::lock_guard<std::shared_mutex> lk(impl_->shard_open_mx_);
         if (!impl_->skch_loaded_) {
             impl_->skch_readers_.reserve(impl_->skch_descs_.size());
             for (const auto& desc : impl_->skch_descs_) {
@@ -1668,7 +1677,7 @@ void ArchiveReader::sketch_for_ids(const std::vector<GenomeId>& sorted_ids,
     if (sorted_ids.empty() || impl_->skch_descs_.empty()) return;
 
     if (!impl_->skch_loaded_) {
-        std::lock_guard<std::mutex> lk(impl_->shard_open_mx_);
+        std::lock_guard<std::shared_mutex> lk(impl_->shard_open_mx_);
         if (!impl_->skch_loaded_) {
             impl_->skch_readers_.reserve(impl_->skch_descs_.size());
             for (const auto& desc : impl_->skch_descs_) {
@@ -1702,7 +1711,7 @@ void ArchiveReader::sketch_for_ids_multi_k(const std::vector<GenomeId>& sorted_i
     if (sorted_ids.empty() || impl_->skch_descs_.empty()) return;
 
     if (!impl_->skch_loaded_) {
-        std::lock_guard<std::mutex> lk(impl_->shard_open_mx_);
+        std::lock_guard<std::shared_mutex> lk(impl_->shard_open_mx_);
         if (!impl_->skch_loaded_) {
             impl_->skch_readers_.reserve(impl_->skch_descs_.size());
             for (const auto& desc : impl_->skch_descs_) {

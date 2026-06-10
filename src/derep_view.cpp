@@ -297,10 +297,11 @@ void DerepView::open(const std::filesystem::path& gpd_path) {
     if (I.map_len < sizeof(GpdFileHeader) + sizeof(GpdTailLocator))
         throw std::runtime_error("gpd: file too short");
 
-    void* m = ::mmap(nullptr, I.map_len, PROT_READ, MAP_PRIVATE, I.fd, 0);
+    void* m = ::mmap(nullptr, I.map_len, PROT_READ, MAP_SHARED, I.fd, 0);
     if (m == MAP_FAILED)
         throw std::runtime_error("gpd: mmap failed");
     I.map = static_cast<const uint8_t*>(m);
+    ::madvise(m, I.map_len, MADV_SEQUENTIAL);  // sections are read front-to-back at open
 
     GpdFileHeader fh{};
     std::memcpy(&fh, I.map, sizeof(fh));
