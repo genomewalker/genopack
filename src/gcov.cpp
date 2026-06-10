@@ -160,6 +160,28 @@ float gcov_spe(const GcovEntry& e, const float* x_minus_mu) noexcept {
     return spe;
 }
 
+void gcov_mahalanobis_spe(const GcovEntry& e, const float* x_minus_mu,
+                          float* mahalanobis_out, float* spe_out) noexcept {
+    static constexpr int K = static_cast<int>(GCOV_N_EIGVECS);
+    // Single projection pass shared by Mahalanobis (T²) and SPE — identical to
+    // calling gcov_mahalanobis() and gcov_spe() separately, but the K×136 dot
+    // products run once. proj is needed by SPE for every k; the eigenvalue gate
+    // only suppresses the T² accumulation (matching gcov_mahalanobis()).
+    float d2 = 0.0f;
+    float resid[136];
+    std::memcpy(resid, x_minus_mu, 136 * sizeof(float));
+    for (int k = 0; k < K; ++k) {
+        float proj = 0.0f;
+        for (int d = 0; d < 136; ++d) proj += x_minus_mu[d] * e.eigvecs[k][d];
+        if (e.eigenvalues[k] >= 1e-9f) d2 += (proj * proj) / e.eigenvalues[k];
+        for (int d = 0; d < 136; ++d) resid[d] -= proj * e.eigvecs[k][d];
+    }
+    float spe = 0.0f;
+    for (int d = 0; d < 136; ++d) spe += resid[d] * resid[d];
+    *mahalanobis_out = std::sqrt(d2);
+    *spe_out = spe;
+}
+
 float gcov_rho_distance(const GcovEntry& e, const float* rho_minus_mean) noexcept {
     static constexpr int R = static_cast<int>(GCOV_RHO_DIM);
     // d² = z^T P z, P stored as lower triangle: P[i][j] = rho_prec_lower[i*(i+1)/2+j] for i>=j

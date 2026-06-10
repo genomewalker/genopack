@@ -279,6 +279,11 @@ float gcov_mahalanobis(const GcovEntry& e, const float* x_minus_mu) noexcept;
 // Catches contamination whose direction lies outside the top-K biological subspace.
 float gcov_spe(const GcovEntry& e, const float* x_minus_mu) noexcept;
 
+// Fused Mahalanobis + SPE: one shared projection pass; results are bit-identical
+// to calling gcov_mahalanobis() and gcov_spe() separately.
+void gcov_mahalanobis_spe(const GcovEntry& e, const float* x_minus_mu,
+                          float* mahalanobis_out, float* spe_out) noexcept;
+
 // Mahalanobis distance in 16-dim ρ* space using stored precision matrix.
 // rho_minus_mean = contig_rho[16] - e.rho_mean[16].
 float gcov_rho_distance(const GcovEntry& e, const float* rho_minus_mean) noexcept;

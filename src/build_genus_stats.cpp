@@ -145,8 +145,7 @@ static void finalize_genus(const std::string& genus_key,
     for (uint32_t ci = 0; ci < n_long; ++ci) {
         float xmu[D];
         for (int d = 0; d < D; ++d) xmu[d] = acc.flat[ci].p[d] - mean[d];
-        dists[ci]     = gcov_mahalanobis(tmp_e, xmu);
-        spe_dists[ci] = gcov_spe(tmp_e, xmu);
+        gcov_mahalanobis_spe(tmp_e, xmu, &dists[ci], &spe_dists[ci]);
     }
     std::sort(dists.begin(), dists.end());
     std::sort(spe_dists.begin(), spe_dists.end());

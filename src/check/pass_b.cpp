@@ -659,9 +659,9 @@ void run_pass_b(ICheckReader& pack,
                                 if (gcov_entry && gcov_rd && cf.contig_length >= gcov_rd->min_long_bp()) {
                                     float xmu[136];
                                     for (int di = 0; di < 136; ++di) xmu[di] = tnf[di] - gcov_entry->mu[di];
-                                    const float dist    = gcov_mahalanobis(*gcov_entry, xmu);
+                                    float dist, spe;
+                                    gcov_mahalanobis_spe(*gcov_entry, xmu, &dist, &spe);
                                     const float pct     = gcov_rd->percentile(*gcov_entry, dist);
-                                    const float spe     = gcov_spe(*gcov_entry, xmu);
                                     const float spe_pct = gcov_rd->spe_percentile(*gcov_entry, spe);
                                     cf.gcov_t2_pct  = pct;       // persisted into QCONTIG
                                     cf.gcov_spe_pct = spe_pct;   // the cross-genus / foreign-contig signal
@@ -691,9 +691,9 @@ void run_pass_b(ICheckReader& pack,
                                             float xmu_fam[136];
                                             for (int di = 0; di < 136; ++di)
                                                 xmu_fam[di] = tnf[di] - fcov_entry->mu[di];
-                                            const float f_dist = gcov_mahalanobis(*fcov_entry, xmu_fam);
+                                            float f_dist, f_spe;
+                                            gcov_mahalanobis_spe(*fcov_entry, xmu_fam, &f_dist, &f_spe);
                                             const float f_pct  = fcov_rd->percentile(*fcov_entry, f_dist);
-                                            const float f_spe  = gcov_spe(*fcov_entry, xmu_fam);
                                             const float f_spct = fcov_rd->spe_percentile(*fcov_entry, f_spe);
                                             family_inlier = (f_pct  < cfg.gcov_outlier_percentile) &&
                                                             (f_spct < cfg.gcov_outlier_percentile);

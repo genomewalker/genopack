@@ -1496,8 +1496,10 @@ struct ArchiveBuilder::Impl {
                         scored_bp += cp.bp;
                         float xmu[136];
                         for (int d=0;d<136;++d) xmu[d] = cp.p[d] - ge.mu[d];
-                        const float pct  = gcov_percentile(ge, gcov_mahalanobis(ge, xmu));
-                        const float spct = gcov_spe_percentile(ge, gcov_spe(ge, xmu));
+                        float mahal, spe_val;
+                        gcov_mahalanobis_spe(ge, xmu, &mahal, &spe_val);
+                        const float pct  = gcov_percentile(ge, mahal);
+                        const float spct = gcov_spe_percentile(ge, spe_val);
                         const bool t2  = pct  >= kGcovOutlierPct;
                         const bool spe = spct >= kGcovOutlierPct;
                         if (t2 || spe) cco_bp += cp.bp;
@@ -1509,8 +1511,10 @@ struct ArchiveBuilder::Impl {
                         if ((t2||spe) && fcov_ok) {
                             float xmuf[136];
                             for (int d=0;d<136;++d) xmuf[d] = cp.p[d] - fe.mu[d];
-                            const float fp  = gcov_percentile(fe, gcov_mahalanobis(fe, xmuf));
-                            const float fsp = gcov_spe_percentile(fe, gcov_spe(fe, xmuf));
+                            float fmahal, fspe;
+                            gcov_mahalanobis_spe(fe, xmuf, &fmahal, &fspe);
+                            const float fp  = gcov_percentile(fe, fmahal);
+                            const float fsp = gcov_spe_percentile(fe, fspe);
                             if (!(fp >= kGcovOutlierPct || fsp >= kGcovOutlierPct))
                                 sib_bp += cp.bp;
                         }

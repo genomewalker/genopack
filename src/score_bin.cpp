@@ -394,9 +394,9 @@ BinScores score_bin(
         float xmu[136];
         for (int d = 0; d < 136; ++d) xmu[d] = tnf[d] - gcov_entry->mu[d];
 
-        const float dist    = gcov_mahalanobis(*gcov_entry, xmu);
+        float dist, spe;
+        gcov_mahalanobis_spe(*gcov_entry, xmu, &dist, &spe);
         const float pct     = gcov_rd->percentile(*gcov_entry, dist);
-        const float spe     = gcov_spe(*gcov_entry, xmu);
         const float spe_pct = gcov_rd->spe_percentile(*gcov_entry, spe);
         const bool  t2_out  = (pct     >= cfg.outlier_percentile);
         const bool  spe_flg = (spe_pct >= cfg.outlier_percentile);
@@ -420,9 +420,9 @@ BinScores score_bin(
         if ((t2_out || spe_flg) && fcov_entry && fcov_rd) {
             float xmu_fam[136];
             for (int d = 0; d < 136; ++d) xmu_fam[d] = tnf[d] - fcov_entry->mu[d];
-            const float f_dist = gcov_mahalanobis(*fcov_entry, xmu_fam);
+            float f_dist, f_spe;
+            gcov_mahalanobis_spe(*fcov_entry, xmu_fam, &f_dist, &f_spe);
             const float f_pct  = fcov_rd->percentile(*fcov_entry, f_dist);
-            const float f_spe  = gcov_spe(*fcov_entry, xmu_fam);
             const float f_spct = fcov_rd->spe_percentile(*fcov_entry, f_spe);
             const bool  fam_out = (f_pct  >= cfg.outlier_percentile) ||
                                   (f_spct >= cfg.outlier_percentile);

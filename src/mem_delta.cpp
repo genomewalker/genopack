@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
+#include <string_view>
 #ifdef __AVX2__
 #  include <immintrin.h>
 #endif
@@ -231,7 +232,7 @@ AnchorIndex build_anchor_index(const std::string& seq) {
 // ── MEM finding ───────────────────────────────────────────────────────────────
 
 static std::vector<MemEntry> find_mems(const std::string& anchor,
-                                        const std::string& query,
+                                        std::string_view query,
                                         const AnchorIndex& idx)
 {
     const uint32_t alen = static_cast<uint32_t>(anchor.size());
@@ -668,7 +669,7 @@ std::vector<uint8_t> encode_mem_delta(const FastaComponents& anchor,
         chunks.size() * sizeof(MemDeltaChunkDesc));
 
     for (const auto& [chunk_start, chunk_len] : chunks) {
-        std::string chunk_query = query.seq.substr(chunk_start, chunk_len);
+        std::string_view chunk_query(query.seq.data() + chunk_start, chunk_len);
         auto mems = find_mems(anchor.seq, chunk_query, anchor_idx);
 
         std::vector<uint8_t> verbatim;

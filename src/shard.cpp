@@ -761,6 +761,19 @@ FrozenShard ShardWriter::freeze() {
     // Reusable scratch buffer for codec sampling — grows to max chunk bound and stays.
     std::vector<char> estimate_scratch;
 
+    // Memoize the blob layout of each sampled target genome: codec selection
+    // re-evaluates the same handful of samples several times (candidate × target,
+    // then plain vs delta), so building the layout once per genome avoids redundant
+    // parse + 2-bit packing. Bounded to the sampled set (≤ a few genomes).
+    std::unordered_map<const Impl::PendingGenome*, SequenceBlobLayout> est_layout_cache;
+    auto get_est_layout = [&](const Impl::PendingGenome& pg) -> const SequenceBlobLayout& {
+        auto it = est_layout_cache.find(&pg);
+        if (it != est_layout_cache.end()) return it->second;
+        auto res = est_layout_cache.emplace(&pg, build_sequence_blob_layout(
+            impl_->raw_buffer.data() + pg.raw_offset, pg.raw_len, impl_->cfg.use_2bit_pack));
+        return res.first->second;
+    };
+
     auto estimate_chunked_cost = [&](const Impl::PendingGenome& pg,
                                      bool use_prefix,
                                      std::string_view ref_seq) {
@@ -772,9 +785,7 @@ FrozenShard ShardWriter::freeze() {
                 ZSTD_CCtx_setParameter(estimate_cctx, ZSTD_c_windowLog, impl_->cfg.zstd_wlog);
             }
 
-            const char* src = impl_->raw_buffer.data() + pg.raw_offset;
-            auto blob_layout = build_sequence_blob_layout(src, pg.raw_len,
-                                                          impl_->cfg.use_2bit_pack);
+            const SequenceBlobLayout& blob_layout = get_est_layout(pg);
             const char* ref_ptr = ref_seq.data();
             size_t ref_len = ref_seq.size();
             size_t target_bases = effective_checkpoint_bases(impl_->cfg.checkpoint_bases, use_prefix);

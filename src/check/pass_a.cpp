@@ -271,11 +271,12 @@ PassAResult run_pass_a(ICheckReader& pack,
                     Eigen::MatrixXf Xc = X.rowwise() - sl.tnf_mu.transpose();
                     Eigen::MatrixXf S  = (Xc.transpose() * Xc) / static_cast<float>(nv - 1);
                     float trS  = S.trace();
-                    float trS2 = (S * S).trace();
+                    // S is symmetric, so trace(S*S) == ||S||_F^2 — avoid the 136x136 matmul.
+                    float trS2 = S.squaredNorm();
                     float alpha  = oas_alpha(trS, trS2, nv, 136);
                     float sigma2 = trS / 136.0f;
-                    Eigen::MatrixXf Sig = (1.0f - alpha) * S
-                                       + alpha * sigma2 * Eigen::MatrixXf::Identity(136, 136);
+                    Eigen::MatrixXf Sig = (1.0f - alpha) * S;
+                    Sig.diagonal().array() += alpha * sigma2;  // shrink toward sigma2*I
                     Eigen::LLT<Eigen::MatrixXf> llt(Sig);
                     if (llt.info() == Eigen::Success) {
                         sl.tnf_L   = llt.matrixL();
