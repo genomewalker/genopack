@@ -120,8 +120,8 @@ SectionDesc SkchWriter::finalize(AppendWriter& writer, uint64_t section_id) {
     std::vector<uint8_t> out_buf(OUT_BUF);
     std::vector<uint8_t> rec(record_size_);
 
-    // One CStream reused for all frames (re-init per frame).
-    ZSTD_CStream* cs = ZSTD_createCStream();
+    // Thread-local CStream: allocated once, re-initialised per frame.
+    static thread_local ZSTD_CStream* cs = ZSTD_createCStream();
     if (!cs) throw std::runtime_error("SkchWriter V4: ZSTD_createCStream failed");
 
     for (uint32_t fi = 0; fi < n_frames; ++fi) {
@@ -195,7 +195,7 @@ SectionDesc SkchWriter::finalize(AppendWriter& writer, uint64_t section_id) {
 
         frame_descs[fi].compressed_size = static_cast<uint32_t>(writer.current_offset() - frame_start);
     }
-    ZSTD_freeCStream(cs);
+    // cs is thread_local — do not free here.
 
     std::fclose(spill_fp_); spill_fp_ = nullptr;
 
@@ -320,8 +320,8 @@ SectionDesc SkchWriterMultiK::finalize(AppendWriter& writer, uint64_t section_id
     std::vector<uint8_t> out_buf(OUT_BUF);
     std::vector<uint8_t> rec(spill_record_size_);
 
-    // One CStream reused for all frames (re-init per frame).
-    ZSTD_CStream* cs = ZSTD_createCStream();
+    // Thread-local CStream: allocated once, re-initialised per frame.
+    static thread_local ZSTD_CStream* cs = ZSTD_createCStream();
     if (!cs) throw std::runtime_error("SkchWriterMultiK V4: ZSTD_createCStream failed");
 
     for (uint32_t fi = 0; fi < n_frames; ++fi) {
@@ -405,7 +405,7 @@ SectionDesc SkchWriterMultiK::finalize(AppendWriter& writer, uint64_t section_id
 
         frame_descs[fi].compressed_size = static_cast<uint32_t>(writer.current_offset() - frame_start);
     }
-    ZSTD_freeCStream(cs);
+    // cs is thread_local — do not free here.
 
     std::fclose(spill_fp_); spill_fp_ = nullptr;
 

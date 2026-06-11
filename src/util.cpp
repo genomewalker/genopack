@@ -73,7 +73,7 @@ static bool is_gzip(const std::string& buf) {
 }
 
 // Shared decompression core — operates on already-loaded compressed bytes.
-static std::string decompress_gz_buf(std::string compressed,
+static std::string decompress_gz_buf(const std::string& compressed,
                                      const std::filesystem::path& path) {
     if (!is_gzip(compressed))
         return compressed; // plain FASTA

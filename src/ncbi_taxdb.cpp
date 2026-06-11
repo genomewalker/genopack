@@ -234,7 +234,8 @@ std::string NcbiTaxdb::taxonomy_for_string(const std::string& tax_str,
 std::vector<std::pair<std::string, std::string>>
 NcbiTaxdb::lineage(int taxid) const {
     std::vector<std::pair<std::string, std::string>> result;
-    std::unordered_set<int> visited;
+    static std::unordered_set<int> visited;
+    visited.clear();
     int cur = taxid;
     while (cur != 1 && cur != 0 && !visited.count(cur)) {
         visited.insert(cur);
