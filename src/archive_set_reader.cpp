@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -57,7 +58,7 @@ struct ArchiveSetReader::Impl {
     // entries are populated on demand under tax_mu.
     mutable std::vector<std::optional<TaxonomyTree>> tax_cache;
     mutable std::vector<bool>                        tax_loaded;
-    mutable std::mutex                                tax_mu;
+    mutable std::shared_mutex                         tax_mu;
 
     int find_owner_part(std::string_view accession) const {
         for (size_t i = 0; i < parts.size(); ++i) {
@@ -68,7 +69,13 @@ struct ArchiveSetReader::Impl {
     }
 
     const TaxonomyTree* tree_for_part(size_t i) const {
-        std::lock_guard<std::mutex> lk(tax_mu);
+        {
+            std::shared_lock<std::shared_mutex> rl(tax_mu);
+            if (i >= parts.size()) return nullptr;
+            if (tax_loaded[i])
+                return tax_cache[i].has_value() ? &(*tax_cache[i]) : nullptr;
+        }
+        std::unique_lock<std::shared_mutex> wl(tax_mu);
         if (i >= parts.size()) return nullptr;
         if (!tax_loaded[i]) {
             tax_cache[i]  = parts[i]->taxonomy_tree();

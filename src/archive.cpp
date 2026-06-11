@@ -35,6 +35,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 namespace genopack {
@@ -145,6 +146,8 @@ struct ArchiveReader::Impl {
 
     // merged tombstones from all TOMB sections
     std::vector<TombstoneReader> tombstones_;
+    // O(1) deleted-genome lookup built from all TOMB sections at open time
+    std::unordered_set<GenomeId> tombstones_idx_;
 
     bool     open_        = false;
     uint64_t live_count_  = 0;
@@ -599,6 +602,7 @@ struct ArchiveReader::Impl {
         for (auto* sd : toc_.find_by_type(SEC_TOMB)) {
             tombstones_.emplace_back();
             tombstones_.back().open(mmap_.data(), sd->file_offset, sd->compressed_size);
+            tombstones_.back().scan([&](GenomeId gid) { tombstones_idx_.insert(gid); });
         }
 
         // Load all KMRX sections (merged archives have one per original part).
@@ -689,6 +693,7 @@ struct ArchiveReader::Impl {
             skch_readers_.clear();
             skch_loaded_          = false;
             tombstones_.clear();
+            tombstones_idx_.clear();
             tree_built_           = false;
             cached_tree_.reset();
             live_count_           = 0;
@@ -741,9 +746,7 @@ struct ArchiveReader::Impl {
     // ── tombstone check ───────────────────────────────────────────────────────
 
     bool is_deleted(GenomeId id) const {
-        for (const auto& t : tombstones_)
-            if (t.is_deleted(id)) return true;
-        return false;
+        return tombstones_idx_.count(id) > 0;
     }
 
     std::optional<ExtractedGenome> fetch_genome_impl(GenomeId id) const {
@@ -1552,17 +1555,21 @@ const ProfReader* ArchiveReader::prof_reader() const {
 std::optional<SketchResult> ArchiveReader::sketch_for(GenomeId genome_id) const {
     if (impl_->skch_descs_.empty()) return std::nullopt;
 
-    // Lazy-load SKCH sections on first call (thread-safe)
+    // Lazy-load SKCH sections on first call (thread-safe double-checked locking)
     if (!impl_->skch_loaded_) {
-        std::lock_guard<std::shared_mutex> lk(impl_->shard_open_mx_);
+        std::shared_lock<std::shared_mutex> rl(impl_->shard_open_mx_);
         if (!impl_->skch_loaded_) {
-            impl_->skch_readers_.reserve(impl_->skch_descs_.size());
-            for (const auto& desc : impl_->skch_descs_) {
-                impl_->skch_readers_.emplace_back();
-                impl_->skch_readers_.back().open(impl_->mmap_.data(),
-                                                 desc.file_offset, desc.compressed_size);
+            rl.unlock();
+            std::unique_lock<std::shared_mutex> wl(impl_->shard_open_mx_);
+            if (!impl_->skch_loaded_) {
+                impl_->skch_readers_.reserve(impl_->skch_descs_.size());
+                for (const auto& desc : impl_->skch_descs_) {
+                    impl_->skch_readers_.emplace_back();
+                    impl_->skch_readers_.back().open(impl_->mmap_.data(),
+                                                     desc.file_offset, desc.compressed_size);
+                }
+                impl_->skch_loaded_ = true;
             }
-            impl_->skch_loaded_ = true;
         }
     }
 
@@ -1610,15 +1617,19 @@ std::optional<SketchResult> ArchiveReader::sketch_for(GenomeId genome_id,
 
     // Trigger lazy load (reuses same lock and readers as the unparameterised overload).
     if (!impl_->skch_loaded_) {
-        std::lock_guard<std::shared_mutex> lk(impl_->shard_open_mx_);
+        std::shared_lock<std::shared_mutex> rl(impl_->shard_open_mx_);
         if (!impl_->skch_loaded_) {
-            impl_->skch_readers_.reserve(impl_->skch_descs_.size());
-            for (const auto& desc : impl_->skch_descs_) {
-                impl_->skch_readers_.emplace_back();
-                impl_->skch_readers_.back().open(impl_->mmap_.data(),
-                                                 desc.file_offset, desc.compressed_size);
+            rl.unlock();
+            std::unique_lock<std::shared_mutex> wl(impl_->shard_open_mx_);
+            if (!impl_->skch_loaded_) {
+                impl_->skch_readers_.reserve(impl_->skch_descs_.size());
+                for (const auto& desc : impl_->skch_descs_) {
+                    impl_->skch_readers_.emplace_back();
+                    impl_->skch_readers_.back().open(impl_->mmap_.data(),
+                                                     desc.file_offset, desc.compressed_size);
+                }
+                impl_->skch_loaded_ = true;
             }
-            impl_->skch_loaded_ = true;
         }
     }
 
@@ -1639,15 +1650,19 @@ void ArchiveReader::sketch_for_ids(const std::vector<GenomeId>& sorted_ids,
     if (sorted_ids.empty() || impl_->skch_descs_.empty()) return;
 
     if (!impl_->skch_loaded_) {
-        std::lock_guard<std::shared_mutex> lk(impl_->shard_open_mx_);
+        std::shared_lock<std::shared_mutex> rl(impl_->shard_open_mx_);
         if (!impl_->skch_loaded_) {
-            impl_->skch_readers_.reserve(impl_->skch_descs_.size());
-            for (const auto& desc : impl_->skch_descs_) {
-                impl_->skch_readers_.emplace_back();
-                impl_->skch_readers_.back().open(impl_->mmap_.data(),
-                                                 desc.file_offset, desc.compressed_size);
+            rl.unlock();
+            std::unique_lock<std::shared_mutex> wl(impl_->shard_open_mx_);
+            if (!impl_->skch_loaded_) {
+                impl_->skch_readers_.reserve(impl_->skch_descs_.size());
+                for (const auto& desc : impl_->skch_descs_) {
+                    impl_->skch_readers_.emplace_back();
+                    impl_->skch_readers_.back().open(impl_->mmap_.data(),
+                                                     desc.file_offset, desc.compressed_size);
+                }
+                impl_->skch_loaded_ = true;
             }
-            impl_->skch_loaded_ = true;
         }
     }
 
@@ -1673,15 +1688,19 @@ void ArchiveReader::sketch_for_ids_multi_k(const std::vector<GenomeId>& sorted_i
     if (sorted_ids.empty() || impl_->skch_descs_.empty()) return;
 
     if (!impl_->skch_loaded_) {
-        std::lock_guard<std::shared_mutex> lk(impl_->shard_open_mx_);
+        std::shared_lock<std::shared_mutex> rl(impl_->shard_open_mx_);
         if (!impl_->skch_loaded_) {
-            impl_->skch_readers_.reserve(impl_->skch_descs_.size());
-            for (const auto& desc : impl_->skch_descs_) {
-                impl_->skch_readers_.emplace_back();
-                impl_->skch_readers_.back().open(impl_->mmap_.data(),
-                                                 desc.file_offset, desc.compressed_size);
+            rl.unlock();
+            std::unique_lock<std::shared_mutex> wl(impl_->shard_open_mx_);
+            if (!impl_->skch_loaded_) {
+                impl_->skch_readers_.reserve(impl_->skch_descs_.size());
+                for (const auto& desc : impl_->skch_descs_) {
+                    impl_->skch_readers_.emplace_back();
+                    impl_->skch_readers_.back().open(impl_->mmap_.data(),
+                                                     desc.file_offset, desc.compressed_size);
+                }
+                impl_->skch_loaded_ = true;
             }
-            impl_->skch_loaded_ = true;
         }
     }
 
