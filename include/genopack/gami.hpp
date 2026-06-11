@@ -1,57 +1,36 @@
 #pragma once
-// ── GAMI section: build-time per-aamer genus-multiplicity index ───────────────
-// Stores a BlockedBloom filter over "rare" aamers (appearing in ≥1 but ≤K
-// distinct genera across the whole archive). Written once by the builder after
-// all genera are processed; loaded at check time via mmap — zero decode cost.
-//
-// Why Bloom, not the full GMI flat hash table:
-//   The full GMI for a dense-PCORE archive can exceed 90 GB (5B unique aamers).
-//   The Bloom filter over rare aamers is ~10× smaller: for K=3 and ~3B rare
-//   aamers at 10 bits/element ≈ 3.75 GB — loadable as a single mmap at check time.
-//   False positives (non-rare aamers classified as rare): conservative, not harmful.
-#include <genopack/markers.hpp>   // BlockedBloom
-#include <genopack/format.hpp>    // SEC_GAMI
+// ── GAMI section: precomputed per-aamer genus-multiplicity index ──────────────
+// V1 (legacy, removed): BlockedBloom filter over rare aamers.
+// V2 (current): exact sorted (hash, count8) pairs, zstd-compressed.
+//   Eliminates the 10–30 min GMI rebuild cost at each `genopack check` run.
+//   Built offline via `genopack gami build`; loaded in seconds at check start.
+#include <genopack/format.hpp>    // SEC_GAMI, SectionDesc
+#include <genopack/mmap_file.hpp> // AppendWriter
 #include <cstdint>
 #include <vector>
 
 namespace genopack {
 
 // SEC_GAMI is defined in format.hpp
-static constexpr uint64_t GAMI_MAGIC = 0x494D414700000001ULL;
-static constexpr uint32_t GAMI_SIZE_CAP_GB = 20; // skip writing if Bloom > this
+static constexpr uint64_t GAMI_MAGIC_V1 = 0x494D414700000001ULL;  // legacy Bloom (unused)
+static constexpr uint64_t GAMI_MAGIC_V2 = 0x494D414700000002ULL;  // exact sorted pairs
 
-// ── On-disk section header (32 bytes) ────────────────────────────────────────
-struct GamiHeader {
-    uint64_t magic;      // GAMI_MAGIC
-    uint32_t n_blocks;   // BlockedBloom n_blocks
-    uint32_t K;          // rare threshold: count ∈ [1, K] → foreign-specific
-    uint64_t n_rare;     // number of rare aamers inserted
-    uint64_t frac_max;   // PCORE frac_max_hash the archive was built with
+// ── V2 on-disk section header (64 bytes) ─────────────────────────────────────
+// Immediately followed by a zstd-compressed payload of sorted
+// (uint64_t hash, uint8_t count) pairs for all aamers with count ≥ 1.
+struct GamiHeaderV2 {
+    uint64_t magic          = GAMI_MAGIC_V2;
+    uint64_t n_entries      = 0;     // total (hash, count) pairs stored
+    uint64_t frac_max       = 0;     // PCORE frac_max_hash for consistency check
+    uint64_t payload_bytes  = 0;     // compressed payload size in bytes
+    uint64_t _pad[4]        = {};
 };
-static_assert(sizeof(GamiHeader) == 32);
+static_assert(sizeof(GamiHeaderV2) == 64);
 
-// ── Check-time view (mmap-backed, zero-copy) ──────────────────────────────────
+// ── Legacy V1 placeholder (kept for call-site compat in foreign_contam.hpp) ──
 struct GamiView {
-    const uint64_t* bloom_data = nullptr;
-    uint32_t        n_blocks   = 0;
-    uint32_t        K          = 3;
-    uint64_t        frac_max   = 0;
-
-    bool valid() const noexcept { return bloom_data != nullptr && n_blocks > 0; }
-
-    // Returns true if h is possibly a rare aamer (genus-count ∈ [1,K]).
-    // False positives: aamers with count=0 may return true (novel organisms,
-    // small fraction in practice). False negatives: never (Bloom guarantee).
-    bool is_rare(uint64_t h) const noexcept {
-        if (!bloom_data) return false;
-        const uint32_t b = static_cast<uint32_t>(h % n_blocks) * 8;
-        uint64_t mix = h;
-        for (int i = 0; i < 4; ++i) {
-            mix = mix * 0x9e3779b97f4a7c15ULL ^ (mix >> 32);
-            if (!((bloom_data[b + ((mix >> 9) & 7)] >> (mix & 63)) & 1)) return false;
-        }
-        return true;
-    }
+    bool valid() const noexcept { return false; }
+    bool is_rare(uint64_t) const noexcept { return false; }
 };
 
 // ── Build-time flat GMI (global multiplicity index) ───────────────────────────
@@ -108,5 +87,19 @@ struct GlobalMultiplicityIndex {
     size_t count() const noexcept { return count_; }
     size_t bytes() const noexcept { return keys_.size() * 9; }
 };
+
+// ── V2 writer: serializes a GlobalMultiplicityIndex → SEC_GAMI v2 ────────────
+// Call finalize() once; the writer sorts all (hash, count) pairs, zstd-compresses
+// them, and appends a SEC_GAMI section to the archive.
+struct GamiV2Writer {
+    SectionDesc finalize(AppendWriter& w, uint64_t section_id,
+                         const GlobalMultiplicityIndex& gmi, uint64_t frac_max);
+};
+
+// ── V2 loader: decompresses SEC_GAMI v2 payload → GlobalMultiplicityIndex ────
+// section_data must point to the start of the SEC_GAMI section (GamiHeaderV2).
+// section_size is the number of bytes in the section.
+void gami_v2_load(const uint8_t* section_data, uint64_t section_size,
+                  GlobalMultiplicityIndex& out);
 
 } // namespace genopack

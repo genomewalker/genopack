@@ -294,8 +294,13 @@ void run_pass_b(ICheckReader& pack,
 
     // GMI: the multiplicity index that drives foreign-aamer scoring.
     // Runtime GMI build (~10-30 min) from PCORE/CORE union when present.
-    const genopack::GamiView gami_view{};   // GAMI section removed; keep variable for call-site compat
+    const genopack::GamiView gami_view{};   // legacy Bloom path (unused)
     GlobalMultiplicityIndex gmi;
+    if (pack.has_gami_v2()) {
+        pack.load_gami_into(gmi);
+        spdlog::info("check pass-B: GMI loaded from SEC_GAMI v2 ({} M entries, {:.1f} GB)",
+                     gmi.count() / 1'000'000, gmi.bytes() / 1e9);
+    }
     std::unordered_map<std::string, OwnedSpan>   genus_host_union;
     std::unordered_map<std::string, OwnedSpan>   family_union_map;
     std::unordered_map<std::string, IndexedSpan> genus_host_index;
@@ -306,7 +311,7 @@ void run_pass_b(ICheckReader& pack,
         }
         return 3;
     }();
-    if ((use_pcore || pack.has_core()) && !flagged_genus.empty()) {
+    if (gmi.empty() && (use_pcore || pack.has_core()) && !flagged_genus.empty()) {
         const int gmi_par = std::min(threads, 8);
         // Start small; maybe_resize() rehashes to 4× when load > 50%.
         gmi.reserve(64'000'000ULL);

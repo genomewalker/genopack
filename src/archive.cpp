@@ -102,6 +102,9 @@ struct ArchiveReader::Impl {
     bool       has_fcore_ = false;
     PcoreReader pcore_;           // unified dense per-genus aamer ref (+ prevalence)
     bool       has_pcore_ = false;
+    // GAMI v2: precomputed GMI (exact sorted pairs, zstd-compressed)
+    const uint8_t* gami_v2_data_ = nullptr;
+    uint64_t       gami_v2_size_ = 0;
     // BPRM: self-describing build parameters (one per archive)
     BprmReader bprm_;
     bool       has_bprm_ = false;
@@ -444,6 +447,24 @@ struct ArchiveReader::Impl {
             }
         }
 
+        // Load GAMI v2 section (precomputed GMI; highest section_id wins)
+        {
+            uint64_t best_id = 0;
+            const SectionDesc* best_sd = nullptr;
+            for (auto* sd : toc_.find_by_type(SEC_GAMI)) {
+                if (sd->version == 2 && sd->section_id > best_id) {
+                    best_id = sd->section_id; best_sd = sd;
+                }
+            }
+            if (best_sd) {
+                const auto* hdr = mmap_.ptr_at<GamiHeaderV2>(best_sd->file_offset);
+                if (hdr && hdr->magic == GAMI_MAGIC_V2) {
+                    gami_v2_data_ = mmap_.ptr_at<uint8_t>(best_sd->file_offset);
+                    gami_v2_size_ = best_sd->compressed_size;
+                }
+            }
+        }
+
         // Load BPRM section (self-describing build params; highest section_id wins)
         {
             uint64_t best_id = 0;
@@ -672,6 +693,8 @@ struct ArchiveReader::Impl {
             has_fcore_            = false;
             pcore_                = PcoreReader{};
             has_pcore_            = false;
+            gami_v2_data_         = nullptr;
+            gami_v2_size_         = 0;
             bprm_                 = BprmReader{};
             has_bprm_             = false;
             qual_                 = QualReader{};
@@ -1505,6 +1528,15 @@ PcoreView ArchiveReader::pcore_for_family(std::string_view family) const {
 
 const PcoreReader* ArchiveReader::pcore_reader() const {
     return impl_->has_pcore_ ? &impl_->pcore_ : nullptr;
+}
+
+bool ArchiveReader::has_gami_v2() const {
+    return impl_->gami_v2_data_ != nullptr;
+}
+
+void ArchiveReader::load_gami_into(GlobalMultiplicityIndex& out) const {
+    if (!impl_->gami_v2_data_) return;
+    gami_v2_load(impl_->gami_v2_data_, impl_->gami_v2_size_, out);
 }
 
 bool ArchiveReader::has_bprm() const { return impl_->has_bprm_; }

@@ -3,6 +3,7 @@
 #include "catalog.hpp"
 #include "fmhr.hpp"
 #include "core_section.hpp"
+#include "gami.hpp"
 #include "colstore.hpp"
 #include "bprm.hpp"
 #include "gcov.hpp"
@@ -232,6 +233,11 @@ public:
     PcoreView pcore_for_genus(std::string_view genus) const;
     PcoreView pcore_for_family(std::string_view family) const;
     const PcoreReader* pcore_reader() const;
+
+    // GAMI v2: precomputed global multiplicity index (exact sorted pairs).
+    bool has_gami_v2() const;
+    // Decompress SEC_GAMI v2 payload into out (replaces runtime GMI build).
+    void load_gami_into(GlobalMultiplicityIndex& out) const;
 
     // BPRM: self-describing build parameters (one per archive).
     bool has_bprm() const;

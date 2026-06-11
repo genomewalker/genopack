@@ -100,6 +100,7 @@ add_library(genopack_lib STATIC
   src/colstore.cpp
   src/core_section.cpp
   src/pcore.cpp
+  src/gami.cpp
   src/xqual_columns.cpp
   src/prof.cpp
   src/qcontig.cpp
@@ -178,6 +179,7 @@ add_executable(genopack
   src/run_report.cpp
   src/run_fcore.cpp
   src/run_pcore.cpp
+  src/run_gami.cpp
   src/run_tier.cpp
   src/bench/bench_grid.cpp
   src/calibrate/calibrate.cpp

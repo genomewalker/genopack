@@ -41,6 +41,8 @@ struct ICheckReader {
     virtual PcoreView pcore_for_genus(std::string_view genus) const = 0;
     virtual PcoreView pcore_for_family(std::string_view family) const = 0;
     virtual const PcoreReader* pcore_reader() const = 0;
+    virtual bool has_gami_v2() const { return false; }
+    virtual void load_gami_into(GlobalMultiplicityIndex& out) const { (void)out; }
     virtual void visit_sketch_batches_multi_k(
         const std::vector<std::string>& accs,
         const std::vector<uint32_t>& ks, uint32_t sz,
@@ -129,6 +131,8 @@ public:
         return ar_.pcore_for_family(family);
     }
     const PcoreReader* pcore_reader() const override { return ar_.pcore_reader(); }
+    bool has_gami_v2() const override { return ar_.has_gami_v2(); }
+    void load_gami_into(GlobalMultiplicityIndex& out) const override { ar_.load_gami_into(out); }
     CoreView core_for_genus(std::string_view genus) const override {
         return ar_.core_for_genus(genus);
     }

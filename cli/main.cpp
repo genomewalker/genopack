@@ -4,6 +4,7 @@
 #include "run_report.hpp"
 #include "run_fcore.hpp"
 #include "run_pcore.hpp"
+#include "run_gami.hpp"
 #include "run_tier.hpp"
 #include <genopack/score_bin.hpp>
 #include <genopack/fmhr.hpp>
@@ -3912,6 +3913,21 @@ int main(int argc, char** argv) {
         std::exit(genopack::cmd_pcore(std::filesystem::path(pcore_pack), pcore_threads,
                                       pcore_members.empty() ? std::filesystem::path{}
                                                             : std::filesystem::path{pcore_members}));
+    });
+
+    // genopack gami — precomputed global multiplicity index (eliminates runtime GMI rebuild)
+    auto* gami_cmd = app.add_subcommand("gami", "SEC_GAMI tools: precomputed global aamer multiplicity index.");
+    gami_cmd->require_subcommand(1);
+
+    auto* gami_build_cmd = gami_cmd->add_subcommand("build",
+        "Build and append SEC_GAMI v2 to a .gpk archive. "
+        "Decodes PCORE/CORE once, serialises the global multiplicity index (exact sorted pairs, zstd), "
+        "eliminating the 10-30 min GMI rebuild at each `genopack check` run.");
+    std::string gami_pack; int gami_threads = 8;
+    gami_build_cmd->add_option("archive", gami_pack, "Path to .gpk or directory of parts")->required();
+    gami_build_cmd->add_option("-t,--threads", gami_threads, "Parallel decode threads (default: 8)");
+    gami_build_cmd->callback([&]() {
+        std::exit(genopack::cmd_gami_build(std::filesystem::path(gami_pack), gami_threads));
     });
 
     // genopack tier — IDF tier table build tools
