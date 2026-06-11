@@ -24,6 +24,7 @@
 #include <atomic>
 #include <cstring>
 #include <future>
+#include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <stdexcept>
@@ -38,41 +39,6 @@
 
 namespace genopack {
 
-// ── ShardBox ─────────────────────────────────────────────────────────────────
-// ShardReader() = default is inline in shard.hpp, which forces the compiler
-// to instantiate the destructor of unique_ptr<ShardReader::Impl> here — but
-// ShardReader::Impl is incomplete in this TU. Workaround: zero-initialize
-// aligned storage for a ShardReader, then call only the out-of-line methods
-// open() and ~ShardReader(). A zero-initialized unique_ptr<Impl> is nullptr
-// on all platforms, so open() (which does `if (!impl_) impl_ = make_unique<Impl>()`)
-// initialises it correctly in shard.cpp where Impl is complete.
-
-struct ShardBox {
-    alignas(ShardReader) unsigned char storage_[sizeof(ShardReader)];
-    bool live_ = false;
-
-    ShardBox() { std::memset(storage_, 0, sizeof(storage_)); }
-
-    ~ShardBox() {
-        if (live_) reinterpret_cast<ShardReader*>(storage_)->~ShardReader();
-    }
-
-    ShardBox(const ShardBox&)            = delete;
-    ShardBox& operator=(const ShardBox&) = delete;
-
-    ShardReader& reader() {
-        return *reinterpret_cast<ShardReader*>(storage_);
-    }
-    const ShardReader& reader() const {
-        return *reinterpret_cast<const ShardReader*>(storage_);
-    }
-
-    void open(const uint8_t* base, uint64_t offset, uint64_t size) {
-        reader().open(base, offset, size);
-        live_ = true;
-    }
-};
-
 // ── ArchiveReader::Impl ───────────────────────────────────────────────────────
 
 struct ArchiveReader::Impl {
@@ -83,7 +49,7 @@ struct ArchiveReader::Impl {
     // shard_id -> SectionDesc pointer (into toc_.sections)
     std::unordered_map<uint32_t, const SectionDesc*> shard_descs_;
     // lazily-opened shard readers keyed by logical shard_id
-    mutable std::unordered_map<uint32_t, ShardBox> shards_;
+    mutable std::unordered_map<uint32_t, std::unique_ptr<ShardReader>> shards_;
     std::unordered_map<uint64_t, uint32_t> shard_section_to_id_;
     mutable std::shared_mutex shard_open_mx_;
 
@@ -751,19 +717,18 @@ struct ArchiveReader::Impl {
         {
             std::shared_lock<std::shared_mutex> rl(shard_open_mx_);
             auto it = shards_.find(shard_id);
-            if (it != shards_.end()) return it->second.reader();
+            if (it != shards_.end()) return *it->second;
         }
         std::unique_lock<std::shared_mutex> wl(shard_open_mx_);
         auto it = shards_.find(shard_id);  // re-check under exclusive lock
         if (it == shards_.end()) {
-            auto [inserted, _] = shards_.emplace(
-                std::piecewise_construct,
-                std::forward_as_tuple(shard_id),
-                std::forward_as_tuple());
-            inserted->second.open(mmap_.data(), desc_it->second->file_offset, desc_it->second->compressed_size);
-            it = inserted;
+            // Open into a local first: if open() throws (corrupt shard), nothing is
+            // published, so the cache is never left holding a non-functional entry.
+            auto reader = std::make_unique<ShardReader>();
+            reader->open(mmap_.data(), desc_it->second->file_offset, desc_it->second->compressed_size);
+            it = shards_.emplace(shard_id, std::move(reader)).first;
         }
-        return it->second.reader();
+        return *it->second;
     }
 
     const ShardReader& get_shard_by_section_id(uint64_t section_id) const {
@@ -1161,12 +1126,17 @@ void ArchiveReader::visit_shard_batches(
         }
     };
 
+    // Double-buffered: decode shard s (parallel across OMP threads) while the next
+    // shard is pread in the background into the other buffer. The two buffers are
+    // always distinct (bufs[cur] decoded, bufs[1-cur] prefetched) and bg.get()
+    // establishes happens-before before a buffer is reopened. Concurrent decode of
+    // one ShardReader is safe: its decompression scratch is thread_local and the
+    // frame cache is keyed per open-generation so recycled buffers never alias.
     std::array<std::vector<uint8_t>, 2> bufs;
-    std::array<ShardBox, 2> boxes;
+    std::array<ShardReader, 2> boxes;
     int cur = 0;
     std::future<void> bg;
 
-    // Synchronously load first shard before entering the loop.
     if (!shard_order.empty()) {
         auto d = impl_->shard_descs_.find(shard_order[0]);
         if (d != impl_->shard_descs_.end()) {
@@ -1177,13 +1147,11 @@ void ArchiveReader::visit_shard_batches(
 
     ShardBatch batch;
     for (size_t s = 0; s < shard_order.size(); ++s) {
-        // Wait for background pread of this shard (skipped for s=0 which was loaded above).
         if (s > 0 && bg.valid()) {
             bg.get();
             boxes[cur].open(bufs[cur].data(), 0, bufs[cur].size());
         }
 
-        // Start background pread of shard s+1 into the other buffer.
         const int nxt = 1 - cur;
         if (s + 1 < shard_order.size()) {
             auto d_nxt = impl_->shard_descs_.find(shard_order[s + 1]);
@@ -1195,11 +1163,9 @@ void ArchiveReader::visit_shard_batches(
             }
         }
 
-        // Parallel decompress + deliver: each blob is independently decompressible.
-        // Previously decompression was serial (one genome at a time), wasting 23/24 threads.
         uint32_t shard_id = shard_order[s];
         const auto& reqs  = by_shard.at(shard_id);
-        const ShardReader& shard = boxes[cur].reader();
+        const ShardReader& shard = boxes[cur];
         const int n_reqs = static_cast<int>(reqs.size());
 
         batch.clear();
@@ -1213,8 +1179,6 @@ void ArchiveReader::visit_shard_batches(
             try {
                 eg.fasta = shard.fetch_genome(req.gid);
             } catch (const std::exception&) {
-                // genome_id in archive metadata but absent from shard directory —
-                // return empty FASTA so the caller can handle it gracefully.
                 eg.fasta.clear();
             }
             auto acc_it = impl_->genome_accession_map_.find(req.gid);
@@ -1223,8 +1187,6 @@ void ArchiveReader::visit_shard_batches(
             batch[static_cast<size_t>(j)] = {req.out_idx, std::move(eg)};
         }
         cb(batch);
-        // No release_pages() — buffer is heap-owned, not mmap
-
         cur = nxt;
     }
     if (bg.valid()) bg.get();
@@ -1302,7 +1264,7 @@ void ArchiveReader::visit_shard_batches_parallel(
                 };
 
                 std::array<std::vector<uint8_t>, 2> bufs;
-                std::array<ShardBox, 2> boxes;
+                std::array<ShardReader, 2> boxes;
                 int cur = 0;
                 std::future<void> bg;
 
@@ -1334,7 +1296,7 @@ void ArchiveReader::visit_shard_batches_parallel(
 
                     uint32_t shard_id     = shard_order[static_cast<size_t>(s)];
                     const auto& reqs      = by_shard.at(shard_id);
-                    const ShardReader& shard = boxes[cur].reader();
+                    const ShardReader& shard = boxes[cur];
                     const int n_reqs      = static_cast<int>(reqs.size());
 
                     batch.clear();

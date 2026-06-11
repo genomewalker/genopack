@@ -384,18 +384,6 @@ static int cmd_extract(const std::string& archive_dir,
         return 0;
     }
 
-    std::vector<ExtractedGenome> results;
-    if (!q.accessions.empty()) {
-        for (const auto& acc : q.accessions) {
-            auto eg = ar.fetch_by_accession(acc);
-            if (eg) results.push_back(std::move(*eg));
-            else spdlog::warn("Accession not found: {}", acc);
-        }
-    } else {
-        results = ar.extract(q);
-    }
-    spdlog::info("Extracted {} genomes", results.size());
-
     std::ostream* out_stream = &std::cout;
     std::ofstream out_file;
     if (!out_fasta.empty() && out_fasta != "-") {
@@ -404,8 +392,30 @@ static int cmd_extract(const std::string& archive_dir,
         out_stream = &out_file;
     }
 
-    for (const auto& eg : results)
-        *out_stream << eg.fasta;
+    if (!q.accessions.empty()) {
+        // Parallel batched fetch: shards are decompressed across threads inside
+        // visit_shard_batches; results are buffered by request index so the
+        // single-stream output stays in accession-list order.
+        std::vector<std::string> ordered(q.accessions.size());
+        ar.visit_shard_batches(q.accessions, [&](ArchiveSetReader::ShardBatch& batch) {
+            for (auto& [idx, eg] : batch) {
+                if (eg.fasta.empty()) {
+                    spdlog::warn("Accession not found or deleted: {}", q.accessions[idx]);
+                    continue;
+                }
+                ordered[idx] = std::move(eg.fasta);
+            }
+        });
+        size_t n = 0;
+        for (auto& f : ordered)
+            if (!f.empty()) { *out_stream << f; ++n; }
+        spdlog::info("Extracted {} genomes", n);
+    } else {
+        std::vector<ExtractedGenome> results = ar.extract(q);
+        spdlog::info("Extracted {} genomes", results.size());
+        for (const auto& eg : results)
+            *out_stream << eg.fasta;
+    }
 
     return 0;
 }
