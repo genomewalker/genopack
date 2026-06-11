@@ -226,62 +226,32 @@ static std::string extract_taxonomy_bucket(std::string_view taxonomy,
     return std::string(taxonomy.substr(start, end - start));
 }
 
-// Greedy nearest-neighbor chain over 136-dim kmer4_profiles.
-// Returns permutation indices that order items for maximum within-shard similarity.
-// Uses the centroid as the starting point.
+// Approximate nearest-neighbor ordering over 136-dim kmer4_profiles.
+// O(n log n): projects each feature vector onto a fixed random direction then
+// sorts by that scalar.  Deterministic (fixed seed — no std::random_device).
 template<typename Item>
 static std::vector<size_t> greedy_nn_chain(const std::vector<Item>& items)
 {
     const size_t n = items.size();
-    if (n <= 1) {
-        std::vector<size_t> idx(n);
-        std::iota(idx.begin(), idx.end(), 0);
-        return idx;
-    }
+    std::vector<size_t> idx(n);
+    std::iota(idx.begin(), idx.end(), 0);
+    if (n <= 1) return idx;
 
-    // Compute centroid
-    std::array<float, 136> centroid{};
-    for (const auto& item : items)
-        for (int d = 0; d < 136; ++d)
-            centroid[d] += item.stats.kmer4_profile[d];
-    for (int d = 0; d < 136; ++d)
-        centroid[d] /= static_cast<float>(n);
+    // Build a fixed random projection vector (136-dim).
+    std::mt19937_64 rng(0x5eed5eed5eed5eedULL);
+    std::uniform_real_distribution<float> ud(-1.f, 1.f);
+    std::array<float, 136> proj{};
+    for (int d = 0; d < 136; ++d) proj[d] = ud(rng);
 
-    auto dot = [](const float* a, const float* b) {
-        float s = 0.f;
-        for (int d = 0; d < 136; ++d) s += a[d] * b[d];
-        return s;
-    };
-
-    // Find genome nearest to centroid as starting point
-    size_t start = 0;
-    float  best  = -2.f;
-    for (size_t i = 0; i < n; ++i) {
-        float sim = dot(items[i].stats.kmer4_profile.data(), centroid.data());
-        if (sim > best) { best = sim; start = i; }
-    }
-
-    std::vector<size_t> order;
-    order.reserve(n);
-    std::vector<bool> visited(n, false);
-    size_t cur = start;
-
-    while (order.size() < n) {
-        visited[cur] = true;
-        order.push_back(cur);
-        if (order.size() == n) break;
-        // Find nearest unvisited
-        size_t next = n;
-        float  best_sim = -2.f;
-        const float* cur_prof = items[cur].stats.kmer4_profile.data();
-        for (size_t j = 0; j < n; ++j) {
-            if (visited[j]) continue;
-            float sim = dot(cur_prof, items[j].stats.kmer4_profile.data());
-            if (sim > best_sim) { best_sim = sim; next = j; }
-        }
-        cur = next;
-    }
-    return order;
+    // Project each genome and sort indices by scalar projection value.
+    std::sort(idx.begin(), idx.end(), [&](size_t a, size_t b) {
+        float pa = 0.f, pb = 0.f;
+        const float* va = items[a].stats.kmer4_profile.data();
+        const float* vb = items[b].stats.kmer4_profile.data();
+        for (int d = 0; d < 136; ++d) { pa += va[d] * proj[d]; pb += vb[d] * proj[d]; }
+        return pa < pb;
+    });
+    return idx;
 }
 
 // ── Checkpoint binary format ──────────────────────────────────────────────────

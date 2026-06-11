@@ -254,8 +254,7 @@ static BuiltTree build_internal(
         uint64_t root_tid = 1;
         path_to_tid[root_path] = root_tid;
         tid_to_path[root_tid]  = root_path;
-        if (path_to_node.find(root_path) == path_to_node.end()) {
-            path_to_node[root_path] = {root_tid, root_tid, TaxRank::NO_RANK, 0, "root", root_path};
+        if (path_to_node.try_emplace(root_path, NodeInfo{root_tid, root_tid, TaxRank::NO_RANK, 0, "root", root_path}).second) {
             insertion_order.push_back(root_path);
         }
     }
@@ -286,8 +285,7 @@ static BuiltTree build_internal(
 
             uint64_t tid = assign_taxid(cur_path);
 
-            if (path_to_node.find(cur_path) == path_to_node.end()) {
-                path_to_node[cur_path] = {tid, prev_tid, pr.rank, 0, pr.name, cur_path};
+            if (path_to_node.try_emplace(cur_path, NodeInfo{tid, prev_tid, pr.rank, 0, pr.name, cur_path}).second) {
                 insertion_order.push_back(cur_path);
             }
 
@@ -321,9 +319,7 @@ static BuiltTree build_internal(
 
             uint64_t syn_tid = assign_taxid(syn_path);
 
-            if (path_to_node.find(syn_path) == path_to_node.end()) {
-                uint8_t syn_flags = is_species ? 0x02u : 0x01u;
-                path_to_node[syn_path] = {syn_tid, prev_tid, fill, syn_flags, syn_name, syn_path};
+            if (path_to_node.try_emplace(syn_path, NodeInfo{syn_tid, prev_tid, fill, is_species ? uint8_t{0x02u} : uint8_t{0x01u}, syn_name, syn_path}).second) {
                 insertion_order.push_back(syn_path);
             }
 
