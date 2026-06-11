@@ -448,7 +448,8 @@ struct ShardWriter::Impl {
     Impl(uint32_t sid, uint32_t cid, Config c)
         : shard_id(sid), cluster_id(cid), cfg(c)
     {
-        raw_buffer.reserve(c.max_shard_size_bytes);
+        // No upfront reserve: the vector grows by amortised doubling as genomes are
+        // added, avoiding a single RSS spike of max_shard_size_bytes at construction.
     }
 };
 

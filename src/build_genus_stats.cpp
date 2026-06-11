@@ -193,7 +193,7 @@ static void finalize_genus(const std::string& genus_key,
     Sigma_rho = (1.f - alpha_rho) * Sigma_rho
               + (alpha_rho * Sigma_rho.trace() / 16.f) * Mat16::Identity();
 
-    Mat16 Prec_rho = Sigma_rho.inverse();
+    Mat16 Prec_rho = Sigma_rho.llt().solve(Mat16::Identity());
 
     float rho_mean_out[GCOV_RHO_DIM];
     float rho_prec_lower_out[GCOV_RHO_PREC_N];
