@@ -54,13 +54,12 @@ void PcoreWriter::open_spill_() {
     std::filesystem::path dir;
     if (!spill_dir_.empty()) {
         dir = std::filesystem::path(spill_dir_);
+    } else if (const char* env = std::getenv("GENOPACK_SKETCH_SPILL_DIR"); env && *env) {
+        dir = std::filesystem::path(env);
     } else if (const char* env = std::getenv("GENOPACK_SPILL_DIR"); env && *env) {
         dir = std::filesystem::path(env);
     } else {
-        std::error_code ec;
-        dir = std::filesystem::exists("/scratch", ec) && !ec
-            ? std::filesystem::path("/scratch")
-            : std::filesystem::temp_directory_path();
+        dir = std::filesystem::temp_directory_path();
     }
     std::error_code ec; std::filesystem::create_directories(dir, ec);
     static std::atomic<uint64_t> ctr{0};

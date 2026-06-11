@@ -1,6 +1,7 @@
 #include <genopack/mem_delta.hpp>
 #include <zstd.h>
 #include <algorithm>
+#include <cassert>
 #include <cstring>
 #include <stdexcept>
 #include <string_view>
@@ -262,7 +263,12 @@ static std::vector<MemEntry> find_mems(const std::string& anchor,
         uint32_t ri = idx.find(h);
         if (ri == UINT32_MAX) continue;
 
-        // 62-bit hash → no false positives for ACGT k=31; memcmp unnecessary
+        // 62-bit hash → no false positives for uppercase-ACGT k=31; caller must guarantee
+        // uppercase-ACGT input (soft-masked lowercase folds to same hash, losing case).
+#ifndef NDEBUG
+        assert(std::memcmp(anchor.data() + ri, query.data() + qi, K) == 0 &&
+               "mem_delta seed mismatch: input must be uppercase-ACGT (no soft-masking)");
+#endif
         uint32_t qpos = qi, rpos = ri;
         while (qpos > covered_until && rpos > 0 &&
                query[qpos - 1] == anchor[rpos - 1]) {
