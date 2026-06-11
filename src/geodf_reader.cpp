@@ -184,12 +184,13 @@ std::string GeodfReader::resolve_taxonomy(const TaxonHeader& hdr) const {
 std::unordered_set<std::string> GeodfReader::completed_taxa() const {
     load_strings();
     std::unordered_set<std::string> result;
-    for (const auto& e : index_) {
-        if (e.stage != PipelineStage::COMPLETE) continue;
-        TaxonHeader hdr{};
-        safe_pread(fd_, &hdr, sizeof(hdr), e.header_offset);
-        if (std::memcmp(hdr.magic, TAXON_MAGIC, 4) == 0) {
-            auto tax = resolve_taxonomy(hdr);
+    std::vector<TaxonHeader> headers(index_.size());
+    for (std::size_t i = 0; i < index_.size(); ++i)
+        safe_pread(fd_, &headers[i], sizeof(TaxonHeader), index_[i].header_offset);
+    for (std::size_t i = 0; i < index_.size(); ++i) {
+        if (index_[i].stage != PipelineStage::COMPLETE) continue;
+        if (std::memcmp(headers[i].magic, TAXON_MAGIC, 4) == 0) {
+            auto tax = resolve_taxonomy(headers[i]);
             if (!tax.empty()) result.insert(std::move(tax));
         }
     }
@@ -200,11 +201,12 @@ std::vector<std::pair<TaxonHeader, std::string>> GeodfReader::scan_headers() con
     load_strings();
     std::vector<std::pair<TaxonHeader, std::string>> result;
     result.reserve(index_.size());
-    for (const auto& e : index_) {
-        TaxonHeader hdr{};
-        safe_pread(fd_, &hdr, sizeof(hdr), e.header_offset);
-        if (std::memcmp(hdr.magic, TAXON_MAGIC, 4) == 0)
-            result.emplace_back(hdr, resolve_taxonomy(hdr));
+    std::vector<TaxonHeader> headers(index_.size());
+    for (std::size_t i = 0; i < index_.size(); ++i)
+        safe_pread(fd_, &headers[i], sizeof(TaxonHeader), index_[i].header_offset);
+    for (std::size_t i = 0; i < index_.size(); ++i) {
+        if (std::memcmp(headers[i].magic, TAXON_MAGIC, 4) == 0)
+            result.emplace_back(headers[i], resolve_taxonomy(headers[i]));
     }
     return result;
 }
@@ -227,12 +229,13 @@ std::optional<TaxonData> GeodfReader::find(const std::string& taxonomy) const {
 
 void GeodfReader::for_each_complete(const std::function<void(const TaxonData&)>& cb) const {
     load_strings();
-    for (const auto& e : index_) {
-        if (e.stage != PipelineStage::COMPLETE) continue;
-        TaxonHeader hdr{};
-        safe_pread(fd_, &hdr, sizeof(hdr), e.header_offset);
-        if (std::memcmp(hdr.magic, TAXON_MAGIC, 4) != 0) continue;
-        cb(decompress_taxon(hdr));
+    std::vector<TaxonHeader> headers(index_.size());
+    for (std::size_t i = 0; i < index_.size(); ++i)
+        safe_pread(fd_, &headers[i], sizeof(TaxonHeader), index_[i].header_offset);
+    for (std::size_t i = 0; i < index_.size(); ++i) {
+        if (index_[i].stage != PipelineStage::COMPLETE) continue;
+        if (std::memcmp(headers[i].magic, TAXON_MAGIC, 4) != 0) continue;
+        cb(decompress_taxon(headers[i]));
     }
 }
 

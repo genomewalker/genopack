@@ -6,6 +6,7 @@
 #include <spdlog/spdlog.h>
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -170,16 +171,24 @@ void CoordinatorServer::run_nfs(
     std::vector<std::string> worker_names;
     std::unordered_set<std::string> allocated;
 
+    // Pre-compute expected .pending paths so we stat() directly instead of readdir polling.
+    std::vector<std::string> pending_paths;
+    pending_paths.reserve(expected_workers);
+    for (int i = 0; i < expected_workers; ++i)
+        pending_paths.push_back((manifest_dir / (std::to_string(i) + ".pending")).string());
+
+    uint32_t delay_us = 10000; // 10 ms
     while ((int)worker_names.size() < expected_workers) {
-        for (auto& entry : std::filesystem::directory_iterator(manifest_dir)) {
-            std::string fname = entry.path().filename().string();
-            if (!fname.ends_with(".pending")) continue;
+        for (auto& p : pending_paths) {
+            struct stat st;
+            if (stat(p.c_str(), &st) != 0) continue; // not ready yet
+            std::string fname = std::filesystem::path(p).filename().string();
             std::string wname = fname.substr(0, fname.size() - 8);
             if (allocated.count(wname)) continue;
 
             uint64_t total_bytes = 0;
             {
-                std::ifstream f(entry.path());
+                std::ifstream f(p);
                 if (!(f >> total_bytes)) continue; // incomplete write, retry
             }
 
@@ -196,8 +205,10 @@ void CoordinatorServer::run_nfs(
             spdlog::info("coordinator-nfs: worker {} → {} bytes at offset {}",
                          wname, total_bytes, alloc_start);
         }
-        if ((int)worker_names.size() < expected_workers)
-            std::this_thread::sleep_for(std::chrono::seconds(5));
+        if ((int)worker_names.size() < expected_workers) {
+            usleep(delay_us);
+            delay_us = std::min(delay_us * 2u, 1000000u); // exponential backoff, cap 1s
+        }
     }
 
     // Pre-allocate output file to cover all worker data (avoids sparse file / NFS holes)
@@ -211,17 +222,24 @@ void CoordinatorServer::run_nfs(
     spdlog::info("coordinator-nfs: all {} workers allocated, waiting for .done files...",
                  expected_workers);
 
-    // Phase 2: watch for .done files, collect SectionDescs
+    // Phase 2: stat() each expected .done path directly — no readdir.
+    std::vector<std::string> done_paths;
+    done_paths.reserve(worker_names.size());
+    for (auto& wname : worker_names)
+        done_paths.push_back((manifest_dir / (wname + ".done")).string());
+
     std::vector<SectionDesc> all_sections;
     std::unordered_set<std::string> collected;
+    uint32_t done_delay_us = 10000; // 10 ms
 
     while ((int)collected.size() < expected_workers) {
-        for (auto& wname : worker_names) {
+        for (size_t i = 0; i < worker_names.size(); ++i) {
+            const auto& wname = worker_names[i];
             if (collected.count(wname)) continue;
-            auto done_file = manifest_dir / (wname + ".done");
-            if (!std::filesystem::exists(done_file)) continue;
+            struct stat st;
+            if (stat(done_paths[i].c_str(), &st) != 0) continue;
 
-            std::ifstream f(done_file);
+            std::ifstream f(done_paths[i]);
             std::string line;
             while (std::getline(f, line)) {
                 if (!line.empty()) all_sections.push_back(decode_section(line));
@@ -231,8 +249,10 @@ void CoordinatorServer::run_nfs(
             spdlog::info("coordinator-nfs: worker {} done ({} total sections)",
                          wname, all_sections.size());
         }
-        if ((int)collected.size() < expected_workers)
-            std::this_thread::sleep_for(std::chrono::seconds(5));
+        if ((int)collected.size() < expected_workers) {
+            usleep(done_delay_us);
+            done_delay_us = std::min(done_delay_us * 2u, 1000000u); // cap 1s
+        }
     }
 
     spdlog::info("coordinator-nfs: all {} workers done, {} sections collected",
