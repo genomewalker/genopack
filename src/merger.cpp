@@ -630,25 +630,16 @@ void merge_archives(const std::vector<std::filesystem::path>& inputs,
                     const uint32_t nk = static_cast<uint32_t>(skch_kmer_sizes.size());
 
                     if (!multi_k) {
-                        // Single-k path (unchanged)
-                        std::vector<GenomeId>              out_ids(n);
-                        std::vector<std::vector<uint16_t>> out_sig1(n), out_sig2(n);
-                        std::vector<std::vector<uint64_t>> out_mask(n);
-                        std::vector<uint32_t>              out_nrb(n);
-                        std::vector<uint64_t>              out_glen(n);
+                        // Single-k path: stream directly into skch_out_1k per genome
                         reader.sketch_for_ids(src_ids, skch_kmer_sizes[0], skch_sketch_size,
                             [&](size_t row, const SketchResult& sr) {
-                                out_ids[row]  = static_cast<GenomeId>(src_ids[row]) + gid_off;
-                                out_sig1[row].assign(sr.sig,  sr.sig  + sr.sketch_size);
-                                out_sig2[row].assign(sr.sig2, sr.sig2 + sr.sketch_size);
-                                out_mask[row].assign(sr.mask, sr.mask + sr.mask_words);
-                                out_nrb[row]  = sr.n_real_bins;
-                                out_glen[row] = sr.genome_length;
+                                GenomeId gid = static_cast<GenomeId>(src_ids[row]) + gid_off;
+                                std::vector<uint16_t> sig1(sr.sig,  sr.sig  + sr.sketch_size);
+                                std::vector<uint16_t> sig2(sr.sig2, sr.sig2 + sr.sketch_size);
+                                std::vector<uint64_t> mask(sr.mask, sr.mask + sr.mask_words);
+                                skch_out_1k->add(gid, sig1, sig2,
+                                                 sr.n_real_bins, sr.genome_length, mask);
                             });
-                        for (size_t j = 0; j < n; ++j)
-                            if (!out_sig1[j].empty())
-                                skch_out_1k->add(out_ids[j], out_sig1[j], out_sig2[j],
-                                                 out_nrb[j], out_glen[j], out_mask[j]);
                     } else {
                         // Multi-k path: collect per-k data then emit per genome
                         // sigs_per_k[ki][genome_row]

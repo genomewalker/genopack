@@ -306,7 +306,7 @@ void run_pass_b(ICheckReader& pack,
         }
         return 3;
     }();
-    if (use_pcore || pack.has_core()) {
+    if ((use_pcore || pack.has_core()) && !flagged_genus.empty()) {
         const int gmi_par = std::min(threads, 8);
         // Start small; maybe_resize() rehashes to 4× when load > 50%.
         gmi.reserve(64'000'000ULL);
@@ -331,9 +331,9 @@ void run_pass_b(ICheckReader& pack,
         spdlog::info("check pass-B: GMI built: {} M unique aamers, {} entries, {:.1f} GB",
                      gmi.count() / 1'000'000, n_entries, gmi.bytes() / 1e9);
     }
-    // Host and family unions: always built when PCORE/CORE present, regardless of GAMI/GMI.
+    // Host and family unions: built only when PCORE/CORE present and genera are flagged.
     // Required for host-specific aamer classification in score_contig_foreign_indexed.
-    if (use_pcore || pack.has_core()) {
+    if ((use_pcore || pack.has_core()) && !flagged_genus.empty()) {
         const int gmi_par = std::min(threads, 8);
         std::unordered_set<std::string> unique_genera, unique_families;
         for (const auto& acc : to_scan) {

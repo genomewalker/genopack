@@ -320,6 +320,67 @@ void repack_archive(const std::filesystem::path& input_gpk,
         ShardReader shard;
         shard.open(src_mmap.data(), src_shards[s]->file_offset, src_shards[s]->compressed_size);
 
+        // Raw-blob fast path: when all genomes in this source shard map to the
+        // same taxon bucket, no partial writer exists for that taxon, and there
+        // are no deleted entries, copy the compressed bytes without
+        // decompress→recompress.
+        {
+            const ShardHeader* src_hdr =
+                reinterpret_cast<const ShardHeader*>(
+                    src_mmap.data() + src_shards[s]->file_offset);
+            bool same_taxon = !rec_idxs.empty();
+            uint32_t first_tax = records[rec_idxs[0]].tax_key_idx;
+            for (size_t j = 1; same_taxon && j < rec_idxs.size(); ++j)
+                same_taxon = (records[rec_idxs[j]].tax_key_idx == first_tax);
+
+            if (same_taxon &&
+                src_hdr->n_deleted == 0 &&
+                rec_idxs.size() == static_cast<size_t>(shard.n_genomes()))
+            {
+                auto& tw = taxon_writers[first_tax];
+                if (!tw.writer) {
+                    tw.shard_id = current_shard_id++;
+                    uint64_t sec_id = next_section_id++;
+                    shard_id_to_section_id[tw.shard_id] = sec_id;
+
+                    for (size_t j = 0; j < rec_idxs.size(); ++j) {
+                        const GenomeRecord& rec = records[rec_idxs[j]];
+                        uint64_t catl_idx = new_catalog.size();
+                        GenomeMeta m = rec.meta;
+                        m.shard_id = tw.shard_id;
+                        new_catalog.push_back(m);
+                        new_gidx.push_back({rec.genome_id, tw.shard_id, rec.dir_idx, catl_idx});
+                        ++n_genomes_done;
+                    }
+
+                    const uint8_t* blob_ptr = src_mmap.data() + src_shards[s]->file_offset;
+                    size_t blob_len = static_cast<size_t>(src_shards[s]->compressed_size);
+                    FrozenShard fs;
+                    fs.bytes.assign(blob_ptr, blob_ptr + blob_len);
+                    fs.shard_id  = tw.shard_id;
+                    fs.n_genomes = src_hdr->n_genomes;
+                    fs.raw_bytes = src_hdr->shard_raw_bp;
+                    WriteTask wt;
+                    wt.section_id = sec_id;
+                    wt.shard_id   = tw.shard_id;
+                    wt.fut = std::async(std::launch::deferred,
+                        [fs = std::move(fs)]() mutable { return std::move(fs); });
+                    {
+                        std::unique_lock lk(write_q_mx);
+                        write_q_space_cv.wait(lk, [&]{ return write_q.size() < 2; });
+                        write_q.push(std::move(wt));
+                    }
+                    write_q_cv.notify_one();
+                    shard.release_pages();
+                    ++n_shards_done;
+                    if (cfg.verbose || n_shards_done % 2000 == 0)
+                        spdlog::info("Phase 3: {}/{} shards (raw), {} genomes",
+                                     n_shards_done, src_shards.size(), n_genomes_done);
+                    continue;
+                }
+            }
+        }
+
         // OMP parallel decompress — fetch_genome_at is read-only on mmap
         std::vector<std::string> fastas(rec_idxs.size());
         #pragma omp parallel for schedule(dynamic, 4) num_threads(n_threads)
@@ -454,16 +515,12 @@ void repack_archive(const std::filesystem::path& input_gpk,
         new_toc.add_section(sd);
     }
 
-    // TAXN
+    // TAXN — reuse the in-memory acc_to_tax map loaded during Phase 0,
+    // avoiding a redundant re-scan of the source SEC_TAXN sections.
     if (!acc_to_tax.empty()) {
         TaxonomyIndexWriter tiw;
-        for (auto* sd : src_toc.find_by_type(SEC_TAXN)) {
-            TaxonomyIndexReader tir;
-            tir.open(src_mmap.data(), sd->file_offset, sd->compressed_size);
-            tir.scan([&](std::string_view acc, std::string_view tax) {
-                tiw.add(std::string(acc), std::string(tax));
-            });
-        }
+        for (const auto& [acc, tax] : acc_to_tax)
+            tiw.add(acc, tax);
         new_toc.add_section(tiw.finalize(mw, next_section_id++));
     }
 

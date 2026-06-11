@@ -359,6 +359,58 @@ void subset_archive(const std::filesystem::path& input_gpk,
         ShardReader shard;
         shard.open(src_mmap.data(), src_shards[s]->file_offset, src_shards[s]->compressed_size);
 
+        // Raw-blob fast path: when no partial output shard is open, every genome
+        // in this source shard is kept, and there are no deleted entries, copy the
+        // compressed bytes directly without decompress→recompress.
+        {
+            const ShardHeader* src_hdr =
+                reinterpret_cast<const ShardHeader*>(
+                    src_mmap.data() + src_shards[s]->file_offset);
+            if (!cur_writer &&
+                src_hdr->n_deleted == 0 &&
+                rec_idxs.size() == static_cast<size_t>(shard.n_genomes()))
+            {
+                ShardId raw_sid = current_shard_id++;
+                uint64_t sec_id = next_section_id++;
+                shard_id_to_section_id[raw_sid] = sec_id;
+
+                for (size_t j = 0; j < rec_idxs.size(); ++j) {
+                    const GenomeRecord& rec = records[rec_idxs[j]];
+                    uint64_t catl_idx = new_catalog.size();
+                    GenomeMeta m = rec.meta;
+                    m.shard_id = raw_sid;
+                    new_catalog.push_back(m);
+                    new_gidx.push_back({rec.genome_id, raw_sid, rec.dir_idx, catl_idx});
+                    ++n_genomes_done;
+                }
+
+                const uint8_t* blob_ptr = src_mmap.data() + src_shards[s]->file_offset;
+                size_t blob_len = static_cast<size_t>(src_shards[s]->compressed_size);
+                FrozenShard fs;
+                fs.bytes.assign(blob_ptr, blob_ptr + blob_len);
+                fs.shard_id  = raw_sid;
+                fs.n_genomes = src_hdr->n_genomes;
+                fs.raw_bytes = src_hdr->shard_raw_bp;
+                WriteTask wt;
+                wt.section_id = sec_id;
+                wt.shard_id   = raw_sid;
+                wt.fut = std::async(std::launch::deferred,
+                    [fs = std::move(fs)]() mutable { return std::move(fs); });
+                {
+                    std::unique_lock lk(write_q_mx);
+                    write_q_space_cv.wait(lk, [&]{ return write_q.size() < 2; });
+                    write_q.push(std::move(wt));
+                }
+                write_q_cv.notify_one();
+                shard.release_pages();
+                ++n_shards_done;
+                if (cfg.verbose || n_shards_done % 2000 == 0)
+                    spdlog::info("Phase 3: {}/{} shards (raw), {} genomes",
+                                 n_shards_done, src_shards.size(), n_genomes_done);
+                continue;
+            }
+        }
+
         std::vector<std::string> fastas(rec_idxs.size());
         #pragma omp parallel for schedule(dynamic, 4) num_threads(n_threads)
         for (int j = 0; j < static_cast<int>(rec_idxs.size()); ++j)
