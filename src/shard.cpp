@@ -1,6 +1,7 @@
 #include <genopack/shard.hpp>
 #include <genopack/checksum.hpp>
 #include <genopack/mem_delta.hpp>
+#include <atomic>
 #include <zstd.h>
 #include <zdict.h>
 #include <spdlog/spdlog.h>
@@ -1187,6 +1188,7 @@ struct ShardReader::Impl {
     mutable std::string  ref_prefix_;   // cached reference prefix for legacy delta shards
     mutable std::mutex   ref_prefix_mx_; // protects ref_prefix_ from concurrent initialization
     std::string  mem_anchor_seq_;      // pure sequence of anchor genome for MEM-delta shards (codec==4)
+    uint64_t     gen_ = 0;             // unique per open(): disambiguates recycled src pointers in the frame cache
 
     // Thread-local ZSTD decompression context with RAII cleanup on thread exit
     struct TlDctx {
@@ -1201,6 +1203,7 @@ struct ShardReader::Impl {
     }
 
     struct CachedFrame {
+        uint64_t gen = 0;            // ShardReader open-generation the src pointer belongs to
         const uint8_t* src = nullptr;
         size_t src_size = 0;
         const char* ref_ptr = nullptr;
@@ -1229,6 +1232,13 @@ struct ShardReader::Impl {
     }
 
     void setup(const uint8_t* section_base, uint64_t section_size) {
+        // Globally-unique generation for this open. The thread_local frame cache
+        // keys on raw src pointers; callers that recycle I/O buffers across shards
+        // (visit_shard_batches) reuse the same address for different content, so the
+        // generation makes a recycled pointer never match a prior shard's entry.
+        static std::atomic<uint64_t> g_open_gen{1};
+        gen_ = g_open_gen.fetch_add(1, std::memory_order_relaxed);
+
         base_         = section_base;
         section_size_ = section_size;
 
@@ -1317,7 +1327,8 @@ struct ShardReader::Impl {
         bool use_prefix = ref_ptr != nullptr && ref_size > 0;
         auto& frame_cache = get_thread_frame_cache();
         for (auto& entry : frame_cache.entries) {
-            if (entry.src == src &&
+            if (entry.gen == gen_ &&
+                entry.src == src &&
                 entry.src_size == src_size &&
                 entry.ref_ptr == ref_ptr &&
                 entry.ref_size == ref_size &&
@@ -1355,6 +1366,7 @@ struct ShardReader::Impl {
             if (entry.age < victim->age)
                 victim = &entry;
         }
+        victim->gen = gen_;
         victim->src = src;
         victim->src_size = src_size;
         victim->ref_ptr = ref_ptr;

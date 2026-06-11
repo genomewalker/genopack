@@ -417,22 +417,21 @@ static std::vector<uint8_t> decompress_payload(const uint8_t* blob,
 }
 
 struct ParsedChunkPayload {
-    const uint8_t* compressed_key = nullptr;
-    size_t compressed_len = 0;
     std::vector<uint8_t> storage;
     std::vector<MemEntry> mems;
     size_t verbatim_offset = 0;
     size_t verbatim_len = 0;
 };
 
+// Re-parses every call into a reused thread_local buffer. A pointer-identity
+// cache (key = blob pointer + length) is unsafe here: visit_shard_batches
+// recycles a small set of pread buffers across shards, so the same address and
+// length can later hold a different chunk's bytes — a stale hit would return the
+// wrong sequence. The caller consumes the returned reference before the next
+// call, so reusing the storage (no per-call allocation) is all the caching needed.
 static const ParsedChunkPayload& parse_chunk_payload(const uint8_t* blob,
                                                      size_t blob_len) {
     static thread_local ParsedChunkPayload cache;
-    if (cache.compressed_key == blob && cache.compressed_len == blob_len)
-        return cache;
-
-    cache.compressed_key = blob;
-    cache.compressed_len = blob_len;
     cache.storage = decompress_payload(blob, blob_len, "decode_mem_delta chunk decompress");
     cache.mems.clear();
     cache.verbatim_offset = 0;
