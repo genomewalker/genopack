@@ -301,10 +301,12 @@ void run_pass_b(ICheckReader& pack,
         spdlog::info("check pass-B: GMI loaded from SEC_GAMI v2 ({} M entries, {:.1f} GB)",
                      gmi.count() / 1'000'000, gmi.bytes() / 1e9);
     }
-    std::unordered_map<std::string, OwnedSpan>   genus_host_union;
-    std::unordered_map<std::string, OwnedSpan>   family_union_map;
-    std::unordered_map<std::string, IndexedSpan> genus_host_index;
-    std::unordered_map<std::string, IndexedSpan> family_index_map;
+    std::unordered_map<std::string, OwnedSpan>           genus_host_union;
+    std::unordered_map<std::string, OwnedSpan>           family_union_map;
+    std::unordered_map<std::string, IndexedSpan>         genus_host_index;
+    std::unordered_map<std::string, IndexedSpan>         family_index_map;
+    std::unordered_map<std::string, std::vector<uint64_t>> genus_core_cache;
+    std::unordered_map<std::string, std::vector<uint64_t>> family_core_cache;
     const uint8_t foreign_K = [&]() -> uint8_t {
         if (const char* e = std::getenv("GENOPACK_FOREIGN_K")) {
             int v = std::atoi(e); if (v > 0 && v < 256) return static_cast<uint8_t>(v);
@@ -355,6 +357,27 @@ void run_pass_b(ICheckReader& pack,
         for (size_t i = 0; i < fvec.size(); ++i) family_union_map[fvec[i]] = materialize_family(fvec[i]);
         spdlog::info("check pass-B: host/family unions: {} genera + {} families, K={}",
                      genus_host_union.size(), family_union_map.size(), foreign_K);
+
+        // Pre-decode PCORE core slices per unique genus/family for completeness scoring.
+        // Avoids O(G_flagged × T_per_genus) PFor re-decodes in the scan loop; reduces to O(G_flagged).
+        if (use_pcore) {
+            std::vector<std::vector<uint64_t>> gcore_buf(gvec.size());
+            std::vector<std::vector<uint64_t>> fcore_buf(fvec.size());
+            #pragma omp parallel for schedule(dynamic,1) num_threads(gmi_par)
+            for (size_t i = 0; i < gvec.size(); ++i) {
+                PcoreView v = pack.pcore_for_genus(gvec[i]);
+                if (v.valid()) v.core_into(gcore_buf[i]);
+            }
+            #pragma omp parallel for schedule(dynamic,1) num_threads(gmi_par)
+            for (size_t i = 0; i < fvec.size(); ++i) {
+                PcoreView v = pack.pcore_for_family(fvec[i]);
+                if (v.valid()) v.core_into(fcore_buf[i]);
+            }
+            genus_core_cache.reserve(gvec.size());
+            family_core_cache.reserve(fvec.size());
+            for (size_t i = 0; i < gvec.size(); ++i) genus_core_cache[gvec[i]] = std::move(gcore_buf[i]);
+            for (size_t i = 0; i < fvec.size(); ++i) family_core_cache[fvec[i]] = std::move(fcore_buf[i]);
+        }
         // Build 16-bit prefix indexes — replaces O(10M) merge-scan with O(~153) binary search.
         genus_host_index.reserve(genus_host_union.size());
         for (const auto& [g, os] : genus_host_union)
@@ -527,12 +550,12 @@ void run_pass_b(ICheckReader& pack,
                     const std::string* genus_s  = (git   != flagged_genus.end())  ? &git->second   : nullptr;
                     const std::string* family_s = (famit != flagged_family.end()) ? &famit->second : nullptr;
                     if (pack.has_pcore()) {
-                        // Unified reference: derive the ≥theta completeness core from PCORE
-                        // (the ≥⌈theta·n⌉-member slice reproduces the old CORE bit-for-bit).
-                        const PcoreReader* pr = pack.pcore_reader();
-                        PcoreView gpv = genus_s  ? pack.pcore_for_genus(*genus_s)   : PcoreView{};
-                        PcoreView fpv = family_s ? pack.pcore_for_family(*family_s) : PcoreView{};
-                        if (gpv.valid() || fpv.valid()) {
+                        auto gcit = genus_s  ? genus_core_cache.find(*genus_s)   : genus_core_cache.end();
+                        auto fcit = family_s ? family_core_cache.find(*family_s) : family_core_cache.end();
+                        const std::vector<uint64_t>* gcore = (gcit != genus_core_cache.end()  && !gcit->second.empty()) ? &gcit->second  : nullptr;
+                        const std::vector<uint64_t>* fcore = (fcit != family_core_cache.end() && !fcit->second.empty()) ? &fcit->second : nullptr;
+                        if (gcore || fcore) {
+                            const PcoreReader* pr = pack.pcore_reader();
                             thread_local std::vector<uint64_t> core_qmers;
                             core_qmers.clear();
                             for (const auto& c : contigs)
@@ -541,8 +564,18 @@ void run_pass_b(ICheckReader& pack,
                             std::sort(core_qmers.begin(), core_qmers.end());
                             core_qmers.erase(std::unique(core_qmers.begin(), core_qmers.end()),
                                              core_qmers.end());
-                            completeness_aamer_core        = pcore_core_coverage(gpv, core_qmers, pr->theta());
-                            completeness_aamer_family_core = pcore_core_coverage(fpv, core_qmers, pr->theta());
+                            auto cached_coverage = [](const std::vector<uint64_t>* core,
+                                                      const std::vector<uint64_t>& qm) -> float {
+                                if (!core || core->empty()) return NAN;
+                                uint32_t inter = 0; size_t qi = 0;
+                                for (uint64_t a : *core) {
+                                    while (qi < qm.size() && qm[qi] < a) ++qi;
+                                    if (qi < qm.size() && qm[qi] == a) ++inter;
+                                }
+                                return static_cast<float>(inter) / static_cast<float>(core->size());
+                            };
+                            completeness_aamer_core        = cached_coverage(gcore, core_qmers);
+                            completeness_aamer_family_core = cached_coverage(fcore, core_qmers);
                         }
                     } else {
                         CoreView gcore = (pack.has_core() && genus_s)  ? pack.core_for_genus(*genus_s)   : CoreView{};
