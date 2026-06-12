@@ -1,6 +1,10 @@
 #pragma once
 #include "mmap_file.hpp"
 #include "types.hpp"
+#include <fcntl.h>
+#include <unistd.h>
+#include <cerrno>
+#include <cstring>
 #include <filesystem>
 #include <memory>
 #include <span>
@@ -103,10 +107,34 @@ struct ShardWriterConfig {
 // The bytes can be appended directly to an AppendWriter in the calling thread
 // while the freeze ran in a background thread.
 struct FrozenShard {
-    std::vector<uint8_t> bytes;     // header + dir + dict + compressed blobs
+    std::vector<uint8_t> bytes;      // header + dir + dict + blobs; empty when tmp_path set
+    std::string          tmp_path;   // temp file written by freeze() when GENOPACK_SPILL_DIR set
+    uint64_t             section_size = 0; // byte length written to tmp_path
     uint32_t             shard_id;
     uint32_t             n_genomes;
-    uint64_t             raw_bytes; // total uncompressed genome bytes
+    uint64_t             raw_bytes;  // total uncompressed genome bytes
+};
+
+// RAII helper for drain-side consumption of FrozenShard::tmp_path.
+// Opens tmp_path O_RDONLY; closes and unlinks on destruction (even on exception).
+struct FrozenShardReader {
+    int         fd   = -1;
+    std::string path;
+
+    explicit FrozenShardReader(const FrozenShard& fs) : path(fs.tmp_path) {
+        if (!path.empty()) {
+            fd = ::open(path.c_str(), O_RDONLY);
+            if (fd < 0)
+                throw std::runtime_error("FrozenShardReader: open " + path + ": " +
+                                         std::string(strerror(errno)));
+        }
+    }
+    ~FrozenShardReader() {
+        if (fd >= 0) { ::close(fd); fd = -1; }
+        if (!path.empty()) { ::unlink(path.c_str()); path.clear(); }
+    }
+    FrozenShardReader(const FrozenShardReader&) = delete;
+    FrozenShardReader& operator=(const FrozenShardReader&) = delete;
 };
 
 // ── ShardWriter ─────────────────────────────────────────────────────────────

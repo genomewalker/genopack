@@ -6,6 +6,11 @@
 #include <zdict.h>
 #include <spdlog/spdlog.h>
 #include <sys/mman.h>
+#include <sys/sendfile.h>
+#include <cerrno>
+#include <cstdlib>
+#include <fcntl.h>
+#include <unistd.h>
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -482,6 +487,74 @@ void ShardWriter::add_genome(GenomeId id, uint64_t oph_fingerprint,
     impl_->pending.push_back(std::move(pg));
 }
 
+// Returns GENOPACK_SPILL_DIR if set; empty string otherwise.
+static std::string shard_spill_dir() {
+    const char* d = ::getenv("GENOPACK_SPILL_DIR");
+    return (d && *d) ? std::string(d) : std::string{};
+}
+
+// RAII guard: closes and unlinks a temp file unless released.
+struct TmpFileGuard {
+    std::string path;
+    int fd = -1;
+    ~TmpFileGuard() {
+        if (fd >= 0) { ::close(fd); fd = -1; }
+        if (!path.empty()) { ::unlink(path.c_str()); path.clear(); }
+    }
+    void release() noexcept { fd = -1; path.clear(); }
+};
+
+// pwrite with EINTR retry and short-write loop.
+static void pwrite_full(int fd, const void* data, size_t len, uint64_t offset) {
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    size_t remaining = len;
+    off_t pos = static_cast<off_t>(offset);
+    while (remaining > 0) {
+        ssize_t n = ::pwrite(fd, p, remaining, pos);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0)
+            throw std::runtime_error("shard pwrite_full: " + std::string(strerror(errno)));
+        p         += n;
+        pos       += n;
+        remaining -= static_cast<size_t>(n);
+    }
+}
+
+// Writes a complete shard section to an already-open seekable fd (offset 0).
+// dir, checkpoint_entries, blobs are consumed: blob data is freed as written.
+// hdr must have checksum zeroed; this function computes and patches it in-place.
+template<typename BlobVec>
+static void write_shard_to_fd(int fd, ShardHeader& hdr,
+                               const std::vector<GenomeDirEntry>& dir,
+                               uint64_t dir_size,
+                               const uint8_t* dict_data, uint64_t dict_bytes,
+                               uint64_t blob_area_offset,
+                               BlobVec& blobs,
+                               const std::vector<CheckpointEntry>& checkpoint_entries,
+                               uint64_t total_section_size) {
+    pwrite_full(fd, &hdr, sizeof(hdr), 0);
+    pwrite_full(fd, dir.data(), dir_size, sizeof(hdr));
+    if (dict_data && dict_bytes > 0)
+        pwrite_full(fd, dict_data, dict_bytes, sizeof(hdr) + dir_size);
+    uint64_t blob_write_off = blob_area_offset;
+    for (auto& b : blobs) {
+        if (!b.data.empty()) {
+            pwrite_full(fd, b.data.data(), b.data.size(), blob_write_off);
+            blob_write_off += b.data.size();
+            b.data.clear();
+            b.data.shrink_to_fit();
+        }
+    }
+    if (!checkpoint_entries.empty())
+        pwrite_full(fd, checkpoint_entries.data(),
+                    checkpoint_entries.size() * sizeof(CheckpointEntry),
+                    blob_write_off);
+    // Patch ShardHeader.checksum: field is pre-zeroed; hash the whole section via fd.
+    if (!checksum_of_fd(fd, 0, total_section_size, hdr.checksum))
+        throw std::runtime_error("shard write_to_fd: checksum_of_fd failed");
+    pwrite_full(fd, hdr.checksum, 16, offsetof(ShardHeader, checksum));
+}
+
 FrozenShard ShardWriter::freeze() {
     const size_t n = impl_->pending.size();
     const bool allow_auto_codec = impl_->cfg.auto_codec;
@@ -692,18 +765,8 @@ FrozenShard ShardWriter::freeze() {
         }
         const uint64_t checkpoint_area_offset = blob_area_offset + blob_cursor;
 
-        FrozenShard frozen;
-        frozen.shard_id  = impl_->shard_id;
-        frozen.n_genomes = static_cast<uint32_t>(n);
-        frozen.raw_bytes = impl_->total_raw_bytes;
-
         const uint64_t total_section_size = checkpoint_area_offset +
             checkpoint_entries.size() * sizeof(CheckpointEntry);
-        frozen.bytes.reserve(total_section_size);
-        auto push_bytes = [&](const void* d, size_t sz) {
-            const auto* p = static_cast<const uint8_t*>(d);
-            frozen.bytes.insert(frozen.bytes.end(), p, p + sz);
-        };
 
         ShardHeader hdr{};
         hdr.magic                  = GPKS_MAGIC;
@@ -726,6 +789,43 @@ FrozenShard ShardWriter::freeze() {
         hdr.shard_compressed_bytes = total_compressed;
         std::memset(hdr.checksum, 0, sizeof(hdr.checksum));
         std::memset(hdr.reserved, 0, sizeof(hdr.reserved));
+
+        const std::string spill = shard_spill_dir();
+        if (!spill.empty()) {
+            TmpFileGuard guard;
+            guard.path = spill + "/gpks-XXXXXX";
+            guard.fd   = ::mkstemp(guard.path.data());
+            if (guard.fd < 0)
+                throw std::runtime_error("shard freeze (mem-delta): mkstemp: " +
+                                         std::string(strerror(errno)));
+            write_shard_to_fd(guard.fd, hdr, dir, dir_size,
+                              nullptr, 0, blob_area_offset,
+                              blobs, checkpoint_entries, total_section_size);
+            ::close(guard.fd);
+            guard.fd = -1; // already closed; let guard only unlink on exception after this point
+            spdlog::info("ShardWriter shard {} (MEM-delta spill): {} genomes ({} ref panel), "
+                         "raw {}B, mem-delta {}, plain {}, section {}B",
+                         impl_->shard_id, n, n_ref, impl_->total_raw_bytes,
+                         mem_delta_count, plain_count, total_section_size);
+            FrozenShard frozen;
+            frozen.shard_id     = impl_->shard_id;
+            frozen.n_genomes    = static_cast<uint32_t>(n);
+            frozen.raw_bytes    = impl_->total_raw_bytes;
+            frozen.tmp_path     = std::move(guard.path);
+            frozen.section_size = total_section_size;
+            guard.release(); // ownership transferred to FrozenShard
+            return frozen;
+        }
+
+        FrozenShard frozen;
+        frozen.shard_id  = impl_->shard_id;
+        frozen.n_genomes = static_cast<uint32_t>(n);
+        frozen.raw_bytes = impl_->total_raw_bytes;
+        frozen.bytes.reserve(total_section_size);
+        auto push_bytes = [&](const void* d, size_t sz) {
+            const auto* p = static_cast<const uint8_t*>(d);
+            frozen.bytes.insert(frozen.bytes.end(), p, p + sz);
+        };
         push_bytes(&hdr, sizeof(hdr));
         push_bytes(dir.data(), dir_size);
         for (const auto& cb : blobs)
@@ -1111,20 +1211,9 @@ FrozenShard ShardWriter::freeze() {
     }
     const uint64_t checkpoint_area_offset = blob_area_offset + blob_cursor;
 
-    // ── 5. Serialize to bytes ─────────────────────────────────────────────────
-    FrozenShard frozen;
-    frozen.shard_id  = impl_->shard_id;
-    frozen.n_genomes = static_cast<uint32_t>(n);
-    frozen.raw_bytes = impl_->total_raw_bytes;
-
+    // ── 5. Serialize ─────────────────────────────────────────────────────────────
     const uint64_t total_section_size = checkpoint_area_offset +
         checkpoint_entries.size() * sizeof(CheckpointEntry);
-    frozen.bytes.reserve(total_section_size);
-
-    auto push_bytes = [&](const void* d, size_t sz) {
-        const auto* p = static_cast<const uint8_t*>(d);
-        frozen.bytes.insert(frozen.bytes.end(), p, p + sz);
-    };
 
     ShardHeader hdr{};
     hdr.magic                  = GPKS_MAGIC;
@@ -1147,6 +1236,43 @@ FrozenShard ShardWriter::freeze() {
     hdr.shard_compressed_bytes = total_compressed;
     std::memset(hdr.checksum, 0, sizeof(hdr.checksum));
     std::memset(hdr.reserved, 0, sizeof(hdr.reserved));
+
+    const std::string spill = shard_spill_dir();
+    if (!spill.empty()) {
+        TmpFileGuard guard;
+        guard.path = spill + "/gpks-XXXXXX";
+        guard.fd   = ::mkstemp(guard.path.data());
+        if (guard.fd < 0)
+            throw std::runtime_error("shard freeze: mkstemp: " +
+                                     std::string(strerror(errno)));
+        const uint8_t* dict_ptr = use_dict
+            ? reinterpret_cast<const uint8_t*>(impl_->shared_dict.data()) : nullptr;
+        write_shard_to_fd(guard.fd, hdr, dir, dir_size,
+                          dict_ptr, dict_bytes, blob_area_offset,
+                          blobs, checkpoint_entries, total_section_size);
+        ::close(guard.fd);
+        guard.fd = -1;
+        spdlog::info("ShardWriter shard {} (spill): wrote {} genomes, raw {}B, compressed {}B, section {}B",
+                     impl_->shard_id, n, impl_->total_raw_bytes, total_compressed, total_section_size);
+        FrozenShard frozen;
+        frozen.shard_id     = impl_->shard_id;
+        frozen.n_genomes    = static_cast<uint32_t>(n);
+        frozen.raw_bytes    = impl_->total_raw_bytes;
+        frozen.tmp_path     = std::move(guard.path);
+        frozen.section_size = total_section_size;
+        guard.release();
+        return frozen;
+    }
+
+    FrozenShard frozen;
+    frozen.shard_id  = impl_->shard_id;
+    frozen.n_genomes = static_cast<uint32_t>(n);
+    frozen.raw_bytes = impl_->total_raw_bytes;
+    frozen.bytes.reserve(total_section_size);
+    auto push_bytes = [&](const void* d, size_t sz) {
+        const auto* p = static_cast<const uint8_t*>(d);
+        frozen.bytes.insert(frozen.bytes.end(), p, p + sz);
+    };
     push_bytes(&hdr, sizeof(hdr));
     push_bytes(dir.data(), dir_size);
     if (use_dict)
@@ -1166,7 +1292,12 @@ FrozenShard ShardWriter::freeze() {
 uint64_t ShardWriter::finalize(AppendWriter& writer) {
     FrozenShard frozen = freeze();
     uint64_t section_start = writer.current_offset();
-    writer.append(frozen.bytes.data(), frozen.bytes.size());
+    if (!frozen.tmp_path.empty()) {
+        FrozenShardReader rdr(frozen); // RAII: closes + unlinks on scope exit
+        writer.append_from_fd(rdr.fd, frozen.section_size);
+    } else {
+        writer.append(frozen.bytes.data(), frozen.bytes.size());
+    }
     return section_start;
 }
 

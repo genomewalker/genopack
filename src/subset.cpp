@@ -22,6 +22,7 @@
 #include <cstring>
 #include <ctime>
 #include <fcntl.h>
+#include <sys/sendfile.h>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -276,7 +277,15 @@ void subset_archive(const std::filesystem::path& input_gpk,
 
             FrozenShard frozen = wt.fut.get();
             uint64_t shard_start = app_writer.current_offset();
-            app_writer.append(frozen.bytes.data(), frozen.bytes.size());
+            uint64_t shard_bytes;
+            if (!frozen.tmp_path.empty()) {
+                FrozenShardReader rdr(frozen); // RAII: closes + unlinks on scope exit
+                app_writer.append_from_fd(rdr.fd, frozen.section_size);
+                shard_bytes = frozen.section_size;
+            } else {
+                app_writer.append(frozen.bytes.data(), frozen.bytes.size());
+                shard_bytes = static_cast<uint64_t>(frozen.bytes.size());
+            }
 
             SectionDesc sd{};
             sd.type              = SEC_SHRD;
@@ -284,12 +293,17 @@ void subset_archive(const std::filesystem::path& input_gpk,
             sd.flags             = 0;
             sd.section_id        = wt.section_id;
             sd.file_offset       = shard_start;
-            sd.compressed_size   = static_cast<uint64_t>(frozen.bytes.size());
+            sd.compressed_size   = shard_bytes;
             sd.uncompressed_size = 0;
             sd.item_count        = frozen.n_genomes;
             sd.aux0              = wt.shard_id;
             sd.aux1              = 0;
-            checksum_of(frozen.bytes.data(), frozen.bytes.size(), sd.checksum);
+            if (!frozen.tmp_path.empty()) {
+                if (!checksum_of_fd(app_writer.fd(), shard_start, shard_bytes, sd.checksum))
+                    throw std::runtime_error("subset drain: checksum_of_fd failed");
+            } else {
+                checksum_of(frozen.bytes.data(), frozen.bytes.size(), sd.checksum);
+            }
             new_toc.add_section(sd);
         }
     });

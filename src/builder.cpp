@@ -12,6 +12,7 @@
 #include <genopack/aamer.hpp>
 #include <genopack/cladesplit.hpp>
 #include <genopack/core_section.hpp>
+#include <genopack/pcore_spiller.hpp>
 #include <genopack/qual.hpp>
 #include <genopack/qual_columns.hpp>
 #include <genopack/kmrx.hpp>
@@ -47,6 +48,7 @@
 #include <thread>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/sendfile.h>
 #include <genopack/checksum.hpp>
 #include <unordered_map>
 #include <vector>
@@ -388,6 +390,10 @@ struct ArchiveBuilder::Impl {
                 for (const auto& [k, v] : rec.extra_fields)
                     if (k == "taxonomy") { ++genus_total[extract_taxonomy_bucket(v, grank)]; break; }
             cc_micro_threshold = resolve_micro_threshold(cfg.micro_genus_threshold, original_total_records);
+            for (const auto& [gk, gc] : genus_total)
+                if (gc > 65535)
+                    throw std::runtime_error("genus '" + gk + "' has " + std::to_string(gc)
+                        + " members (>65535); uint16_t aamer counts would wrap — aborting");
         }
 
         // ── Checkpoint paths ──────────────────────────────────────────────────
@@ -744,7 +750,15 @@ struct ArchiveBuilder::Impl {
 
                 FrozenShard frozen = wt.fut.get();
                 uint64_t shard_start = app_writer.current_offset();
-                app_writer.append(frozen.bytes.data(), frozen.bytes.size());
+                uint64_t shard_bytes;
+                if (!frozen.tmp_path.empty()) {
+                    FrozenShardReader rdr(frozen); // RAII: closes + unlinks on scope exit
+                    app_writer.append_from_fd(rdr.fd, frozen.section_size);
+                    shard_bytes = frozen.section_size;
+                } else {
+                    app_writer.append(frozen.bytes.data(), frozen.bytes.size());
+                    shard_bytes = static_cast<uint64_t>(frozen.bytes.size());
+                }
                 // Make the shard bytes server-durable BEFORE recording the resume
                 // offset in the checkpoint, so a crash cannot leave a checkpoint
                 // pointing past bytes the NFS server never committed (P13).
@@ -755,17 +769,21 @@ struct ArchiveBuilder::Impl {
                 sd.flags            = 0;
                 sd.section_id       = wt.section_id;
                 sd.file_offset      = shard_start;
-                sd.compressed_size  = static_cast<uint64_t>(frozen.bytes.size());
+                sd.compressed_size  = shard_bytes;
                 sd.uncompressed_size = 0;
                 sd.item_count       = wt.n_genomes;
                 sd.aux0             = wt.shard_id;
                 sd.aux1             = 0;
                 // XXH128 content hash of the whole shard section body (P1) —
                 // checked by `genopack verify`.
-                checksum_of(frozen.bytes.data(), frozen.bytes.size(), sd.checksum);
+                if (!frozen.tmp_path.empty()) {
+                    if (!checksum_of_fd(app_writer.fd(), shard_start, shard_bytes, sd.checksum))
+                        throw std::runtime_error("builder drain: checksum_of_fd failed");
+                } else {
+                    checksum_of(frozen.bytes.data(), frozen.bytes.size(), sd.checksum);
+                }
                 toc.add_section(sd);
-                DrainResult dr{wt.shard_id, wt.section_id, shard_start,
-                               static_cast<uint64_t>(frozen.bytes.size()),
+                DrainResult dr{wt.shard_id, wt.section_id, shard_start, shard_bytes,
                                wt.n_genomes, wt.catalog_start};
                 write_checkpoint(dr);
             }
@@ -1058,8 +1076,11 @@ struct ArchiveBuilder::Impl {
         // Global cap: flush the largest bucket whenever total in-memory genome
         // data exceeds this limit. Prevents unbounded accumulation across many
         // small-genus buckets that never individually hit max_shard_size_bytes.
-        const uint64_t taxon_global_cap = 8ULL << 30;   // 8 GB FASTA buffered
-        const uint64_t taxon_aamer_cap  = 2ULL << 30;  // 2 GB aamer arrays buffered (FMH-subsampled)
+        const uint64_t taxon_global_cap = 2ULL << 30;   // 2 GB FASTA buffered
+        const uint64_t taxon_aamer_cap  = 512ULL << 20; // 512 MB aamer arrays buffered (FMH-subsampled)
+        // Cross-genus bin-pack buffer for micro-genera flushed immediately at completion.
+        std::vector<ChunkItem> micro_combine;
+        uint64_t micro_combine_bytes = 0;
         std::vector<ChunkItem> staging_buffer; // used when !cfg.taxonomy_group
         staging_buffer.reserve(sort_buf * 4);
         uint64_t staging_raw_bytes = 0;
@@ -1094,6 +1115,9 @@ struct ArchiveBuilder::Impl {
         // inline from the same chunk_aamers (zero extra passes); genus tier only here
         // (the family tier is added post-hoc by `genopack pcore`, like FCORE).
         PcoreWriter build_pcore_w(AAMER_K, /*min_seg_aa=*/8, cfg.core_theta, cfg.tmpdir);
+        PcoreSpillWriter pcore_spiller(cfg.tmpdir.empty()
+            ? std::filesystem::temp_directory_path()
+            : std::filesystem::path(cfg.tmpdir));
         if (cfg.build_tier && cfg.build_pcore) {
             const std::string tier_path = gpk_path_.string() + ".ptier";
             build_pcore_w.set_tier_sidechannel(tier_path);
@@ -1198,7 +1222,7 @@ struct ArchiveBuilder::Impl {
                 for (int ki = 0; ki < nk && ki < (int)item.sketches_mk.size(); ++ki) {
                     const auto& sk = item.sketches_mk[ki];
                     for (int b = 0; b < bins; ++b) {
-                        uint16_t v = static_cast<uint16_t>(sk.signature1[b] & 0xFFFF);
+                        uint16_t v = sk.signature1[b];
                         if      (vote[ki][b] == 0) { cand[ki][b] = v; vote[ki][b] = 1; }
                         else if (v == cand[ki][b]) { ++vote[ki][b]; }
                         else                       { --vote[ki][b]; }
@@ -1216,7 +1240,7 @@ struct ArchiveBuilder::Impl {
                     const auto& sk = item.sketches_mk[0];
                     int match = 0;
                     for (int b = 0; b < bins; ++b)
-                        if (static_cast<uint16_t>(sk.signature1[b] & 0xFFFF) == cand[0][b]) ++match;
+                        if (sk.signature1[b] == cand[0][b]) ++match;
                     cont0_v.push_back(static_cast<float>(match) / bins);
                 }
             }
@@ -1233,7 +1257,7 @@ struct ArchiveBuilder::Impl {
                     const auto& sk = buf[ii].sketches_mk[ki];
                     int match = 0;
                     for (int b = 0; b < bins; ++b)
-                        if (static_cast<uint16_t>(sk.signature1[b] & 0xFFFF) == cand[ki][b]) ++match;
+                        if (sk.signature1[b] == cand[ki][b]) ++match;
                     c.push_back(static_cast<float>(match) / bins);
                 }
                 if (c.empty()) {
@@ -1242,7 +1266,7 @@ struct ArchiveBuilder::Impl {
                         const auto& sk = item.sketches_mk[ki];
                         int match = 0;
                         for (int b = 0; b < bins; ++b)
-                            if (static_cast<uint16_t>(sk.signature1[b] & 0xFFFF) == cand[ki][b]) ++match;
+                            if (sk.signature1[b] == cand[ki][b]) ++match;
                         c.push_back(static_cast<float>(match) / bins);
                     }
                 }
@@ -1318,7 +1342,7 @@ struct ArchiveBuilder::Impl {
                     const auto& sk = item.sketches_mk[ki];
                     int match = 0;
                     for (int b = 0; b < bins; ++b)
-                        if (static_cast<uint16_t>(sk.signature1[b] & 0xFFFF) == cand[ki][b])
+                        if (sk.signature1[b] == cand[ki][b])
                             ++match;
                     cont[ki] = static_cast<float>(match) / bins;
                 }
@@ -1412,14 +1436,21 @@ struct ArchiveBuilder::Impl {
                 }
 
                 if (!aamers_capped && (cfg.build_core || cfg.build_pcore)) {
+                    const uint64_t gkh_spill = GcovWriter::hash_genus(genus_key);
                     std::vector<const std::vector<uint64_t>*> ptrs;
                     ptrs.reserve(buf.size());
-                    for (size_t ii = 0; ii < buf.size(); ++ii)
-                        if (!buf[ii].aamers.empty()) {
+                    for (size_t ii = 0; ii < buf.size(); ++ii) {
+                        if (buf[ii].aamers.empty()) continue;
+                        if (cfg.build_core) {
                             ptrs.push_back(&buf[ii].aamers);
                             if (accum_member_ids) accum_member_ids->push_back(buf[ii].genome_id);
                         }
-                    if (!ptrs.empty()) ctr->add_chunk(ptrs);
+                        if (cfg.build_pcore) {
+                            pcore_spiller.add_member(gkh_spill);
+                            pcore_spiller.add_genome(gkh_spill, buf[ii].aamers);
+                        }
+                    }
+                    if (cfg.build_core && !ptrs.empty()) ctr->add_chunk(ptrs);
                 }
 
                 const uint32_t n_mem = static_cast<uint32_t>(buf.size());
@@ -1441,7 +1472,7 @@ struct ArchiveBuilder::Impl {
                     build_fmhr_w.add(GcovWriter::hash_genus(genus_key), std::move(fmh_all));
                 }
 
-                if (!cross_chunk && (cfg.build_core || cfg.build_pcore) && !local_counter.empty()) {
+                if (!cross_chunk && cfg.build_core && !local_counter.empty()) {
                     std::vector<uint64_t> aamers; std::vector<uint32_t> counts;
                     local_counter.finalize_sorted(aamers, counts);
                     const uint64_t gkh = GcovWriter::hash_genus(genus_key);
@@ -1449,8 +1480,7 @@ struct ArchiveBuilder::Impl {
                     member_ids.reserve(pending_qrs.size());
                     for (const auto& qr : pending_qrs) member_ids.push_back(qr.genome_id);
                     std::lock_guard<std::mutex> lk(core_writer_mx);
-                    if (cfg.build_core)  build_core_w.add_sorted(gkh, aamers, counts, n_mem, member_ids);
-                    if (cfg.build_pcore) build_pcore_w.add_sorted(gkh, aamers, counts, n_mem);
+                    build_core_w.add_sorted(gkh, aamers, counts, n_mem, member_ids);
                 }
 
                 // Score contigs and populate outlier fields.
@@ -1624,15 +1654,8 @@ struct ArchiveBuilder::Impl {
                         std::vector<uint32_t>              n_real_bins_per_k;
                         std::vector<std::vector<uint64_t>> masks_per_k;
                         for (const auto& sk : item.sketches_mk) {
-                            const size_t n = sk.signature1.size();
-                            std::vector<uint16_t> sig1_16(n);
-                            std::vector<uint16_t> sig2_16(n);
-                            for (size_t si = 0; si < n; ++si) {
-                                sig1_16[si] = static_cast<uint16_t>(sk.signature1[si] & 0xFFFF);
-                                sig2_16[si] = static_cast<uint16_t>(sk.signature2[si] & 0xFFFF);
-                            }
-                            sigs1_per_k.push_back(std::move(sig1_16));
-                            sigs2_per_k.push_back(std::move(sig2_16));
+                            sigs1_per_k.push_back(sk.signature1);
+                            sigs2_per_k.push_back(sk.signature2);
                             n_real_bins_per_k.push_back(sk.n_real_bins);
                             masks_per_k.push_back(sk.real_bins_bitmask);
                         }
@@ -1641,14 +1664,7 @@ struct ArchiveBuilder::Impl {
                                             n_real_bins_per_k, masks_per_k);
                     } else if (skch_writer && !item.sketch.signature1.empty()) {
                         const auto& sk = item.sketch;
-                        const size_t n = sk.signature1.size();
-                        std::vector<uint16_t> sig1_16(n);
-                        std::vector<uint16_t> sig2_16(n);
-                        for (size_t si = 0; si < n; ++si) {
-                            sig1_16[si] = static_cast<uint16_t>(sk.signature1[si] & 0xFFFF);
-                            sig2_16[si] = static_cast<uint16_t>(sk.signature2[si] & 0xFFFF);
-                        }
-                        skch_writer->add(item.genome_id, sig1_16, sig2_16,
+                        skch_writer->add(item.genome_id, sk.signature1, sk.signature2,
                                          sk.n_real_bins, sk.genome_length,
                                          sk.real_bins_bitmask);
                     }
@@ -1695,17 +1711,19 @@ struct ArchiveBuilder::Impl {
         // folded into bucket.genus_counter (the cross-chunk aggregation), then free it.
         auto emit_core_pcore = [&](const std::string& key, TaxonBucket& b) {
             if (b.model_emitted || !b.genus_counter || b.genus_counter->empty()) return;
-            std::vector<uint64_t> aamers; std::vector<uint32_t> counts;
-            b.genus_counter->finalize_sorted(aamers, counts);
-            const uint64_t gkh = GcovWriter::hash_genus(key);
-            // n_mem = members actually FOLDED (the count basis; capped) so the ceil(theta*n)
-            // core slice and the prevalences are relative to the sampled members.
-            const uint32_t n_mem = static_cast<uint32_t>(b.member_ids.size());
-            if (cfg.build_core)  build_core_w.add_sorted(gkh, aamers, counts, n_mem, b.member_ids);
-            if (cfg.build_pcore) build_pcore_w.add_sorted(gkh, aamers, counts, n_mem);
-
+            if (cfg.build_core) {
+                std::vector<uint64_t> aamers; std::vector<uint32_t> counts;
+                b.genus_counter->finalize_sorted(aamers, counts);
+                const uint64_t gkh = GcovWriter::hash_genus(key);
+                // n_mem = members actually FOLDED (capped); the ceil(theta*n) core slice
+                // and prevalences are relative to sampled members.
+                const uint32_t n_mem = static_cast<uint32_t>(b.member_ids.size());
+                std::lock_guard<std::mutex> lk(core_writer_mx);
+                build_core_w.add_sorted(gkh, aamers, counts, n_mem, b.member_ids);
+            }
+            // PCORE is handled by pcore_spiller.finalize() after all genomes drain.
             b.model_emitted = true;
-            b.genus_counter.reset();                       // free union RAM
+            b.genus_counter.reset();
             std::vector<uint64_t>().swap(b.member_ids);
         };
 
@@ -1745,11 +1763,29 @@ struct ArchiveBuilder::Impl {
                     const bool genus_done = (cfg.build_core || cfg.build_pcore)
                         && genus_total.count(key) && bucket.arrived >= genus_total[key]
                         && genus_total[key] >= cc_micro_threshold;
+                    // Micro-genus complete: all expected genomes arrived, no CORE/PCORE model.
+                    // Fold immediately into the cross-genus bin-pack buffer to free the memory
+                    // rather than letting it accumulate until the end-of-build sweep.
+                    const bool micro_done = cc_micro_threshold > 0
+                        && genus_total.count(key) && bucket.arrived >= genus_total[key]
+                        && genus_total[key] < cc_micro_threshold;
                     if (genus_done) {
                         // All members of a modeled genus have arrived → flush the
                         // remainder (folds it in) and emit one full-density CORE/PCORE.
                         drop(bucket);
                         emit_core_pcore(key, bucket);
+                    } else if (micro_done) {
+                        taxon_total_bytes -= bucket.raw_bytes;
+                        taxon_total_aamer -= bucket.aamer_bytes;
+                        if (!micro_combine.empty() && micro_combine_bytes + bucket.raw_bytes
+                                >= cfg.shard_cfg.max_shard_size_bytes) {
+                            flush_staging_buf(micro_combine);
+                            micro_combine_bytes = 0;
+                        }
+                        micro_combine_bytes += bucket.raw_bytes;
+                        for (auto& item : bucket.items) micro_combine.push_back(std::move(item));
+                        bucket.raw_bytes = 0; bucket.aamer_bytes = 0;
+                        bucket.items.clear(); bucket.items.shrink_to_fit();
                     } else if (bucket.raw_bytes >= cfg.shard_cfg.max_shard_size_bytes) {
                         drop(bucket);
                     } else if (taxon_total_aamer >= taxon_aamer_cap || taxon_total_bytes >= taxon_global_cap) {
@@ -1759,7 +1795,47 @@ struct ArchiveBuilder::Impl {
                             [](const auto& a, const auto& b){
                                 return (a.second.aamer_bytes + a.second.raw_bytes)
                                      < (b.second.aamer_bytes + b.second.raw_bytes); });
-                        drop(it->second);
+                        // When the largest remaining bucket is a micro-genus, all large genera
+                        // have already been flushed.  Batch-flush every COMPLETE micro-genus in
+                        // sorted-key order (deterministic packing) instead of one-at-a-time,
+                        // which can never drain fast enough since each is well below the cap.
+                        const bool max_is_micro = cc_micro_threshold > 0
+                            && genus_total.count(it->first)
+                            && genus_total[it->first] < cc_micro_threshold;
+                        if (max_is_micro) {
+                            std::vector<std::pair<std::string, uint64_t>> ready;
+                            for (auto& [mk, mb] : taxon_buckets) {
+                                if (mb.items.empty()) continue;
+                                if (!genus_total.count(mk) || genus_total[mk] >= cc_micro_threshold) continue;
+                                if (mb.arrived < genus_total[mk]) continue;
+                                ready.push_back({mk, mb.raw_bytes});
+                            }
+                            if (!ready.empty()) {
+                                std::sort(ready.begin(), ready.end(),
+                                    [](const auto& a, const auto& b){ return a.first < b.first; });
+                                std::vector<ChunkItem> mcomb;
+                                uint64_t mcomb_bytes = 0;
+                                for (auto& [mk2, gbytes] : ready) {
+                                    auto& mb2 = taxon_buckets[mk2];
+                                    if (!mcomb.empty() && mcomb_bytes + gbytes >= cfg.shard_cfg.max_shard_size_bytes) {
+                                        flush_staging_buf(mcomb);
+                                        mcomb_bytes = 0;
+                                    }
+                                    taxon_total_bytes -= mb2.raw_bytes;
+                                    taxon_total_aamer -= mb2.aamer_bytes;
+                                    for (auto& item : mb2.items) mcomb.push_back(std::move(item));
+                                    mcomb_bytes += gbytes;
+                                    mb2.raw_bytes = 0; mb2.aamer_bytes = 0;
+                                    mb2.items.clear(); mb2.items.shrink_to_fit();
+                                }
+                                if (!mcomb.empty()) flush_staging_buf(mcomb);
+                            } else {
+                                // No complete micro-genera yet; flush the largest incomplete one.
+                                drop(it->second);
+                            }
+                        } else {
+                            drop(it->second);
+                        }
                     }
                 } else {
                     staging_raw_bytes += d.item->fasta.size();
@@ -1776,6 +1852,9 @@ struct ArchiveBuilder::Impl {
                              100.0 * n_done / std::max<size_t>(size_t(1), original_total_records),
                              current_shard_id, n_failed);
         }
+        // Flush any micro-genera that completed mid-build but didn't fill the shard.
+        if (!micro_combine.empty()) flush_staging_buf(micro_combine);
+
         // Final flush: remaining items in all buffers.
         // Micro-genera (below threshold) are bin-packed together to avoid
         // thousands of tiny shards from singleton-genus inputs.
@@ -1786,11 +1865,15 @@ struct ArchiveBuilder::Impl {
                 spdlog::info("micro-genus-threshold: auto -> {} ({} genomes)",
                              micro_genome_threshold, original_total_records);
 
-            std::vector<std::pair<std::string, std::vector<ChunkItem>>> micro_queue;
+            // Collect micro-genus keys + their raw_bytes for bin-packing, without moving
+            // all ChunkItems into one vector (which would spike peak RSS by n_micro * shard_size).
+            std::vector<std::pair<std::string, uint64_t>> micro_keys; // (key, raw_bytes)
+            uint32_t n_micro = 0;
             for (auto& [key, bucket] : taxon_buckets) {
                 if (bucket.items.empty()) continue;
                 if (static_cast<uint32_t>(bucket.items.size()) < micro_genome_threshold) {
-                    micro_queue.push_back({key, std::move(bucket.items)});
+                    micro_keys.push_back({key, bucket.raw_bytes});
+                    ++n_micro;
                 } else {
                     taxon_total_bytes -= bucket.raw_bytes; taxon_total_aamer -= bucket.aamer_bytes;
                     flush_staging_buf(bucket.items, &bucket.genus_counter, &bucket.member_ids);
@@ -1801,27 +1884,30 @@ struct ArchiveBuilder::Impl {
             // Safety: emit CORE/PCORE for any modeled genus not closed during the drain.
             for (auto& [k2, b2] : taxon_buckets) emit_core_pcore(k2, b2);
 
-            // Deterministic ordering → reproducible packing across builds
-            std::sort(micro_queue.begin(), micro_queue.end(),
+            // Deterministic ordering → reproducible packing across builds.
+            // Sort only the keys; items stay in taxon_buckets until consumed below.
+            std::sort(micro_keys.begin(), micro_keys.end(),
                 [](const auto& a, const auto& b) { return a.first < b.first; });
 
-            // Greedy first-fit: pack micro-genera until shard size target reached
+            // Greedy first-fit: pack micro-genera one-at-a-time (bounded combined buffer)
+            // rather than materialising all items at once.
             std::vector<ChunkItem> combined;
             uint64_t combined_bytes = 0;
-            for (auto& [key, items] : micro_queue) {
-                uint64_t genus_bytes = 0;
-                for (const auto& item : items) genus_bytes += item.fasta.size();
+            for (auto& [key, genus_bytes] : micro_keys) {
+                auto& bucket = taxon_buckets[key];
                 if (!combined.empty() && combined_bytes + genus_bytes >= cfg.shard_cfg.max_shard_size_bytes) {
                     flush_staging_buf(combined);
                     combined_bytes = 0;
                 }
-                for (auto& item : items) combined.push_back(std::move(item));
+                for (auto& item : bucket.items) combined.push_back(std::move(item));
                 combined_bytes += genus_bytes;
+                bucket.items.clear();
+                bucket.items.shrink_to_fit();
             }
             if (!combined.empty()) flush_staging_buf(combined);
 
-            if (!micro_queue.empty())
-                spdlog::info("Packed {} micro-genera into combined shards", micro_queue.size());
+            if (n_micro > 0)
+                spdlog::info("Packed {} micro-genera into combined shards", n_micro);
         } else {
             if (!staging_buffer.empty()) flush_staging_buf(staging_buffer);
         }
@@ -1840,6 +1926,18 @@ struct ArchiveBuilder::Impl {
         // Drain all in-flight genus-finalization tasks before writing metadata sections.
         for (auto& f : genus_futs) f.wait();
         genus_futs.clear();
+
+        // Sort + scan all PCORE spill partitions; emit one add_sorted() per genus.
+        if (cfg.build_pcore && !pcore_spiller.empty()) {
+            spdlog::info("build: PCORE — sorting {} spill partitions…",
+                         PcoreSpillWriter::N_PARTS);
+            pcore_spiller.finalize(static_cast<int>(n_workers),
+                [&](uint64_t gkh, std::vector<uint64_t>& aamers,
+                    std::vector<uint32_t>& counts, uint32_t n_mem) {
+                    std::lock_guard<std::mutex> lk(core_writer_mx);
+                    build_pcore_w.add_sorted(gkh, aamers, counts, n_mem);
+                });
+        }
 
         std::fclose(ckpt_meta_file);
         ckpt_meta_file = nullptr;

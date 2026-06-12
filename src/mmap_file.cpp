@@ -1,9 +1,11 @@
 #include <genopack/mmap_file.hpp>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/sendfile.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <cerrno>
+#include <vector>
 #include <cstring>
 #include <stdexcept>
 #include <thread>
@@ -74,7 +76,7 @@ void MmapFileReader::advise(uint64_t offset, uint64_t len, int advice) const {
 
 void AppendWriter::create(const std::filesystem::path& path) {
     close();
-    fd_ = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
     if (fd_ < 0)
         throw std::runtime_error("AppendWriter: cannot create " + path.string()
                                  + ": " + std::strerror(errno));
@@ -83,7 +85,7 @@ void AppendWriter::create(const std::filesystem::path& path) {
 
 void AppendWriter::open_append(const std::filesystem::path& path) {
     close();
-    fd_ = ::open(path.c_str(), O_WRONLY, 0644);
+    fd_ = ::open(path.c_str(), O_RDWR, 0644);
     if (fd_ < 0)
         throw std::runtime_error("AppendWriter: cannot open " + path.string()
                                  + ": " + std::strerror(errno));
@@ -176,6 +178,62 @@ void AppendWriter::write_at(uint64_t offset, const void* data, uint64_t len) {
         remaining -= static_cast<uint64_t>(n);
         pos       += n;
     }
+}
+
+uint64_t AppendWriter::append_from_fd(int src_fd, uint64_t count) {
+    const uint64_t start = offset_;
+    // Position output fd at the write target offset (sendfile uses fd position).
+    if (::lseek(fd_, static_cast<off_t>(offset_), SEEK_SET) < 0)
+        throw std::runtime_error("AppendWriter::append_from_fd: lseek: " +
+                                 std::string(std::strerror(errno)));
+    uint64_t remaining = count;
+    bool use_sendfile = true;
+    int retry_secs = 5;
+    while (remaining > 0) {
+        if (use_sendfile) {
+            const size_t want = static_cast<size_t>(std::min<uint64_t>(remaining, 64u << 20));
+            ssize_t n = ::sendfile(fd_, src_fd, nullptr, want);
+            if (n > 0) {
+                remaining  -= static_cast<uint64_t>(n);
+                offset_    += static_cast<uint64_t>(n);
+                retry_secs  = 5;
+                continue;
+            }
+            if (n < 0 && errno == EINTR) continue;
+            if (n < 0 && (errno == EINVAL || errno == ENOSYS)) {
+                // sendfile not supported by this filesystem; fall through to pread+pwrite.
+                use_sendfile = false;
+                continue;
+            }
+            // ENOSPC/EIO: match AppendWriter::append() NFS retry behaviour.
+            if (n < 0 && (errno == ENOSPC || errno == EIO) && retry_secs <= 300) {
+                spdlog::warn("AppendWriter::append_from_fd: sendfile failed ({}), retrying in {}s…",
+                             std::strerror(errno), retry_secs);
+                std::this_thread::sleep_for(std::chrono::seconds(retry_secs));
+                retry_secs = std::min(retry_secs * 2, 300);
+                // Re-seek output fd; the fd position is undefined after a failed sendfile.
+                ::lseek(fd_, static_cast<off_t>(offset_), SEEK_SET);
+                continue;
+            }
+            throw std::runtime_error("AppendWriter::append_from_fd: sendfile: " +
+                                     std::string(std::strerror(errno)));
+        } else {
+            // Fallback: pread from src_fd at absolute offset 0+progress, write via append().
+            // Callers must open src_fd at position 0; src_off tracks progress within the src.
+            static thread_local std::vector<uint8_t> buf;
+            if (buf.size() < (4u << 20)) buf.resize(4u << 20);
+            const size_t want = static_cast<size_t>(std::min<uint64_t>(remaining, buf.size()));
+            const uint64_t src_off = count - remaining; // assumes src_fd opened at offset 0
+            ssize_t nr = ::pread(src_fd, buf.data(), want, static_cast<off_t>(src_off));
+            if (nr < 0 && errno == EINTR) continue;
+            if (nr <= 0)
+                throw std::runtime_error("AppendWriter::append_from_fd: pread: " +
+                                         std::string(std::strerror(errno)));
+            append(buf.data(), static_cast<uint64_t>(nr)); // append() has ENOSPC/EIO retry
+            remaining -= static_cast<uint64_t>(nr);
+        }
+    }
+    return start;
 }
 
 void AppendWriter::enable_sync_writes() {

@@ -78,6 +78,11 @@ public:
     // Append bytes; returns start offset of this write.
     uint64_t append(const void* data, uint64_t len);
 
+    // Append count bytes from src_fd (at its current file position) using
+    // sendfile(2) with short-write loop, EINTR retry, and pread+pwrite fallback
+    // for filesystems where sendfile is unsupported (EINVAL/ENOSYS).
+    uint64_t append_from_fd(int src_fd, uint64_t count);
+
     // Pad to alignment boundary with zero bytes; returns new offset.
     uint64_t align(uint64_t alignment = 8);
 
@@ -95,6 +100,8 @@ public:
     void enable_sync_writes();
 
     void flush();
+
+    int fd() const noexcept { return fd_; }
 
 private:
     int      fd_     = -1;
