@@ -352,8 +352,9 @@ SectionDesc SkchWriterMultiK::finalize(AppendWriter& writer, uint64_t section_id
         };
 
         // ── Sequential-read pass: load all frame records sorted by spill offset ──
-        // Previously: 9 × frame_n random fseeks (sig1/sig2/mask × nk).
-        // Now: 1 × frame_n reads in ascending spill-offset order → 9× fewer I/Os.
+        // Sort frame indices by spill offset, then batch consecutive runs into a
+        // single fread. For taxonomy-sorted input, most frame records are
+        // consecutive → a handful of frreads per frame instead of frame_n.
         std::vector<std::pair<uint32_t,uint32_t>> read_order_frame(frame_n);
         for (uint32_t j = 0; j < frame_n; ++j)
             read_order_frame[j] = {order[row_start + j], j};
@@ -362,16 +363,25 @@ SectionDesc SkchWriterMultiK::finalize(AppendWriter& writer, uint64_t section_id
 
         std::vector<uint8_t> frame_buf(static_cast<size_t>(frame_n) * spill_record_size_);
         std::vector<uint32_t> rank_to_slot(frame_n);
-        for (uint32_t slot = 0; slot < frame_n; ++slot) {
-            const uint32_t spill_idx = read_order_frame[slot].first;
-            const uint32_t local_j   = read_order_frame[slot].second;
-            const long off = static_cast<long>(static_cast<size_t>(spill_idx) * spill_record_size_);
+
+        // Batch contiguous spill-index runs into a single fread each.
+        uint32_t slot = 0;
+        while (slot < frame_n) {
+            uint32_t run_end = slot + 1;
+            while (run_end < frame_n &&
+                   read_order_frame[run_end].first == read_order_frame[run_end - 1].first + 1)
+                ++run_end;
+            const uint32_t run_len = run_end - slot;
+            const long off = static_cast<long>(
+                static_cast<size_t>(read_order_frame[slot].first) * spill_record_size_);
             if (std::fseek(spill_fp_, off, SEEK_SET) != 0)
                 throw std::runtime_error("SkchWriterMultiK V4: fseek frame");
             if (std::fread(frame_buf.data() + static_cast<size_t>(slot) * spill_record_size_,
-                           1, spill_record_size_, spill_fp_) != spill_record_size_)
+                           spill_record_size_, run_len, spill_fp_) != run_len)
                 throw std::runtime_error("SkchWriterMultiK V4: fread frame");
-            rank_to_slot[local_j] = slot;
+            for (uint32_t s = slot; s < run_end; ++s)
+                rank_to_slot[read_order_frame[s].second] = s;
+            slot = run_end;
         }
         // ────────────────────────────────────────────────────────────────────
 
