@@ -443,29 +443,57 @@ PassAResult run_pass_a(ICheckReader& pack,
                          gstx_targets.size());
         }
 
-        // ── 3b: Legacy per-genus path for no-GSTX genera (serial) ───────────────
+        // ── 3b: No-GSTX genera — two global sorted passes then parallel post-process
+        // Old: 2 × N_genera sequential visit_sketch_gids calls (N≈500 → ~1000 NFS scans)
+        // New: 2 global sorted scans (one consensus, one leakage) + parallel per-genus scoring
         if (!nogstx_targets.empty()) {
             spdlog::info("check pass-A: {} targets in no-GSTX genera (legacy path)",
                          nogstx_targets.size());
 
+            static constexpr int kMaxSample = 2000;
+
             std::unordered_map<uint32_t, int> k_to_ki;
             for (int ki = 0; ki < n_k; ++ki) k_to_ki[avail_k[ki]] = ki;
 
-            // Collect unique genus indices with no GSTX
             std::vector<int> nogstx_gi;
             {
                 std::unordered_set<int> seen;
                 for (const auto& gt : nogstx_targets)
                     if (seen.insert(gt.gi).second) nogstx_gi.push_back(gt.gi);
             }
+            const int n_nogstx = static_cast<int>(nogstx_gi.size());
 
-            for (int gi : nogstx_gi) {
-                const std::string& genus  = active_genera[gi];
-                const auto& all_members   = genus_all.at(genus);
-                auto& tq                  = genus_tq[gi];
-                const int n               = static_cast<int>(all_members.size());
+            struct GenusState {
+                std::vector<GenusSignatureVote>   votes;
+                std::vector<GenomeId>             sample_gids;
+                std::unordered_map<GenomeId, int> sample_pos;
+                std::vector<float>                sample_lk;   // [n_sample × GSTX_MAX_K]
+                std::vector<uint32_t>             sample_nrb;
+                std::unordered_set<GenomeId>      tq_gids;
+                std::unordered_map<GenomeId, int> tq_by_gid;
+            };
+            std::vector<GenusState> gstates(n_nogstx);
 
-                // Sort all member gids for sequential frame access
+            // gid → gstates index for the two global passes
+            std::unordered_map<GenomeId, int> gid_to_gsidx;
+            std::unordered_map<GenomeId, int> sgid_to_gsidx;
+
+            for (int gii = 0; gii < n_nogstx; ++gii) {
+                const int gi             = nogstx_gi[gii];
+                const auto& all_members  = genus_all.at(active_genera[gi]);
+                const auto& tq           = genus_tq[gi];
+                auto& gs                 = gstates[gii];
+                const int n              = static_cast<int>(all_members.size());
+
+                gs.votes.reserve(n_k);
+                for (int ki = 0; ki < n_k; ++ki) gs.votes.emplace_back(sketch_sz);
+
+                for (int ti = 0; ti < static_cast<int>(tq.size()); ++ti) {
+                    if (!tq[ti].m->gid) continue;
+                    gs.tq_by_gid[tq[ti].m->gid] = ti;
+                    gs.tq_gids.insert(tq[ti].m->gid);
+                }
+
                 std::vector<std::pair<GenomeId, std::string>> id_acc;
                 id_acc.reserve(n);
                 for (const auto& m : all_members)
@@ -473,103 +501,113 @@ PassAResult run_pass_a(ICheckReader& pack,
                 std::sort(id_acc.begin(), id_acc.end(),
                           [](const auto& a, const auto& b) { return a.first < b.first; });
 
-                std::vector<GenomeId> all_gids;
-                all_gids.reserve(id_acc.size());
-                for (const auto& [gid, _] : id_acc) all_gids.push_back(gid);
+                for (const auto& [gid, _] : id_acc) gid_to_gsidx[gid] = gii;
 
-                // BM consensus pass
-                std::vector<GenusSignatureVote> votes;
-                votes.reserve(n_k);
-                for (int ki = 0; ki < n_k; ++ki) votes.emplace_back(sketch_sz);
+                for (const auto& [gid, _] : id_acc)
+                    if (gs.tq_by_gid.count(gid)) gs.sample_gids.push_back(gid);
+                const int budget = kMaxSample - static_cast<int>(gs.sample_gids.size());
+                if (budget > 0) {
+                    int step = std::max(1, n / budget);
+                    for (int i = 0; i < n &&
+                             static_cast<int>(gs.sample_gids.size()) < kMaxSample; i += step)
+                        if (!gs.tq_by_gid.count(id_acc[i].first))
+                            gs.sample_gids.push_back(id_acc[i].first);
+                    std::sort(gs.sample_gids.begin(), gs.sample_gids.end());
+                }
+                const int ns = static_cast<int>(gs.sample_gids.size());
+                for (int si = 0; si < ns; ++si) {
+                    gs.sample_pos[gs.sample_gids[si]] = si;
+                    sgid_to_gsidx[gs.sample_gids[si]] = gii;
+                }
+                gs.sample_lk.assign(static_cast<size_t>(ns) * GSTX_MAX_K, NAN);
+                gs.sample_nrb.assign(static_cast<size_t>(ns), 0);
+            }
+
+            // Pass 1: one global sorted scan — update BM consensus for every genus
+            {
+                std::vector<GenomeId> all_gids;
+                all_gids.reserve(gid_to_gsidx.size());
+                for (const auto& [gid, _] : gid_to_gsidx) all_gids.push_back(gid);
+                std::sort(all_gids.begin(), all_gids.end());
 
                 pack.visit_sketch_gids(all_gids, sketch_sz,
-                    [&](size_t, uint32_t ki_raw, const SketchResult& sk) {
-                        auto it = k_to_ki.find(ki_raw);
-                        if (it == k_to_ki.end()) return;
-                        votes[it->second].update(sk.sig, sk.sketch_size);
+                    [&](size_t bidx, uint32_t ki_raw, const SketchResult& sk) {
+                        auto kit = k_to_ki.find(ki_raw);
+                        if (kit == k_to_ki.end()) return;
+                        auto git = gid_to_gsidx.find(all_gids[bidx]);
+                        if (git == gid_to_gsidx.end()) return;
+                        gstates[git->second].votes[kit->second].update(sk.sig, sk.sketch_size);
                     });
+            }
 
-                // Sample for scoring (targets + uniform sample up to 2000)
-                static constexpr int kMaxSample = 2000;
-                std::unordered_map<GenomeId, int> tq_by_gid;
-                for (int ti = 0; ti < static_cast<int>(tq.size()); ++ti)
-                    if (tq[ti].m->gid > 0) tq_by_gid[tq[ti].m->gid] = ti;
+            // Pass 2: one global sorted scan — compute leakage against per-genus consensus
+            {
+                std::vector<GenomeId> all_sample;
+                all_sample.reserve(sgid_to_gsidx.size());
+                for (const auto& [gid, _] : sgid_to_gsidx) all_sample.push_back(gid);
+                std::sort(all_sample.begin(), all_sample.end());
 
-                std::vector<GenomeId> sample_gids;
-                for (const auto& [gid, _] : id_acc)
-                    if (tq_by_gid.count(gid)) sample_gids.push_back(gid);
-                const int budget = kMaxSample - static_cast<int>(sample_gids.size());
-                if (budget > 0) {
-                    int step = std::max(1, static_cast<int>(id_acc.size()) / budget);
-                    for (int i = 0; i < static_cast<int>(id_acc.size()) &&
-                             static_cast<int>(sample_gids.size()) < kMaxSample; i += step)
-                        if (!tq_by_gid.count(id_acc[i].first))
-                            sample_gids.push_back(id_acc[i].first);
-                    std::sort(sample_gids.begin(), sample_gids.end());
-                }
-                const int n_sample = static_cast<int>(sample_gids.size());
-
-                // Leakage + n_real_bins pass over sample
-                std::vector<float>    sample_lk(static_cast<size_t>(n_sample) * GSTX_MAX_K, NAN);
-                std::vector<uint32_t> sample_nrb(static_cast<size_t>(n_sample), 0);
-
-                pack.visit_sketch_gids(sample_gids, sketch_sz,
-                    [&](size_t sidx, uint32_t ki_raw, const SketchResult& sk) {
-                        auto it = k_to_ki.find(ki_raw);
-                        if (it == k_to_ki.end()) return;
-                        const int ki = it->second;
-                        sample_lk[sidx * GSTX_MAX_K + ki] =
-                            votes[ki].leakage(sk.sig, sk.sketch_size);
-                        if (ki == 0) sample_nrb[sidx] = sk.n_real_bins;
+                pack.visit_sketch_gids(all_sample, sketch_sz,
+                    [&](size_t bidx, uint32_t ki_raw, const SketchResult& sk) {
+                        auto kit = k_to_ki.find(ki_raw);
+                        if (kit == k_to_ki.end()) return;
+                        const int ki   = kit->second;
+                        const GenomeId gid = all_sample[bidx];
+                        auto git = sgid_to_gsidx.find(gid);
+                        if (git == sgid_to_gsidx.end()) return;
+                        auto& gs   = gstates[git->second];
+                        auto sit   = gs.sample_pos.find(gid);
+                        if (sit == gs.sample_pos.end()) return;
+                        const int si = sit->second;
+                        gs.sample_lk[static_cast<size_t>(si) * GSTX_MAX_K + ki] =
+                            gs.votes[ki].leakage(sk.sig, sk.sketch_size);
+                        if (ki == 0) gs.sample_nrb[si] = sk.n_real_bins;
                     });
+            }
 
-                // p90 from k=0 containment + nrb across reference members in sample
-                // (exclude query targets from p90 computation)
-                std::unordered_set<GenomeId> tq_gids;
-                for (const auto& tqr : tq)
-                    if (tqr.m->gid) tq_gids.insert(tqr.m->gid);
+            // Post-process: p90 + score application — no I/O, parallel across genera
+            #pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
+            for (int gii = 0; gii < n_nogstx; ++gii) {
+                auto& gs     = gstates[gii];
+                auto& tq     = genus_tq[nogstx_gi[gii]];
+                const int ns = static_cast<int>(gs.sample_gids.size());
 
                 std::vector<float> c0_all, nrb_ref;
-                c0_all.reserve(n_sample);
-                nrb_ref.reserve(n_sample);
-                for (int si = 0; si < n_sample; ++si) {
-                    float v = sample_lk[static_cast<size_t>(si) * GSTX_MAX_K + 0];
+                c0_all.reserve(ns);
+                nrb_ref.reserve(ns);
+                for (int si = 0; si < ns; ++si) {
+                    const float v = gs.sample_lk[static_cast<size_t>(si) * GSTX_MAX_K + 0];
                     if (!std::isnan(v)) c0_all.push_back(1.0f - v);
-                    if (!tq_gids.count(sample_gids[si]) && sample_nrb[si] > 0)
-                        nrb_ref.push_back(static_cast<float>(sample_nrb[si]));
+                    if (!gs.tq_gids.count(gs.sample_gids[si]) && gs.sample_nrb[si] > 0)
+                        nrb_ref.push_back(static_cast<float>(gs.sample_nrb[si]));
                 }
                 float p90_c0 = 0.0f;
                 if (!c0_all.empty()) {
-                    size_t p90_idx = static_cast<size_t>(
+                    size_t idx = static_cast<size_t>(
                         std::ceil(0.9f * static_cast<float>(c0_all.size())) - 1);
                     std::nth_element(c0_all.begin(),
-                                     c0_all.begin() + static_cast<ptrdiff_t>(p90_idx),
+                                     c0_all.begin() + static_cast<ptrdiff_t>(idx),
                                      c0_all.end());
-                    p90_c0 = c0_all[p90_idx];
+                    p90_c0 = c0_all[idx];
                 }
                 float nrb_p90 = 0.0f;
                 if (!nrb_ref.empty()) {
-                    size_t p90_idx = static_cast<size_t>(
+                    size_t idx = static_cast<size_t>(
                         0.9f * static_cast<float>(nrb_ref.size()));
-                    if (p90_idx >= nrb_ref.size()) p90_idx = nrb_ref.size() - 1;
+                    if (idx >= nrb_ref.size()) idx = nrb_ref.size() - 1;
                     std::nth_element(nrb_ref.begin(),
-                                     nrb_ref.begin() + static_cast<ptrdiff_t>(p90_idx),
+                                     nrb_ref.begin() + static_cast<ptrdiff_t>(idx),
                                      nrb_ref.end());
-                    nrb_p90 = nrb_ref[p90_idx];
+                    nrb_p90 = nrb_ref[idx];
                 }
-
-                // Apply scores to target genomes
-                std::unordered_map<GenomeId, int> sample_pos;
-                for (int si = 0; si < n_sample; ++si)
-                    sample_pos[sample_gids[si]] = si;
 
                 for (auto& tqr : tq) {
                     if (!tqr.m->gid) continue;
-                    auto it = sample_pos.find(tqr.m->gid);
-                    if (it == sample_pos.end()) continue;
-                    const float* tlk = &sample_lk[static_cast<size_t>(it->second) * GSTX_MAX_K];
+                    auto it = gs.sample_pos.find(tqr.m->gid);
+                    if (it == gs.sample_pos.end()) continue;
+                    const float* tlk = &gs.sample_lk[static_cast<size_t>(it->second) * GSTX_MAX_K];
                     apply_leakage_scores(tqr.q, tlk, n_k, avail_k.data(), p90_c0);
-                    const uint32_t qnrb = sample_nrb[it->second];
+                    const uint32_t qnrb = gs.sample_nrb[it->second];
                     if (nrb_p90 > 0.0f && qnrb > 0)
                         tqr.q.completeness_sketch_fill = std::clamp(
                             static_cast<float>(qnrb) / nrb_p90, 0.0f, 1.5f);
