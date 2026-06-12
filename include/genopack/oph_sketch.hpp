@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <span>
 #include <vector>
 
 namespace genopack {
@@ -48,5 +49,12 @@ OPHDualSketchResult sketch_oph_dual_from_buffer(const char* data, size_t len,
                                                 int kmer_size, int sketch_size,
                                                 int syncmer_s,
                                                 uint64_t seed1, uint64_t seed2);
+
+// Fused multi-k dual-seed OPH: ONE DNA scan for all k values in parallel.
+// results[i] is byte-identical to sketch_oph_dual_from_buffer(..., ks[i], ...).
+std::vector<OPHDualSketchResult> sketch_oph_dual_multik(
+    const char* seq, size_t len, std::span<const int> ks,
+    int sketch_size, int syncmer_s,
+    uint64_t seed1, uint64_t seed2);
 
 } // namespace genopack

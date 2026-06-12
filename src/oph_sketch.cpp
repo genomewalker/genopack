@@ -3,6 +3,7 @@
 #include <array>
 #include <cstring>
 #include <limits>
+#include <span>
 #ifdef __AVX2__
 #include <immintrin.h>
 #endif
@@ -452,6 +453,125 @@ OPHDualSketchResult sketch_oph_dual_impl(const char* data, size_t size,
     return result;
 }
 
+// ── Fused multi-k OPH: one DNA scan, nks parallel k-mer lanes ─────────────────
+struct MultiKLane {
+    OPHKmerState state{};
+    uint64_t k_mask   = 0;
+    int      rev_shift = 0;
+    int      k         = 0;
+};
+
+template <uint32_t FixedBins>
+[[gnu::always_inline]] static void multik_process_run(
+        const char* data, size_t i, size_t run_end,
+        uint64_t seed1, uint64_t seed2, uint32_t runtime_bins,
+        MultiKLane* lanes, int nks,
+        uint16_t* const* sig1, uint64_t* const* rb1,
+        uint16_t* const* sig2, uint64_t* const* rb2) {
+    for (size_t j = i; j < run_end; ++j) {
+        const uint8_t base  = BASE_ENCODE[static_cast<uint8_t>(data[j])];
+        const uint64_t cbase = 3ULL - base;
+        for (int l = 0; l < nks; ++l) {
+            MultiKLane& L = lanes[l];
+            L.state.fwd = ((L.state.fwd << 2) | base) & L.k_mask;
+            L.state.rev = (L.state.rev >> 2) | (cbase << L.rev_shift);
+            if (L.state.valid < L.k) { if (++L.state.valid < L.k) continue; }
+            const uint64_t can = L.state.fwd ^ ((L.state.fwd ^ L.state.rev) &
+                                  -(uint64_t)(L.state.fwd > L.state.rev));
+            const uint64_t h1 = oph_hash_wymix(can, seed1);
+            const uint64_t h2 = oph_hash_wymix(can, seed2);
+            if constexpr (FixedBins != 0)
+                update_dual_bin(sig1[l], rb1[l], sig2[l], rb2[l], h1, h2, FixedBins);
+            else
+                update_dual_bin(sig1[l], rb1[l], sig2[l], rb2[l], h1, h2, runtime_bins);
+        }
+    }
+}
+
+template <uint32_t FixedBins>
+std::vector<OPHDualSketchResult> sketch_oph_dual_multik_impl(
+        const char* data, size_t size, std::span<const int> ks,
+        int m, uint64_t seed1, uint64_t seed2) {
+    const uint16_t EMPTY = std::numeric_limits<uint16_t>::max();
+    const int      nks   = static_cast<int>(ks.size());
+    const uint32_t runtime_bins = static_cast<uint32_t>(m);
+    const size_t   words = (static_cast<size_t>(m) + 63) / 64;
+
+    std::vector<OPHDualSketchResult> results(nks);
+    std::vector<uint64_t>  rbins_flat(2 * words * static_cast<size_t>(nks), 0ULL);
+    std::vector<MultiKLane> lanes(nks);
+    std::vector<uint16_t*> p_sig1(nks), p_sig2(nks);
+    std::vector<uint64_t*> p_rb1(nks), p_rb2(nks);
+
+    for (int l = 0; l < nks; ++l) {
+        const int k = ks[l];
+        auto& r = results[l];
+        r.signature1.assign(m, EMPTY);
+        r.signature2.assign(m, EMPTY);
+        r.real_bins_bitmask.assign(words, 0ULL);
+        lanes[l].k         = k;
+        lanes[l].k_mask    = (k == 32) ? UINT64_MAX : ((1ULL << (2 * k)) - 1);
+        lanes[l].rev_shift = 2 * (k - 1);
+        p_sig1[l] = r.signature1.data();
+        p_sig2[l] = r.signature2.data();
+        p_rb1[l]  = rbins_flat.data() + static_cast<size_t>(2 * l) * words;
+        p_rb2[l]  = rbins_flat.data() + static_cast<size_t>(2 * l + 1) * words;
+    }
+
+    bool     in_header    = false;
+    size_t   i            = 0;
+    uint64_t genome_length = 0;
+    uint32_t n_contigs    = 0;
+
+    while (i < size) {
+        const char c = data[i];
+        if (c == '>') {
+            ++n_contigs;
+            for (auto& L : lanes) L.state.reset();
+            in_header = true;
+            const char* nl = static_cast<const char*>(std::memchr(data + i, '\n', size - i));
+            if (nl) { i = static_cast<size_t>(nl - data) + 1; in_header = false; }
+            else break;
+            continue;
+        }
+        if (in_header) { if (c == '\n') in_header = false; ++i; continue; }
+        if (c == '\n' || c == '\r') { ++i; continue; }
+        if (encode_base(c) == 255) {
+            for (auto& L : lanes) L.state.reset();
+            ++i; continue;
+        }
+        const size_t run_start = i;
+        const size_t run_end   = i + scan_valid_run(data + i, size - i);
+        multik_process_run<FixedBins>(
+            data, i, run_end, seed1, seed2, runtime_bins,
+            lanes.data(), nks,
+            p_sig1.data(), p_rb1.data(), p_sig2.data(), p_rb2.data());
+        i = run_end;
+        genome_length += static_cast<uint64_t>(i - run_start);
+        if (i < size) {
+            const char stop = data[i];
+            if (stop != '\n' && stop != '\r' && stop != '>') {
+                for (auto& L : lanes) L.state.reset();
+                ++i;
+            }
+        }
+    }
+
+    for (int l = 0; l < nks; ++l) {
+        auto& r = results[l];
+        for (size_t w = 0; w < words; ++w)
+            r.real_bins_bitmask[w] = p_rb1[l][w] | p_rb2[l][w];
+        r.n_real_bins = 0;
+        for (auto w : r.real_bins_bitmask)
+            r.n_real_bins += static_cast<uint32_t>(__builtin_popcountll(w));
+        r.genome_length = genome_length;
+        r.n_contigs     = n_contigs;
+        finalize_signature(r.signature1, m);
+        finalize_signature(r.signature2, m);
+    }
+    return results;
+}
+
 } // anonymous namespace
 
 OPHDualSketchResult sketch_oph_dual_from_buffer(const char* data, size_t len,
@@ -461,6 +581,15 @@ OPHDualSketchResult sketch_oph_dual_from_buffer(const char* data, size_t len,
     if (sketch_size == static_cast<int>(DEFAULT_OPH_BINS))
         return sketch_oph_dual_impl<DEFAULT_OPH_BINS>(data, len, sketch_size, kmer_size, seed1, seed2);
     return sketch_oph_dual_impl<0>(data, len, sketch_size, kmer_size, seed1, seed2);
+}
+
+std::vector<OPHDualSketchResult> sketch_oph_dual_multik(
+        const char* seq, size_t len, std::span<const int> ks,
+        int sketch_size, int /*syncmer_s*/,
+        uint64_t seed1, uint64_t seed2) {
+    if (sketch_size == static_cast<int>(DEFAULT_OPH_BINS))
+        return sketch_oph_dual_multik_impl<DEFAULT_OPH_BINS>(seq, len, ks, sketch_size, seed1, seed2);
+    return sketch_oph_dual_multik_impl<0>(seq, len, ks, sketch_size, seed1, seed2);
 }
 
 } // namespace genopack

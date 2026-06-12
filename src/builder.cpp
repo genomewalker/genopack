@@ -44,6 +44,7 @@
 #include <queue>
 #include <random>
 #include <stdexcept>
+#include <span>
 #include <string_view>
 #include <thread>
 #include <unistd.h>
@@ -54,6 +55,34 @@
 #include <vector>
 
 namespace genopack {
+
+namespace {
+// LSD byte-radix sort + dedup for uint64_t. O(8n), branch-free inner loop.
+// Output is ascending with duplicates removed — bit-identical to std::sort+unique.
+// `scratch` is a caller-supplied reusable buffer (use thread_local to amortise alloc).
+static void radix_sort_dedup_u64(std::vector<uint64_t>& v,
+                                 std::vector<uint64_t>& scratch) {
+    const size_t n = v.size();
+    if (n < 2) return;
+    scratch.resize(n);
+    uint64_t* src = v.data();
+    uint64_t* dst = scratch.data();
+    for (int shift = 0; shift < 64; shift += 8) {
+        size_t cnt[257] = {};
+        for (size_t i = 0; i < n; ++i) ++cnt[((src[i] >> shift) & 0xFF) + 1];
+        bool single = false;
+        for (int b = 0; b < 256; ++b) if (cnt[b + 1] == n) { single = true; break; }
+        if (single) continue;
+        for (int b = 0; b < 256; ++b) cnt[b + 1] += cnt[b];
+        for (size_t i = 0; i < n; ++i) dst[cnt[(src[i] >> shift) & 0xFF]++] = src[i];
+        std::swap(src, dst);
+    }
+    if (src != v.data()) std::memcpy(v.data(), src, n * sizeof(uint64_t));
+    size_t w = 1;
+    for (size_t r = 1; r < n; ++r) if (v[r] != v[r - 1]) v[w++] = v[r];
+    v.resize(w);
+}
+} // namespace
 
 // ── Build-params (BPRM) ───────────────────────────────────────────────────────
 // Build the canonical BprmHeader from the config. Pure function of cfg, so it is
@@ -851,8 +880,9 @@ struct ArchiveBuilder::Impl {
         std::mutex              task_mx;
         std::condition_variable task_cv;
 
-        // Completion queue — bounded to prevent OOM on large archives.
-        const size_t            done_q_max = n_workers * 2;
+        // Completion queue — sized to absorb n_workers genomes during a full shard
+        // flush (~500 ms) so workers never stall on done_push_cv.
+        const size_t            done_q_max = n_workers * 4;
         struct Done { std::optional<ChunkItem> item; };
         std::queue<Done>        done_q;
         std::mutex              done_mx;
@@ -972,12 +1002,11 @@ struct ArchiveBuilder::Impl {
                             const uint64_t seed1 = cfg.sketch_seed;
                             const uint64_t seed2 = cfg.sketch_seed + 1;
                             if (multi_k_sketch) {
-                                for (int k : cfg.sketch_kmer_sizes) {
-                                    sks_mk.push_back(sketch_oph_dual_from_buffer(
-                                        fasta.data(), fasta.size(),
-                                        k, cfg.sketch_size, cfg.sketch_syncmer_s,
-                                        seed1, seed2));
-                                }
+                                sks_mk = sketch_oph_dual_multik(
+                                    fasta.data(), fasta.size(),
+                                    std::span<const int>(cfg.sketch_kmer_sizes),
+                                    cfg.sketch_size, cfg.sketch_syncmer_s,
+                                    seed1, seed2);
                             } else {
                                 sk = sketch_oph_dual_from_buffer(
                                     fasta.data(), fasta.size(),
@@ -1030,8 +1059,8 @@ struct ArchiveBuilder::Impl {
                                 }
                             }
                             if (want_aamers) {
-                                std::sort(aamers.begin(), aamers.end());
-                                aamers.erase(std::unique(aamers.begin(), aamers.end()), aamers.end());
+                                thread_local std::vector<uint64_t> radix_scratch;
+                                radix_sort_dedup_u64(aamers, radix_scratch);
                             }
                         }
                         d.item = ChunkItem{*t.record, t.gid, t.input_row_index,
