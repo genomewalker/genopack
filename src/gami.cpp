@@ -3,6 +3,7 @@
 #include <genopack/format.hpp>      // SectionDesc, SEC_GAMI
 #include <zstd.h>
 #include <algorithm>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -84,19 +85,16 @@ void gami_v2_load(const uint8_t* section_data, uint64_t section_size,
     if (dsz != raw_size)
         throw std::runtime_error("gami_v2_load: size mismatch after decompress");
 
-    const auto* hptr = reinterpret_cast<const uint64_t*>(raw.data());
     const uint8_t* cptr = raw.data() + N * sizeof(uint64_t);
+    const size_t n = static_cast<size_t>(N);
 
-    out.reserve(static_cast<size_t>(N));
-    for (uint64_t i = 0; i < N; ++i) {
-        // Direct insert bypassing increment() — we already have exact counts.
-        const uint64_t h = hptr[i];
-        uint64_t slot = h & out.mask_;
-        while (out.keys_[slot] != GlobalMultiplicityIndex::kEmpty) slot = (slot + 1) & out.mask_;
-        out.keys_[slot] = h;
-        out.vals_[slot] = cptr[i];
-        ++out.count_;
-    }
+    // SEC_GAMI payload is already sorted by hash; EF is an in-memory-only key codec.
+    std::vector<uint64_t> hashes(n);
+    std::memcpy(hashes.data(), raw.data(), N * sizeof(uint64_t));
+    out.ef_.build(hashes.data(), n, UINT64_MAX);
+
+    out.sorted_vals_.resize(n);
+    std::memcpy(out.sorted_vals_.data(), cptr, N);
 }
 
 } // namespace genopack

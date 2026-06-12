@@ -68,18 +68,18 @@ struct OPHKmerState {
 };
 
 inline void finalize_oph_sketch(OPHSketchResult& result, int m) {
-    const uint32_t EMPTY = std::numeric_limits<uint32_t>::max();
+    const uint16_t EMPTY = std::numeric_limits<uint16_t>::max();
 
     for (auto w : result.real_bins_bitmask)
         result.n_real_bins += static_cast<uint32_t>(__builtin_popcountll(w));
 
-    auto mix = [](uint64_t x) -> uint32_t {
+    auto mix = [](uint64_t x) -> uint16_t {
         x ^= x >> 30;
         x *= 0xbf58476d1ce4e5b9ULL;
         x ^= x >> 27;
         x *= 0x94d049bb133111ebULL;
         x ^= x >> 31;
-        return static_cast<uint32_t>(x >> 32);
+        return static_cast<uint16_t>(x >> 32);
     };
     for (int t = 1; t < m; ++t)
         if (result.signature[t] == EMPTY && result.signature[t - 1] != EMPTY)
@@ -93,7 +93,7 @@ inline void finalize_oph_sketch(OPHSketchResult& result, int m) {
 
 template <uint32_t FixedBins>
 [[gnu::always_inline]] inline void update_oph_bin(
-        uint32_t* __restrict signature,
+        uint16_t* __restrict signature,
         uint64_t* __restrict real_bins,
         uint32_t runtime_bins,
         uint64_t canonical_hash) {
@@ -102,8 +102,8 @@ template <uint32_t FixedBins>
         return fast_range_u64(canonical_hash, runtime_bins);
     }();
 
-    const uint32_t h = oph_sig32(canonical_hash);
-    uint32_t& cur = signature[bin];
+    const uint16_t h = static_cast<uint16_t>(canonical_hash >> 32);
+    uint16_t& cur = signature[bin];
     if (__builtin_expect(h < cur, 0)) {
         cur = h;
         real_bins[bin >> 6] |= (1ULL << (bin & 63));
@@ -152,7 +152,7 @@ template <uint32_t FixedBins>
         int rev_shift,
         uint32_t runtime_bins,
         OPHKmerState& state,
-        uint32_t* __restrict signature,
+        uint16_t* __restrict signature,
         uint64_t* __restrict real_bins) {
     uint64_t fwd   = state.fwd;
     uint64_t rev   = state.rev;
@@ -190,7 +190,7 @@ constexpr uint32_t DEFAULT_OPH_BINS = 10000;
 template <uint32_t FixedBins>
 OPHSketchResult sketch_oph_impl(const char* data, size_t size,
                                  int m, const OPHSketchConfig& cfg) {
-    const uint32_t EMPTY = std::numeric_limits<uint32_t>::max();
+    const uint16_t EMPTY = std::numeric_limits<uint16_t>::max();
 
     OPHSketchResult result;
     result.genome_length = 0;
@@ -208,7 +208,7 @@ OPHSketchResult sketch_oph_impl(const char* data, size_t size,
     OPHKmerState state;
     bool in_header = false;
 
-    uint32_t* __restrict signature = result.signature.data();
+    uint16_t* __restrict signature = result.signature.data();
     uint64_t* __restrict real_bins = result.real_bins_bitmask.data();
 
     size_t i = 0;
@@ -287,15 +287,15 @@ OPHSketchResult sketch_oph_from_buffer(const char* data, size_t len,
 
 namespace {
 
-inline void finalize_signature(std::vector<uint32_t>& signature, int m) {
-    const uint32_t EMPTY = std::numeric_limits<uint32_t>::max();
-    auto mix = [](uint64_t x) -> uint32_t {
+inline void finalize_signature(std::vector<uint16_t>& signature, int m) {
+    const uint16_t EMPTY = std::numeric_limits<uint16_t>::max();
+    auto mix = [](uint64_t x) -> uint16_t {
         x ^= x >> 30;
         x *= 0xbf58476d1ce4e5b9ULL;
         x ^= x >> 27;
         x *= 0x94d049bb133111ebULL;
         x ^= x >> 31;
-        return static_cast<uint32_t>(x >> 32);
+        return static_cast<uint16_t>(x >> 32);
     };
     for (int t = 1; t < m; ++t)
         if (signature[t] == EMPTY && signature[t - 1] != EMPTY)
@@ -309,13 +309,13 @@ inline void finalize_signature(std::vector<uint32_t>& signature, int m) {
 // the same hash. This matches what two independent sketch_oph_impl runs
 // would produce because each seed sees the same canonical k-mer stream.
 [[gnu::always_inline]] inline void update_dual_bin(
-        uint32_t* __restrict sig1, uint64_t* __restrict real_bins1,
-        uint32_t* __restrict sig2, uint64_t* __restrict real_bins2,
+        uint16_t* __restrict sig1, uint64_t* __restrict real_bins1,
+        uint16_t* __restrict sig2, uint64_t* __restrict real_bins2,
         uint64_t h1, uint64_t h2, uint32_t bins) {
     const uint32_t bin1 = fast_range_u64(h1, bins);
     const uint32_t bin2 = fast_range_u64(h2, bins);
-    const uint32_t v1 = oph_sig32(h1);
-    const uint32_t v2 = oph_sig32(h2);
+    const uint16_t v1 = static_cast<uint16_t>(h1 >> 32);
+    const uint16_t v2 = static_cast<uint16_t>(h2 >> 32);
     if (__builtin_expect(v1 < sig1[bin1], 0)) {
         sig1[bin1] = v1;
         real_bins1[bin1 >> 6] |= (1ULL << (bin1 & 63));
@@ -335,8 +335,8 @@ void process_valid_run_dual(
         uint64_t k_mask, int rev_shift,
         uint32_t runtime_bins,
         OPHKmerState& state,
-        uint32_t* __restrict sig1, uint64_t* __restrict real_bins1,
-        uint32_t* __restrict sig2, uint64_t* __restrict real_bins2) {
+        uint16_t* __restrict sig1, uint64_t* __restrict real_bins1,
+        uint16_t* __restrict sig2, uint64_t* __restrict real_bins2) {
     uint64_t fwd   = state.fwd;
     uint64_t rev   = state.rev;
     int      valid = state.valid;
@@ -378,7 +378,7 @@ template <uint32_t FixedBins>
 OPHDualSketchResult sketch_oph_dual_impl(const char* data, size_t size,
                                           int m, int k,
                                           uint64_t seed1, uint64_t seed2) {
-    const uint32_t EMPTY = std::numeric_limits<uint32_t>::max();
+    const uint16_t EMPTY = std::numeric_limits<uint16_t>::max();
 
     OPHDualSketchResult result;
     result.signature1.assign(m, EMPTY);
@@ -401,8 +401,8 @@ OPHDualSketchResult sketch_oph_dual_impl(const char* data, size_t size,
     OPHKmerState state;
     bool in_header = false;
 
-    uint32_t* __restrict s1 = result.signature1.data();
-    uint32_t* __restrict s2 = result.signature2.data();
+    uint16_t* __restrict s1 = result.signature1.data();
+    uint16_t* __restrict s2 = result.signature2.data();
     uint64_t* __restrict rb1 = rbins1.data();
     uint64_t* __restrict rb2 = rbins2.data();
 

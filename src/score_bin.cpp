@@ -21,7 +21,7 @@ static float oph_jaccard_contigs(const OPHSketchResult& a, const OPHSketchResult
         if (!ra && !rb) continue;
         ++union_cnt;
         if (ra && rb &&
-            (a.signature[b_] & 0xFFFF) == (b.signature[b_] & 0xFFFF)) ++match;
+            a.signature[b_] == b.signature[b_]) ++match;
     }
     return union_cnt ? static_cast<float>(match) / static_cast<float>(union_cnt) : 0.f;
 }
@@ -79,7 +79,7 @@ ContainmentSplitResult score_bin_containment(
                 uint32_t matches = 0;
                 for (uint32_t b = 0; b < sketch_sz; ++b) {
                     if (!(cs.sk.real_bins_bitmask[b/64] & (1ULL << (b%64)))) continue;
-                    if ((cs.sk.signature[b] & 0xFFFF) == e->consensus[ki][b]) ++matches;
+                    if (cs.sk.signature[b] == e->consensus[ki][b]) ++matches;
                 }
                 float cont = static_cast<float>(matches) / static_cast<float>(cs.sk.n_real_bins);
                 if (cont > best_cont) { best_cont = cont; best_hash = e->genus_hash; }
@@ -98,7 +98,7 @@ ContainmentSplitResult score_bin_containment(
     for (const auto& cs : csk) {
         for (uint32_t b = 0; b < sketch_sz; ++b) {
             if (!(cs.sk.real_bins_bitmask[b/64] & (1ULL << (b%64)))) continue;
-            const uint16_t v = static_cast<uint16_t>(cs.sk.signature[b] & 0xFFFF);
+            const uint16_t v = cs.sk.signature[b];
             if (votes[b] == 0) { consensus[b] = v; votes[b] = 1; }
             else if (v == consensus[b]) ++votes[b];
             else                        --votes[b];
@@ -110,7 +110,7 @@ ContainmentSplitResult score_bin_containment(
         uint32_t match = 0;
         for (uint32_t b = 0; b < sketch_sz; ++b) {
             if (!(csk[i].sk.real_bins_bitmask[b/64] & (1ULL << (b%64)))) continue;
-            if ((csk[i].sk.signature[b] & 0xFFFF) == consensus[b]) ++match;
+            if (csk[i].sk.signature[b] == consensus[b]) ++match;
         }
         self_cont[i] = static_cast<float>(match) / static_cast<float>(csk[i].sk.n_real_bins);
     }

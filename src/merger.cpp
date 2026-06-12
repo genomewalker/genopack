@@ -21,6 +21,7 @@
 #include <chrono>
 #include <cstring>
 #include <ctime>
+#include <mutex>
 #include <fcntl.h>
 #include <genopack/checksum.hpp>
 #include <filesystem>
@@ -626,7 +627,6 @@ void merge_archives(const std::vector<std::filesystem::path>& inputs,
                     reader.open(archives[ai].mmap.data(),
                                 sd->file_offset, sd->compressed_size);
                     const auto& src_ids = reader.genome_ids();
-                    const size_t n = src_ids.size();
                     const uint32_t nk = static_cast<uint32_t>(skch_kmer_sizes.size());
 
                     if (!multi_k) {
@@ -641,20 +641,51 @@ void merge_archives(const std::vector<std::filesystem::path>& inputs,
                                                  sr.n_real_bins, sr.genome_length, mask);
                             });
                     } else {
-                        // Multi-k path: collect per-k data then emit per genome
-                        // sigs_per_k[ki][genome_row]
-                        std::vector<std::vector<std::vector<uint16_t>>>
-                            sigs1(nk, std::vector<std::vector<uint16_t>>(n)),
-                            sigs2(nk, std::vector<std::vector<uint16_t>>(n));
-                        std::vector<std::vector<uint32_t>>
-                            nrbs(nk, std::vector<uint32_t>(n, 0));
-                        std::vector<std::vector<uint64_t>> masks(n);
-                        std::vector<uint64_t> glens(n, 0);
-
                         // Build map from k-value → output ki
                         std::unordered_map<uint32_t,uint32_t> k_to_out_ki;
                         for (uint32_t ki = 0; ki < nk; ++ki)
                             k_to_out_ki[skch_kmer_sizes[ki]] = ki;
+
+                        struct MultiKAccum {
+                            size_t row = static_cast<size_t>(-1);
+                            GenomeId gid = 0;
+                            uint64_t genome_length = 0;
+                            std::vector<std::vector<uint16_t>> sigs1;
+                            std::vector<std::vector<uint16_t>> sigs2;
+                            std::vector<uint32_t> nrbs;
+                            std::vector<std::vector<uint64_t>> masks;
+                            std::vector<uint8_t> seen;
+                            uint32_t seen_count = 0;
+
+                            explicit MultiKAccum(uint32_t n_k)
+                                : sigs1(n_k), sigs2(n_k), nrbs(n_k, 0),
+                                  masks(n_k), seen(n_k, 0) {}
+
+                            bool active() const { return row != static_cast<size_t>(-1); }
+
+                            void reset(size_t next_row, GenomeId next_gid) {
+                                row = next_row;
+                                gid = next_gid;
+                                genome_length = 0;
+                                seen_count = 0;
+                                for (size_t ki = 0; ki < sigs1.size(); ++ki) {
+                                    sigs1[ki].clear();
+                                    sigs2[ki].clear();
+                                    nrbs[ki] = 0;
+                                    masks[ki].clear();
+                                    seen[ki] = 0;
+                                }
+                            }
+                        };
+
+                        MultiKAccum acc(nk);
+                        auto flush_acc = [&]() {
+                            if (!acc.active()) return;
+                            if (acc.seen_count != nk)
+                                throw std::runtime_error("SKCH merge: incomplete multi-k sketch row");
+                            skch_out_mk->add(acc.gid, acc.genome_length,
+                                             acc.sigs1, acc.sigs2, acc.nrbs, acc.masks);
+                        };
 
                         reader.sketch_for_ids_multi_k(src_ids, skch_sketch_size,
                             [&](size_t row, uint32_t /*src_ki*/, const SketchResult& sr) {
@@ -662,29 +693,22 @@ void merge_archives(const std::vector<std::filesystem::path>& inputs,
                                 auto it = k_to_out_ki.find(k);
                                 if (it == k_to_out_ki.end()) return;
                                 const uint32_t oki = it->second;
-                                sigs1[oki][row].assign(sr.sig,  sr.sig  + sr.sketch_size);
-                                sigs2[oki][row].assign(sr.sig2, sr.sig2 + sr.sketch_size);
-                                nrbs[oki][row] = sr.n_real_bins;
-                                if (masks[row].empty()) {
-                                    masks[row].assign(sr.mask, sr.mask + sr.mask_words);
-                                    glens[row] = sr.genome_length;
+                                if (acc.row != row) {
+                                    flush_acc();
+                                    GenomeId gid = static_cast<GenomeId>(src_ids[row]) + gid_off;
+                                    acc.reset(row, gid);
                                 }
-                            });
-
-                        for (size_t j = 0; j < n; ++j) {
-                            if (sigs1[0][j].empty()) continue;
-                            GenomeId gid = static_cast<GenomeId>(src_ids[j]) + gid_off;
-                            std::vector<std::vector<uint16_t>> s1(nk), s2(nk);
-                            std::vector<uint32_t>              nrb_j(nk, 0);
-                            std::vector<std::vector<uint64_t>> mk(nk);
-                            for (uint32_t ki = 0; ki < nk; ++ki) {
-                                s1[ki]    = std::move(sigs1[ki][j]);
-                                s2[ki]    = std::move(sigs2[ki][j]);
-                                nrb_j[ki] = nrbs[ki][j];
-                                mk[ki]    = masks[j]; // shared bitmask
-                            }
-                            skch_out_mk->add(gid, glens[j], s1, s2, nrb_j, mk);
-                        }
+                                acc.sigs1[oki].assign(sr.sig,  sr.sig  + sr.sketch_size);
+                                acc.sigs2[oki].assign(sr.sig2, sr.sig2 + sr.sketch_size);
+                                acc.nrbs[oki] = sr.n_real_bins;
+                                acc.masks[oki].assign(sr.mask, sr.mask + sr.mask_words);
+                                acc.genome_length = sr.genome_length;
+                                if (!acc.seen[oki]) {
+                                    acc.seen[oki] = 1;
+                                    ++acc.seen_count;
+                                }
+                            }, 1);
+                        flush_acc();
                     }
                 }
             }

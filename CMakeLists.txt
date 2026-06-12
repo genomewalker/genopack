@@ -55,6 +55,22 @@ FetchContent_Declare(spdlog
   GIT_TAG        v1.14.1)
 FetchContent_MakeAvailable(spdlog)
 
+FetchContent_Declare(unordered_dense
+  GIT_REPOSITORY https://github.com/martinus/unordered_dense.git
+  GIT_TAG        v4.4.0)
+FetchContent_MakeAvailable(unordered_dense)
+
+# mimalloc — low-fragmentation allocator; reduces VmHWM from glibc arena retention
+FetchContent_Declare(mimalloc
+  GIT_REPOSITORY https://github.com/microsoft/mimalloc.git
+  GIT_TAG        v2.1.7
+  GIT_SHALLOW    TRUE)
+set(MI_BUILD_SHARED     OFF CACHE BOOL "" FORCE)
+set(MI_BUILD_OBJECT     OFF CACHE BOOL "" FORCE)
+set(MI_BUILD_TESTS      OFF CACHE BOOL "" FORCE)
+set(MI_INSTALL_TOPLEVEL OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(mimalloc)
+
 # CLI11
 find_path(CLI11_INCLUDE_DIR CLI/CLI.hpp
   HINTS /usr/include /usr/local/include)
@@ -100,6 +116,7 @@ add_library(genopack_lib STATIC
   src/colstore.cpp
   src/core_section.cpp
   src/pcore.cpp
+  src/pcore_spiller.cpp
   src/gami.cpp
   src/xqual_columns.cpp
   src/prof.cpp
@@ -149,6 +166,10 @@ if(TARGET spdlog::spdlog)
   target_link_libraries(genopack_lib PUBLIC spdlog::spdlog)
 endif()
 
+if(TARGET unordered_dense::unordered_dense)
+  target_link_libraries(genopack_lib PUBLIC unordered_dense::unordered_dense)
+endif()
+
 # Eigen3 for check module (TNF/GC-skew contig scoring)
 find_package(Eigen3 3.3 QUIET NO_MODULE)
 if(NOT Eigen3_FOUND)
@@ -196,6 +217,10 @@ if(CLI11_INCLUDE_DIR)
 endif()
 if(TARGET CLI11::CLI11)
   target_link_libraries(genopack PRIVATE CLI11::CLI11)
+endif()
+if(TARGET mimalloc-static)
+  target_link_libraries(genopack PRIVATE mimalloc-static)
+  message(STATUS "mimalloc: linked (override system malloc for the genopack binary)")
 endif()
 
 # ── Tests ─────────────────────────────────────────────────────────────────────

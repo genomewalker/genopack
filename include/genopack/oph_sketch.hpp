@@ -8,7 +8,7 @@ namespace genopack {
 // m bins, each holds the minimum hash among k-mers assigned to that bin.
 // Empty bins are densified deterministically.
 struct OPHSketchResult {
-    std::vector<uint32_t> signature;        // m bins (uint32_t; caller truncates to uint16_t for storage)
+    std::vector<uint16_t> signature;        // m bins; low 16 bits of the 32-bit per-bin minimum hash
     std::vector<uint64_t> real_bins_bitmask; // ceil(m/64) words; bit t=1 iff bin t has a real k-mer
     uint64_t genome_length = 0;
     uint32_t n_real_bins   = 0;             // non-empty bins before densification
@@ -19,8 +19,8 @@ struct OPHSketchResult {
 // real_bins_bitmask is seed-independent (which bins were hit by any real k-mer),
 // so it is stored once and shared by both signatures.
 struct OPHDualSketchResult {
-    std::vector<uint32_t> signature1;       // seed1
-    std::vector<uint32_t> signature2;       // seed2
+    std::vector<uint16_t> signature1;       // seed1; low 16 bits of 32-bit per-bin minimum hash
+    std::vector<uint16_t> signature2;       // seed2
     std::vector<uint64_t> real_bins_bitmask;
     uint64_t genome_length = 0;
     uint32_t n_real_bins   = 0;

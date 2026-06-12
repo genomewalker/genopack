@@ -307,6 +307,18 @@ public:
         if (!header_ || i >= header_->n_entries) return 0;
         return (codec_ == PCORE_CODEC_V1) ? entries1_[i].key_hash : entries0_[i].key_hash;
     }
+    uint64_t total_union_aamers() const noexcept {
+        if (!header_) return 0;
+        uint64_t total = 0;
+        if (codec_ == PCORE_CODEC_V1 || codec_ == PCORE_CODEC_V2) {
+            for (uint32_t i = 0; i < header_->n_entries; ++i)
+                total += uint64_t(entries1_[i].n_singleton) + entries1_[i].n_multi + entries1_[i].n_core;
+        } else {
+            for (uint32_t i = 0; i < header_->n_entries; ++i)
+                total += entries0_[i].n_aamers;
+        }
+        return total;
+    }
     int      k() const noexcept { return header_ ? static_cast<int>(header_->k) : 0; }
     int      min_seg_aa() const noexcept { return header_ ? static_cast<int>(header_->min_seg_aa) : 0; }
     float    theta() const noexcept { return header_ ? header_->theta : 0.90f; }
