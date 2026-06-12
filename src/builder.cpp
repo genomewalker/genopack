@@ -918,8 +918,11 @@ struct ArchiveBuilder::Impl {
             pending_input_rows = std::move(sr);
         }
 
-        // Streaming producer: feeds tasks lazily to cap queue at 4*n_workers entries
-        const size_t task_q_max = n_workers * 4;
+        // Streaming producer: fadvise(WILLNEED) is issued before the lock, so the queue
+        // depth determines how far ahead NFS prefetch runs. n_workers*16 = 256 ahead
+        // gives ~4s of prefetch runway at 250ms/genome × 16 workers, covering NFS cold-
+        // miss latency of 100-400ms/file for random-order inputs.
+        const size_t task_q_max = n_workers * 16;
 
         std::thread producer([&]() {
             if (src_reader_) {
