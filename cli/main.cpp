@@ -188,6 +188,8 @@ static int cmd_build(const std::string& input_tsv, const std::string& output_dir
         ArchiveBuilder builder(output_dir, cfg);
         builder.add_from_tsv(input_tsv);
         builder.finalize();
+        if (cfg.build_pcore || cfg.build_core)
+            cmd_gami_build(output_dir, threads);
         return 0;
     }
 
@@ -308,6 +310,8 @@ static int cmd_build(const std::string& input_tsv, const std::string& output_dir
                     /*build_gstx=*/true, /*build_qual=*/true,
                     /*build_gcov=*/cfg.build_gcov);
     }
+    if (cfg.build_pcore || cfg.build_core)
+        cmd_gami_build(output_dir, threads);
 
     // Cleanup temp parts only after a fully successful merge.
     std::error_code ec;
