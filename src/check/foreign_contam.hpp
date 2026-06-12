@@ -297,7 +297,7 @@ inline ForeignScore score_contig_foreign_indexed(
         }
     }
     s.classifiable = s.host_specific + s.foreign_specific;
-    if (s.classifiable > 0) {
+    if (s.classifiable >= 16) {
         // Prevalence-weighted fraction: host side weighted by within-genus prevalence,
         // foreign side uniform (unknown foreign prevalence). Amplifies signal for small
         // or noisy genera where sampled host aamers have low prevalence.
@@ -306,6 +306,16 @@ inline ForeignScore score_contig_foreign_indexed(
             ? static_cast<float>(s.foreign_specific) / denom
             : static_cast<float>(s.foreign_specific) / static_cast<float>(s.classifiable);
         s.score = static_cast<float>(loglr / static_cast<double>(s.classifiable));
+    } else if (family.valid() && !contig_aamers.empty()) {
+        // Sub-floor (classifiable < 16): too few host/foreign aamers for the standard scorer.
+        // Use family-hit density as contamination proxy: a family member should hit roughly
+        // expected = |contig| * |family| / hash_space aamers; far fewer hits → foreign.
+        const float expected = static_cast<float>(contig_aamers.size()) *
+                               static_cast<float>(family.n) / 2e6f;
+        if (expected >= 1.0f) {
+            s.foreign_fraction = 1.0f - std::min(1.0f,
+                static_cast<float>(s.family_hits) / expected);
+        }
     }
     return s;
 }

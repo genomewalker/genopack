@@ -9,6 +9,7 @@
 #include <genopack/util.hpp>
 #include <Eigen/Dense>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <mutex>
 #include <omp.h>
@@ -307,16 +308,19 @@ void run_pass_b(ICheckReader& pack,
     std::unordered_map<std::string, IndexedSpan>         family_index_map;
     std::unordered_map<std::string, std::vector<uint64_t>> genus_core_cache;
     std::unordered_map<std::string, std::vector<uint64_t>> family_core_cache;
+    std::mutex eviction_mtx;
+    std::unordered_map<std::string, std::atomic<int>> genus_refcount, family_refcount;
     const uint8_t foreign_K = [&]() -> uint8_t {
         if (const char* e = std::getenv("GENOPACK_FOREIGN_K")) {
             int v = std::atoi(e); if (v > 0 && v < 256) return static_cast<uint8_t>(v);
         }
-        return 3;
+        const uint32_t k = std::max(2u, n_entries / 500u);
+        return static_cast<uint8_t>(k < 255u ? k : 255u);
     }();
     if (gmi.empty() && (use_pcore || pack.has_core()) && !flagged_genus.empty()) {
         const int gmi_par = std::min(threads, 8);
-        // Start small; maybe_resize() rehashes to 4× when load > 50%.
-        gmi.reserve(64'000'000ULL);
+        // Exact prescan eliminates all rehash transients.
+        gmi.reserve(use_pcore ? pack.pcore_reader()->total_union_aamers() : 64'000'000ULL);
         // Batched parallel decode → sequential insert avoids atomic/mutex on GMI.
         std::vector<OwnedSpan> buf(gmi_par);
         for (uint32_t bs = 0; bs < n_entries; bs += static_cast<uint32_t>(gmi_par)) {
@@ -349,6 +353,20 @@ void run_pass_b(ICheckReader& pack,
         }
         std::vector<std::string> gvec(unique_genera.begin(), unique_genera.end());
         std::vector<std::string> fvec(unique_families.begin(), unique_families.end());
+        genus_refcount.reserve(unique_genera.size());
+        family_refcount.reserve(unique_families.size());
+        for (const auto& acc : to_scan) {
+            if (auto it = flagged_genus.find(acc); it != flagged_genus.end()) {
+                auto [rit, inserted] = genus_refcount.try_emplace(it->second, 0);
+                (void)inserted;
+                rit->second.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (auto it = flagged_family.find(acc); it != flagged_family.end()) {
+                auto [rit, inserted] = family_refcount.try_emplace(it->second, 0);
+                (void)inserted;
+                rit->second.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         for (const auto& g : gvec) genus_host_union[g];
         for (const auto& f : fvec) family_union_map[f];
         #pragma omp parallel for schedule(dynamic, 1) num_threads(gmi_par)
@@ -402,6 +420,9 @@ void run_pass_b(ICheckReader& pack,
             mrk_rd.reset();
         }
     }
+    // TODO(D3): load a mobile-element marker index when GENOPACK_MOBILE_INDEX is set.
+    // const char* mob_idx_path = std::getenv("GENOPACK_MOBILE_INDEX");
+    // if (mob_idx_path) { ... open MobileMarkerIndex ... }
     if (mrk_rd && mrk_rd->is_open()) {
         mrk_rd->build_merged_pool();
         spdlog::info("check pass-B: merged pool: {} M bac + {} M arc hashes",
@@ -473,6 +494,28 @@ void run_pass_b(ICheckReader& pack,
     std::mutex quality_mtx;
     size_t n_done = 0;
     const size_t n_flagged = to_scan.size();
+    auto release_host_refs = [&](const std::string& acc) {
+        if (auto git = flagged_genus.find(acc); git != flagged_genus.end()) {
+            const std::string& g = git->second;
+            if (auto rit = genus_refcount.find(g); rit != genus_refcount.end()) {
+                if (rit->second.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    std::lock_guard<std::mutex> lk(eviction_mtx);
+                    genus_host_index.erase(g);
+                    genus_host_union.erase(g);
+                }
+            }
+        }
+        if (auto fit = flagged_family.find(acc); fit != flagged_family.end()) {
+            const std::string& f = fit->second;
+            if (auto rit = family_refcount.find(f); rit != family_refcount.end()) {
+                if (rit->second.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    std::lock_guard<std::mutex> lk(eviction_mtx);
+                    family_index_map.erase(f);
+                    family_union_map.erase(f);
+                }
+            }
+        }
+    };
 
     pack.visit_shard_batches_parallel(to_scan, k_shard_readers,
         [&](ArchiveReader::ShardBatch& batch) {
@@ -480,11 +523,17 @@ void run_pass_b(ICheckReader& pack,
             #pragma omp parallel for schedule(dynamic, 1) num_threads(inner_threads)
             for (int j = 0; j < n; ++j) {
                 const auto& [idx, eg] = batch[static_cast<size_t>(j)];
-                if (eg.fasta.empty()) continue;
                 const std::string& acc = to_scan[idx];
+                if (eg.fasta.empty()) {
+                    release_host_refs(acc);
+                    continue;
+                }
 
                 auto contigs = parse_fasta(eg.fasta);
-                if (contigs.empty()) continue;
+                if (contigs.empty()) {
+                    release_host_refs(acc);
+                    continue;
+                }
 
                 // GC skew inline — no full concatenation needed.
                 float skew_score = NAN;
@@ -522,13 +571,16 @@ void run_pass_b(ICheckReader& pack,
 
                 // Indexed host/family spans for foreign-aamer scoring (read-only, zero-copy).
                 IndexedSpan host_ix, fam_ix;
-                if (!genus_host_index.empty() && git != flagged_genus.end()) {
-                    auto hit = genus_host_index.find(git->second);
-                    if (hit != genus_host_index.end()) host_ix = hit->second;
-                    auto famit = flagged_family.find(acc);
-                    if (famit != flagged_family.end()) {
-                        auto fit = family_index_map.find(famit->second);
-                        if (fit != family_index_map.end()) fam_ix = fit->second;
+                if (git != flagged_genus.end()) {
+                    std::lock_guard<std::mutex> lk(eviction_mtx);
+                    if (!genus_host_index.empty()) {
+                        auto hit = genus_host_index.find(git->second);
+                        if (hit != genus_host_index.end()) host_ix = hit->second;
+                        auto famit = flagged_family.find(acc);
+                        if (famit != flagged_family.end()) {
+                            auto fit = family_index_map.find(famit->second);
+                            if (fit != family_index_map.end()) fam_ix = fit->second;
+                        }
                     }
                 }
 
@@ -781,6 +833,8 @@ void run_pass_b(ICheckReader& pack,
                             if (fs.classifiable < 16) pf |= PROT_ABSTAIN_LOW_N;
                             if (fs.foreign_specific >= 12 && fs.family_hits >= fs.foreign_specific)
                                 pf |= PROT_MOBILE_NATIVE;
+                            // TODO(D3): score against mobile-element index when loaded;
+                            // set PROT_MOBILE_ELEMENT flag for contigs matching a mobile MGE.
                             cf.prot_flags = pf;
                         }
 
@@ -1035,6 +1089,9 @@ void run_pass_b(ICheckReader& pack,
                         }
                         if (marker_n_expected > 0) {
                             const float ne = static_cast<float>(marker_n_expected);
+                            // TODO(D4): adjust denominator when mobile-element marker sets are
+                            // loaded — subtract mobile-element markers from ne before dividing
+                            // so completeness is not penalised for absent MGE-associated markers.
                             marker_completeness        = static_cast<float>(marker_n_present) / ne;
                             marker_redundancy          = static_cast<float>(redundant_n) / ne;
                             marker_joint_contamination = static_cast<float>(joint_n) / ne;
@@ -1118,6 +1175,7 @@ void run_pass_b(ICheckReader& pack,
                     const bool skip_mix = (needs_full_set.find(acc) == needs_full_set.end());
                     AllSignals sig = compute_all_signals(
                         std::span<const ContigAccum>(accum_contigs), 5000, 16384, 5, skip_mix);
+                    release_host_refs(acc);
 
                     std::lock_guard<std::mutex> lk(quality_mtx);
                     auto& q = quality.at(acc);

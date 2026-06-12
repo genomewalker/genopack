@@ -427,6 +427,16 @@ int cmd_check(const std::filesystem::path& pack_path,
         return std::isnan(v) ? "NA" : std::to_string(v);
     };
 
+    // TODO(D1): Replace fixed thresholds with a trained ensemble scorer.
+    // Wire comp_eff, cont_val, fiedler_oph_split, and marker signals into
+    // EnsembleScorer::predict() and replace the qtier chain below when ready.
+    struct EnsembleScorer {
+        float w_comp = 0.0f, w_cont = 0.0f, w_fiedler = 0.0f; // zero → no-op
+        const char* predict(float /*comp*/, float /*cont*/, float /*fiedler*/) const {
+            return nullptr; // nullptr → fall through to rule-based assignment
+        }
+    };
+
     for (const auto& [acc, q] : all_quality) {
         const float comp_eff = !std::isnan(q.completeness_post_decontam)
                                ? q.completeness_post_decontam
@@ -434,9 +444,11 @@ int cmd_check(const std::filesystem::path& pack_path,
         const float fmh_cont = !std::isnan(q.fmh_minority_fraction) ? q.fmh_minority_fraction : NAN;
         const float cont_primary = !std::isnan(fmh_cont) ? fmh_cont : q.contamination_leakage;
         const float cont_val = std::isnan(cont_primary) ? 0.0f : cont_primary;
+        // TODO(D1): const EnsembleScorer ens; if (auto t = ens.predict(...)) qtier = t;
         const char* qtier = "LQ";
         if (!std::isnan(comp_eff) && comp_eff >= 0.90f && cont_val < 0.05f) qtier = "HQ";
         else if (!std::isnan(comp_eff) && comp_eff >= 0.50f && cont_val < 0.10f) qtier = "MQ";
+        if (!std::isnan(q.fiedler_oph_split) && q.fiedler_oph_split < 0.1f) qtier = "LQ";
         tsv << acc << '\t'
             << qtier << '\t'
             << fmt(comp_eff) << '\t'
