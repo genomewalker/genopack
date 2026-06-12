@@ -318,7 +318,6 @@ SectionDesc SkchWriterMultiK::finalize(AppendWriter& writer, uint64_t section_id
 
     const size_t OUT_BUF = 4 << 20;
     std::vector<uint8_t> out_buf(OUT_BUF);
-    std::vector<uint8_t> rec(spill_record_size_);
 
     // Thread-local CStream: allocated once, re-initialised per frame.
     static thread_local ZSTD_CStream* cs = ZSTD_createCStream();
@@ -352,46 +351,52 @@ SectionDesc SkchWriterMultiK::finalize(AppendWriter& writer, uint64_t section_id
             }
         };
 
-        // n_real_bins planar by k.
-        for (uint32_t ki = 0; ki < nk; ++ki)
-            for (uint32_t rank = row_start; rank < row_end; ++rank)
-                compress(&n_real_bins_[ki][order[rank]], sizeof(uint32_t));
+        // ── Sequential-read pass: load all frame records sorted by spill offset ──
+        // Previously: 9 × frame_n random fseeks (sig1/sig2/mask × nk).
+        // Now: 1 × frame_n reads in ascending spill-offset order → 9× fewer I/Os.
+        std::vector<std::pair<uint32_t,uint32_t>> read_order_frame(frame_n);
+        for (uint32_t j = 0; j < frame_n; ++j)
+            read_order_frame[j] = {order[row_start + j], j};
+        std::sort(read_order_frame.begin(), read_order_frame.end(),
+                  [](const auto& a, const auto& b) { return a.first < b.first; });
 
-        // sigs1 planar by k.
+        std::vector<uint8_t> frame_buf(static_cast<size_t>(frame_n) * spill_record_size_);
+        std::vector<uint32_t> rank_to_slot(frame_n);
+        for (uint32_t slot = 0; slot < frame_n; ++slot) {
+            const uint32_t spill_idx = read_order_frame[slot].first;
+            const uint32_t local_j   = read_order_frame[slot].second;
+            const long off = static_cast<long>(static_cast<size_t>(spill_idx) * spill_record_size_);
+            if (std::fseek(spill_fp_, off, SEEK_SET) != 0)
+                throw std::runtime_error("SkchWriterMultiK V4: fseek frame");
+            if (std::fread(frame_buf.data() + static_cast<size_t>(slot) * spill_record_size_,
+                           1, spill_record_size_, spill_fp_) != spill_record_size_)
+                throw std::runtime_error("SkchWriterMultiK V4: fread frame");
+            rank_to_slot[local_j] = slot;
+        }
+        // ────────────────────────────────────────────────────────────────────
+
+        // n_real_bins planar by k (in-memory, no spill access).
+        for (uint32_t ki = 0; ki < nk; ++ki)
+            for (uint32_t j = 0; j < frame_n; ++j)
+                compress(&n_real_bins_[ki][order[row_start + j]], sizeof(uint32_t));
+
+        // sigs1 planar by k — from frame_buf via rank_to_slot.
         for (uint32_t ki = 0; ki < nk; ++ki) {
-            const size_t k_off = ki * k_triple_sz;  // offset of this k's triple in the record
-            for (uint32_t rank = row_start; rank < row_end; ++rank) {
-                long off = static_cast<long>(static_cast<size_t>(order[rank]) * spill_record_size_);
-                if (std::fseek(spill_fp_, off, SEEK_SET) != 0)
-                    throw std::runtime_error("SkchWriterMultiK V4: fseek sig1");
-                if (std::fread(rec.data(), 1, spill_record_size_, spill_fp_) != spill_record_size_)
-                    throw std::runtime_error("SkchWriterMultiK V4: fread sig1");
-                compress(rec.data() + k_off, sig_bytes_k);
-            }
+            const size_t k_off = ki * k_triple_sz;
+            for (uint32_t j = 0; j < frame_n; ++j)
+                compress(frame_buf.data() + static_cast<size_t>(rank_to_slot[j]) * spill_record_size_ + k_off, sig_bytes_k);
         }
         // sigs2 planar by k.
         for (uint32_t ki = 0; ki < nk; ++ki) {
             const size_t k_off = ki * k_triple_sz + sig_bytes_k;
-            for (uint32_t rank = row_start; rank < row_end; ++rank) {
-                long off = static_cast<long>(static_cast<size_t>(order[rank]) * spill_record_size_);
-                if (std::fseek(spill_fp_, off, SEEK_SET) != 0)
-                    throw std::runtime_error("SkchWriterMultiK V4: fseek sig2");
-                if (std::fread(rec.data(), 1, spill_record_size_, spill_fp_) != spill_record_size_)
-                    throw std::runtime_error("SkchWriterMultiK V4: fread sig2");
-                compress(rec.data() + k_off, sig_bytes_k);
-            }
+            for (uint32_t j = 0; j < frame_n; ++j)
+                compress(frame_buf.data() + static_cast<size_t>(rank_to_slot[j]) * spill_record_size_ + k_off, sig_bytes_k);
         }
         // masks planar by k.
         for (uint32_t ki = 0; ki < nk; ++ki) {
             const size_t k_off = ki * k_triple_sz + 2 * sig_bytes_k;
-            for (uint32_t rank = row_start; rank < row_end; ++rank) {
-                long off = static_cast<long>(static_cast<size_t>(order[rank]) * spill_record_size_);
-                if (std::fseek(spill_fp_, off, SEEK_SET) != 0)
-                    throw std::runtime_error("SkchWriterMultiK V4: fseek mask");
-                if (std::fread(rec.data(), 1, spill_record_size_, spill_fp_) != spill_record_size_)
-                    throw std::runtime_error("SkchWriterMultiK V4: fread mask");
-                compress(rec.data() + k_off, mask_bytes_k);
-            }
+            for (uint32_t j = 0; j < frame_n; ++j)
+                compress(frame_buf.data() + static_cast<size_t>(rank_to_slot[j]) * spill_record_size_ + k_off, mask_bytes_k);
         }
 
         size_t remaining = 1;
