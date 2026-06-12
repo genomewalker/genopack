@@ -6,20 +6,20 @@
 // aamer prevalence.  genome_id is NOT stored in the spill — n_mem is tracked via
 // a separate per-genus member counter (add_member, one call per genome).
 //
-// Partitions by aamer_hash top-11 bits so tuples for one genus spread evenly
-// across all 2048 partitions regardless of genus size.  A 600k-member genus ×
-// 100 aamers contributes ~29k tuples per partition (not 60M into one partition).
+// Partitions by genus_hash top-11 bits: all aamers for genus G land in exactly
+// one partition (pi = genus_hash >> 53).  finalize() processes each partition
+// independently and emits its genera immediately — peak RAM = largest single
+// partition, not the sum of all unique (genus, aamer) pairs.
 //
-// finalize() two-phase algorithm:
-//   Phase 1 (parallel): for each partition, load spill file (or in-memory buffer
-//     if small enough to avoid file I/O), sort by (genus_hash, aamer_hash), scan,
-//     collect {aamers[], counts[]} per genus.
-//   Phase 2 (serial): for each genus, concatenate sorted aamer runs from all
-//     partitions (disjoint hash ranges → already globally sorted), look up n_mem
-//     from member_count_, call cb(genus_hash, aamers, counts, n_mem).
+// finalize() algorithm (requires quiescence — no concurrent add_genome/add_member):
+//   Flush remaining in-memory buffers.
+//   For each dirty partition (parallel, schedule dynamic):
+//     Close write handle, load spill file, sort by (genus_hash, aamer_hash),
+//     scan into local per_genus map, emit each genus via cb immediately.
+//   Peak memory ≈ O(largest partition size) instead of O(all unique pairs).
 //
-// Memory at finalize = sum of unique (genus, aamer) pairs × 12 bytes + phase1
-// overhead.  genome_ids are never stored; n_mem is O(n_genera).
+// Memory at finalize ≈ max(partition_file_size) × 2 + O(n_genera_in_partition).
+// genome_ids are never stored; n_mem is O(n_genera).
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -57,10 +57,8 @@ public:
     PcoreSpillWriter& operator=(const PcoreSpillWriter&) = delete;
 
     // Thread-safe: add all aamers for one genome in a single batch.
-    // sorted_aamers must be sorted ascending (standard aamer order); since the
-    // partition index is the top PART_BITS of each aamer_hash, a sorted aamer
-    // array is also partition-ordered, so each partition's mutex is acquired
-    // exactly once per genome instead of once per aamer.
+    // All aamers route to the single partition for genus_hash — one lock-acquire
+    // per genome regardless of aamer count.
     void add_genome(uint64_t genus_hash, const uint64_t* sorted_aamers, size_t n);
     void add_genome(uint64_t genus_hash, const std::vector<uint64_t>& sorted_aamers) {
         add_genome(genus_hash, sorted_aamers.data(), sorted_aamers.size());
