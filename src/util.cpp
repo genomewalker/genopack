@@ -1199,6 +1199,7 @@ AllSignals compute_all_signals(const std::string& fasta,
 // Pre-parsed contig overload — eliminates the raw FASTA re-scan and duplicate TNF construction.
 // Walks each contig's seq once for: k4_raw (chargaff), k3 transitions, mix windows.
 // Uses caller-provided tnf136 (already computed by compute_tnf) for self_coherence contig_profs.
+static std::atomic<int64_t> s_cas_scan{0}, s_cas_coh{0}, s_cas_chargaff{0}, s_cas_spectral{0}, s_cas_mix{0};
 AllSignals compute_all_signals(std::span<const ContigAccum> contigs,
                                int  min_contig_len,
                                int  mix_window,
@@ -1206,6 +1207,8 @@ AllSignals compute_all_signals(std::span<const ContigAccum> contigs,
                                bool skip_mixture)
 {
     AllSignals res;
+    using Clock = std::chrono::steady_clock;
+    const auto t_cas0 = Clock::now();
     const auto& lut       = char_lut();
     const auto& canon_idx = kmer4_canon_index();
 
@@ -1295,6 +1298,7 @@ AllSignals compute_all_signals(std::span<const ContigAccum> contigs,
             contig_profs.push_back(cp);
         }
     }
+    const auto t_cas1 = Clock::now();
 
     // ── self_coherence, chargaff, spectral, mixture ───────────────────────────
     // (identical post-processing as the original compute_all_signals)
@@ -1329,6 +1333,7 @@ AllSignals compute_all_signals(std::span<const ContigAccum> contigs,
         }
         res.self_coherence = total_bp > 0 ? static_cast<float>(clean_bp)/static_cast<float>(total_bp) : NAN;
     }
+    const auto t_cas2 = Clock::now();
     {
         double sum = 0; int n = 0;
         for (int i = 0; i < D4; ++i) {
@@ -1342,6 +1347,7 @@ AllSignals compute_all_signals(std::span<const ContigAccum> contigs,
         }
         if (n > 0) res.chargaff_parity = static_cast<float>(sum/n);
     }
+    const auto t_cas3 = Clock::now();
     {
         normalise_rows(T_global);
         auto mods = eigen_mods(T_global);
@@ -1361,6 +1367,7 @@ AllSignals compute_all_signals(std::span<const ContigAccum> contigs,
         if (kink >= 0 && max_diff > 0.02f)
             res.scale_kink = static_cast<float>(std::log2(static_cast<double>(sc_sizes[kink])));
     }
+    const auto t_cas4 = Clock::now();
     {
         const int n = static_cast<int>(mix_wins.size());
         res.n_mix_windows = static_cast<uint16_t>(std::min(n, 65535));
@@ -1500,7 +1507,18 @@ AllSignals compute_all_signals(std::span<const ContigAccum> contigs,
             res.mix_no_data = true;
         }
     }
+    const auto t_cas5 = Clock::now();
+    s_cas_scan.fetch_add((t_cas1-t_cas0).count(), std::memory_order_relaxed);
+    s_cas_coh.fetch_add((t_cas2-t_cas1).count(), std::memory_order_relaxed);
+    s_cas_chargaff.fetch_add((t_cas3-t_cas2).count(), std::memory_order_relaxed);
+    s_cas_spectral.fetch_add((t_cas4-t_cas3).count(), std::memory_order_relaxed);
+    s_cas_mix.fetch_add((t_cas5-t_cas4).count(), std::memory_order_relaxed);
     return res;
+}
+
+CasTimings get_cas_timings() {
+    return {s_cas_scan.load(), s_cas_coh.load(), s_cas_chargaff.load(),
+            s_cas_spectral.load(), s_cas_mix.load()};
 }
 
 uint32_t days_since_epoch() {

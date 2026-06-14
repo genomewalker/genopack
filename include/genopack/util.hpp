@@ -119,6 +119,10 @@ AllSignals compute_all_signals(std::span<const ContigAccum> contigs,
                                 int  min_mix_windows = 5,
                                 bool skip_mixture    = false);
 
+// Thread-aggregated sub-phase nanosecond totals from compute_all_signals (ContigAccum overload).
+struct CasTimings { int64_t scan_ns, coh_ns, chargaff_ns, spectral_ns, mix_ns; };
+CasTimings get_cas_timings();
+
 // L2-normalised k=4 TNF profile per contig, for contigs >= min_bp.
 // Uses the same canonical k=4 index as compute_fasta_stats().
 struct ContigProfile {

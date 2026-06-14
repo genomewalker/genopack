@@ -7,6 +7,7 @@
 #include <array>
 #include <cmath>
 #include <numeric>
+#include <thread>
 #include <vector>
 
 namespace genopack {
@@ -132,7 +133,7 @@ ContainmentSplitResult score_bin_containment(
     }
 
     // ── 3. Sketch Fiedler (spectral gap of pairwise Jaccard graph) ───────────
-    static constexpr uint32_t k_max_fiedler = 256;
+    static constexpr uint32_t k_max_fiedler = 32;
     if (N >= 3) {
         // Cap to longest k_max_fiedler contigs to bound O(N³) eigensolver cost.
         std::vector<uint32_t> idx(N);
@@ -278,6 +279,10 @@ float score_bin_fmh_containment(
     return static_cast<float>(minority_bp) / static_cast<float>(scored_bp);
 }
 
+// When ref is larger than this, stride-subsample to keep binary search in L3 cache.
+// FMH hashes are uniform random → every-K-th is an unbiased sample; multiply result by K.
+static constexpr uint32_t kFmhRefCap = 200000;
+
 float score_bin_fmh_containment(
     const std::vector<std::string_view>& bin_seqs,
     uint64_t primary_genus_hash,
@@ -286,6 +291,28 @@ float score_bin_fmh_containment(
     uint32_t min_contig_bp)
 {
     if (refs.size() < 2) return NAN;
+
+    // Pre-build strided views of large refs so we rebuild only once per call.
+    struct RefView { const uint64_t* data; uint32_t n; uint32_t stride; uint64_t gh; };
+    thread_local std::vector<uint64_t> tl_ref_buf;
+    std::vector<RefView> rv;
+    rv.reserve(refs.size());
+    tl_ref_buf.clear();
+    for (const auto& ref : refs) {
+        if (!ref.valid()) continue;
+        if (ref.n_hashes <= kFmhRefCap) {
+            rv.push_back({ref.hashes, ref.n_hashes, 1u, ref.genus_hash});
+        } else {
+            const uint32_t stride = (ref.n_hashes + kFmhRefCap - 1) / kFmhRefCap;
+            const size_t base = tl_ref_buf.size();
+            for (uint32_t i = 0; i < ref.n_hashes; i += stride)
+                tl_ref_buf.push_back(ref.hashes[i]);
+            rv.push_back({tl_ref_buf.data() + base,
+                          static_cast<uint32_t>(tl_ref_buf.size() - base),
+                          stride, ref.genus_hash});
+        }
+    }
+
     uint64_t minority_bp = 0, scored_bp = 0;
     for (const auto& seq : bin_seqs) {
         if (seq.size() < min_contig_bp) continue;
@@ -295,10 +322,9 @@ float score_bin_fmh_containment(
         if (sk.hashes.empty()) continue;
         uint64_t best_hash = 0;
         double   best_cont = -1.0;
-        for (const auto& ref : refs) {
-            if (!ref.valid()) continue;
-            double cont = fmh_containment(sk.hashes, ref.hashes, ref.n_hashes);
-            if (cont > best_cont) { best_cont = cont; best_hash = ref.genus_hash; }
+        for (const auto& r : rv) {
+            double cont = fmh_containment(sk.hashes, r.data, r.n) * r.stride;
+            if (cont > best_cont) { best_cont = cont; best_hash = r.gh; }
         }
         if (best_hash != 0 && best_hash != primary_genus_hash)
             minority_bp += clen;

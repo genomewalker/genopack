@@ -273,18 +273,49 @@ SkaniResult compute_ani(const SkaniSketch& a, const SkaniSketch& b, int k) {
     return res;
 }
 
+// Galloping merge: exploits sorted query to scan ref sequentially.
+// For each q[i], gallop forward from last position (sequential reads, L2-friendly),
+// then binary-search the bracketed range (small, cache-hot).
+// O(|q| * log(|r|/|q|)) amortized — optimal when |r| >> |q|.
+static size_t intersect_count_gallop(const uint64_t* q, size_t nq,
+                                      const uint64_t* r, size_t nr) noexcept {
+    size_t count = 0, j = 0;
+    for (size_t i = 0; i < nq && j < nr; ++i) {
+        const uint64_t qi = q[i];
+        // Gallop forward until r[lo+step] >= qi.
+        size_t lo = j, step = 1;
+        while (lo + step < nr && r[lo + step] < qi) { lo += step; step <<= 1; }
+        const size_t hi = std::min(lo + step, nr);
+        // Binary search in the now-cached bracket r[lo..hi).
+        const uint64_t* it = std::lower_bound(r + lo, r + hi, qi);
+        j = static_cast<size_t>(it - r);
+        if (j < nr && r[j] == qi) { ++count; ++j; }
+    }
+    return count;
+}
+
+// Use gallop when |ref| > 32*|query| (gallop beats merge); else use AVX2 merge.
+static constexpr size_t kGallopThresh = 32;
+
 double fmh_containment(const std::vector<uint64_t>& query,
                         const std::vector<uint64_t>& ref) noexcept {
     if (query.empty()) return 0.0;
-    const size_t isect = intersect_count(query.data(), query.size(),
-                                         ref.data(),   ref.size());
+    size_t isect;
+    if (ref.size() > kGallopThresh * query.size())
+        isect = intersect_count_gallop(query.data(), query.size(), ref.data(), ref.size());
+    else
+        isect = intersect_count(query.data(), query.size(), ref.data(), ref.size());
     return double(isect) / double(query.size());
 }
 
 double fmh_containment(const std::vector<uint64_t>& query,
                         const uint64_t* ref_data, uint32_t ref_n) noexcept {
     if (query.empty()) return 0.0;
-    const size_t isect = intersect_count(query.data(), query.size(), ref_data, ref_n);
+    size_t isect;
+    if (static_cast<size_t>(ref_n) > kGallopThresh * query.size())
+        isect = intersect_count_gallop(query.data(), query.size(), ref_data, ref_n);
+    else
+        isect = intersect_count(query.data(), query.size(), ref_data, ref_n);
     return double(isect) / double(query.size());
 }
 
