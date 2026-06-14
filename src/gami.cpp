@@ -2,6 +2,7 @@
 #include <genopack/mmap_file.hpp>   // AppendWriter
 #include <genopack/format.hpp>      // SectionDesc, SEC_GAMI
 #include <zstd.h>
+#include <sys/mman.h>
 #include <algorithm>
 #include <cstring>
 #include <stdexcept>
@@ -76,6 +77,10 @@ void gami_v2_load(const uint8_t* section_data, uint64_t section_size,
     if (sizeof(GamiHeaderV2) + psz > section_size)
         throw std::runtime_error("gami_v2_load: truncated section");
 
+    // Pre-warm NFS mmap pages sequentially so ZSTD doesn't page-fault 4 KB at a time.
+    ::madvise(const_cast<void*>(static_cast<const void*>(section_data + sizeof(GamiHeaderV2))),
+              static_cast<size_t>(psz), MADV_SEQUENTIAL);
+
     const size_t raw_size = N * sizeof(uint64_t) + N;
     std::vector<uint8_t> raw(raw_size);
     const size_t dsz = ZSTD_decompress(raw.data(), raw_size,
@@ -85,16 +90,17 @@ void gami_v2_load(const uint8_t* section_data, uint64_t section_size,
     if (dsz != raw_size)
         throw std::runtime_error("gami_v2_load: size mismatch after decompress");
 
-    const uint8_t* cptr = raw.data() + N * sizeof(uint64_t);
     const size_t n = static_cast<size_t>(N);
-
-    // SEC_GAMI payload is already sorted by hash; EF is an in-memory-only key codec.
     std::vector<uint64_t> hashes(n);
     std::memcpy(hashes.data(), raw.data(), N * sizeof(uint64_t));
     out.ef_.build(hashes.data(), n, UINT64_MAX);
 
-    out.sorted_vals_.resize(n);
-    std::memcpy(out.sorted_vals_.data(), cptr, N);
+    const uint8_t* src = raw.data() + N * sizeof(uint64_t);
+    out.packed_vals_.assign((n + 31) / 32, 0);
+    for (size_t i = 0; i < n; ++i) {
+        const uint8_t gc = src[i];
+        write_pv(out.packed_vals_.data(), i, gc >= 3 ? uint8_t(3) : gc);
+    }
 }
 
 } // namespace genopack

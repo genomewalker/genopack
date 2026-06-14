@@ -20,6 +20,9 @@ namespace {
 std::vector<std::filesystem::path> collect_gpks(const std::filesystem::path& p) {
     std::vector<std::filesystem::path> v;
     if (p.extension() == ".gpk") { v.push_back(p); return v; }
+    // Caller may have passed the output stem (e.g. "pack" → actual file is "pack.gpk")
+    auto with_ext = std::filesystem::path(p.string() + ".gpk");
+    if (std::filesystem::is_regular_file(with_ext)) { v.push_back(with_ext); return v; }
     for (const auto& e : std::filesystem::directory_iterator(p))
         if (e.path().extension() == ".gpk") v.push_back(e.path());
     std::sort(v.begin(), v.end());

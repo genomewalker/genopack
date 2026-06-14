@@ -50,8 +50,7 @@ struct OwnedSpan {
 
 // 16-bit prefix index over a sorted OwnedSpan.
 // offsets[b] = first entry index where h>>48 == b; offsets[65536] = n (sentinel).
-// Avg bucket width ≈ n/65536. For a 10M-entry host union: ~153 entries/bucket.
-// contains() costs ~7 comparisons in a contiguous 1.2 KB span vs a full 80 MB scan.
+// Avg bucket width ≈ n/65536. For a 10M-entry host union: ~153 entries/bucket → ~7 comparisons.
 struct IndexedSpan {
     const uint64_t* data  = nullptr;
     const float*    prevf = nullptr;  // parallel prevalence; null → 1.0
@@ -264,7 +263,24 @@ inline ForeignScore score_contig_foreign_indexed(
     if (!host.valid()) return s;
     constexpr float eps = 0.01f;
     double loglr = 0.0;
-    for (uint64_t q : contig_aamers) {
+
+    // Pre-batch GMI lookups when the EF path is active (contig_aamers is sorted-unique).
+    // Avoids per-aamer random EF access; find_sorted carries bucket state across queries.
+    const bool use_gmi_batch = !tier_view.valid() && !gv.valid() && !gmi.empty();
+    thread_local std::vector<uint8_t> gmi_counts;
+    if (use_gmi_batch) {
+        gmi_counts.resize(contig_aamers.size());
+        gmi.lookup_sorted(contig_aamers.data(), contig_aamers.size(), gmi_counts.data());
+    }
+
+    const size_t na = contig_aamers.size();
+    for (size_t qi = 0; qi < na; ++qi) {
+        const uint64_t q = contig_aamers[qi];
+        // Prefetch the next query's host bucket base (16-bit prefix index).
+        if (qi + 1 < na && !host.offsets.empty()) {
+            const uint32_t nb = static_cast<uint32_t>(contig_aamers[qi + 1] >> 48);
+            __builtin_prefetch(host.data + host.offsets[nb], 0, 0);
+        }
         const uint32_t hpos    = host.find(q);
         const bool     in_host = hpos < host.n;
         const bool     in_fam  = family.valid() && family.contains(q);
@@ -285,9 +301,8 @@ inline ForeignScore score_contig_foreign_indexed(
             } else if (gv.valid()) {
                 // Legacy GAMI path (prebuilt Bloom).
                 if (gv.is_rare(q)) { ++s.foreign_specific; loglr += std::log(1.0f / eps); }
-            } else if (!gmi.empty()) {
-                // Legacy runtime-GMI path.
-                const uint8_t gc = gmi.lookup(q);
+            } else if (use_gmi_batch) {
+                const uint8_t gc = gmi_counts[qi];
                 if (gc >= 1 && gc <= K) { ++s.foreign_specific; loglr += std::log(1.0f / eps); }
             } else {
                 // No tier / GAMI / GMI: unweighted baseline — every foreign aamer counts.

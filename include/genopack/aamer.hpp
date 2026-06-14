@@ -4,6 +4,9 @@
 #include <functional>
 #include <string_view>
 #include <vector>
+#ifdef __AVX2__
+#  include <immintrin.h>
+#endif
 
 namespace genopack {
 
@@ -158,26 +161,186 @@ inline void emit_aamers(const uint8_t* seg, int len, int k,
     }
 }
 
+// FracMinHash variant with rolling packed-value: avoids re-packing 8 bytes per slide.
+// v_{i+1} = (v_i - seg[i]) >> 5 | (seg[i+k] << (k-1)*5)  — 3 ops vs 22 for full repack.
+// Hash output is bit-identical to aamer_hash(seg+i); GMI index is unaffected.
+// seg[i] values are 0..19 < 32, so low 5 bits of v always equal seg[i] (no borrow on subtract).
+
+inline void emit_aamers_frac(const uint8_t* seg, int len, int k,
+                               uint64_t max_hash, std::vector<uint64_t>& out) {
+    if (len < k) return;
+    uint64_t v = 0;
+    for (int j = 0; j < k; ++j) v |= (uint64_t)seg[j] << (j * 5);
+    const int tail_shift = (k - 1) * 5;
+    for (int i = 0; i + k <= len; ++i) {
+        if (!aamer_is_low_complexity(seg + i, k)) {
+            uint64_t h = v;
+            h ^= h >> 30; h *= 0xbf58476d1ce4e5b9ULL;
+            h ^= h >> 27; h *= 0x94d049bb133111ebULL;
+            h ^= h >> 31;
+            if (h <= max_hash) out.push_back(h);
+        }
+        if (i + k < len)
+            v = ((v - (uint64_t)seg[i]) >> 5) | ((uint64_t)seg[i + k] << tail_shift);
+    }
+}
+
+// ── SIMD helpers for 6-frame translation (AVX2/SSSE3/SSE4.1) ─────────────────
+#ifdef __AVX2__
+namespace aamer_detail {
+
+// CODON11 split into four 16-byte SSSE3 shuffle tables indexed by (codon & 0x0F).
+// Quarter selected by (codon >> 4). Stops (0xFF in scalar) stored as 0x7F to keep
+// them distinct from the 0xFF ambiguous-base sentinel used in SIMD logic.
+alignas(16) static constexpr int8_t C11Q0[16] = {  // b0=A, indices 0..15
+     8, 11,  8, 11, 16, 16, 16, 16, 14, 15, 14, 15,  7,  7, 10,  7};
+alignas(16) static constexpr int8_t C11Q1[16] = {  // b0=C, indices 16..31
+    13,  6, 13,  6, 12, 12, 12, 12, 14, 14, 14, 14,  9,  9,  9,  9};
+alignas(16) static constexpr int8_t C11Q2[16] = {  // b0=G, indices 32..47
+     3,  2,  3,  2,  0,  0,  0,  0,  5,  5,  5,  5, 17, 17, 17, 17};
+alignas(16) static constexpr int8_t C11Q3[16] = {  // b0=T, indices 48..63 (TAA/TAG/TGA→0x7F)
+    0x7F, 19, 0x7F, 19, 15, 15, 15, 15, 0x7F, 1, 18, 1, 9, 4, 9, 4};
+
+// Deinterleave 24 input bytes (lo=p[0..15], hi=p[8..23]) into three 8-wide base streams.
+// Byte positions: b0 at {0,3,6,9,12,15,18,21}, b1 at {1,4,7,10,13,16,19,22},
+//                b2 at {2,5,8,11,14,17,20,23}.  Lanes 8..15 zeroed (0x80 mask).
+alignas(16) static constexpr int8_t DIB0LO[16] = {
+     0,  3,  6,  9, 12, 15, -128,-128,-128,-128,-128,-128,-128,-128,-128,-128};
+alignas(16) static constexpr int8_t DIB0HI[16] = {
+    -128,-128,-128,-128,-128,-128, 10, 13,-128,-128,-128,-128,-128,-128,-128,-128};
+alignas(16) static constexpr int8_t DIB1LO[16] = {
+     1,  4,  7, 10, 13,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128};
+alignas(16) static constexpr int8_t DIB1HI[16] = {
+    -128,-128,-128,-128,-128,  8, 11, 14,-128,-128,-128,-128,-128,-128,-128,-128};
+alignas(16) static constexpr int8_t DIB2LO[16] = {
+     2,  5,  8, 11, 14,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128,-128};
+alignas(16) static constexpr int8_t DIB2HI[16] = {
+    -128,-128,-128,-128,-128,  9, 12, 15,-128,-128,-128,-128,-128,-128,-128,-128};
+
+// Encode 16 ASCII DNA bytes → 0(A),1(C),2(G),3(T/U) or 0xFF (invalid/ambiguous).
+// Clears bits {7,5} to normalise case (a→A, t→T, u→U) then does exact comparison.
+static inline __m128i enc16(const __m128i v) noexcept {
+    // 0x5F = 0101 1111: clears bits 7 and 5 → maps acgtu → ACGTU, N/other unchanged
+    const __m128i upr  = _mm_and_si128(v, _mm_set1_epi8(0x5F));
+    const __m128i isA  = _mm_cmpeq_epi8(upr, _mm_set1_epi8('A'));
+    const __m128i isC  = _mm_cmpeq_epi8(upr, _mm_set1_epi8('C'));
+    const __m128i isG  = _mm_cmpeq_epi8(upr, _mm_set1_epi8('G'));
+    const __m128i isT  = _mm_cmpeq_epi8(upr, _mm_set1_epi8('T'));
+    const __m128i isU  = _mm_cmpeq_epi8(upr, _mm_set1_epi8('U'));
+    const __m128i isTU = _mm_or_si128(isT, isU);
+    const __m128i base = _mm_or_si128(
+        _mm_or_si128(_mm_and_si128(isC, _mm_set1_epi8(1)),
+                     _mm_and_si128(isG, _mm_set1_epi8(2))),
+        _mm_and_si128(isTU, _mm_set1_epi8(3)));
+    const __m128i valid = _mm_or_si128(_mm_or_si128(isA, isC), _mm_or_si128(isG, isTU));
+    return _mm_or_si128(base, _mm_andnot_si128(valid, _mm_set1_epi8(-1)));
+}
+
+// 4-shuffle CODON11 lookup: 8 6-bit indices → 8 AA bytes (0..19) or 0x7F (stop).
+static inline __m128i codon8(const __m128i idx6) noexcept {
+    const __m128i lo4 = _mm_and_si128(idx6, _mm_set1_epi8(0x0F));
+    const __m128i q0  = _mm_shuffle_epi8(_mm_load_si128(reinterpret_cast<const __m128i*>(C11Q0)), lo4);
+    const __m128i q1  = _mm_shuffle_epi8(_mm_load_si128(reinterpret_cast<const __m128i*>(C11Q1)), lo4);
+    const __m128i q2  = _mm_shuffle_epi8(_mm_load_si128(reinterpret_cast<const __m128i*>(C11Q2)), lo4);
+    const __m128i q3  = _mm_shuffle_epi8(_mm_load_si128(reinterpret_cast<const __m128i*>(C11Q3)), lo4);
+    // Per-byte >>4 without lane bleed: mask to high 3 bits (idx<64 so bit6=0 always),
+    // then 16-bit right-shift 4 — the zero lower nibble prevents cross-byte contamination.
+    const __m128i hi2 = _mm_srli_epi16(_mm_and_si128(idx6, _mm_set1_epi8(0x70)), 4);
+    const __m128i is1 = _mm_cmpeq_epi8(hi2, _mm_set1_epi8(1));
+    const __m128i is2 = _mm_cmpeq_epi8(hi2, _mm_set1_epi8(2));
+    const __m128i is3 = _mm_cmpeq_epi8(hi2, _mm_set1_epi8(3));
+    __m128i r = _mm_blendv_epi8(q0, q1, is1);
+    r = _mm_blendv_epi8(r, q2, is2);
+    r = _mm_blendv_epi8(r, q3, is3);
+    return r;
+}
+
+// Translate 8 codons at p[0..23]. Writes 8 AA bytes to out[0..7].
+// Returns 8-bit mask: bit i set → out[i] is a valid AA (not stop/ambiguous).
+// Caller must ensure p[0..23] are all readable.
+static inline unsigned xlate8(const char* p, uint8_t* out) noexcept {
+    const __m128i lo = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
+    const __m128i hi = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + 8));
+    const __m128i b0 = enc16(_mm_or_si128(
+        _mm_shuffle_epi8(lo, _mm_load_si128(reinterpret_cast<const __m128i*>(DIB0LO))),
+        _mm_shuffle_epi8(hi, _mm_load_si128(reinterpret_cast<const __m128i*>(DIB0HI)))));
+    const __m128i b1 = enc16(_mm_or_si128(
+        _mm_shuffle_epi8(lo, _mm_load_si128(reinterpret_cast<const __m128i*>(DIB1LO))),
+        _mm_shuffle_epi8(hi, _mm_load_si128(reinterpret_cast<const __m128i*>(DIB1HI)))));
+    const __m128i b2 = enc16(_mm_or_si128(
+        _mm_shuffle_epi8(lo, _mm_load_si128(reinterpret_cast<const __m128i*>(DIB2LO))),
+        _mm_shuffle_epi8(hi, _mm_load_si128(reinterpret_cast<const __m128i*>(DIB2HI)))));
+    // Ambiguous: any base has bit7 set (0xFF in signed = negative)
+    const __m128i amb  = _mm_cmpgt_epi8(_mm_setzero_si128(),
+                                         _mm_or_si128(_mm_or_si128(b0, b1), b2));
+    // Codon index = b0*16 + b1*4 + b2. Mask to 0..3 first to neutralise 0xFF bases.
+    // slli_epi16 on values 0..3 stays within each byte (max 3*16=48, 3*4=12 < 256).
+    const __m128i b0s = _mm_and_si128(b0, _mm_set1_epi8(3));
+    const __m128i b1s = _mm_and_si128(b1, _mm_set1_epi8(3));
+    const __m128i b2s = _mm_and_si128(b2, _mm_set1_epi8(3));
+    const __m128i idx = _mm_add_epi8(
+        _mm_add_epi8(_mm_slli_epi16(b0s, 4), _mm_slli_epi16(b1s, 2)), b2s);
+    const __m128i aa   = codon8(idx);
+    const __m128i stop = _mm_cmpeq_epi8(aa, _mm_set1_epi8(0x7F));
+    const __m128i brk  = _mm_or_si128(stop, amb);
+    _mm_storel_epi64(reinterpret_cast<__m128i*>(out), aa);
+    return (~static_cast<unsigned>(_mm_movemask_epi8(brk))) & 0xFFu;
+}
+
+} // namespace aamer_detail
+#endif // __AVX2__
+
 // ── 6-frame translation ───────────────────────────────────────────────────────
 
 // For each inter-stop AA segment of length >= min_aa_len in all 6 reading frames,
 // calls cb(frame, aa_ptr, aa_len, nt_start, nt_end) where [nt_start, nt_end) is the
 // half-open interval on the FORWARD strand (reverse-strand ORFs are complemented back).
 // Frame 0-2 = forward, 3-5 = reverse complement.
-// aa_ptr is valid only for the duration of the call (points into a local buffer).
+// aa_ptr is valid only for the duration of the call (points into a thread-local buffer).
 // Ambiguous bases (N etc.) break the reading frame like a stop codon.
 // Genetic code 11 (standard bacterial/archaeal).
 template <typename Cb>
 inline void translate_6frame(std::string_view seq, int min_aa_len, Cb&& cb) {
     const int n = static_cast<int>(seq.size());
     const char* s = seq.data();
+    // Thread-local AA segment buffer: eliminates 6 per-call heap allocations.
+    thread_local std::vector<uint8_t> seg;
 
     // Forward frames 0-2
     for (int frame = 0; frame < 3; ++frame) {
-        std::vector<uint8_t> seg;
-        seg.reserve(n / 3 + 2);
+        seg.clear();
         int seg_nt_start = frame;
-        for (int i = frame; i + 2 < n; i += 3) {
+        const int ncod = (n - frame) / 3;
+        const char* base = s + frame;
+        int c = 0;
+
+#ifdef __AVX2__
+        uint8_t tmp[8];
+        // SIMD loop: 8 codons per iteration.
+        // Loop guard: c+8 <= ncod ensures bytes base[c*3..c*3+23] are all in-bounds
+        // (since (c+8)*3 <= ncod*3 <= n-frame, so frame+(c+8)*3 <= n).
+        for (; c + 8 <= ncod; c += 8) {
+            const unsigned vmask = aamer_detail::xlate8(base + c * 3, tmp);
+            if (vmask == 0xFFu) {
+                seg.insert(seg.end(), tmp, tmp + 8);
+                continue;
+            }
+            for (int j = 0; j < 8; ++j) {
+                if (vmask & (1u << j)) {
+                    seg.push_back(tmp[j]);
+                } else {
+                    const int nt = frame + (c + j) * 3;
+                    if ((int)seg.size() >= min_aa_len)
+                        cb(frame, seg.data(), (int)seg.size(), seg_nt_start, nt);
+                    seg.clear();
+                    seg_nt_start = nt + 3;
+                }
+            }
+        }
+#endif
+
+        // Scalar tail (remainder after SIMD, or full loop when !AVX2)
+        for (int i = frame + c * 3; i + 2 < n; i += 3) {
             const uint8_t b0 = DNA_ENC[(uint8_t)s[i]];
             const uint8_t b1 = DNA_ENC[(uint8_t)s[i+1]];
             const uint8_t b2 = DNA_ENC[(uint8_t)s[i+2]];
@@ -202,14 +365,12 @@ inline void translate_6frame(std::string_view seq, int min_aa_len, Cb&& cb) {
             cb(frame, seg.data(), (int)seg.size(), seg_nt_start, n);
     }
 
-    // Reverse complement frames 3-5.
-    // RC frame `frame` reads backward from position (n-1-frame).
-    // nt_start/nt_end reported on the forward strand: nt_start = n - pos - 1, nt_end = n - seg_rc_end.
+    // Reverse complement frames 3-5 (scalar backward scan — faster than any SIMD RC
+    // variant on this workload: 16 threads, up to 500 KB contigs, NFS+DDR4).
     for (int frame = 0; frame < 3; ++frame) {
-        std::vector<uint8_t> seg;
-        seg.reserve(n / 3 + 2);
+        seg.clear();
         const int rc_start = n - 1 - frame;
-        int seg_rc_end = rc_start + 1; // exclusive RC end (= fwd nt_start = n - seg_rc_end)
+        int seg_rc_end = rc_start + 1;
         for (int pos = rc_start; pos - 2 >= 0; pos -= 3) {
             const uint8_t e0 = DNA_ENC[(uint8_t)s[pos]];
             const uint8_t e1 = DNA_ENC[(uint8_t)s[pos-1]];
@@ -246,12 +407,38 @@ template <typename Cb>
 inline void translate_3frame_fwd(std::string_view seq, int min_aa_len, Cb&& cb) {
     const int n = static_cast<int>(seq.size());
     const char* s = seq.data();
+    thread_local std::vector<uint8_t> seg;
 
     for (int frame = 0; frame < 3; ++frame) {
-        std::vector<uint8_t> seg;
-        seg.reserve(n / 3 + 2);
+        seg.clear();
         int seg_nt_start = frame;
-        for (int i = frame; i + 2 < n; i += 3) {
+        const int ncod = (n - frame) / 3;
+        const char* base = s + frame;
+        int c = 0;
+
+#ifdef __AVX2__
+        uint8_t tmp[8];
+        for (; c + 8 <= ncod; c += 8) {
+            const unsigned vmask = aamer_detail::xlate8(base + c * 3, tmp);
+            if (vmask == 0xFFu) {
+                seg.insert(seg.end(), tmp, tmp + 8);
+                continue;
+            }
+            for (int j = 0; j < 8; ++j) {
+                if (vmask & (1u << j)) {
+                    seg.push_back(tmp[j]);
+                } else {
+                    const int nt = frame + (c + j) * 3;
+                    if ((int)seg.size() >= min_aa_len)
+                        cb(frame, seg.data(), (int)seg.size(), seg_nt_start, nt);
+                    seg.clear();
+                    seg_nt_start = nt + 3;
+                }
+            }
+        }
+#endif
+
+        for (int i = frame + c * 3; i + 2 < n; i += 3) {
             const uint8_t b0 = DNA_ENC[(uint8_t)s[i]];
             const uint8_t b1 = DNA_ENC[(uint8_t)s[i+1]];
             const uint8_t b2 = DNA_ENC[(uint8_t)s[i+2]];
@@ -299,12 +486,7 @@ extract_aamers_dna(std::string_view seq, int k, int min_seg_aa, uint64_t max_has
     std::vector<uint64_t> hashes;
     hashes.reserve(seq.size() / (4 * 32));
     translate_6frame(seq, min_seg_aa, [&](int, const uint8_t* seg, int len, int, int) {
-        for (int i = 0; i + k <= len; ++i) {
-            if (!aamer_is_low_complexity(seg + i, k)) {
-                uint64_t h = aamer_hash(seg + i);
-                if (h <= max_hash) hashes.push_back(h);
-            }
-        }
+        emit_aamers_frac(seg, len, k, max_hash, hashes);
     });
     std::sort(hashes.begin(), hashes.end());
     hashes.erase(std::unique(hashes.begin(), hashes.end()), hashes.end());
@@ -317,12 +499,7 @@ inline void
 extract_aamers_dna_into(std::string_view seq, int k, int min_seg_aa, uint64_t max_hash,
                           std::vector<uint64_t>& out) {
     translate_6frame(seq, min_seg_aa, [&](int, const uint8_t* seg, int len, int, int) {
-        for (int i = 0; i + k <= len; ++i) {
-            if (!aamer_is_low_complexity(seg + i, k)) {
-                uint64_t h = aamer_hash(seg + i);
-                if (h <= max_hash) out.push_back(h);
-            }
-        }
+        emit_aamers_frac(seg, len, k, max_hash, out);
     });
 }
 

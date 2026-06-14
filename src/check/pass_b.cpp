@@ -570,16 +570,19 @@ void run_pass_b(ICheckReader& pack,
                 }
 
                 // Indexed host/family spans for foreign-aamer scoring (read-only, zero-copy).
-                IndexedSpan host_ix, fam_ix;
+                // Use pointers into the map entries — valid for the genome's lifetime since
+                // release_host_refs() only evicts AFTER processing completes (line ~1178).
+                const IndexedSpan* host_ix_ptr = nullptr;
+                const IndexedSpan* fam_ix_ptr  = nullptr;
                 if (git != flagged_genus.end()) {
                     std::lock_guard<std::mutex> lk(eviction_mtx);
                     if (!genus_host_index.empty()) {
                         auto hit = genus_host_index.find(git->second);
-                        if (hit != genus_host_index.end()) host_ix = hit->second;
+                        if (hit != genus_host_index.end()) host_ix_ptr = &hit->second;
                         auto famit = flagged_family.find(acc);
                         if (famit != flagged_family.end()) {
                             auto fit = family_index_map.find(famit->second);
-                            if (fit != family_index_map.end()) fam_ix = fit->second;
+                            if (fit != family_index_map.end()) fam_ix_ptr = &fit->second;
                         }
                     }
                 }
@@ -809,15 +812,23 @@ void run_pass_b(ICheckReader& pack,
                         // Composition-independent; runs for every contig >=1kb (where TNF
                         // abstains). Classifies the contig's 6-frame aamers as host- vs
                         // foreign-specific against the precomputed reference set.
-                        if (host_ix.valid() && contig.seq.size() >= 1000) {
+                        // Skip extraction for large (>=5kb) contigs that are TNF inliers:
+                        // the composition signal already confirms host origin.
+                        if (host_ix_ptr && host_ix_ptr->valid() && contig.seq.size() >= 1000) {
+                            const bool skip_aamer = contig.seq.size() >= 5000
+                                && !std::isnan(cf.tnf_score)
+                                && cf.tnf_score < cfg.contig_tnf_threshold;
                             thread_local std::vector<uint64_t> prot_qm;
+                            if (!skip_aamer) {
                             prot_qm.clear();
                             extract_aamers_dna_into(contig.seq, foreign_k, foreign_min_seg,
                                                     foreign_frac_max, prot_qm);
                             std::sort(prot_qm.begin(), prot_qm.end());
                             prot_qm.erase(std::unique(prot_qm.begin(), prot_qm.end()), prot_qm.end());
+                            static const IndexedSpan empty_ix;
+                            const IndexedSpan& fam_ref = fam_ix_ptr ? *fam_ix_ptr : empty_ix;
                             ForeignScore fs = score_contig_foreign_indexed(
-                                host_ix, fam_ix, gmi, gami_view, foreign_K, prot_qm);
+                                *host_ix_ptr, fam_ref, gmi, gami_view, foreign_K, prot_qm);
                             cf.prot_classifiable     = static_cast<uint16_t>(std::min<uint32_t>(fs.classifiable, 65535));
                             cf.prot_host_specific    = static_cast<uint16_t>(std::min<uint32_t>(fs.host_specific, 65535));
                             cf.prot_foreign_specific = static_cast<uint16_t>(std::min<uint32_t>(fs.foreign_specific, 65535));
@@ -836,6 +847,7 @@ void run_pass_b(ICheckReader& pack,
                             // TODO(D3): score against mobile-element index when loaded;
                             // set PROT_MOBILE_ELEMENT flag for contigs matching a mobile MGE.
                             cf.prot_flags = pf;
+                            } // if (!skip_aamer)
                         }
 
                         flags.push_back(cf);

@@ -624,22 +624,29 @@ static std::string decode_mem_delta_legacy_full(const std::string& anchor_seq,
         throw std::runtime_error("decode_mem_delta: verbatim overflow");
     const uint8_t* verbatim = p;
 
+    // MEMs from find_mems are in non-decreasing qpos order; sort defensively for
+    // old packs whose encoder predates the ordering guarantee.
+    std::sort(mems.begin(), mems.end(),
+              [](const MemEntry& a, const MemEntry& b){ return a.qpos < b.qpos; });
+
     std::string seq(query_seq_len, 'N');
-    std::vector<uint8_t> cov(query_seq_len, 0);
+    size_t vi = 0;
+    uint32_t cursor = 0;
     for (const auto& m : mems) {
         if (m.rpos + m.length > anchor_seq.size() || m.qpos + m.length > query_seq_len)
             throw std::runtime_error("decode_mem_delta: MEM out of bounds");
-        std::memcpy(&seq[m.qpos], anchor_seq.data() + m.rpos, m.length);
-        std::fill(cov.begin() + m.qpos, cov.begin() + m.qpos + m.length, 1);
-    }
-
-    size_t vi = 0;
-    for (uint32_t i = 0; i < query_seq_len; ++i) {
-        if (!cov[i]) {
+        while (cursor < m.qpos) {
             if (vi >= verbatim_len)
                 throw std::runtime_error("decode_mem_delta: verbatim underflow");
-            seq[i] = static_cast<char>(verbatim[vi++]);
+            seq[cursor++] = static_cast<char>(verbatim[vi++]);
         }
+        std::memcpy(&seq[m.qpos], anchor_seq.data() + m.rpos, m.length);
+        if (m.qpos + m.length > cursor) cursor = m.qpos + m.length;
+    }
+    while (cursor < query_seq_len) {
+        if (vi >= verbatim_len)
+            throw std::runtime_error("decode_mem_delta: verbatim underflow");
+        seq[cursor++] = static_cast<char>(verbatim[vi++]);
     }
 
     return reconstruct_fasta_from_seq(seq, contig_ends.data(), n_contigs, headers, headers_len);

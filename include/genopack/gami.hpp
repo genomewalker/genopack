@@ -10,9 +10,20 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace genopack {
+
+// 2-bit packed value array: gc clamped to [0,3] (4 states, 2 bits/entry).
+// Encoding: 0=absent, 1=gc=1, 2=gc=2, 3=gc≥3.  Correct for K≤3.
+// 102M entries → 25.5 MB (vs 102 MB for uint8_t), fits in L3 on most nodes.
+inline uint8_t read_pv(const uint64_t* pv, size_t i) noexcept {
+    return static_cast<uint8_t>((pv[i >> 5] >> ((i & 31) << 1)) & 3);
+}
+inline void write_pv(uint64_t* pv, size_t i, uint8_t v) noexcept {
+    pv[i >> 5] |= static_cast<uint64_t>(v & 3) << ((i & 31) << 1);
+}
 
 // SEC_GAMI is defined in format.hpp
 static constexpr uint64_t GAMI_MAGIC_V1 = 0x494D414700000001ULL;  // legacy Bloom (unused)
@@ -50,6 +61,7 @@ struct EliasFano {
         low_.clear();
         high_.clear();
         high_rank_.clear();
+        sel0_inv_.clear();
         if (n == 0) return;
 
         const uint64_t ratio = universe_ / static_cast<uint64_t>(n);
@@ -72,6 +84,32 @@ struct EliasFano {
         high_rank_.assign(high_.size() + 1, 0);
         for (size_t i = 0; i < high_.size(); ++i)
             high_rank_[i + 1] = high_rank_[i] + std::popcount(high_[i]);
+
+        // Build sampled select0 directory: sel0_inv_[j] = bit-position of the
+        // (j * kSel0Rate)-th 0-bit in high_.  Replaces the 22-deep binary search
+        // over high_rank_ (29MB, DRAM) with 1 lookup + ~7 sequential word scans.
+        sel0_inv_.clear();
+        {
+            uint64_t zeros_so_far = 0;
+            uint64_t next_sample  = 0;
+            for (size_t wi = 0; wi < high_.size(); ++wi) {
+                uint64_t word = high_[wi];
+                if (wi + 1 == high_.size() && (high_bit_count_ % 64) != 0) {
+                    const uint32_t valid = static_cast<uint32_t>(high_bit_count_ % 64);
+                    word |= ~((uint64_t(1) << valid) - 1);
+                }
+                const uint64_t zeros = static_cast<uint64_t>(64 - std::popcount(word));
+                while (next_sample < zeros_so_far + zeros) {
+                    const uint64_t skip = next_sample - zeros_so_far;
+                    uint64_t tmp = ~word;
+                    for (uint64_t r = 0; r < skip; ++r) tmp &= tmp - 1;
+                    sel0_inv_.push_back(static_cast<uint32_t>(wi * 64 + std::countr_zero(tmp)));
+                    next_sample += kSel0Rate;
+                }
+                zeros_so_far += zeros;
+            }
+            sel0_inv_.push_back(static_cast<uint32_t>(high_bit_count_));  // sentinel
+        }
     }
 
     size_t find(uint64_t v) const noexcept {
@@ -79,8 +117,11 @@ struct EliasFano {
         const uint64_t high = v >> l_;
         if (high > max_high_) return n;
 
-        const uint64_t begin = high == 0 ? 0 : rank1_before(select0(high - 1));
-        const uint64_t end = rank1_before(select0(high));
+        // rank1_before(select0(k)) == select0(k) - k  (EF identity, no high_rank_ needed)
+        const uint64_t s0_hi_m1 = high == 0 ? 0 : select0(high - 1);
+        const uint64_t begin = high == 0 ? 0 : (s0_hi_m1 - (high - 1));
+        const uint64_t s0_hi = select0(high);
+        const uint64_t end   = s0_hi - high;
         const uint64_t low = v & low_mask();
 
         size_t lo = static_cast<size_t>(begin);
@@ -93,6 +134,40 @@ struct EliasFano {
         return lo < static_cast<size_t>(end) && read_low(lo) == low ? lo : n;
     }
 
+    // Batch lookup for a SORTED, unique key array.
+    // Carries the EF high-bucket position across queries so consecutive keys
+    // in the same bucket skip re-running select0 from scratch.
+    // out[i] = vals[pos] if q[i] is present, 0 otherwise.
+    // q must be strictly ascending (caller ensures sorted-unique).
+    void find_sorted(const uint64_t* q, size_t m,
+                     const uint64_t* pv, uint8_t* out) const noexcept {
+        if (n == 0 || m == 0) { for (size_t i = 0; i < m; ++i) out[i] = 0; return; }
+        uint64_t prev_high = ~uint64_t(0);
+        uint64_t begin_idx = 0, end_idx = 0;
+        for (size_t i = 0; i < m; ++i) {
+            const uint64_t v = q[i];
+            if (v >= universe_) { out[i] = 0; continue; }
+            const uint64_t high = v >> l_;
+            if (high > max_high_) { out[i] = 0; continue; }
+            if (high != prev_high) {
+                // rank1_before(select0(k)) == select0(k) - k  (EF identity, avoids high_rank_)
+                begin_idx = (high == 0) ? 0 : (select0(high - 1) - (high - 1));
+                end_idx   = select0(high) - high;
+                prev_high = high;
+            }
+            const uint64_t low = v & low_mask();
+            size_t lo = static_cast<size_t>(begin_idx);
+            size_t hi = static_cast<size_t>(end_idx);
+            while (lo < hi) {
+                const size_t mid = lo + (hi - lo) / 2;
+                if (read_low(mid) < low) lo = mid + 1;
+                else hi = mid;
+            }
+            out[i] = (lo < static_cast<size_t>(end_idx) && read_low(lo) == low)
+                     ? read_pv(pv, lo) : 0;
+        }
+    }
+
     uint64_t access(size_t i) const noexcept {
         if (i >= n) return 0;
         const uint64_t pos = select1(static_cast<uint64_t>(i));
@@ -103,7 +178,8 @@ struct EliasFano {
     size_t bytes() const noexcept {
         return low_.size() * sizeof(uint64_t)
              + high_.size() * sizeof(uint64_t)
-             + high_rank_.size() * sizeof(uint64_t);
+             + high_rank_.size() * sizeof(uint64_t)
+             + sel0_inv_.size() * sizeof(uint32_t);
     }
 
 private:
@@ -111,9 +187,11 @@ private:
     uint64_t max_high_ = 0;
     uint64_t high_bit_count_ = 0;
     uint8_t  l_ = 0;
+    static constexpr uint32_t kSel0Rate = 256;
     std::vector<uint64_t> low_;
     std::vector<uint64_t> high_;
     std::vector<uint64_t> high_rank_;
+    std::vector<uint32_t> sel0_inv_;   // bit-pos of every kSel0Rate-th 0-bit (~2MB)
 
     static uint8_t floor_log2(uint64_t v) noexcept {
         uint8_t r = 0;
@@ -172,28 +250,29 @@ private:
     }
 
     uint64_t select0(uint64_t k) const noexcept {
-        size_t lo = 0, hi = high_.size();
-        while (lo < hi) {
-            const size_t mid = lo + (hi - lo) / 2;
-            const uint64_t valid_bits_end =
-                std::min<uint64_t>((static_cast<uint64_t>(mid) + 1) * 64, high_bit_count_);
-            const uint64_t zeros_end = valid_bits_end - high_rank_[mid + 1];
-            if (zeros_end > k) hi = mid;
-            else lo = mid + 1;
-        }
+        // Jump to approximate word via sampled directory, then scan sequentially.
+        // Cost: 1 random access (sel0_inv_, 2MB, likely L3) + ~7 sequential words.
+        const size_t   j    = static_cast<size_t>(k / kSel0Rate);
+        const uint64_t pos  = sel0_inv_[j];          // bit-pos of (j*kSel0Rate)-th 0-bit
+        size_t         wi   = static_cast<size_t>(pos >> 6);
+        uint64_t       rem  = k - static_cast<uint64_t>(j) * kSel0Rate;
+        const uint64_t mask = ~((uint64_t(1) << (pos & 63)) - 1);  // bits from pos onward
 
-        const uint64_t valid_bits_before =
-            std::min<uint64_t>(static_cast<uint64_t>(lo) * 64, high_bit_count_);
-        const uint64_t zeros_before = valid_bits_before - high_rank_[lo];
-        uint64_t word = high_[lo];
-        if (lo + 1 == high_.size() && (high_bit_count_ % 64) != 0) {
-            const uint32_t valid = static_cast<uint32_t>(high_bit_count_ % 64);
-            word |= ~((uint64_t{1} << valid) - 1);
+        while (true) {
+            uint64_t word = high_[wi];
+            if (wi + 1 == high_.size() && (high_bit_count_ % 64) != 0) {
+                const uint32_t valid = static_cast<uint32_t>(high_bit_count_ % 64);
+                word |= ~((uint64_t(1) << valid) - 1);
+            }
+            uint64_t inv = ~word & (wi == static_cast<size_t>(pos >> 6) ? mask : ~uint64_t(0));
+            const uint64_t z = static_cast<uint64_t>(std::popcount(inv));
+            if (rem < z) {
+                for (uint64_t r = 0; r < rem; ++r) inv &= inv - 1;
+                return static_cast<uint64_t>(wi) * 64 + std::countr_zero(inv);
+            }
+            rem -= z;
+            ++wi;
         }
-        word = ~word;
-        uint64_t in_word = k - zeros_before;
-        while (in_word-- > 0) word &= word - 1;
-        return static_cast<uint64_t>(lo) * 64 + std::countr_zero(word);
     }
 };
 
@@ -210,8 +289,8 @@ struct GlobalMultiplicityIndex {
     uint64_t              mask_  = 0;
     size_t                count_ = 0;
 
-    // Elias-Fano key storage plus flat counts: used by the SEC_GAMI load path.
-    std::vector<uint8_t>  sorted_vals_;
+    // Elias-Fano key storage plus 2-bit packed counts: used by the SEC_GAMI load path.
+    std::vector<uint64_t> packed_vals_;  // 2-bit per entry, min(gc,3); 25MB for 102M entries
     EliasFano             ef_;
 
     void reserve(size_t expected) {
@@ -248,7 +327,7 @@ struct GlobalMultiplicityIndex {
     uint8_t lookup(uint64_t h) const noexcept {
         if (ef_.n != 0) {
             const size_t i = ef_.find(h);
-            return i < ef_.n ? sorted_vals_[i] : 0;
+            return i < ef_.n ? read_pv(packed_vals_.data(), i) : 0;
         }
         if (keys_.empty()) return 0;
         uint64_t i = h & mask_;
@@ -256,11 +335,18 @@ struct GlobalMultiplicityIndex {
         return keys_[i] == h ? vals_[i] : 0;
     }
 
+    void lookup_sorted(const uint64_t* q, size_t m, uint8_t* out) const noexcept {
+        if (ef_.n != 0) {
+            ef_.find_sorted(q, m, packed_vals_.data(), out);
+            return;
+        }
+        for (size_t i = 0; i < m; ++i) out[i] = lookup(q[i]);
+    }
+
     bool   empty() const noexcept { return count_ == 0 && ef_.n == 0; }
     size_t count() const noexcept { return count_ + ef_.n; }
     size_t bytes() const noexcept {
-        return keys_.size() * 9
-             + ef_.bytes() + sorted_vals_.size();
+        return keys_.size() * 9 + ef_.bytes() + packed_vals_.size() * 8;
     }
 };
 
