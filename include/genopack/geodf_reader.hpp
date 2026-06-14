@@ -60,6 +60,7 @@ private:
     std::string lookup_string(uint32_t id) const;
     std::string lookup_recovered(size_t idx) const;
     std::string resolve_taxonomy(const TaxonHeader& hdr) const;
+    std::vector<TaxonHeader> read_all_headers() const;
     void        load_strings() const;
     void        load_index();
     void        scan_and_recover(uint64_t file_size);

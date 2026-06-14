@@ -372,20 +372,16 @@ void cladesplit_score_gpk(const std::filesystem::path& gpk,
     const unsigned nt = resolve_threads(threads);
     spdlog::info("cladesplit score-gpk: {} live genomes vs panel ({} aamers, {} clades), {} threads",
                  accs.size(), panel.n_aamers(), panel.n_clades(), nt);
-    auto egs = ar.batch_fetch_by_accessions(accs);
     std::vector<std::string> lines(accs.size());
-    std::atomic<size_t> next{0}, done{0};
-    auto worker = [&]() {
-        size_t i;
-        while ((i = next.fetch_add(1)) < accs.size()) {
-            if (!egs[i]) continue;
-            lines[i] = fmt_line(accs[i], panel.score(egs[i]->fasta, cfg), panel);
-            if (size_t d = ++done; d % 500 == 0) spdlog::info("cladesplit score-gpk: {}/{}", d, accs.size());
-        }
-    };
-    std::vector<std::thread> pool;
-    for (unsigned t = 0; t < nt; ++t) pool.emplace_back(worker);
-    for (auto& th : pool) th.join();
+    std::atomic<size_t> done{0};
+    ar.visit_shard_batches_parallel(accs, static_cast<int>(nt),
+        [&](ArchiveReader::ShardBatch& batch) {
+            for (auto& [idx, eg] : batch) {
+                lines[idx] = fmt_line(accs[idx], panel.score(eg.fasta, cfg), panel);
+                if (size_t d = ++done; d % 500 == 0)
+                    spdlog::info("cladesplit score-gpk: {}/{}", d, accs.size());
+            }
+        });
     std::ofstream o(out);
     o << "accession\tminority_fraction\tredundancy_fraction\tmajority_clade\tminority_clade\tn_votes\n";
     for (const auto& l : lines) if (!l.empty()) o << l;

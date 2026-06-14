@@ -181,12 +181,21 @@ std::string GeodfReader::resolve_taxonomy(const TaxonHeader& hdr) const {
     return {};
 }
 
+std::vector<TaxonHeader> GeodfReader::read_all_headers() const {
+    std::vector<size_t> order(index_.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::sort(order.begin(), order.end(),
+        [&](size_t a, size_t b) { return index_[a].header_offset < index_[b].header_offset; });
+    std::vector<TaxonHeader> headers(index_.size());
+    for (size_t i : order)
+        safe_pread(fd_, &headers[i], sizeof(TaxonHeader), index_[i].header_offset);
+    return headers;
+}
+
 std::unordered_set<std::string> GeodfReader::completed_taxa() const {
     load_strings();
     std::unordered_set<std::string> result;
-    std::vector<TaxonHeader> headers(index_.size());
-    for (std::size_t i = 0; i < index_.size(); ++i)
-        safe_pread(fd_, &headers[i], sizeof(TaxonHeader), index_[i].header_offset);
+    auto headers = read_all_headers();
     for (std::size_t i = 0; i < index_.size(); ++i) {
         if (index_[i].stage != PipelineStage::COMPLETE) continue;
         if (std::memcmp(headers[i].magic, TAXON_MAGIC, 4) == 0) {
@@ -201,9 +210,7 @@ std::vector<std::pair<TaxonHeader, std::string>> GeodfReader::scan_headers() con
     load_strings();
     std::vector<std::pair<TaxonHeader, std::string>> result;
     result.reserve(index_.size());
-    std::vector<TaxonHeader> headers(index_.size());
-    for (std::size_t i = 0; i < index_.size(); ++i)
-        safe_pread(fd_, &headers[i], sizeof(TaxonHeader), index_[i].header_offset);
+    auto headers = read_all_headers();
     for (std::size_t i = 0; i < index_.size(); ++i) {
         if (std::memcmp(headers[i].magic, TAXON_MAGIC, 4) == 0)
             result.emplace_back(headers[i], resolve_taxonomy(headers[i]));
@@ -229,9 +236,7 @@ std::optional<TaxonData> GeodfReader::find(const std::string& taxonomy) const {
 
 void GeodfReader::for_each_complete(const std::function<void(const TaxonData&)>& cb) const {
     load_strings();
-    std::vector<TaxonHeader> headers(index_.size());
-    for (std::size_t i = 0; i < index_.size(); ++i)
-        safe_pread(fd_, &headers[i], sizeof(TaxonHeader), index_[i].header_offset);
+    auto headers = read_all_headers();
     for (std::size_t i = 0; i < index_.size(); ++i) {
         if (index_[i].stage != PipelineStage::COMPLETE) continue;
         if (std::memcmp(headers[i].magic, TAXON_MAGIC, 4) != 0) continue;
