@@ -136,13 +136,22 @@ inline SectionDesc qcol_write(AppendWriter& w, uint64_t section_id,
 }
 
 // Materialize each row of a SEC_QCOL store back into a QualRecord (legacy fields
-// only; absent columns keep make_empty defaults). Drop-in for QualReader::scan.
+// + aamer_core extra columns; absent columns keep make_empty defaults).
+// Drop-in for QualReader::scan.
 inline void qcol_scan(const ColStoreReader& r,
                       const std::function<void(const QualRecord&)>& cb) {
     const auto& fields = qcol_fields();
     std::vector<int> idx(fields.size());
     for (size_t fi = 0; fi < fields.size(); ++fi)
         idx[fi] = r.find_column(qcol_legacy_key(fields[fi]));
+
+    // Extra columns stored with core_model_hash in key — find by method name.
+    int aamer_core_col = -1, aamer_family_col = -1;
+    for (uint32_t c = 0; c < r.n_columns(); ++c) {
+        auto cv = r.column(c);
+        if (cv.method == qual_method::AAMER_GENUS_CORE)  aamer_core_col   = static_cast<int>(c);
+        if (cv.method == qual_method::AAMER_FAMILY_CORE) aamer_family_col = static_cast<int>(c);
+    }
 
     const uint32_t n = r.n_rows();
     for (uint32_t row = 0; row < n; ++row) {
@@ -153,6 +162,14 @@ inline void qcol_scan(const ColStoreReader& r,
             const uint64_t sz = dtype_size(fields[fi].dtype);
             std::memcpy(reinterpret_cast<uint8_t*>(&q) + fields[fi].offset,
                         cv.values + static_cast<size_t>(row) * sz, sz);
+        }
+        if (aamer_core_col >= 0) {
+            auto cv = r.column(static_cast<uint32_t>(aamer_core_col));
+            if (cv.present(row)) q.completeness_aamer_core = cv.get<float>(row);
+        }
+        if (aamer_family_col >= 0) {
+            auto cv = r.column(static_cast<uint32_t>(aamer_family_col));
+            if (cv.present(row)) q.completeness_aamer_family_core = cv.get<float>(row);
         }
         cb(q);
     }

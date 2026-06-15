@@ -315,6 +315,8 @@ PassAResult run_pass_a(ICheckReader& pack,
                     q.contamination_leakage         = r.contamination_leakage;
                     q.leakage_residual              = r.leakage_residual;
                     q.contamination_duplication     = QualRecord::decode_dup(r.contamination_duplication_u16);
+                    if (r.sketch_fill_u8 > 0)
+                        q.completeness_sketch_fill  = r.sketch_fill_u8 / 200.0f;
                 }
             } else if (sl.S_c > 0.0f) {
                 q.completeness_cluster_relative =

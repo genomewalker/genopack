@@ -111,7 +111,9 @@ void run_pass_b(ICheckReader& pack,
                 const PassBConfig& cfg,
                 int threads,
                 const std::unordered_map<uint64_t, QualRecord>* qual_cache,
-                const std::unordered_map<uint64_t, QualRecord>* baseline_cache)
+                const std::unordered_map<uint64_t, QualRecord>* baseline_cache,
+                genopack::GlobalMultiplicityIndex* preloaded_gmi,
+                std::future<void>* gmi_future)
 {
     std::atomic<int64_t> s_extract_ns{0}, s_score_ns{0}, s_genome_ns{0}, s_mutex_ns{0};
     std::atomic<int64_t> s_parse_ns{0}, s_completeness_ns{0}, s_contig_ns{0},
@@ -192,6 +194,13 @@ void run_pass_b(ICheckReader& pack,
             q.contamination_cross_genus     = r.cross_genus_u8     / 255.0f;
             if (r.sketch_fill_u8 > 0)
                 q.completeness_sketch_fill = r.sketch_fill_u8 / 200.0f;
+            q.contamination_mixture = r.contamination_mixture;
+            q.mixture_sources       = r.mixture_sources;
+            q.n_mix_windows         = r.n_mix_windows;
+            if (!std::isnan(r.completeness_aamer_core))
+                q.completeness_aamer_core        = r.completeness_aamer_core;
+            if (!std::isnan(r.completeness_aamer_family_core))
+                q.completeness_aamer_family_core = r.completeness_aamer_family_core;
         }
         if (to_scan.empty()) {
             spdlog::info("check pass-B: complete — all scores from QUAL cache");
@@ -312,8 +321,11 @@ void run_pass_b(ICheckReader& pack,
     // GMI: the multiplicity index that drives foreign-aamer scoring.
     // Runtime GMI build (~10-30 min) from PCORE/CORE union when present.
     const genopack::GamiView gami_view{};   // legacy Bloom path (unused)
-    GlobalMultiplicityIndex gmi;
-    if (pack.has_gami_v2()) {
+    GlobalMultiplicityIndex local_gmi;
+    GlobalMultiplicityIndex& gmi = preloaded_gmi ? *preloaded_gmi : local_gmi;
+    // Preloaded GMI (started concurrently with pass-A) is joined after host unions below.
+    // Fallback: load synchronously here only when no preloaded GMI is provided.
+    if (!preloaded_gmi && pack.has_gami_v2()) {
         pack.load_gami_into(gmi);
         spdlog::info("check pass-B: GMI loaded from SEC_GAMI v2 ({} M entries, {:.1f} GB)",
                      gmi.count() / 1'000'000, gmi.bytes() / 1e9);
@@ -334,7 +346,7 @@ void run_pass_b(ICheckReader& pack,
         const uint32_t k = std::max(2u, n_entries / 500u);
         return static_cast<uint8_t>(k < 255u ? k : 255u);
     }();
-    if (gmi.empty() && (use_pcore || pack.has_core()) && !flagged_genus.empty()) {
+    if (!preloaded_gmi && gmi.empty() && (use_pcore || pack.has_core()) && !flagged_genus.empty()) {
         const int gmi_par = std::min(threads, 8);
         // Exact prescan eliminates all rehash transients.
         gmi.reserve(use_pcore ? pack.pcore_reader()->total_union_aamers() : 64'000'000ULL);
@@ -424,6 +436,14 @@ void run_pass_b(ICheckReader& pack,
         spdlog::info("check pass-B: host index: {} genera, {} families built",
                      genus_host_index.size(), family_index_map.size());
     }
+    // Join preloaded GMI (started concurrently with pass-A, ~37s).
+    // Host unions ran concurrently; by now GMI is almost certainly done.
+    if (gmi_future && gmi_future->valid()) {
+        gmi_future->get();
+        spdlog::info("check pass-B: GMI loaded from SEC_GAMI v2 ({} M entries, {:.1f} GB)",
+                     gmi.count() / 1'000'000, gmi.bytes() / 1e9);
+        spdlog::info("pass-B RSS after GMI load: {:.1f} GB", rss_kb() / 1e6);
+    }
 
     // Open marker panel (read-only, mmap — safe for concurrent reads across all threads).
     std::unique_ptr<MarkerReader> mrk_rd;
@@ -506,7 +526,6 @@ void run_pass_b(ICheckReader& pack,
 
     // N parallel reader threads each own an independent fd and sequential shard band.
     // Callback is invoked concurrently; quality_mtx guards shared state.
-    // Scale shard readers with thread count — more readers = higher I/O concurrency.
     const int k_shard_readers = std::min(16, std::max(4, threads / 2));
     const int inner_threads = std::max(1, threads / k_shard_readers);
     std::mutex quality_mtx;
