@@ -95,19 +95,17 @@ public:
 private:
     struct Part {
         std::vector<uint64_t> keys;
-        std::vector<uint16_t> counts;     // 0 = empty slot; present key ≥ 1; safe because
-                                          // per-genome aamers are sort+unique'd before insertion,
-                                          // so max count = genus member count (≤65535, guarded at build start)
+        std::vector<uint32_t> counts;     // 0 = empty slot; present key ≥ 1; max = genus member count
         uint32_t size = 0, mask = 0, occ = 0;
         void reset(uint32_t cap) { size=cap; mask=cap-1; keys.assign(cap,0); counts.assign(cap,0); occ=0; }
         void grow() {
             std::vector<uint64_t> ok = std::move(keys);
-            std::vector<uint16_t> oc = std::move(counts);
+            std::vector<uint32_t> oc = std::move(counts);
             const uint32_t osz = size;
             reset(size << 1);
             for (uint32_t i = 0; i < osz; ++i) if (oc[i]) put_(ok[i], oc[i]);
         }
-        inline void put_(uint64_t h, uint16_t c) {
+        inline void put_(uint64_t h, uint32_t c) {
             uint32_t s = static_cast<uint32_t>(h) & mask;
             while (counts[s]) { if (keys[s]==h) { counts[s]+=c; return; } s=(s+1)&mask; }
             keys[s]=h; counts[s]=c; ++occ;

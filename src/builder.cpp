@@ -419,10 +419,6 @@ struct ArchiveBuilder::Impl {
                 for (const auto& [k, v] : rec.extra_fields)
                     if (k == "taxonomy") { ++genus_total[extract_taxonomy_bucket(v, grank)]; break; }
             cc_micro_threshold = resolve_micro_threshold(cfg.micro_genus_threshold, original_total_records);
-            for (const auto& [gk, gc] : genus_total)
-                if (gc > 65535)
-                    throw std::runtime_error("genus '" + gk + "' has " + std::to_string(gc)
-                        + " members (>65535); uint16_t aamer counts would wrap — aborting");
         }
 
         // ── Checkpoint paths ──────────────────────────────────────────────────
