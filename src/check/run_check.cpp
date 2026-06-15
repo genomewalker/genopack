@@ -98,8 +98,11 @@ void write_qual_to_archive(const std::filesystem::path& gpk_path,
         r.n_mix_windows                 = q.n_mix_windows;
         r.fiedler_u16                   = static_cast<uint16_t>(
             std::min(1.0f, std::isnan(q.fiedler_value) ? 0.0f : q.fiedler_value) * 65535.0f);
-        r.contig_outlier_u8             = static_cast<uint8_t>(
-            std::min(1.0f, std::isnan(q.contamination_contig_outlier) ? 0.0f : q.contamination_contig_outlier) * 255.0f);
+        {
+            const float cf = std::min(1.0f, std::isnan(q.contamination_contig_outlier) ? 0.0f : q.contamination_contig_outlier);
+            r.contig_outlier_u8   = static_cast<uint8_t> (cf * 255.0f);
+            r.contig_outlier_u16  = static_cast<uint16_t>(cf * 65535.0f + 0.5f);
+        }
         r.spe_outlier_u8                = static_cast<uint8_t>(
             std::min(1.0f, std::isnan(q.contamination_spe) ? 0.0f : q.contamination_spe) * 255.0f);
         r.sibling_outlier_u8            = static_cast<uint8_t>(

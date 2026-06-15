@@ -50,7 +50,7 @@ inline const std::vector<QcolField>& qcol_fields() {
         {qual_axis::CONTAMINATION, qual_method::SPECTRAL,         Unit::Fraction01, ColDType::U16, offsetof(QualRecord, fiedler_u16)},
         {qual_axis::CONTAMINATION, qual_method::MIXTURE_WINDOWS,  Unit::Count,      ColDType::U16, offsetof(QualRecord, n_mix_windows)},
         {qual_axis::SUPPORT,       qual_method::FLAGS,            Unit::Count,      ColDType::U8,  offsetof(QualRecord, qual_flags)},
-        {qual_axis::CONTAMINATION, qual_method::CONTIG_OUTLIER,   Unit::Fraction01, ColDType::U8,  offsetof(QualRecord, contig_outlier_u8)},
+        {qual_axis::CONTAMINATION, qual_method::CONTIG_OUTLIER,   Unit::Fraction01, ColDType::U16, offsetof(QualRecord, contig_outlier_u16)},
         {qual_axis::CONTAMINATION, qual_method::FMH_MINORITY,     Unit::Fraction01, ColDType::U16, offsetof(QualRecord, fmh_minority_u16)},
         {qual_axis::COMPLETENESS,  qual_method::MARKER_SCG,       Unit::Fraction01, ColDType::U8,  offsetof(QualRecord, marker_completeness_u8)},
         {qual_axis::CONTAMINATION, qual_method::MARKER_REDUNDANCY,Unit::Ratio,      ColDType::U16, offsetof(QualRecord, marker_redundancy_u16)},

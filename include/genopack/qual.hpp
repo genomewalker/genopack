@@ -44,7 +44,8 @@ struct QualRecord {
     float    completeness_aamer_core;        //  4  CORE aamer coverage [0,1]; NAN = not scored
     float    completeness_aamer_family_core; //  4  FCORE aamer coverage [0,1]; NAN = not scored
     uint16_t fmh_minority_u16;              //  2  fmh_minority_fraction × 65535 (rounded); 0=not scored/clean
-    uint8_t  _reserved[6];                  //  6  reserved for future fields
+    uint16_t contig_outlier_u16;            //  2  contamination_contig_outlier × 65535 (rounded); 0=not scored/clean
+    uint8_t  _reserved[4];                  //  4  reserved for future fields
     // total = 96
 
     // contamination_duplication encode/decode (0 reserved as not-scored sentinel,
@@ -99,6 +100,7 @@ struct QualRecord {
         r.qual_flags                  = 0;
         r.fmh_minority_u8             = 0;
         r.fmh_minority_u16            = 0;
+        r.contig_outlier_u16          = 0;
         r.marker_completeness_u8      = 0;
         r.contamination_duplication_u16 = 0; // 0 = not scored
         r.completeness_aamer_core        = NAN;

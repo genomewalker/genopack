@@ -190,7 +190,9 @@ void run_pass_b(ICheckReader& pack,
                     : r.fmh_minority_u8  / 255.0f;
             if (r.marker_completeness_u8 > 0)
                 q.marker_completeness = (r.marker_completeness_u8 - 1) / 254.0f;
-            q.contamination_contig_outlier  = r.contig_outlier_u8  / 255.0f;
+            q.contamination_contig_outlier  = r.contig_outlier_u16 > 0
+                ? r.contig_outlier_u16 / 65535.0f
+                : r.contig_outlier_u8  / 255.0f;
             q.contamination_spe             = r.spe_outlier_u8     / 255.0f;
             q.contamination_sibling_outlier = r.sibling_outlier_u8 / 255.0f;
             q.contamination_rho_outlier     = r.rho_outlier_u8     / 255.0f;
