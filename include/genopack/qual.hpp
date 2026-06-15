@@ -31,7 +31,7 @@ struct QualRecord {
     uint16_t n_mix_windows;               //  2  windows used in mixture model
     uint8_t  qual_flags;                  //  1  bitfield — see QUAL_FLAG_* constants
     uint8_t  contig_outlier_u8;          //  1  contamination_contig_outlier × 255; 0=pure
-    uint8_t  fmh_minority_u8;             //  1  fmh_minority_fraction × 255; 0=clean/not computed
+    uint8_t  fmh_minority_u8;             //  1  LEGACY: fmh_minority_fraction × 255 (truncated); prefer fmh_minority_u16
     uint8_t  marker_completeness_u8;     //  1  marker_completeness encoded: 0=not_scored, 1-255=(v-1)/254.0
     uint16_t marker_redundancy_u16;      //  2  raw marker_redundancy × 65535 (0xFFFF = not scored)
     float    chargaff_parity;            //  4  Chargaff 2nd parity score [0,1]; NAN = not computed
@@ -43,7 +43,8 @@ struct QualRecord {
     // total = 80 (v3 layout — kV3Stride)
     float    completeness_aamer_core;        //  4  CORE aamer coverage [0,1]; NAN = not scored
     float    completeness_aamer_family_core; //  4  FCORE aamer coverage [0,1]; NAN = not scored
-    uint8_t  _reserved[8];                  //  8  reserved for future fields
+    uint16_t fmh_minority_u16;              //  2  fmh_minority_fraction × 65535 (rounded); 0=not scored/clean
+    uint8_t  _reserved[6];                  //  6  reserved for future fields
     // total = 96
 
     // contamination_duplication encode/decode (0 reserved as not-scored sentinel,
@@ -97,6 +98,7 @@ struct QualRecord {
         r.scale_kink                  = NAN;
         r.qual_flags                  = 0;
         r.fmh_minority_u8             = 0;
+        r.fmh_minority_u16            = 0;
         r.marker_completeness_u8      = 0;
         r.contamination_duplication_u16 = 0; // 0 = not scored
         r.completeness_aamer_core        = NAN;

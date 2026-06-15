@@ -169,7 +169,7 @@ void run_pass_b(ICheckReader& pack,
             const bool has_gcov_scored   = (r.qual_flags & QualRecord::QUAL_FLAG_GCOV_SCORED)   != 0;
             if (std::isnan(r.chromosome_skew_closure) || std::isnan(r.completeness_post_decontam) ||
                 (!has_build_signals && r.self_coherence == 0.0f) ||
-                (fmhr_rd && r.fmh_minority_u8 == 0 && !std::isnan(r.chromosome_skew_closure)) ||
+                (fmhr_rd && r.fmh_minority_u8 == 0 && r.fmh_minority_u16 == 0 && !std::isnan(r.chromosome_skew_closure)) ||
                 (!cfg.markers_path.empty() && r.marker_completeness_u8 == 0) ||
                 !has_gcov_scored) {
                 to_scan.push_back(acc); continue;
@@ -184,7 +184,10 @@ void run_pass_b(ICheckReader& pack,
             // No FMHR section -> the FMH axis is unavailable; degrade to NaN so
             // cache-served genomes match the FASTA-scan path (which leaves it NaN)
             // and the axis-fallback flag fires consistently.
-            q.fmh_minority_fraction      = fmhr_rd ? (r.fmh_minority_u8 / 255.0f) : NAN;
+            if (fmhr_rd)
+                q.fmh_minority_fraction = r.fmh_minority_u16 > 0
+                    ? r.fmh_minority_u16 / 65535.0f
+                    : r.fmh_minority_u8  / 255.0f;
             if (r.marker_completeness_u8 > 0)
                 q.marker_completeness = (r.marker_completeness_u8 - 1) / 254.0f;
             q.contamination_contig_outlier  = r.contig_outlier_u8  / 255.0f;

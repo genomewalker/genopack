@@ -51,7 +51,7 @@ inline const std::vector<QcolField>& qcol_fields() {
         {qual_axis::CONTAMINATION, qual_method::MIXTURE_WINDOWS,  Unit::Count,      ColDType::U16, offsetof(QualRecord, n_mix_windows)},
         {qual_axis::SUPPORT,       qual_method::FLAGS,            Unit::Count,      ColDType::U8,  offsetof(QualRecord, qual_flags)},
         {qual_axis::CONTAMINATION, qual_method::CONTIG_OUTLIER,   Unit::Fraction01, ColDType::U8,  offsetof(QualRecord, contig_outlier_u8)},
-        {qual_axis::CONTAMINATION, qual_method::FMH_MINORITY,     Unit::Fraction01, ColDType::U8,  offsetof(QualRecord, fmh_minority_u8)},
+        {qual_axis::CONTAMINATION, qual_method::FMH_MINORITY,     Unit::Fraction01, ColDType::U16, offsetof(QualRecord, fmh_minority_u16)},
         {qual_axis::COMPLETENESS,  qual_method::MARKER_SCG,       Unit::Fraction01, ColDType::U8,  offsetof(QualRecord, marker_completeness_u8)},
         {qual_axis::CONTAMINATION, qual_method::MARKER_REDUNDANCY,Unit::Ratio,      ColDType::U16, offsetof(QualRecord, marker_redundancy_u16)},
         {qual_axis::COHERENCE,     qual_method::CHARGAFF_PARITY,  Unit::Fraction01, ColDType::F32, offsetof(QualRecord, chargaff_parity)},
@@ -142,8 +142,13 @@ inline void qcol_scan(const ColStoreReader& r,
                       const std::function<void(const QualRecord&)>& cb) {
     const auto& fields = qcol_fields();
     std::vector<int> idx(fields.size());
-    for (size_t fi = 0; fi < fields.size(); ++fi)
-        idx[fi] = r.find_column(qcol_legacy_key(fields[fi]));
+    for (size_t fi = 0; fi < fields.size(); ++fi) {
+        int ci = r.find_column(qcol_legacy_key(fields[fi]));
+        // Skip if on-disk dtype doesn't match: stale U8 column for a field now stored as U16
+        // (or any other format change). Lets the fallback path (make_empty defaults) stay consistent.
+        if (ci >= 0 && r.column(static_cast<uint32_t>(ci)).dtype != fields[fi].dtype) ci = -1;
+        idx[fi] = ci;
+    }
 
     // Extra columns stored with core_model_hash in key — find by method name.
     int aamer_core_col = -1, aamer_family_col = -1;

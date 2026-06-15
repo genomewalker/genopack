@@ -111,8 +111,11 @@ void write_qual_to_archive(const std::filesystem::path& gpk_path,
         // sketch_fill: 0=not_scored, 1-255 = clamp(value,0,1.27)*200 (200=100%)
         r.sketch_fill_u8 = std::isnan(q.completeness_sketch_fill) ? 0u
             : static_cast<uint8_t>(std::clamp(q.completeness_sketch_fill, 0.0f, 1.27f) * 200.0f + 0.5f);
-        r.fmh_minority_u8               = static_cast<uint8_t>(
-            std::min(1.0f, std::isnan(q.fmh_minority_fraction) ? 0.0f : q.fmh_minority_fraction) * 255.0f);
+        {
+            const float fmhf = std::min(1.0f, std::isnan(q.fmh_minority_fraction) ? 0.0f : q.fmh_minority_fraction);
+            r.fmh_minority_u8  = static_cast<uint8_t> (fmhf * 255.0f);   // legacy: kept for old readers
+            r.fmh_minority_u16 = static_cast<uint16_t>(fmhf * 65535.0f + 0.5f);
+        }
         // marker_completeness: 0=not_scored, 1-255=(value-1)/254 → range [0,1] with sentinel 0
         if (!std::isnan(q.marker_completeness))
             r.marker_completeness_u8 = static_cast<uint8_t>(
