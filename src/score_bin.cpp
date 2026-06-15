@@ -297,7 +297,15 @@ float score_bin_fmh_containment(
     thread_local std::vector<uint64_t> tl_ref_buf;
     std::vector<RefView> rv;
     rv.reserve(refs.size());
-    tl_ref_buf.clear();
+    // Reserve tl_ref_buf before populating rv: push_back reallocation would invalidate
+    // rv[*].data pointers stored as (tl_ref_buf.data() + base).
+    {
+        size_t needed = 0;
+        for (const auto& ref : refs)
+            if (ref.valid() && ref.n_hashes > kFmhRefCap) needed += kFmhRefCap;
+        tl_ref_buf.clear();
+        tl_ref_buf.reserve(needed);
+    }
     for (const auto& ref : refs) {
         if (!ref.valid()) continue;
         if (ref.n_hashes <= kFmhRefCap) {

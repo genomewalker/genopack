@@ -365,8 +365,8 @@ inline void translate_6frame(std::string_view seq, int min_aa_len, Cb&& cb) {
             cb(frame, seg.data(), (int)seg.size(), seg_nt_start, n);
     }
 
-    // Reverse complement frames 3-5 (scalar backward scan — faster than any SIMD RC
-    // variant on this workload: 16 threads, up to 500 KB contigs, NFS+DDR4).
+    // Reverse complement frames 3-5 (scalar backward scan — faster than SIMD RC on
+    // this workload: small contigs dominate, precompute overhead exceeds SIMD gain).
     for (int frame = 0; frame < 3; ++frame) {
         seg.clear();
         const int rc_start = n - 1 - frame;

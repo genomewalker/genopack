@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cmath>
 #include <fstream>
+#include <future>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -122,6 +123,8 @@ void write_qual_to_archive(const std::filesystem::path& gpk_path,
         r.chargaff_parity               = q.chargaff_parity;
         r.spectral_gap                  = q.spectral_gap;
         r.scale_kink                    = q.scale_kink;
+        r.completeness_aamer_core        = q.completeness_aamer_core;
+        r.completeness_aamer_family_core = q.completeness_aamer_family_core;
 
         r.qual_flags                    = q.qual_flags;
         // Mark GCOV scoring as complete. Set whenever pass-B ran for this genome
@@ -272,6 +275,13 @@ int cmd_check(const std::filesystem::path& pack_path,
             }
         }
 
+        // Preload GMI concurrently with pass-A: SEC_GAMI is independent of flagged-genome results.
+        genopack::GlobalMultiplicityIndex preloaded_gmi;
+        std::future<void> gmi_future;
+        if (pack.has_gami_v2())
+            gmi_future = std::async(std::launch::async,
+                                    [&]{ pack.load_gami_into(preloaded_gmi); });
+
         auto pass_a = run_pass_a(pack, accessions, threads, min_genus_size,
                                  leakage_threshold, /*min_gstx_members=*/50,
                                  qual_cache_ptr);
@@ -281,7 +291,9 @@ int cmd_check(const std::filesystem::path& pack_path,
         pb_cfg.markers_path = markers_path.string();   // empty = marker scoring disabled
         pb_cfg.scan_all     = scan_all;
         const auto* baseline_ptr = qual_cache.empty() ? nullptr : &qual_cache;
-        run_pass_b(pack, pass_a, quality, pb_cfg, threads, qual_cache_ptr, baseline_ptr);
+        run_pass_b(pack, pass_a, quality, pb_cfg, threads, qual_cache_ptr, baseline_ptr,
+                   pack.has_gami_v2() ? &preloaded_gmi : nullptr,
+                   gmi_future.valid()  ? &gmi_future   : nullptr);
 
         // Re-score marker_redundancy_z using in-distribution per-genus calibration.
         // MSA-based calibration (in .mrk file) underestimates by ~16× because gap-spanning

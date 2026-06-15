@@ -2,8 +2,10 @@
 #include "types.hpp"
 #include "pass_a.hpp"
 #include "pack_iface.hpp"
+#include <genopack/gami.hpp>
 #include <genopack/qual.hpp>
 #include <cstdint>
+#include <future>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -41,6 +43,8 @@ void run_pass_b(ICheckReader& pack,
                 const PassBConfig& cfg,
                 int threads,
                 const std::unordered_map<uint64_t, QualRecord>* qual_cache = nullptr,
-                const std::unordered_map<uint64_t, QualRecord>* baseline_cache = nullptr);
+                const std::unordered_map<uint64_t, QualRecord>* baseline_cache = nullptr,
+                genopack::GlobalMultiplicityIndex* preloaded_gmi = nullptr,
+                std::future<void>* gmi_future = nullptr);
 
 } // namespace genopack::check
