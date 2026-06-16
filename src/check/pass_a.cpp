@@ -6,7 +6,6 @@
 #include <mutex>
 #include <omp.h>
 #include <spdlog/spdlog.h>
-#include <set>
 #include <unordered_set>
 
 namespace genopack::check {
@@ -643,14 +642,17 @@ PassAResult run_pass_a(ICheckReader& pack,
         for (const auto& [g, members] : genus_all)
             for (const auto& m : members)
                 acc_to_genus[m.acc] = g;
-        std::unordered_map<std::string, std::set<std::string>> fam_genera;
+        std::unordered_map<std::string, std::unordered_set<std::string>> fam_genera;
         for (const auto& [acc, fam] : acc_to_family) {
             auto git = acc_to_genus.find(acc);
             if (git != acc_to_genus.end())
                 fam_genera[fam].insert(git->second);
         }
-        for (auto& [fam, genera_set] : fam_genera)
-            result.family_to_genera[fam] = {genera_set.begin(), genera_set.end()};
+        for (auto& [fam, genera_set] : fam_genera) {
+            auto& v = result.family_to_genera[fam];
+            v.assign(genera_set.begin(), genera_set.end());
+            std::sort(v.begin(), v.end());
+        }
     }
 
     spdlog::info("check pass-A: complete — {} genera processed", active_genera.size());
