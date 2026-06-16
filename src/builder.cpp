@@ -742,10 +742,10 @@ struct ArchiveBuilder::Impl {
             }
             std::fflush(ckpt_meta_file);
 
-            // Update scalar checkpoint atomically (tmp + rename) so a crash
-            // mid-write cannot leave a torn checkpoint that forces a full
-            // rebuild (P12).
-            {
+            // Update scalar checkpoint atomically (tmp + rename). Non-fatal:
+            // a transient NFS error here just means we lose the resume point
+            // for this shard but the archive data is already durable.
+            try {
                 std::filesystem::path ckpt_tmp =
                     std::filesystem::path(ckpt_path.string() + ".tmp");
                 {
@@ -757,6 +757,8 @@ struct ArchiveBuilder::Impl {
                        << "next_section_id="  << next_section_id                   << "\n";
                 }
                 std::filesystem::rename(ckpt_tmp, ckpt_path);
+            } catch (const std::exception& e) {
+                spdlog::warn("checkpoint write skipped (transient error): {}", e.what());
             }
         };
 
