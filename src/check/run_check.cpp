@@ -1,5 +1,6 @@
 #include "run_check.hpp"
 #include "pass_a.hpp"
+#include "pass_aamer.hpp"
 #include "pass_b.hpp"
 #include "pack_iface.hpp"
 #include <genopack/archive.hpp>
@@ -293,6 +294,8 @@ int cmd_check(const std::filesystem::path& pack_path,
                                  qual_cache_ptr);
         auto quality = pass_a.quality;
 
+        run_pass_aamer(pack, pass_a, quality, threads);
+
         PassBConfig pb_cfg;
         pb_cfg.markers_path = markers_path.string();   // empty = marker scoring disabled
         pb_cfg.scan_all     = scan_all;
@@ -456,9 +459,12 @@ int cmd_check(const std::filesystem::path& pack_path,
     };
 
     for (const auto& [acc, q] : all_quality) {
-        const float comp_eff = !std::isnan(q.completeness_post_decontam)
-                               ? q.completeness_post_decontam
-                               : q.completeness_cluster_relative;
+        const bool aamer_only = std::isnan(q.completeness_post_decontam) &&
+                                std::isnan(q.completeness_cluster_relative) &&
+                                !std::isnan(q.completeness_aamer_core);
+        const float comp_eff = !std::isnan(q.completeness_post_decontam)   ? q.completeness_post_decontam
+                             : !std::isnan(q.completeness_cluster_relative) ? q.completeness_cluster_relative
+                             : q.completeness_aamer_core;
         const float fmh_cont = !std::isnan(q.fmh_minority_fraction) ? q.fmh_minority_fraction : NAN;
         const float cont_primary = !std::isnan(fmh_cont) ? fmh_cont : q.contamination_leakage;
         const float cont_val = std::isnan(cont_primary) ? 0.0f : cont_primary;
@@ -467,6 +473,7 @@ int cmd_check(const std::filesystem::path& pack_path,
         if (!std::isnan(comp_eff) && comp_eff >= 0.90f && cont_val < 0.05f) qtier = "HQ";
         else if (!std::isnan(comp_eff) && comp_eff >= 0.50f && cont_val < 0.10f) qtier = "MQ";
         if (!std::isnan(q.fiedler_oph_split) && q.fiedler_oph_split < 0.1f) qtier = "LQ";
+        if (aamer_only && qtier[0] == 'H') qtier = "MQ";
         tsv << acc << '\t'
             << qtier << '\t'
             << fmt(comp_eff) << '\t'

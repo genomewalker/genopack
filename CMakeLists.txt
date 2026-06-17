@@ -194,6 +194,7 @@ endif()
 add_executable(genopack
   cli/main.cpp
   src/check/pass_a.cpp
+  src/check/pass_aamer.cpp
   src/check/pass_b.cpp
   src/check/run_check.cpp
   src/run_ingest.cpp
