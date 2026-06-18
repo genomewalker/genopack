@@ -45,7 +45,8 @@ struct QualRecord {
     float    completeness_aamer_family_core; //  4  FCORE aamer coverage [0,1]; NAN = not scored
     uint16_t fmh_minority_u16;              //  2  fmh_minority_fraction × 65535 (rounded); 0=not scored/clean
     uint16_t contig_outlier_u16;            //  2  contamination_contig_outlier × 65535 (rounded); 0=not scored/clean
-    uint8_t  _reserved[4];                  //  4  reserved for future fields
+    uint8_t  quality_tier_u8;               //  1  0=not_set, 1=LQ, 2=MQ, 3=HQ (written by genopack check)
+    uint8_t  _reserved[3];                  //  3  reserved for future fields
     // total = 96
 
     // contamination_duplication encode/decode (0 reserved as not-scored sentinel,
@@ -68,6 +69,19 @@ struct QualRecord {
     static constexpr uint8_t QUAL_FLAG_BUILD_SIGNALS      = 0x20; // AllSignals computed at build time (chargaff/spectral/scale_kink valid)
     static constexpr uint8_t QUAL_FLAG_GCOV_SCORED        = 0x40; // per-contig GCOV scoring cached (contig_outlier/spe/sibling/rho valid)
     static constexpr uint8_t QUAL_FLAG_FMH_AXIS_ABSENT    = 0x80; // FMH minority axis unavailable -> contamination tier used the sketch-leakage fallback
+
+    // quality_tier_u8 values (0 = not written, backward-compatible with old packs)
+    static constexpr uint8_t QTIER_NOT_SET = 0;
+    static constexpr uint8_t QTIER_LQ      = 1;
+    static constexpr uint8_t QTIER_MQ      = 2;
+    static constexpr uint8_t QTIER_HQ      = 3;
+
+    static uint8_t encode_qtier(const char* tier) {
+        if (tier[0] == 'H') return QTIER_HQ;
+        if (tier[0] == 'M') return QTIER_MQ;
+        if (tier[0] == 'L') return QTIER_LQ;
+        return QTIER_NOT_SET;
+    }
 
     // support_tier sentinel: no genus-level reference available (singleton genus)
     static constexpr uint8_t TIER_NO_GENUS_REF = 0xFF;
@@ -105,6 +119,7 @@ struct QualRecord {
         r.contamination_duplication_u16 = 0; // 0 = not scored
         r.completeness_aamer_core        = NAN;
         r.completeness_aamer_family_core = NAN;
+        r.quality_tier_u8                = QTIER_NOT_SET;
         return r;
     }
 };

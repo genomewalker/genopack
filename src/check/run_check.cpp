@@ -150,6 +150,31 @@ void write_qual_to_archive(const std::filesystem::path& gpk_path,
             r.qual_flags |= QualRecord::QUAL_FLAG_FRAG_GATED;
         if (!std::isnan(q.self_coherence) && q.self_coherence < 0.80f)
             r.qual_flags |= QualRecord::QUAL_FLAG_COHERENCE_GATED;
+        // Encode the quality tier (mirrors TSV output logic).
+        {
+            const bool aamer_only = std::isnan(q.completeness_post_decontam) &&
+                                    std::isnan(q.completeness_cluster_relative) &&
+                                    !std::isnan(q.completeness_aamer_core);
+            const float ce = !std::isnan(q.completeness_post_decontam)   ? q.completeness_post_decontam
+                           : !std::isnan(q.completeness_cluster_relative) ? q.completeness_cluster_relative
+                           : q.completeness_aamer_core;
+            const float fmh = !std::isnan(q.fmh_minority_fraction) ? q.fmh_minority_fraction : NAN;
+            const int nsig =
+                (!std::isnan(fmh)                          && fmh                          >= 0.10f) +
+                (!std::isnan(q.contamination_mixture)      && q.contamination_mixture      >= 0.10f) +
+                (!std::isnan(q.contamination_contig_outlier) && q.contamination_contig_outlier >= 0.05f) +
+                (!std::isnan(q.contamination_contig_split) && q.contamination_contig_split >= 0.05f) +
+                (q.contamination_leakage >= 0.02f);
+            const float cp = (nsig >= 2) ? (!std::isnan(fmh) ? fmh : q.contamination_leakage)
+                                         : q.contamination_leakage;
+            const float cv = std::isnan(cp) ? 0.0f : cp;
+            const char* t = "LQ";
+            if (!std::isnan(ce) && ce >= 0.90f && cv < 0.05f) t = "HQ";
+            else if (!std::isnan(ce) && ce >= 0.50f && cv < 0.10f) t = "MQ";
+            if (!std::isnan(q.fiedler_oph_split) && q.fiedler_oph_split < 0.1f) t = "LQ";
+            if (aamer_only && t[0] == 'H') t = "MQ";
+            r.quality_tier_u8 = QualRecord::encode_qtier(t);
+        }
         recs.push_back(r);
     }
 
