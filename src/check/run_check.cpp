@@ -466,7 +466,18 @@ int cmd_check(const std::filesystem::path& pack_path,
                              : !std::isnan(q.completeness_cluster_relative) ? q.completeness_cluster_relative
                              : q.completeness_aamer_core;
         const float fmh_cont = !std::isnan(q.fmh_minority_fraction) ? q.fmh_minority_fraction : NAN;
-        const float cont_primary = !std::isnan(fmh_cont) ? fmh_cont : q.contamination_leakage;
+        // Count independent contamination signals that fire. FMH alone is insufficient because
+        // it captures HGT/mobile elements as "foreign" k-mers (leakage disagrees for genuine HGT).
+        // LQ on contamination grounds requires >=2 orthogonal signals to fire simultaneously.
+        const int cont_signals =
+            (!std::isnan(fmh_cont)                         && fmh_cont                         >= 0.10f) +
+            (!std::isnan(q.contamination_mixture)          && q.contamination_mixture          >= 0.10f) +
+            (!std::isnan(q.contamination_contig_outlier)   && q.contamination_contig_outlier   >= 0.05f) +
+            (!std::isnan(q.contamination_contig_split)     && q.contamination_contig_split     >= 0.05f) +
+            (q.contamination_leakage >= 0.02f);
+        const float cont_primary = (cont_signals >= 2)
+            ? (!std::isnan(fmh_cont) ? fmh_cont : q.contamination_leakage)
+            : q.contamination_leakage;
         const float cont_val = std::isnan(cont_primary) ? 0.0f : cont_primary;
         // TODO(D1): const EnsembleScorer ens; if (auto t = ens.predict(...)) qtier = t;
         const char* qtier = "LQ";
