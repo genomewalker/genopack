@@ -117,6 +117,7 @@ inline constexpr const char* SCALE_KINK       = "scale_kink";
 inline constexpr const char* LEAKAGE_RESIDUAL = "leakage_residual";
 inline constexpr const char* SKEW_CLOSURE     = "skew_closure";
 inline constexpr const char* TIER             = "tier";
+inline constexpr const char* QUALITY_TIER     = "quality_tier";
 inline constexpr const char* WIDTH            = "width";
 }
 

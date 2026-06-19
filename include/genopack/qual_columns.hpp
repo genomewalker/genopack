@@ -60,6 +60,7 @@ inline const std::vector<QcolField>& qcol_fields() {
         {qual_axis::CONTAMINATION, qual_method::CROSS_GENUS,      Unit::Fraction01, ColDType::U8,  offsetof(QualRecord, cross_genus_u8)},
         {qual_axis::COMPLETENESS,  qual_method::SKETCH_FILL,      Unit::Fraction01, ColDType::U8,  offsetof(QualRecord, sketch_fill_u8)},
         {qual_axis::CONTAMINATION, qual_method::DUPLICATION,      Unit::Fraction01, ColDType::U16, offsetof(QualRecord, contamination_duplication_u16)},
+        {qual_axis::SUPPORT,       qual_method::QUALITY_TIER,     Unit::Count,      ColDType::U8,  offsetof(QualRecord, quality_tier_u8)},
     };
     return F;
 }
