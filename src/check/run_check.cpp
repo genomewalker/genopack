@@ -157,9 +157,17 @@ void write_qual_to_archive(const std::filesystem::path& gpk_path,
                                     !std::isnan(q.completeness_aamer_core);
             const float _pd = q.completeness_post_decontam;
             const float _cr = q.completeness_cluster_relative;
-            const float ce = (!std::isnan(_pd) && !std::isnan(_cr) && std::fabs(_pd - _cr) > 0.30f)
+            const float _ac = q.completeness_aamer_core;
+            // When FMH containment and marker genes both indicate ≥90% completeness but
+            // cluster_relative is low (<0.50), the cluster centroid is sparse (large diverse genus)
+            // and the geometric mean would produce a false LQ. Use post_decontam directly.
+            const bool cr_unreliable = !std::isnan(_pd) && _pd >= 0.90f
+                                    && !std::isnan(_ac) && _ac >= 0.90f
+                                    && !std::isnan(_cr) && _cr < 0.50f;
+            const float ce = cr_unreliable ? _pd
+                           : (!std::isnan(_pd) && !std::isnan(_cr) && std::fabs(_pd - _cr) > 0.30f)
                            ? std::sqrt(_pd * _cr)
-                           : (!std::isnan(_pd) ? _pd : (!std::isnan(_cr) ? _cr : q.completeness_aamer_core));
+                           : (!std::isnan(_pd) ? _pd : (!std::isnan(_cr) ? _cr : _ac));
             const float fmh = !std::isnan(q.fmh_minority_fraction) ? q.fmh_minority_fraction : NAN;
             const bool leakage_fires = (q.contamination_leakage >= 0.02f);
             const int nsig =
@@ -494,9 +502,14 @@ int cmd_check(const std::filesystem::path& pack_path,
                                 !std::isnan(q.completeness_aamer_core);
         const float _pd2 = q.completeness_post_decontam;
         const float _cr2 = q.completeness_cluster_relative;
-        const float comp_eff = (!std::isnan(_pd2) && !std::isnan(_cr2) && std::fabs(_pd2 - _cr2) > 0.30f)
+        const float _ac2 = q.completeness_aamer_core;
+        const bool cr2_unreliable = !std::isnan(_pd2) && _pd2 >= 0.90f
+                                 && !std::isnan(_ac2) && _ac2 >= 0.90f
+                                 && !std::isnan(_cr2) && _cr2 < 0.50f;
+        const float comp_eff = cr2_unreliable ? _pd2
+                             : (!std::isnan(_pd2) && !std::isnan(_cr2) && std::fabs(_pd2 - _cr2) > 0.30f)
                              ? std::sqrt(_pd2 * _cr2)
-                             : (!std::isnan(_pd2) ? _pd2 : (!std::isnan(_cr2) ? _cr2 : q.completeness_aamer_core));
+                             : (!std::isnan(_pd2) ? _pd2 : (!std::isnan(_cr2) ? _cr2 : _ac2));
         const float fmh_cont = !std::isnan(q.fmh_minority_fraction) ? q.fmh_minority_fraction : NAN;
         // Count independent contamination signals that fire. FMH alone is insufficient because
         // it captures HGT/mobile elements as "foreign" k-mers (leakage disagrees for genuine HGT).
