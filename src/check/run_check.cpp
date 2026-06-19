@@ -161,14 +161,17 @@ void write_qual_to_archive(const std::filesystem::path& gpk_path,
                            ? std::sqrt(_pd * _cr)
                            : (!std::isnan(_pd) ? _pd : (!std::isnan(_cr) ? _cr : q.completeness_aamer_core));
             const float fmh = !std::isnan(q.fmh_minority_fraction) ? q.fmh_minority_fraction : NAN;
+            const bool leakage_fires = (q.contamination_leakage >= 0.02f);
             const int nsig =
                 (!std::isnan(fmh)                          && fmh                          >= 0.10f) +
                 (!std::isnan(q.contamination_mixture)      && q.contamination_mixture      >= 0.10f) +
                 (!std::isnan(q.contamination_contig_outlier) && q.contamination_contig_outlier >= 0.05f) +
                 (!std::isnan(q.contamination_contig_split) && q.contamination_contig_split >= 0.05f) +
-                (q.contamination_leakage >= 0.02f);
-            const float cp = (nsig >= 2) ? (!std::isnan(fmh) ? fmh : q.contamination_leakage)
-                                         : q.contamination_leakage;
+                leakage_fires;
+            // FMH/CCO can co-fire on HGT/mobile elements without genuine contamination.
+            // Only upgrade to FMH as primary proxy when leakage independently corroborates.
+            const float cp = (nsig >= 2 && leakage_fires) ? (!std::isnan(fmh) ? fmh : q.contamination_leakage)
+                                                          : q.contamination_leakage;
             const float cv = std::isnan(cp) ? 0.0f : cp;
             const char* t = "LQ";
             if (!std::isnan(ce) && ce >= 0.90f && cv < 0.05f) t = "HQ";
@@ -497,14 +500,16 @@ int cmd_check(const std::filesystem::path& pack_path,
         const float fmh_cont = !std::isnan(q.fmh_minority_fraction) ? q.fmh_minority_fraction : NAN;
         // Count independent contamination signals that fire. FMH alone is insufficient because
         // it captures HGT/mobile elements as "foreign" k-mers (leakage disagrees for genuine HGT).
-        // LQ on contamination grounds requires >=2 orthogonal signals to fire simultaneously.
+        // LQ on contamination grounds requires >=2 orthogonal signals to fire simultaneously,
+        // AND leakage must co-fire before FMH is used as primary proxy (prevents FMH+CCO-only FPs).
+        const bool leak_fires = (q.contamination_leakage >= 0.02f);
         const int cont_signals =
             (!std::isnan(fmh_cont)                         && fmh_cont                         >= 0.10f) +
             (!std::isnan(q.contamination_mixture)          && q.contamination_mixture          >= 0.10f) +
             (!std::isnan(q.contamination_contig_outlier)   && q.contamination_contig_outlier   >= 0.05f) +
             (!std::isnan(q.contamination_contig_split)     && q.contamination_contig_split     >= 0.05f) +
-            (q.contamination_leakage >= 0.02f);
-        const float cont_primary = (cont_signals >= 2)
+            leak_fires;
+        const float cont_primary = (cont_signals >= 2 && leak_fires)
             ? (!std::isnan(fmh_cont) ? fmh_cont : q.contamination_leakage)
             : q.contamination_leakage;
         const float cont_val = std::isnan(cont_primary) ? 0.0f : cont_primary;
