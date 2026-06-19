@@ -155,9 +155,11 @@ void write_qual_to_archive(const std::filesystem::path& gpk_path,
             const bool aamer_only = std::isnan(q.completeness_post_decontam) &&
                                     std::isnan(q.completeness_cluster_relative) &&
                                     !std::isnan(q.completeness_aamer_core);
-            const float ce = !std::isnan(q.completeness_post_decontam)   ? q.completeness_post_decontam
-                           : !std::isnan(q.completeness_cluster_relative) ? q.completeness_cluster_relative
-                           : q.completeness_aamer_core;
+            const float _pd = q.completeness_post_decontam;
+            const float _cr = q.completeness_cluster_relative;
+            const float ce = (!std::isnan(_pd) && !std::isnan(_cr) && std::fabs(_pd - _cr) > 0.30f)
+                           ? std::sqrt(_pd * _cr)
+                           : (!std::isnan(_pd) ? _pd : (!std::isnan(_cr) ? _cr : q.completeness_aamer_core));
             const float fmh = !std::isnan(q.fmh_minority_fraction) ? q.fmh_minority_fraction : NAN;
             const int nsig =
                 (!std::isnan(fmh)                          && fmh                          >= 0.10f) +
@@ -447,7 +449,7 @@ int cmd_check(const std::filesystem::path& pack_path,
     // TSV output (aggregated across all parts)
     std::ofstream tsv(output);
     if (!tsv) throw std::runtime_error("check: cannot open output: " + output.string());
-    tsv << "accession\tquality_tier\tcompleteness_effective\tcompleteness_cluster_relative\tcompleteness_sketch_fill\tcompleteness_fragmentation"
+    tsv << "accession\tquality_tier\tgenome_fill\tcompleteness_cluster_relative\tcompleteness_sketch_fill\tcompleteness_fragmentation"
            "\tcompleteness_post_decontam"
            "\tcompleteness_aamer_core"
            "\tcompleteness_aamer_family_core"
@@ -487,9 +489,11 @@ int cmd_check(const std::filesystem::path& pack_path,
         const bool aamer_only = std::isnan(q.completeness_post_decontam) &&
                                 std::isnan(q.completeness_cluster_relative) &&
                                 !std::isnan(q.completeness_aamer_core);
-        const float comp_eff = !std::isnan(q.completeness_post_decontam)   ? q.completeness_post_decontam
-                             : !std::isnan(q.completeness_cluster_relative) ? q.completeness_cluster_relative
-                             : q.completeness_aamer_core;
+        const float _pd2 = q.completeness_post_decontam;
+        const float _cr2 = q.completeness_cluster_relative;
+        const float comp_eff = (!std::isnan(_pd2) && !std::isnan(_cr2) && std::fabs(_pd2 - _cr2) > 0.30f)
+                             ? std::sqrt(_pd2 * _cr2)
+                             : (!std::isnan(_pd2) ? _pd2 : (!std::isnan(_cr2) ? _cr2 : q.completeness_aamer_core));
         const float fmh_cont = !std::isnan(q.fmh_minority_fraction) ? q.fmh_minority_fraction : NAN;
         // Count independent contamination signals that fire. FMH alone is insufficient because
         // it captures HGT/mobile elements as "foreign" k-mers (leakage disagrees for genuine HGT).
