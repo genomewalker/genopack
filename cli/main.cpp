@@ -1508,8 +1508,8 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
                                 mr.sigs1[ki].resize(ns);
                                 mr.sigs2[ki].resize(ns);
                                 for (size_t si = 0; si < ns; ++si) {
-                                    mr.sigs1[ki][si] = static_cast<uint16_t>(sk.signature1[si] >> 16);
-                                    mr.sigs2[ki][si] = static_cast<uint16_t>(sk.signature2[si] >> 16);
+                                    mr.sigs1[ki][si] = sk.signature1[si];
+                                    mr.sigs2[ki][si] = sk.signature2[si];
                                 }
                             }
                         } catch (...) {
@@ -1549,8 +1549,8 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
                         const size_t n = sk.signature1.size();
                         std::vector<uint16_t> sig1_16(n), sig2_16(n);
                         for (size_t si = 0; si < n; ++si) {
-                            sig1_16[si] = static_cast<uint16_t>(sk.signature1[si] >> 16);
-                            sig2_16[si] = static_cast<uint16_t>(sk.signature2[si] >> 16);
+                            sig1_16[si] = sk.signature1[si];
+                            sig2_16[si] = sk.signature2[si];
                         }
                         skch_writer->add(gid, sig1_16, sig2_16,
                                          sk.n_real_bins, sk.genome_length,
