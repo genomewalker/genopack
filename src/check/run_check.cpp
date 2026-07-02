@@ -28,6 +28,29 @@ namespace genopack::check {
 
 namespace {
 
+// Continuous genome quality score in [0,1] for threshold-free ranking, replacing the
+// discrete HQ/MQ/LQ cutoffs. Multiplicative because completeness, contamination, and
+// contig-coherence (fiedler) are near-independent failure modes — a complete-but-chimeric
+// bin is still a poor representative, and additive mixing would let high completeness mask
+// contamination. NaN completeness → 0.5 neutral prior; NaN contamination/fiedler → no penalty.
+//   comp_eff already encodes the cr_unreliable insight, so sparse-reference MAGs are not crushed.
+//   cont_factor: rational decay centred on 0.05 (=0.5 there, =0.2 at 0.10) — a smooth analog of
+//     the old HQ/MQ contamination cliffs, so ranking stays stable across them.
+//   coh_penalty: bounded ≤50% cut, engaged only for HIGH fiedler_split (>0.5, = chimera/bin-split);
+//     capped rather than a hard gate because the fiedler threshold is uncalibrated (no test coverage).
+//     NB: high fiedler_oph_split = poorly-connected contig graph = split; low = coherent (score_bin.cpp).
+float compute_quality_score(float comp_eff, float cont_val, float fiedler_split) {
+    const float C = std::isnan(comp_eff) ? 0.5f : comp_eff;
+    const float X = std::isnan(cont_val) ? 0.0f : cont_val;
+    const float s = std::isnan(fiedler_split) ? 0.0f : fiedler_split;
+    const float xr = X / 0.05f;
+    const float cont_factor = 1.0f / (1.0f + xr * xr);
+    float ramp = (s - 0.5f) / 0.4f;
+    ramp = ramp < 0.0f ? 0.0f : (ramp > 1.0f ? 1.0f : ramp);
+    const float coh_penalty = 1.0f - 0.5f * ramp;
+    return C * cont_factor * coh_penalty;
+}
+
 std::vector<std::string> read_accession_list(const std::filesystem::path& p) {
     std::vector<std::string> result;
     std::ifstream f(p);
@@ -158,12 +181,27 @@ void write_qual_to_archive(const std::filesystem::path& gpk_path,
             const float _pd = q.completeness_post_decontam;
             const float _cr = q.completeness_cluster_relative;
             const float _ac = q.completeness_aamer_core;
-            // When FMH containment and marker genes both indicate ≥90% completeness but
-            // cluster_relative is low (<0.50), the cluster centroid is sparse (large diverse genus)
-            // and the geometric mean would produce a false LQ. Use post_decontam directly.
+            // cr_unreliable: cluster_relative near zero means centroid sparsity in a diverse
+            // genus, not low completeness. Safe to bypass geomean and use pd directly when:
+            //   (a) classic: pd≥0.90 + ac≥0.90 + cr<0.50 (original guard), OR
+            //   (b) degenerate cr<0.05 + all contamination axes quiet — a clean genome at
+            //       cr=0.02 is centroid-geometry noise, not misassignment; but if ANY
+            //       contamination signal fires, low cr IS a misbin fingerprint and must stand, OR
+            //   (c) no marker-core data (ac NaN) + contamination quiet — MAGs from undersampled
+            //       biomes (marine/soil/wastewater) have sparse reference clusters; a low cr there
+            //       reflects a bad comparator, not incomplete sequence. Without ac to fall back on,
+            //       geomean(pd,cr) mislabeled ~1.2M otherwise-clean MAGs as LQ in the r232_v5 audit.
+            const bool cont_quiet_cr =
+                (std::isnan(q.fmh_minority_fraction)        || q.fmh_minority_fraction        < 0.10f) &&
+                (std::isnan(q.contamination_mixture)        || q.contamination_mixture        < 0.10f) &&
+                (std::isnan(q.contamination_leakage)        || q.contamination_leakage        < 0.02f) &&
+                (std::isnan(q.contamination_contig_outlier) || q.contamination_contig_outlier < 0.05f) &&
+                (std::isnan(q.contamination_contig_split)   || q.contamination_contig_split   < 0.05f);
             const bool cr_unreliable = !std::isnan(_pd) && _pd >= 0.90f
-                                    && !std::isnan(_ac) && _ac >= 0.90f
-                                    && !std::isnan(_cr) && _cr < 0.50f;
+                                    && !std::isnan(_cr) && _cr < 0.50f
+                                    && ((!std::isnan(_ac) && _ac >= 0.90f)
+                                        || (_cr < 0.05f && cont_quiet_cr)
+                                        || (std::isnan(_ac) && cont_quiet_cr));
             const float ce = cr_unreliable ? _pd
                            : (!std::isnan(_pd) && !std::isnan(_cr) && std::fabs(_pd - _cr) > 0.30f)
                            ? std::sqrt(_pd * _cr)
@@ -184,9 +222,13 @@ void write_qual_to_archive(const std::filesystem::path& gpk_path,
             const char* t = "LQ";
             if (!std::isnan(ce) && ce >= 0.90f && cv < 0.05f) t = "HQ";
             else if (!std::isnan(ce) && ce >= 0.50f && cv < 0.10f) t = "MQ";
-            if (!std::isnan(q.fiedler_oph_split) && q.fiedler_oph_split < 0.1f) t = "LQ";
+            // fiedler_oph_split has no validated threshold or test coverage (audited 2026-07-02);
+            // require at least one corroborating contamination/split signal before trusting it
+            // alone to override an otherwise-clean comp/cont verdict.
+            if (!std::isnan(q.fiedler_oph_split) && q.fiedler_oph_split < 0.1f && nsig >= 1) t = "LQ";
             if (aamer_only && t[0] == 'H') t = "MQ";
             r.quality_tier_u8 = QualRecord::encode_qtier(t);
+            r.set_quality_score(compute_quality_score(ce, cv, q.fiedler_oph_split));
         }
         recs.push_back(r);
     }
@@ -460,7 +502,7 @@ int cmd_check(const std::filesystem::path& pack_path,
     // TSV output (aggregated across all parts)
     std::ofstream tsv(output);
     if (!tsv) throw std::runtime_error("check: cannot open output: " + output.string());
-    tsv << "accession\tquality_tier\tgenome_fill\tcompleteness_cluster_relative\tcompleteness_sketch_fill\tcompleteness_fragmentation"
+    tsv << "accession\tquality_tier\tquality_score\tcompleteness_effective\tcompleteness_cluster_relative\tcompleteness_sketch_fill\tcompleteness_fragmentation"
            "\tcompleteness_post_decontam"
            "\tcompleteness_aamer_core"
            "\tcompleteness_aamer_family_core"
@@ -470,9 +512,9 @@ int cmd_check(const std::filesystem::path& pack_path,
            "\tchargaff_parity\tspectral_gap\tscale_kink\tcontamination_mixture\tmixture_sources"
            "\tn_mix_windows\tcontamination_contig_outlier\tcontamination_spe"
            "\tcontamination_rho_outlier\tcontamination_cross_genus\tcontamination_contig_split"
-           "\tcontamination_duplication"
+           "\tcontamination_duplication\tmarker_present_bits"
            "\tqual_flags\tsupport_tier\tinterval_width"
-           "\tcontamination_contig_outlier_adj\tmimag_tier\n";
+           "\tcontamination_contig_outlier_adj\tassembly_tier\n";
 
     auto tier_str = [](SupportTier t) -> const char* {
         switch (t) {
@@ -503,9 +545,17 @@ int cmd_check(const std::filesystem::path& pack_path,
         const float _pd2 = q.completeness_post_decontam;
         const float _cr2 = q.completeness_cluster_relative;
         const float _ac2 = q.completeness_aamer_core;
+        const bool cont_quiet_cr2 =
+            (std::isnan(q.fmh_minority_fraction)        || q.fmh_minority_fraction        < 0.10f) &&
+            (std::isnan(q.contamination_mixture)        || q.contamination_mixture        < 0.10f) &&
+            (std::isnan(q.contamination_leakage)        || q.contamination_leakage        < 0.02f) &&
+            (std::isnan(q.contamination_contig_outlier) || q.contamination_contig_outlier < 0.05f) &&
+            (std::isnan(q.contamination_contig_split)   || q.contamination_contig_split   < 0.05f);
         const bool cr2_unreliable = !std::isnan(_pd2) && _pd2 >= 0.90f
-                                 && !std::isnan(_ac2) && _ac2 >= 0.90f
-                                 && !std::isnan(_cr2) && _cr2 < 0.50f;
+                                 && !std::isnan(_cr2) && _cr2 < 0.50f
+                                 && ((!std::isnan(_ac2) && _ac2 >= 0.90f)
+                                     || (_cr2 < 0.05f && cont_quiet_cr2)
+                                     || (std::isnan(_ac2) && cont_quiet_cr2));
         const float comp_eff = cr2_unreliable ? _pd2
                              : (!std::isnan(_pd2) && !std::isnan(_cr2) && std::fabs(_pd2 - _cr2) > 0.30f)
                              ? std::sqrt(_pd2 * _cr2)
@@ -530,10 +580,15 @@ int cmd_check(const std::filesystem::path& pack_path,
         const char* qtier = "LQ";
         if (!std::isnan(comp_eff) && comp_eff >= 0.90f && cont_val < 0.05f) qtier = "HQ";
         else if (!std::isnan(comp_eff) && comp_eff >= 0.50f && cont_val < 0.10f) qtier = "MQ";
-        if (!std::isnan(q.fiedler_oph_split) && q.fiedler_oph_split < 0.1f) qtier = "LQ";
+        // fiedler_oph_split has no validated threshold or test coverage (audited 2026-07-02);
+        // require at least one corroborating contamination/split signal before trusting it
+        // alone to override an otherwise-clean comp/cont verdict.
+        if (!std::isnan(q.fiedler_oph_split) && q.fiedler_oph_split < 0.1f && cont_signals >= 1) qtier = "LQ";
         if (aamer_only && qtier[0] == 'H') qtier = "MQ";
+        const float quality_score = compute_quality_score(comp_eff, cont_val, q.fiedler_oph_split);
         tsv << acc << '\t'
             << qtier << '\t'
+            << fmt(quality_score) << '\t'
             << fmt(comp_eff) << '\t'
             << fmt(q.completeness_cluster_relative) << '\t'
             << fmt(q.completeness_sketch_fill) << '\t'
@@ -566,21 +621,21 @@ int cmd_check(const std::filesystem::path& pack_path,
                 tsv << hex[b >> 4] << hex[b & 0xf];
             }
         }
-        // MIMAG-standard tier using completeness_effective + adjusted CCO.
+        // Assembly quality tier using completeness_effective + adjusted CCO.
         const float cont_axis = !std::isnan(q.contamination_contig_outlier_adj)
                                     ? q.contamination_contig_outlier_adj
                                     : (std::isnan(q.contamination_contig_outlier) ? 0.0f
                                                                                   : q.contamination_contig_outlier);
-        const char* mimag = "LQ";
-        if (!std::isnan(comp_eff) && comp_eff >= 0.90f && cont_axis < 0.05f) mimag = "HQ";
-        else if (!std::isnan(comp_eff) && comp_eff >= 0.50f && cont_axis < 0.10f) mimag = "MQ";
+        const char* assembly_tier = "LQ";
+        if (!std::isnan(comp_eff) && comp_eff >= 0.90f && cont_axis < 0.05f) assembly_tier = "HQ";
+        else if (!std::isnan(comp_eff) && comp_eff >= 0.50f && cont_axis < 0.10f) assembly_tier = "MQ";
 
         tsv << '\t'
             << static_cast<int>(q.qual_flags) << '\t'
             << tier_str(q.support_tier) << '\t'
             << q.interval_width << '\t'
             << fmt(q.contamination_contig_outlier_adj) << '\t'
-            << mimag << '\n';
+            << assembly_tier << '\n';
     }
     spdlog::info("check: TSV written to {}", output.string());
     return 0;

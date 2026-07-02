@@ -45,8 +45,10 @@ struct QualRecord {
     float    completeness_aamer_family_core; //  4  FCORE aamer coverage [0,1]; NAN = not scored
     uint16_t fmh_minority_u16;              //  2  fmh_minority_fraction × 65535 (rounded); 0=not scored/clean
     uint16_t contig_outlier_u16;            //  2  contamination_contig_outlier × 65535 (rounded); 0=not scored/clean
-    uint8_t  quality_tier_u8;               //  1  0=not_set, 1=LQ, 2=MQ, 3=HQ (written by genopack check)
-    uint8_t  _reserved[3];                  //  3  reserved for future fields
+    uint8_t  quality_tier_u8;               //  1  LEGACY discrete tier; 0=not_set,1=LQ,2=MQ,3=HQ (kept for back-compat)
+    uint8_t  qscore_lo;                     //  1  low byte of continuous quality ∈ [0,1] × 65534 + 1; 0 = not scored
+    uint8_t  qscore_hi;                     //  1  high byte (split into two u8 to keep quality_tier_u8 at a fixed offset)
+    uint8_t  _reserved[1];                  //  1  reserved for future fields
     // total = 96
 
     // contamination_duplication encode/decode (0 reserved as not-scored sentinel,
@@ -81,6 +83,27 @@ struct QualRecord {
         if (tier[0] == 'M') return QTIER_MQ;
         if (tier[0] == 'L') return QTIER_LQ;
         return QTIER_NOT_SET;
+    }
+
+    // Continuous quality score encode/decode (0 reserved as not-scored sentinel,
+    // so a genuine 0.0 stays distinguishable from an unscored genome). Stored across
+    // qscore_lo/qscore_hi so quality_tier_u8 keeps its fixed on-disk offset.
+    static uint16_t encode_qscore(float s) {
+        if (!(s >= 0.0f)) return 0;            // NaN / negative -> not scored
+        if (s > 1.0f) s = 1.0f;
+        return static_cast<uint16_t>(s * 65534.0f + 0.5f) + 1;
+    }
+    static float decode_qscore(uint16_t v) {
+        return v == 0 ? NAN : static_cast<float>(v - 1) / 65534.0f;
+    }
+    void set_quality_score(float s) {
+        const uint16_t v = encode_qscore(s);
+        qscore_lo = static_cast<uint8_t>(v & 0xFF);
+        qscore_hi = static_cast<uint8_t>(v >> 8);
+    }
+    float quality_score() const {
+        return decode_qscore(static_cast<uint16_t>(qscore_lo) |
+                             (static_cast<uint16_t>(qscore_hi) << 8));
     }
 
     // support_tier sentinel: no genus-level reference available (singleton genus)
@@ -120,6 +143,8 @@ struct QualRecord {
         r.completeness_aamer_core        = NAN;
         r.completeness_aamer_family_core = NAN;
         r.quality_tier_u8                = QTIER_NOT_SET;
+        r.qscore_lo                      = 0; // 0 = not scored
+        r.qscore_hi                      = 0;
         return r;
     }
 };
