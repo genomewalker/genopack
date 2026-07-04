@@ -94,6 +94,7 @@ struct AllSignals {
     float    spectral_gap          = NAN;
     float    scale_kink            = NAN;
     float    contamination_mixture = NAN;
+    float    contamination_tnf_minor = NAN; // near-clade TNF-GMM minority mass (BIC-free, multi-contig guarded); span overload only
     int      mixture_sources       = 1;
     uint16_t n_mix_windows         = 0;
     bool     mix_no_data           = false;

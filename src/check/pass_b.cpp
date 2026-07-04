@@ -1276,6 +1276,7 @@ void run_pass_b(ICheckReader& pack,
                     q.spectral_gap               = sig.spectral_gap;
                     q.scale_kink                 = sig.scale_kink;
                     q.contamination_mixture      = sig.contamination_mixture;
+                    q.contamination_tnf_minor    = sig.contamination_tnf_minor;
                     q.mixture_sources            = sig.mixture_sources;
                     q.n_mix_windows              = sig.n_mix_windows;
                     q.fiedler_value                   = sig.fiedler_value;

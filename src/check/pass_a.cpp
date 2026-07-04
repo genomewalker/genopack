@@ -307,6 +307,7 @@ PassAResult run_pass_a(ICheckReader& pack,
 
             // When a QUAL cache is provided, load sketch-derived scores from it.
             // TNF and fragmentation are always recomputed (cheap, no I/O).
+            bool qual_cache_hit = false;
             if (qual_cache && m->gid > 0) {
                 auto it = qual_cache->find(m->gid);
                 if (it != qual_cache->end()) {
@@ -317,8 +318,14 @@ PassAResult run_pass_a(ICheckReader& pack,
                     q.contamination_duplication     = QualRecord::decode_dup(r.contamination_duplication_u16);
                     if (r.sketch_fill_u8 > 0)
                         q.completeness_sketch_fill  = r.sketch_fill_u8 / 200.0f;
+                    qual_cache_hit = true;
                 }
-            } else if (sl.S_c > 0.0f) {
+            }
+            // Cache miss (gid absent from QUAL section, e.g. GenusSparse genera not scored at
+            // build time) falls through to the length-ratio proxy so completeness_cluster_relative
+            // is non-NaN. Without this, pass_b's by_completeness gate never fires and these
+            // genomes skip FASTA scoring entirely, leaving all quality fields NaN → stuck LQ.
+            if (!qual_cache_hit && sl.S_c > 0.0f) {
                 q.completeness_cluster_relative =
                     std::clamp(static_cast<float>(m->len) / sl.S_c, 0.0f, 1.5f);
             }

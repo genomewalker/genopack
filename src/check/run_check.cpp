@@ -51,6 +51,57 @@ float compute_quality_score(float comp_eff, float cont_val, float fiedler_split)
     return C * cont_factor * coh_penalty;
 }
 
+// Single contamination determinant: NA-safe max over every observable contamination axis.
+// HQ used to hinge on the FMH minority axis alone, so a missing (NA) FMH call was scored as
+// zero contamination and a genuinely dirty genome slipped through HQ (GCMeta_00156701: fmh
+// NA, CheckM2 12.2%). Taking the max over all axes and ignoring NA means no single absent
+// axis can lower the score. All axes are [0,1] minority/outlier fractions (mixture util.hpp:81,
+// spe/rho = u8/255 pass_b.cpp:196-198, duplication/contig_outlier_adj fractions types.hpp:70,81)
+// except tnf_excess (dist/ref-1 ratio, builder.cpp:1415) which is clamped into the same range.
+// cross_genus is deliberately excluded — it is a hard chimera veto handled at the call site.
+//   contamination_tnf_minor is the near-clade detector (util.cpp: BIC-free TNF-GMM minority
+//   mass, multi-contig guarded) — catches same-species/genus mergers that stay k-mer-similar
+//   so fmh/cross_genus read ~0 but a compositional minority still exists.
+//   observed: FMH/mixture/tnf_minor/contig_outlier_adj/spe/rho/duplication carry a NAN sentinel
+//     when unmeasured, so any non-NAN one proves contamination was actually observed. leakage and
+//     tnf_excess default to 0.0f when unmeasured (indistinguishable from clean), so they raise
+//     the max but never by themselves establish observability. When observed stays false, no
+//     axis was available → contamination is unconfirmed and HQ must be capped at MQ.
+float contamination_aggregate(const GenomeQuality& q, bool& observed) {
+    float m = 0.0f;
+    observed = false;
+    auto clamp01 = [](float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); };
+    auto acc = [&](float v) {                         // NA-capable axes: establish observability
+        if (std::isnan(v)) return;
+        observed = true;
+        const float c = clamp01(v);
+        if (c > m) m = c;
+    };
+    auto acc_max = [&](float v) {                     // default-0 axes: raise max only
+        if (std::isnan(v)) return;
+        const float c = clamp01(v);
+        if (c > m) m = c;
+    };
+    acc(q.fmh_minority_fraction);
+    acc(q.contamination_mixture);
+    acc(q.contamination_tnf_minor);
+    acc(q.contamination_contig_outlier_adj);
+    acc(q.contamination_spe);
+    acc(q.contamination_rho_outlier);
+    acc(q.contamination_duplication);
+    acc_max(q.contamination_leakage);
+    acc_max(q.contamination_tnf_excess);
+    return m;
+}
+
+// Cross-genus chimera veto: a bin whose contigs fit a foreign genus better than the assigned
+// one is the most dangerous defect for a reference DB. Kept independent of the aggregate (a
+// chimera can look clean on every other axis, e.g. ZAHE052 cross_genus=1.0). >=0.10 of scored
+// bp cross-assigned = chimera, above the incidental-HGT range.
+bool cross_genus_chimera(const GenomeQuality& q) {
+    return !std::isnan(q.contamination_cross_genus) && q.contamination_cross_genus >= 0.10f;
+}
+
 std::vector<std::string> read_accession_list(const std::filesystem::path& p) {
     std::vector<std::string> result;
     std::ifstream f(p);
@@ -214,11 +265,8 @@ void write_qual_to_archive(const std::filesystem::path& gpk_path,
                 (!std::isnan(q.contamination_contig_outlier) && q.contamination_contig_outlier >= 0.05f) +
                 (!std::isnan(q.contamination_contig_split) && q.contamination_contig_split >= 0.05f) +
                 leakage_fires;
-            // FMH/CCO can co-fire on HGT/mobile elements without genuine contamination.
-            // Only upgrade to FMH as primary proxy when leakage independently corroborates.
-            const float cp = (nsig >= 2 && leakage_fires) ? (!std::isnan(fmh) ? fmh : q.contamination_leakage)
-                                                          : q.contamination_leakage;
-            const float cv = std::isnan(cp) ? 0.0f : cp;
+            bool cont_observed = false;
+            const float cv = contamination_aggregate(q, cont_observed);
             const char* t = "LQ";
             if (!std::isnan(ce) && ce >= 0.90f && cv < 0.05f) t = "HQ";
             else if (!std::isnan(ce) && ce >= 0.50f && cv < 0.10f) t = "MQ";
@@ -227,6 +275,11 @@ void write_qual_to_archive(const std::filesystem::path& gpk_path,
             // alone to override an otherwise-clean comp/cont verdict.
             if (!std::isnan(q.fiedler_oph_split) && q.fiedler_oph_split < 0.1f && nsig >= 1) t = "LQ";
             if (aamer_only && t[0] == 'H') t = "MQ";
+            // Cross-genus chimera: hard veto, independent of the aggregate.
+            if (cross_genus_chimera(q) && t[0] != 'L') t = "LQ";
+            // HQ requires a positive, observed clean contamination axis. If nothing was
+            // observable, contamination is unconfirmed → cap at MQ, never HQ.
+            if (t[0] == 'H' && !cont_observed) t = "MQ";
             r.quality_tier_u8 = QualRecord::encode_qtier(t);
             r.set_quality_score(compute_quality_score(ce, cv, q.fiedler_oph_split));
         }
@@ -572,11 +625,10 @@ int cmd_check(const std::filesystem::path& pack_path,
             (!std::isnan(q.contamination_contig_outlier)   && q.contamination_contig_outlier   >= 0.05f) +
             (!std::isnan(q.contamination_contig_split)     && q.contamination_contig_split     >= 0.05f) +
             leak_fires;
-        const float cont_primary = (cont_signals >= 2 && leak_fires)
-            ? (!std::isnan(fmh_cont) ? fmh_cont : q.contamination_leakage)
-            : q.contamination_leakage;
-        const float cont_val = std::isnan(cont_primary) ? 0.0f : cont_primary;
         // TODO(D1): const EnsembleScorer ens; if (auto t = ens.predict(...)) qtier = t;
+        // NA-safe contamination aggregate (mirrors QCOL): max over all observable axes.
+        bool cont_observed = false;
+        const float cont_val = contamination_aggregate(q, cont_observed);
         const char* qtier = "LQ";
         if (!std::isnan(comp_eff) && comp_eff >= 0.90f && cont_val < 0.05f) qtier = "HQ";
         else if (!std::isnan(comp_eff) && comp_eff >= 0.50f && cont_val < 0.10f) qtier = "MQ";
@@ -585,6 +637,11 @@ int cmd_check(const std::filesystem::path& pack_path,
         // alone to override an otherwise-clean comp/cont verdict.
         if (!std::isnan(q.fiedler_oph_split) && q.fiedler_oph_split < 0.1f && cont_signals >= 1) qtier = "LQ";
         if (aamer_only && qtier[0] == 'H') qtier = "MQ";
+        // Cross-genus chimera: hard veto, independent of the aggregate.
+        if (cross_genus_chimera(q) && qtier[0] != 'L') qtier = "LQ";
+        // HQ requires a positive, observed clean contamination axis; if none was observable,
+        // contamination is unconfirmed → cap at MQ, never HQ.
+        if (qtier[0] == 'H' && !cont_observed) qtier = "MQ";
         const float quality_score = compute_quality_score(comp_eff, cont_val, q.fiedler_oph_split);
         tsv << acc << '\t'
             << qtier << '\t'

@@ -35,14 +35,20 @@ static thread_local TlDecompressor tl_decomp;
 #endif
 
 static std::string read_file_bytes(const std::filesystem::path& path) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f) throw std::runtime_error("Cannot open: " + path.string());
-    size_t sz = static_cast<size_t>(f.tellg());
-    f.seekg(0);
-    std::string buf(sz, '\0');
-    f.read(buf.data(), static_cast<std::streamsize>(sz));
-    if (!f) throw std::runtime_error("Read error: " + path.string());
-    return buf;
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        std::ifstream f(path, std::ios::binary | std::ios::ate);
+        if (f) {
+            size_t sz = static_cast<size_t>(f.tellg());
+            f.seekg(0);
+            std::string buf(sz, '\0');
+            f.read(buf.data(), static_cast<std::streamsize>(sz));
+            if (!f) throw std::runtime_error("Read error: " + path.string());
+            return buf;
+        }
+        if (attempt < 4)
+            std::this_thread::sleep_for(std::chrono::seconds(1 << attempt)); // 1, 2, 4, 8 s
+    }
+    throw std::runtime_error("Cannot open: " + path.string());
 }
 
 // Read from an already-open fd (closes fd before returning).
@@ -1228,9 +1234,12 @@ AllSignals compute_all_signals(std::span<const ContigAccum> contigs,
     struct MixWin { std::array<float, D4c> prof; uint64_t bp; double norm_sq; };
     thread_local std::vector<MixWin> mix_wins;
     thread_local std::vector<int>    mix_labels;
+    thread_local std::vector<int>    mix_win_contig;   // originating contig index per window (near-clade guard)
     thread_local std::vector<float>  bpi_U;
     thread_local std::vector<int>    sp_order;
     mix_wins.clear();
+    mix_win_contig.clear();
+    int mix_cur_contig = -1;
 
     auto flush_mix_win = [&](uint32_t buf[D4c], uint64_t bp_w) {
         float total = 0;
@@ -1242,10 +1251,12 @@ AllSignals compute_all_signals(std::span<const ContigAccum> contigs,
                 w.norm_sq += static_cast<double>(w.prof[i]) * w.prof[i];
             }
         mix_wins.push_back(w);
+        mix_win_contig.push_back(mix_cur_contig);
     };
 
     for (const auto& ca : contigs) {
         if (static_cast<int>(ca.len) < min_contig_len) continue;
+        ++mix_cur_contig;
 
         uint32_t k4_raw[D4]  = {};
         double   T_loc[D3][D3] = {};
@@ -1503,6 +1514,34 @@ AllSignals compute_all_signals(std::span<const ContigAccum> contigs,
                 res.mixture_sources       = 1;
                 res.contamination_mixture = 0.0f;
             }
+
+            // Near-clade contamination: surface the TNF-GMM minority mass even when BIC
+            // prefers K=1. Near-clade (same-species/genus) sub-populations are composition-
+            // ally close, so the BIC penalty (∝ log n, harsh on few-window genomes) rejects
+            // a coherent minority that a duplicated-marker method (CheckM2) still detects.
+            // Guarded against legitimate strain accessory genome: (a) Cohen's-d separation
+            // above the strand-asymmetry band, and (b) the minority must span >=2 distinct
+            // contigs — a plasmid/accessory island lives on one contig.
+            // ceiling: sep floor 1.6 sits above normal strand asymmetry (0.5-1.5) and below
+            //   cross-species (>=2); an identical-strain contaminant (sep~0) stays invisible
+            //   to composition alone and needs read coverage. Thresholds are calibrated by
+            //   check/validate/chimera_panel.sh.
+            float tnf_minor = 0.0f;
+            if (total > 0 && sep >= 1.6 && minor_frac >= 0.03) {
+                const bool minority_in_a = (len_a <= len_b);
+                int prev_contig = -1, n_minor_contigs = 0;   // recorded contig ids are always >=0
+                for (int i = 0; i < n; ++i) {
+                    const bool win_in_a = (gmm_r1[i] >= 0.5);
+                    if (win_in_a == minority_in_a) {            // window belongs to minority component
+                        if (mix_win_contig[i] != prev_contig) { // windows are emitted in contig order
+                            ++n_minor_contigs;
+                            prev_contig = mix_win_contig[i];
+                        }
+                    }
+                }
+                if (n_minor_contigs >= 2) tnf_minor = static_cast<float>(minor_frac);
+            }
+            res.contamination_tnf_minor = tnf_minor;
         } else {
             res.mix_no_data = true;
         }

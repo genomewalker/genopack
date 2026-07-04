@@ -63,6 +63,7 @@ struct GenomeQuality {
     float spectral_gap            = NAN;
     float scale_kink              = NAN;
     float contamination_mixture   = NAN;
+    float contamination_tnf_minor = NAN;  // near-clade TNF-GMM minority mass (BIC-free, multi-contig guarded)
     int   mixture_sources         = 1;
     uint16_t n_mix_windows        = 0;
     float    fiedler_value              = NAN;
