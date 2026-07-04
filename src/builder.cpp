@@ -254,6 +254,7 @@ static std::string extract_taxonomy_bucket(std::string_view taxonomy,
     size_t start = pos;
     size_t end   = taxonomy.find(';', start + 3);
     if (end == std::string_view::npos) end = taxonomy.size();
+    if (end - start <= 3) return "__unclassified__";  // prefix only, no name
     return std::string(taxonomy.substr(start, end - start));
 }
 
@@ -867,6 +868,7 @@ struct ArchiveBuilder::Impl {
             std::vector<ContigProfile> long_profiles;      // long-contig TNF profiles for GCOV (worker-computed)
             std::vector<uint64_t> aamers;                  // sorted-unique k=8 protein aamers (worker-computed)
             std::vector<uint64_t> fmh;                     // FracMinHash hashes, ≥1kb contigs (worker-computed)
+            float contam_dup_excess = NAN;                 // SCC core_dup excess (worker-computed; fasta is freed before finalize)
         };
 
         // Task queue (all tasks submitted upfront; poison-pill sentinel at end)
@@ -974,6 +976,23 @@ struct ArchiveBuilder::Impl {
             }
         });
 
+        // Contamination (SCC core_dup) at build time — own 6-frame pass per genome via the
+        // .csp panel. Declared BEFORE the worker pool and scored INSIDE the worker (while the
+        // FASTA is alive): finalize_genus runs after flush_staging_buf frees item.fasta, so the
+        // result is carried on ChunkItem.contam_dup_excess. panel.score is const/thread-safe.
+        std::unique_ptr<CladeSplitPanel> build_contam_panel;
+        if (!cfg.contam_panel_path.empty()) {
+            build_contam_panel = std::make_unique<CladeSplitPanel>();
+            try {
+                build_contam_panel->open(cfg.contam_panel_path);
+                spdlog::info("build: contamination panel {} aamers, {} clades",
+                             build_contam_panel->n_aamers(), build_contam_panel->n_clades());
+            } catch (const std::exception& ex) {
+                spdlog::warn("build: cannot open contamination panel ({}); skipping", ex.what());
+                build_contam_panel.reset();
+            }
+        }
+
         std::vector<std::thread> workers;
         workers.reserve(n_workers);
         for (size_t i = 0; i < n_workers; ++i) {
@@ -1068,6 +1087,11 @@ struct ArchiveBuilder::Impl {
                                            stats, std::move(fasta), std::move(sk), std::move(sks_mk),
                                            std::move(signals), std::move(lprof),
                                            std::move(aamers), std::move(fmh)};
+                        // SCC core_dup excess — score here (FASTA alive); finalize_genus reads
+                        // the stored value (item.fasta is freed by flush_staging_buf before it runs).
+                        if (build_contam_panel)
+                            d.item->contam_dup_excess =
+                                build_contam_panel->score(d.item->fasta).core_dup_excess;
                     } catch (const std::exception& ex) {
                         spdlog::warn("Skipping {}: {}", t.record->accession, ex.what());
                     }
@@ -1117,7 +1141,11 @@ struct ArchiveBuilder::Impl {
 
         // In-memory GCOV/FCOV/FMHR writers populated during flush_staging_buf (one-pass).
         GcovWriter build_gcov_w, build_fcov_w;
-        FmhrWriter build_fmhr_w;
+        // FmhrWriter spills per-genus FMH hash sets to disk to avoid accumulating
+        // O(n_genomes × hashes_per_genome) in RAM throughout the build.
+        FmhrWriter build_fmhr_w(cfg.tmpdir.empty()
+            ? std::filesystem::temp_directory_path().string()
+            : cfg.tmpdir);
 
         // ── Genus-finalization futures (Steps 4-5) ─────────────────────────────
         // Each genus's GSTX/GCOV/QUAL block is dispatched to the thread pool so
@@ -1147,7 +1175,8 @@ struct ArchiveBuilder::Impl {
         PcoreWriter build_pcore_w(AAMER_K, /*min_seg_aa=*/8, cfg.core_theta, cfg.tmpdir);
         PcoreSpillWriter pcore_spiller(cfg.tmpdir.empty()
             ? std::filesystem::temp_directory_path()
-            : std::filesystem::path(cfg.tmpdir));
+            : std::filesystem::path(cfg.tmpdir),
+            /*buf_tuples=*/4096);
         if (cfg.build_tier && cfg.build_pcore) {
             const std::string tier_path = gpk_path_.string() + ".ptier";
             build_pcore_w.set_tier_sidechannel(tier_path);
@@ -1188,20 +1217,6 @@ struct ArchiveBuilder::Impl {
             }
         }
 
-        // Contamination (intra-genome marker duplication) at build time — own 6-frame
-        // pass per genome via the .csp panel (own subsample; not shareable with markers).
-        std::unique_ptr<CladeSplitPanel> build_contam_panel;
-        if (!cfg.contam_panel_path.empty()) {
-            build_contam_panel = std::make_unique<CladeSplitPanel>();
-            try {
-                build_contam_panel->open(cfg.contam_panel_path);
-                spdlog::info("build: contamination panel {} aamers, {} clades",
-                             build_contam_panel->n_aamers(), build_contam_panel->n_clades());
-            } catch (const std::exception& ex) {
-                spdlog::warn("build: cannot open contamination panel ({}); skipping", ex.what());
-                build_contam_panel.reset();
-            }
-        }
 
         // ── finalize_genus ──────────────────────────────────────────────────────
         // Computes GSTX consensus, GCOV covariance, QUAL records, CORE/PCORE for
@@ -1624,11 +1639,18 @@ struct ArchiveBuilder::Impl {
                 }
 
                 // Contamination duplication — panel.score is const/thread-safe.
+                // v3 panels: store the SCC-restricted core_dup EXCESS (relative to the placed
+                // genus's clean ceiling) in the existing u16 slot. It flags same-genus/strain
+                // duplication that redundancy_fraction (diagnostic-only) and CheckM/CheckM2 miss.
+                // NAN (no SCC set: v2 panel or underpopulated/novel genus) -> encode_dup=0 sentinel
+                // -> check reads NA and defers to the observability cap. Clean-but-scored -> 0.
                 if (build_contam_panel) {
-                    for (size_t ii = 0; ii < pending_qrs.size(); ++ii) {
-                        const auto sc = build_contam_panel->score(buf[ii].fasta);
+                    for (size_t ii = 0; ii < pending_qrs.size() && ii < buf.size(); ++ii) {
+                        // contam_dup_excess was computed in the worker (FASTA alive). NAN when no
+                        // SCC set (v2 panel / underpopulated genus) -> encode_dup(NAN)=0 sentinel
+                        // -> check decodes NA -> observability cap.
                         pending_qrs[ii].contamination_duplication_u16 =
-                            QualRecord::encode_dup(sc.redundancy_fraction);
+                            QualRecord::encode_dup(buf[ii].contam_dup_excess);
                     }
                 }
             }
@@ -1961,7 +1983,7 @@ struct ArchiveBuilder::Impl {
         if (cfg.build_pcore && !pcore_spiller.empty()) {
             spdlog::info("build: PCORE — sorting {} spill partitions…",
                          PcoreSpillWriter::N_PARTS);
-            pcore_spiller.finalize(static_cast<int>(n_workers),
+            pcore_spiller.finalize(std::max(1, static_cast<int>(n_workers) / 8),
                 [&](uint64_t gkh, std::vector<uint64_t>& aamers,
                     std::vector<uint32_t>& counts, uint32_t n_mem) {
                     std::lock_guard<std::mutex> lk(core_writer_mx);

@@ -9,12 +9,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace genopack {
 
@@ -29,8 +31,11 @@ struct CspHeader {
     uint16_t min_aa;
     uint16_t mode;
     uint16_t _reserved;
+    uint64_t scc_off;    // v3 only: byte offset of the per-genus SCC section (0 in v2; first 40 bytes match v2)
 };
-static_assert(sizeof(CspHeader) == 40, "csp v2 header must be 40 bytes");
+static_assert(sizeof(CspHeader) == 48, "csp v3 header must be 48 bytes (first 40 match v2)");
+constexpr size_t kCspHdrV2 = 40;   // v2 on-disk header size (no scc_off)
+constexpr size_t kCspHdrV3 = 48;
 
 std::string load_fasta(const std::filesystem::path& p) {
     if (p.extension() == ".gz") return decompress_gz(p);
@@ -147,6 +152,29 @@ std::vector<uint64_t> cladesplit_aamers(std::string_view fasta, const CladeSplit
     return out;
 }
 
+namespace {
+// Per-genome aamer MULTIPLICITY (needed for the SCC single-copy criterion, which
+// cladesplit_aamers discards by uniquing). Same primitive/config as the panel.
+std::unordered_map<uint64_t, uint32_t> aamer_counts(std::string_view fasta, const CladeSplitConfig& cfg) {
+    const uint64_t cc = cfg.frac_c > 0 ? (uint64_t)cfg.frac_c : 1;
+    std::vector<uint64_t> raw;
+    auto contigs = genopack::check::parse_fasta(fasta);
+    for (const auto& ctg : contigs)
+        walk_codons(ctg.seq, cfg.min_aa, cfg.mode, cc, raw);
+    std::unordered_map<uint64_t, uint32_t> cnt;
+    cnt.reserve(raw.size());
+    for (uint64_t h : raw) ++cnt[h];
+    return cnt;
+}
+// core_dup of one genome's count map over a genus SCC hash set.
+float core_dup_of(const std::unordered_map<uint64_t, uint32_t>& cnt,
+                  const std::unordered_set<uint64_t>& scc) {
+    uint32_t present = 0, dup = 0;
+    for (const auto& [h, c] : cnt) if (scc.count(h)) { ++present; if (c >= 2) ++dup; }
+    return present ? (float)dup / (float)present : 0.0f;
+}
+} // namespace
+
 void cladesplit_build(const std::filesystem::path& tsv,
                       const std::filesystem::path& out,
                       const CladeSplitConfig& cfg, int threads) {
@@ -214,6 +242,67 @@ void cladesplit_build(const std::filesystem::path& tsv,
                  clade_names.size(), total_mm, diag.size(),
                  total_mm == 0 ? 0.0 : 100.0 * diag.size() / total_mm);
 
+    // ── v3: per-genus single-copy-core (SCC) index + clean core_dup ceiling ──
+    // SCC is NOT the diagnostic set (a prevalence-core aamer may be shared across genera).
+    // It is derived per genus from its own genomes' aamer MULTIPLICITY: prevalent AND
+    // single-copy. Only genera with >= kSccMinRefs get an SCC set; others -> core_dup NA.
+    // ceiling: <what breaks> holding every participating genome's count map in RAM does not
+    //          scale to full GTDB; upgrade: stream per-genus (one genus resident at a time).
+    std::unordered_map<int32_t, std::vector<size_t>> genus_recs;
+    for (size_t i = 0; i < recs.size(); ++i) if (rec_cid[i] >= 0) genus_recs[rec_cid[i]].push_back(i);
+    std::vector<char> participates(recs.size(), 0);
+    for (auto& [cid, idxs] : genus_recs)
+        if (idxs.size() >= kSccMinRefs) for (size_t i : idxs) participates[i] = 1;
+    std::vector<std::unordered_map<uint64_t, uint32_t>> gcounts(recs.size());
+    {
+        std::atomic<size_t> gi{0}, gdone{0};
+        auto gw = [&]() {
+            size_t i;
+            while ((i = gi.fetch_add(1)) < recs.size()) {
+                if (!participates[i]) continue;
+                std::string fasta;
+                try { fasta = load_fasta(recs[i].file_path); } catch (const std::exception&) { continue; }
+                gcounts[i] = aamer_counts(fasta, cfg);
+                if (size_t d = ++gdone; d % 500 == 0) spdlog::info("cladesplit scc: counted {}", d);
+            }
+        };
+        std::vector<std::thread> gp;
+        for (unsigned t = 0; t < nt; ++t) gp.emplace_back(gw);
+        for (auto& th : gp) th.join();
+    }
+    struct SccOut { int32_t clade; float ceiling; std::vector<uint64_t> hashes; };
+    std::vector<SccOut> scc_out;
+    for (auto& [cid, idxs] : genus_recs) {
+        if (idxs.size() < kSccMinRefs) continue;
+        std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> pm;  // hash -> (present, multi)
+        uint32_t N = 0;
+        for (size_t i : idxs) {
+            if (gcounts[i].empty()) continue;
+            ++N;
+            for (auto& [h, c] : gcounts[i]) { auto& e = pm[h]; ++e.first; if (c >= 2) ++e.second; }
+        }
+        if (N < kSccMinRefs) continue;
+        const uint32_t need_prev = (uint32_t)std::ceil(kSccPrevalence * N);
+        std::unordered_set<uint64_t> scc;
+        for (auto& [h, e] : pm)
+            if (e.first >= need_prev && e.second <= (uint32_t)std::floor(kSccMultiFrac * e.first)) scc.insert(h);
+        if (scc.empty()) continue;
+        std::vector<float> cds;
+        for (size_t i : idxs) { if (!gcounts[i].empty()) cds.push_back(core_dup_of(gcounts[i], scc)); }
+        std::sort(cds.begin(), cds.end());
+        const float med = cds[cds.size() / 2];
+        std::vector<float> ad(cds.size());
+        for (size_t k = 0; k < cds.size(); ++k) ad[k] = std::fabs(cds[k] - med);
+        std::sort(ad.begin(), ad.end());
+        const float mad = ad[ad.size() / 2];
+        const float ceiling = med + 20.0f * mad;
+        std::vector<uint64_t> sv(scc.begin(), scc.end());
+        std::sort(sv.begin(), sv.end());
+        spdlog::info("cladesplit scc: genus '{}' refs={} SCC={} ceiling={:.5f} (median={:.5f} MAD={:.5f})",
+                     clade_names[cid], N, sv.size(), ceiling, med, mad);
+        scc_out.push_back({ cid, ceiling, std::move(sv) });
+    }
+
     AppendWriter w;
     w.create(out);
     CspHeader h{};
@@ -226,13 +315,24 @@ void cladesplit_build(const std::filesystem::path& tsv,
         w.append(&len, sizeof(len));
         w.append(nm.data(), nm.size());
     }
-    h.magic = kCspMagic;
+    uint64_t scc_off = w.current_offset();
+    uint32_t n_genus = (uint32_t)scc_out.size();
+    w.append(&n_genus, sizeof(n_genus));
+    for (const auto& e : scc_out) {
+        w.append(&e.clade, sizeof(e.clade));
+        w.append(&e.ceiling, sizeof(e.ceiling));
+        uint32_t ns = (uint32_t)e.hashes.size();
+        w.append(&ns, sizeof(ns));
+        if (ns) w.append(e.hashes.data(), (size_t)ns * sizeof(uint64_t));
+    }
+    h.magic = kCspMagicV3;
     h.n_aamers = diag.size();
     h.n_clades = clade_names.size();
     h.names_off = names_off;
     h.frac_c = (uint16_t)cfg.frac_c;
     h.min_aa    = (uint16_t)cfg.min_aa;
     h.mode      = (uint16_t)cfg.mode;
+    h.scc_off   = scc_off;
     w.write_at(0, &h, sizeof(h));
     w.flush();
     w.close();
@@ -242,15 +342,20 @@ void cladesplit_build(const std::filesystem::path& tsv,
 void CladeSplitPanel::open(const std::filesystem::path& path) {
     m_.open(path);
     if (m_.size() < sizeof(CspHeader)) throw std::runtime_error("cladesplit: file too small");
-    CspHeader h;
+    CspHeader h{};
+    // v3 header (48B) shares its first 40 bytes with v2, so a 48-byte read is safe for
+    // both (the file has diagnostic hashes after the header); scc_off is only used for v3.
     std::memcpy(&h, m_.data(), sizeof(h));
-    if (h.magic != kCspMagic) throw std::runtime_error("cladesplit: bad magic (not a .csp v2 panel — rebuild)");
+    if (h.magic != kCspMagic && h.magic != kCspMagicV3)
+        throw std::runtime_error("cladesplit: bad magic (not a .csp v2/v3 panel — rebuild)");
+    const bool v3 = (h.magic == kCspMagicV3);
+    const size_t hdr = v3 ? kCspHdrV3 : kCspHdrV2;   // v2 hashes start at 40, v3 at 48
     n_aamers_   = h.n_aamers;
     panel_c_      = h.frac_c ? h.frac_c : 30;
     panel_min_aa_ = h.min_aa    ? h.min_aa    : 8;
     panel_mode_   = h.mode;
-    hashes_    = reinterpret_cast<const uint64_t*>(m_.data() + sizeof(CspHeader));
-    clade_ids_ = reinterpret_cast<const uint32_t*>(m_.data() + sizeof(CspHeader) + n_aamers_ * sizeof(uint64_t));
+    hashes_    = reinterpret_cast<const uint64_t*>(m_.data() + hdr);
+    clade_ids_ = reinterpret_cast<const uint32_t*>(m_.data() + hdr + n_aamers_ * sizeof(uint64_t));
     const uint8_t* p   = m_.data() + h.names_off;
     const uint8_t* end = m_.data() + m_.size();
     clade_names_.reserve(h.n_clades);
@@ -259,6 +364,23 @@ void CladeSplitPanel::open(const std::filesystem::path& path) {
         if (p + len > end) break;
         clade_names_.emplace_back(reinterpret_cast<const char*>(p), len);
         p += len;
+    }
+    // v3: per-genus SCC index (clade_id, ceiling, sorted SCC hashes).
+    if (v3 && h.scc_off > 0 && h.scc_off + 4 <= m_.size()) {
+        const uint8_t* q    = m_.data() + h.scc_off;
+        const uint8_t* qend = m_.data() + m_.size();
+        uint32_t ng; std::memcpy(&ng, q, 4); q += 4;
+        for (uint32_t g = 0; g < ng && q + 12 <= qend; ++g) {
+            int32_t  clade;   std::memcpy(&clade, q, 4);   q += 4;
+            float    ceiling; std::memcpy(&ceiling, q, 4); q += 4;
+            uint32_t ns;      std::memcpy(&ns, q, 4);      q += 4;
+            if (q + (size_t)ns * 8 > qend) break;
+            SccEntry se;
+            se.ceiling = ceiling;
+            se.hashes.reserve(ns);
+            for (uint32_t k = 0; k < ns; ++k) { uint64_t hh; std::memcpy(&hh, q, 8); q += 8; se.hashes.insert(hh); }
+            scc_[clade] = std::move(se);
+        }
     }
     // Blocked Bloom prefilter over the diagnostic aamers (10 bits/elem, k=4).
     if (n_aamers_ > 0) {
@@ -282,12 +404,16 @@ std::string_view CladeSplitPanel::clade_name(int32_t id) const {
 
 namespace {
 std::string fmt_line(const std::string& acc, const CladeSplitScore& s, const CladeSplitPanel& panel) {
-    char num[64];
+    char num[96];
     std::string l = acc; l += '\t';
     std::snprintf(num, sizeof(num), "%.6g\t%.6g\t", s.minority_fraction, s.redundancy_fraction); l += num;
     l += (s.majority_clade >= 0 ? std::string(panel.clade_name(s.majority_clade)) : "-"); l += '\t';
     l += (s.minority_clade >= 0 ? std::string(panel.clade_name(s.minority_clade)) : "-"); l += '\t';
-    l += std::to_string(s.n_votes); l += '\n';
+    l += std::to_string(s.n_votes); l += '\t';
+    // core_dup / core_dup_excess: "NA" when the majority genus has no SCC set (v2 panel or underpopulated genus).
+    if (std::isnan(s.core_dup)) l += "NA\tNA";
+    else { std::snprintf(num, sizeof(num), "%.6g\t%.6g", s.core_dup, s.core_dup_excess); l += num; }
+    l += '\n';
     return l;
 }
 unsigned resolve_threads(int t) { return t > 0 ? (unsigned)t : std::max(1u, std::thread::hardware_concurrency()); }
@@ -318,7 +444,7 @@ void cladesplit_score_tsv(const std::filesystem::path& tsv,
     for (unsigned t = 0; t < nt; ++t) pool.emplace_back(worker);
     for (auto& th : pool) th.join();
     std::ofstream o(out);
-    o << "accession\tminority_fraction\tredundancy_fraction\tmajority_clade\tminority_clade\tn_votes\n";
+    o << "accession\tminority_fraction\tredundancy_fraction\tmajority_clade\tminority_clade\tn_votes\tcore_dup\tcore_dup_excess\n";
     for (const auto& l : lines) if (!l.empty()) o << l;
     spdlog::info("cladesplit score: wrote {}", out.string());
 }
@@ -383,7 +509,7 @@ void cladesplit_score_gpk(const std::filesystem::path& gpk,
             }
         });
     std::ofstream o(out);
-    o << "accession\tminority_fraction\tredundancy_fraction\tmajority_clade\tminority_clade\tn_votes\n";
+    o << "accession\tminority_fraction\tredundancy_fraction\tmajority_clade\tminority_clade\tn_votes\tcore_dup\tcore_dup_excess\n";
     for (const auto& l : lines) if (!l.empty()) o << l;
     spdlog::info("cladesplit score-gpk: wrote {}", out.string());
 }
@@ -427,6 +553,22 @@ CladeSplitScore CladeSplitPanel::score(std::string_view fasta, const CladeSplitC
     s.majority_clade = maj_c;
     s.minority_clade = min_c;
     s.minority_fraction = 1.0f - (float)maj_v / (float)total;
+
+    // v3: SCC-restricted core duplication for the placed (majority) genus. Structurally
+    // excludes accessory/multi-copy families, so it flags same-genus/strain redundancy
+    // that redundancy_fraction (diagnostic-only) and CheckM/CheckM2 miss. NAN when the
+    // majority genus has no SCC set (underpopulated/novel) -> defers to observability cap.
+    if (auto sit = scc_.find(maj_c); sit != scc_.end() && !sit->second.hashes.empty()) {
+        const auto& sset = sit->second.hashes;
+        std::unordered_map<uint64_t, uint32_t> sc_cnt;
+        for (uint64_t h : ms) if (sset.count(h)) ++sc_cnt[h];
+        uint32_t present = (uint32_t)sc_cnt.size(), dup = 0;
+        for (const auto& [h, c] : sc_cnt) if (c >= 2) ++dup;
+        s.core_dup = present ? (float)dup / (float)present : 0.0f;
+        const float ceil_ = sit->second.ceiling;
+        float ex = ceil_ > 0.0f ? (s.core_dup - ceil_) / ceil_ : 0.0f;
+        s.core_dup_excess = ex < 0.0f ? 0.0f : (ex > 1.0f ? 1.0f : ex);
+    }
     return s;
 }
 

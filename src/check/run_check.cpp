@@ -163,6 +163,10 @@ void write_qual_to_archive(const std::filesystem::path& gpk_path,
         r.completeness_post_decontam    = q.completeness_post_decontam;
         r.contamination_leakage         = q.contamination_leakage;
         r.contamination_tnf_excess      = q.contamination_tnf_excess;
+        // Build-time SCC core-duplication (encode_dup maps NaN -> 0 sentinel = not scored).
+        // Must be re-persisted here: a zero-initialized QualRecord would otherwise wipe the
+        // build value on every QCOL write-back, flipping a contaminated genome back to HQ.
+        r.contamination_duplication_u16 = QualRecord::encode_dup(q.contamination_duplication);
         r.chromosome_skew_closure       = q.chromosome_skew_closure;
         r.leakage_residual              = q.leakage_residual;
         r.support_tier                  = static_cast<uint8_t>(q.support_tier);
@@ -526,6 +530,21 @@ int cmd_check(const std::filesystem::path& pack_path,
         ar.scan_genome_accessions([&](std::string_view acc, GenomeId gid) {
             acc_to_id.emplace(std::string(acc), gid);
         });
+
+        // core_dup is a build-time-only signal: the per-genus SCC set and ceiling live in
+        // the .csp panel, not the pack, so check cannot recompute it. Preserve the build
+        // value from the QUAL cache in ALL modes — pass_a skips it under --recompute (cache
+        // ptr nulled) and a fresh scan never fills it, which otherwise drops the axis to NA
+        // and lets a same-species-contaminated genome climb back to HQ under --scan-all.
+        for (auto& [acc, q] : quality) {
+            if (!std::isnan(q.contamination_duplication)) continue;
+            auto idit = acc_to_id.find(acc);
+            if (idit == acc_to_id.end()) continue;
+            auto cit = qual_cache.find(idit->second);
+            if (cit != qual_cache.end())
+                q.contamination_duplication =
+                    QualRecord::decode_dup(cit->second.contamination_duplication_u16);
+        }
 
         const uint64_t core_model_hash =
             ar.core_reader() ? ar.core_reader()->core_model_hash() : 0;

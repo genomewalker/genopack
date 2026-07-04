@@ -1,9 +1,12 @@
 #pragma once
 #include "mmap_file.hpp"
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace genopack {
@@ -18,7 +21,17 @@ namespace genopack {
 // genus / total diagnostic votes. No per-genus model, no contig length floor that
 // kills TNF/FMH — works on fragmented MAGs and across all taxonomic distances.
 
-constexpr uint64_t kCspMagic = 0x4753435350000002ULL; // "GCSP" v2: header carries build config
+constexpr uint64_t kCspMagic   = 0x4753435350000002ULL; // "GCSP" v2: header carries build config
+constexpr uint64_t kCspMagicV3 = 0x4753435350000003ULL; // "GCSP" v3: adds per-genus single-copy-core (SCC) index + ceiling
+
+// Single-copy-core (SCC) aamer parameters. An aamer is SCC for a genus if it is
+// prevalent (present in >= kSccPrevalence of the genus's genomes) AND single-copy
+// (occurs exactly once in >= 1-kSccMultiFrac of the genomes where present). core_dup =
+// (# SCC aamers occurring >=2x in a query) / (# SCC aamers present). Genera with fewer
+// than kSccMinRefs reference genomes get no SCC set -> core_dup NA (defers to obs cap).
+constexpr uint32_t kSccMinRefs    = 10;
+constexpr double   kSccPrevalence = 0.90;
+constexpr double   kSccMultiFrac  = 0.10;
 
 // Protein k-mer primitive (build and score must match):
 //   AAMER   = 8 amino acids only (the production signal; not a Metabuli metamer)
@@ -38,6 +51,10 @@ struct CladeSplitScore {
     uint32_t n_votes             = 0;
     int32_t  majority_clade      = -1;
     int32_t  minority_clade      = -1;
+    // SCC-restricted intra-lineage duplication (v3 panels only; NAN when the majority
+    // genus has no SCC set). core_dup = SCC aamers seen >=2x / SCC aamers present.
+    float    core_dup            = NAN;  // raw SCC duplication fraction
+    float    core_dup_excess     = NAN;  // clamp01((core_dup - genus_ceiling)/genus_ceiling): 0=clean, ->1 contaminated
 };
 
 // Build a panel from a TSV (accession, file_path, taxonomy[, ...]); writes `out`.
@@ -83,6 +100,9 @@ private:
     uint16_t                 panel_c_      = 30;     // build config — score uses these, not the cfg arg
     uint16_t                 panel_min_aa_ = 8;
     uint16_t                 panel_mode_   = PK_AAMER;
+    // v3 per-genus SCC index: clade_id -> (SCC hash set for fast scoring, clean core_dup ceiling).
+    struct SccEntry { std::unordered_set<uint64_t> hashes; float ceiling = 0.0f; };
+    std::unordered_map<int32_t, SccEntry> scc_;
 };
 
 // Extract per-genome subsampled, sorted-unique k=8 protein aamers (6-frame).
