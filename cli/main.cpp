@@ -31,6 +31,7 @@
 #include <genopack/cidx.hpp>
 #include <genopack/checksum.hpp>
 #include <genopack/section_checksum.hpp>
+#include <xxhash.h>
 #include <genopack/format.hpp>
 #include <genopack/gidx.hpp>
 #include <genopack/qual.hpp>
@@ -2999,7 +3000,7 @@ int main(int argc, char** argv) {
         "GTDB prokaryotes (d__-prefixed) are normalized by rank propagation. "
         "Eukaryotes and viruses are resolved from their taxonomy string via NCBI taxdump "
         "when --ncbi-taxdump is provided.");
-    std::filesystem::path tax_norm_input, tax_norm_output, tax_norm_taxdump;
+    std::filesystem::path tax_norm_input, tax_norm_output, tax_norm_taxdump, tax_norm_dupmap;
     tax_norm->add_option("-i,--input", tax_norm_input,
         "Input TSV (accession TAB taxonomy TAB file_path)")->required()->check(CLI::ExistingFile);
     tax_norm->add_option("-o,--output", tax_norm_output, "Output normalized TSV")->required();
@@ -3007,11 +3008,116 @@ int main(int argc, char** argv) {
         "Directory containing NCBI nodes.dmp + names.dmp. "
         "Downloaded automatically if absent or older than 30 days. "
         "Enables resolution of eukaryote/virus taxonomy by matching names against the NCBI tree.");
+    tax_norm->add_option("--dup-manifest", tax_norm_dupmap,
+        "Optional path to write a TSV manifest of accession collisions resolved "
+        "(accession, file_path, resolved_accession, action, content_hash)");
     tax_norm->callback([&]() {
         std::ifstream fin(tax_norm_input);
         if (!fin) { spdlog::error("Cannot open: {}", tax_norm_input.string()); std::exit(1); }
         std::ofstream fout(tax_norm_output);
         if (!fout) { spdlog::error("Cannot write: {}", tax_norm_output.string()); std::exit(1); }
+
+        // ── Accession-collision detection (must run before `taxonomy partition`
+        // splits genomes across parts — a per-part check cannot see a collision
+        // whose two rows land in different parts). Some source ids (eg. GCMeta
+        // MAG ids) are independently reused across different assemblies; resolve
+        // each colliding group by decompressed-sequence content hash: exact
+        // repeats are dropped, genuinely distinct genomes get a `~dupN` suffix
+        // (never `.N` — that already means "assembly version" for real
+        // GCA_/GCF_ accessions in the same manifest). ──
+        std::unordered_map<std::string, uint32_t> acc_count;
+        {
+            std::ifstream fcount(tax_norm_input);
+            std::string h, l;
+            std::getline(fcount, h);
+            while (std::getline(fcount, l)) {
+                if (l.empty()) continue;
+                auto t1 = l.find('\t');
+                if (t1 == std::string::npos) continue;
+                ++acc_count[l.substr(0, t1)];
+            }
+        }
+        std::unordered_map<std::string, std::vector<std::string>> dup_files;
+        {
+            std::ifstream fscan(tax_norm_input);
+            std::string h, l;
+            std::getline(fscan, h);
+            while (std::getline(fscan, l)) {
+                if (l.empty()) continue;
+                auto t1 = l.find('\t');
+                if (t1 == std::string::npos) continue;
+                std::string acc = l.substr(0, t1);
+                auto it = acc_count.find(acc);
+                if (it == acc_count.end() || it->second < 2) continue;
+                auto t2 = l.find('\t', t1 + 1);
+                dup_files[acc].push_back(t2 == std::string::npos ? "" : l.substr(t2 + 1));
+            }
+        }
+        struct DupResolution { std::string final_acc; bool drop; };
+        std::unordered_map<std::string, DupResolution> resolve; // key: accession '\x01' file_path
+        size_t n_content_dropped = 0, n_variant_groups = 0, n_unhashed = 0;
+        std::ofstream fmanifest;
+        if (!tax_norm_dupmap.empty()) {
+            fmanifest.open(tax_norm_dupmap);
+            if (fmanifest) fmanifest << "accession\tfile_path\tresolved_accession\taction\tcontent_hash\n";
+        }
+        auto canonical_content_hash = [](const std::string& file_path) -> uint64_t {
+            std::string fasta = decompress_gz(file_path);
+            auto contigs = genopack::check::parse_fasta(fasta);
+            std::vector<std::string> seqs;
+            seqs.reserve(contigs.size());
+            for (auto& c : contigs) {
+                std::string s = c.seq;
+                for (auto& ch : s) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+                seqs.push_back(std::move(s));
+            }
+            std::sort(seqs.begin(), seqs.end());
+            std::string canon;
+            for (auto& s : seqs) { canon += s; canon.push_back('\n'); }
+            return XXH3_64bits(canon.data(), canon.size());
+        };
+        for (auto& [acc, files] : dup_files) {
+            struct Variant { uint64_t hash; std::string final_acc; };
+            std::vector<Variant> seen;
+            for (auto& fp : files) {
+                std::string key = acc; key.push_back('\x01'); key += fp;
+                uint64_t h = 0;
+                bool ok = true;
+                try { h = canonical_content_hash(fp); }
+                catch (const std::exception& ex) {
+                    spdlog::warn("dup-resolve: cannot hash {} ({}): keeping under original accession", fp, ex.what());
+                    ok = false;
+                    ++n_unhashed;
+                }
+                if (!ok) {
+                    resolve[key] = {acc, false};
+                    if (fmanifest) fmanifest << acc << '\t' << fp << '\t' << acc << "\tkeep-unhashed\t-\n";
+                    continue;
+                }
+                auto found = std::find_if(seen.begin(), seen.end(),
+                                          [&](const Variant& v) { return v.hash == h; });
+                char hexbuf[17];
+                std::snprintf(hexbuf, sizeof(hexbuf), "%016llx", static_cast<unsigned long long>(h));
+                if (found != seen.end()) {
+                    resolve[key] = {found->final_acc, true};
+                    ++n_content_dropped;
+                    if (fmanifest) fmanifest << acc << '\t' << fp << '\t' << found->final_acc
+                                              << "\tdrop-exact-duplicate\t" << hexbuf << '\n';
+                } else {
+                    std::string final_acc = seen.empty() ? acc : (acc + "~dup" + std::to_string(seen.size() + 1));
+                    seen.push_back({h, final_acc});
+                    resolve[key] = {final_acc, false};
+                    if (fmanifest) fmanifest << acc << '\t' << fp << '\t' << final_acc
+                                              << "\tkeep\t" << hexbuf << '\n';
+                }
+            }
+            if (seen.size() > 1) ++n_variant_groups;
+        }
+        if (fmanifest) fmanifest.close();
+        if (!dup_files.empty())
+            spdlog::info("taxonomy normalize: {} colliding accession(s); {} distinct-content variant group(s); "
+                         "{} exact-duplicate row(s) dropped; {} unhashable (kept as-is)",
+                         dup_files.size(), n_variant_groups, n_content_dropped, n_unhashed);
 
         // Optionally load NCBI taxdb for eukaryote/virus rows
         std::optional<genopack::NcbiTaxdb> ncbi;
@@ -3024,6 +3130,7 @@ int main(int argc, char** argv) {
         static constexpr std::array<std::string_view, 10> kRanks = {
             "d__","l__","k__","p__","c__","o__","f__","g__","s__","S__"
         };
+        size_t n_conflicting_rank = 0, n_malformed_line = 0, n_no_file = 0;
         auto stem_fn = [](std::string_view acc) -> std::string {
             if (acc.starts_with("RS_") || acc.starts_with("GB_")) acc = acc.substr(3);
             if (acc.starts_with("GCF_") || acc.starts_with("GCA_")) {
@@ -3040,14 +3147,29 @@ int main(int argc, char** argv) {
             while (!sv.empty()) {
                 auto sep = sv.find(';');
                 auto tok = sv.substr(0, sep);
-                if (tok.size() >= 3 && tok[1]=='_' && tok[2]=='_')
-                    rm.emplace(std::string(tok.substr(0,3)), std::string(tok));
+                if (tok.size() >= 3 && tok[1]=='_' && tok[2]=='_') {
+                    auto [it, inserted] = rm.emplace(std::string(tok.substr(0,3)), std::string(tok));
+                    if (!inserted && it->second != tok) {
+                        ++n_conflicting_rank;
+                        if (n_conflicting_rank <= 10)
+                            spdlog::warn("taxonomy normalize: conflicting rank token for {} — kept '{}', ignored '{}'",
+                                         acc, it->second, tok);
+                    }
+                }
                 sv = (sep == std::string_view::npos) ? "" : sv.substr(sep+1);
             }
             auto prop = [&](std::string_view c, std::string_view p){
                 std::string cs(c), ps(p);
                 if (!rm.count(cs)||rm[cs]==cs) if(rm.count(ps)) rm[cs]=cs+rm[ps].substr(3);
             };
+            // Bare-prefix domain (e.g. input was "d__;l__;k__;...") means the
+            // source catalog carried no real classification at all — treat it
+            // as unresolved rather than silently emitting empty rank values.
+            if (!rm.count("d__") || rm.at("d__") == "d__") {
+                return "d__Unclassified;l__" + stem + ";k__" + stem + ";"
+                       "p__" + stem + ";c__" + stem + ";o__" + stem + ";"
+                       "f__" + stem + ";g__" + stem + ";s__" + stem + ";S__" + stem;
+            }
             prop("l__","d__"); prop("k__","l__"); prop("p__","k__"); prop("c__","p__");
             prop("o__","c__"); prop("f__","o__"); prop("g__","f__");
             auto& s=rm["s__"]; if(s.empty()||s=="s__") s="s__"+stem;
@@ -3060,20 +3182,41 @@ int main(int argc, char** argv) {
         std::string header, line;
         std::getline(fin, header);
         fout << header << '\n';
-        size_t n_gtdb=0, n_ncbi=0, n_unresolved=0, total=0;
+        size_t n_gtdb=0, n_ncbi=0, n_unresolved=0, total=0, n_dropped=0;
         while (std::getline(fin, line)) {
             if (line.empty()) continue; ++total;
             auto t1=line.find('\t');
-            if (t1==std::string::npos) { fout<<line<<'\n'; continue; }
+            if (t1==std::string::npos || t1==0) {
+                ++n_malformed_line;
+                if (n_malformed_line <= 10)
+                    spdlog::warn("taxonomy normalize: malformed line {} (no accession/taxonomy separator), passed through unmodified", total);
+                fout<<line<<'\n'; continue;
+            }
             auto t2=line.find('\t',t1+1);
             std::string acc=line.substr(0,t1);
             std::string tax=(t2==std::string::npos)?line.substr(t1+1):line.substr(t1+1,t2-t1-1);
             std::string rest=(t2==std::string::npos)?"":line.substr(t2);
+            if (t2==std::string::npos || t2+1>=line.size()) {
+                ++n_no_file;
+                if (n_no_file <= 10)
+                    spdlog::warn("taxonomy normalize: {} has no file path", acc);
+            }
+
+            if (t2!=std::string::npos) {
+                std::string file_path = rest.substr(1);
+                std::string rkey = acc; rkey.push_back('\x01'); rkey += file_path;
+                auto rit = resolve.find(rkey);
+                if (rit != resolve.end()) {
+                    if (rit->second.drop) { ++n_dropped; --total; continue; }
+                    acc = rit->second.final_acc;
+                }
+            }
 
             std::string norm;
             if (tax.starts_with("d__")) {
                 norm = normalize_gtdb(tax, acc);
-                ++n_gtdb;
+                if (norm.starts_with("d__Unclassified")) ++n_unresolved;
+                else ++n_gtdb;
             } else if (ncbi.has_value()) {
                 norm = ncbi->taxonomy_for_string(tax, acc);
                 if (norm.empty()) {
@@ -3100,6 +3243,14 @@ int main(int argc, char** argv) {
         spdlog::info("  GTDB prokaryotes:    {}", n_gtdb);
         spdlog::info("  NCBI euk/virus:      {}", n_ncbi);
         spdlog::info("  unresolved (stub):   {}", n_unresolved);
+        spdlog::info("  dropped (exact dup): {}", n_dropped);
+        spdlog::info("  conflicting ranks:   {}", n_conflicting_rank);
+        spdlog::info("  malformed lines:     {}", n_malformed_line);
+        spdlog::info("  missing file path:   {}", n_no_file);
+        if (n_conflicting_rank || n_malformed_line || n_no_file)
+            spdlog::warn("taxonomy normalize: {} row(s) had unexpected input shape (conflicting ranks, "
+                         "malformed lines, or missing file paths) — see warnings above for the first 10 of each",
+                         n_conflicting_rank + n_malformed_line + n_no_file);
         std::exit(0);
     });
 
