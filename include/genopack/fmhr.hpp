@@ -3,8 +3,10 @@
 #include "mmap_file.hpp"
 #include "types.hpp"
 #include <cstdint>
+#include <cstdio>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -53,17 +55,37 @@ struct FmhrView {
 
 class FmhrWriter {
 public:
-    // hashes must already be sorted and deduplicated.
-    void add(uint64_t genus_hash, std::vector<uint64_t> hashes) {
-        entries_.push_back({genus_hash, std::move(hashes)});
-    }
+    // spill_dir: if non-empty, hash data is written to a tmpfile instead of kept
+    // in RAM.  finalize() loads and merges from the tmpfile (peak RAM = largest
+    // single genus's deduplicated hash set, not the global union of all genera).
+    explicit FmhrWriter(std::string spill_dir = {});
+    ~FmhrWriter();
+    FmhrWriter(FmhrWriter&& o) noexcept;
+    FmhrWriter& operator=(FmhrWriter&& o) noexcept;
+    FmhrWriter(const FmhrWriter&) = delete;
+    FmhrWriter& operator=(const FmhrWriter&) = delete;
+
+    // hashes must already be sorted and deduplicated (per-chunk).
+    void add(uint64_t genus_hash, std::vector<uint64_t> hashes);
     SectionDesc finalize(AppendWriter& w, uint64_t section_id,
                          uint32_t k = 21, uint32_t c = 125);
-    size_t n_genera() const { return entries_.size(); }
+    size_t n_genera() const {
+        return spill_fp_ ? spill_index_.size() : entries_.size();
+    }
 
 private:
     struct Entry { uint64_t genus_hash; std::vector<uint64_t> hashes; };
     std::vector<Entry> entries_;
+
+    // Spill state (used when spill_dir is non-empty).
+    std::string spill_path_;
+    FILE*       spill_fp_ = nullptr;
+    struct SpillIndex {
+        uint64_t genus_hash;
+        int64_t  file_offset;  // byte offset of genus_hash field in spill file
+        uint32_t n_hashes;
+    };
+    std::vector<SpillIndex> spill_index_;
 
     static uint32_t next_pow2(uint32_t v) noexcept {
         if (v == 0) return 1;

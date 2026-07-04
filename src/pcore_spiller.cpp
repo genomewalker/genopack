@@ -1,11 +1,27 @@
 #include <genopack/pcore_spiller.hpp>
 #include <algorithm>
+#include <cerrno>
+#include <chrono>
+#include <cstring>
 #include <stdexcept>
+#include <thread>
 #include <sys/mman.h>
+#include <unistd.h>
 #include <unordered_map>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
+
+namespace {
+static FILE* fopen_retry(const char* path, const char* mode) {
+    for (int i = 0; i < 5; ++i) {
+        FILE* f = std::fopen(path, mode);
+        if (f) return f;
+        if (i < 4) std::this_thread::sleep_for(std::chrono::seconds(1 << i));
+    }
+    return nullptr;
+}
+}
 
 namespace genopack {
 
@@ -29,7 +45,7 @@ PcoreSpillWriter::~PcoreSpillWriter() { cleanup(); }
 void PcoreSpillWriter::flush_part(Part& p) {
     if (p.buf.empty()) return;
     if (!p.fp) {
-        p.fp = std::fopen(p.path.c_str(), "wb");
+        p.fp = fopen_retry(p.path.c_str(), "wb");
         if (!p.fp) throw std::runtime_error("pcore_spiller: cannot open " + p.path);
         p.file_exists = true;
         const uint32_t pi = static_cast<uint32_t>(&p - parts_.get());
@@ -121,12 +137,40 @@ void PcoreSpillWriter::finalize(int threads, Callback cb) {
             Part& p = parts_[pi];
 
             if (p.fp) {
-                if (std::fclose(p.fp) != 0)
-                    throw std::runtime_error("pcore_spiller: fclose failed: " + p.path);
+                // fflush + fdatasync before fclose: NFS defers write errors
+                // until fclose (lazy page-cache writeback).  By issuing an
+                // NFS COMMIT synchronously here we surface any error early
+                // and can retry before the FILE* is invalidated by fclose.
+                if (std::fflush(p.fp) != 0) {
+                    const int e = errno;
+                    std::fclose(p.fp); p.fp = nullptr;
+                    throw std::runtime_error("pcore_spiller: fflush failed: " +
+                                             p.path + ": " + std::strerror(e));
+                }
+                const int fd = ::fileno(p.fp);
+                if (fd >= 0) {
+                    for (int retry = 0; retry < 5; ++retry) {
+                        if (::fdatasync(fd) == 0) break;
+                        if (errno == EINTR) { --retry; continue; }
+                        if (retry == 4) {
+                            const int e = errno;
+                            std::fclose(p.fp); p.fp = nullptr;
+                            throw std::runtime_error("pcore_spiller: fdatasync failed: " +
+                                                     p.path + ": " + std::strerror(e));
+                        }
+                        std::this_thread::sleep_for(std::chrono::seconds(1 << retry));
+                    }
+                }
+                if (std::fclose(p.fp) != 0) {
+                    const int e = errno;
+                    p.fp = nullptr;
+                    throw std::runtime_error("pcore_spiller: fclose failed: " +
+                                             p.path + ": " + std::strerror(e));
+                }
                 p.fp = nullptr;
             }
 
-            FILE* f = std::fopen(p.path.c_str(), "rb");
+            FILE* f = fopen_retry(p.path.c_str(), "rb");
             if (!f) throw std::runtime_error("pcore_spiller: cannot open " + p.path);
             std::fseek(f, 0, SEEK_END);
             const long fsz = std::ftell(f);

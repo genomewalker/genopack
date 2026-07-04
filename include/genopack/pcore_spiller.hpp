@@ -35,8 +35,8 @@ namespace genopack {
 
 class PcoreSpillWriter {
 public:
-    static constexpr uint32_t N_PARTS   = 2048;
-    static constexpr int      PART_BITS = 11;
+    static constexpr uint32_t N_PARTS   = 8192;
+    static constexpr int      PART_BITS = 13;
     static constexpr int      BUF_TUPLES = 65536;
 
     struct Tuple {
