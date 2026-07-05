@@ -196,12 +196,43 @@ void cladesplit_build(const std::filesystem::path& tsv,
     const unsigned nt = threads > 0 ? (unsigned)threads : std::max(1u, std::thread::hardware_concurrency());
     spdlog::info("cladesplit build: {} genomes, {} genera, {} threads", recs.size(), clade_names.size(), nt);
 
-    // Sharded global aamer→(clade,state) map: state 1 = single genus (diagnostic),
-    // 2 = multi-genus. Per-genome aamers are bucketed by shard so each genome takes
-    // one lock per shard, not one per aamer.
+    // Sharded global aamer diagnosticity map, 256-way by low 8 hash bits. Each shard
+    // is a compact open-addressing table {uint64 key, uint32 val} at <=70% load —
+    // ~17 B/entry vs ~50 B for std::unordered_map, the dominant Phase-A footprint at
+    // GTDB scale. val packing: 0 = empty; bit31 = multi-genus (non-diagnostic);
+    // bits0..30 = cid+1 (single-genus diagnostic while bit31 clear).
     constexpr int NSH = 256;
-    struct Shard { std::unordered_map<uint64_t, std::pair<int32_t, uint8_t>> m; std::mutex mu; };
-    std::vector<Shard> shards(NSH);
+    struct DiagShard {
+        std::vector<uint64_t> keys; std::vector<uint32_t> vals;
+        uint32_t size = 0, mask = 0, occ = 0;
+        std::mutex mu;
+        void reset(uint32_t cap) { size = cap; mask = cap - 1; keys.assign(cap, 0); vals.assign(cap, 0); occ = 0; }
+        inline void reput_(uint64_t h, uint32_t v) {          // reinsert on grow, no update logic
+            uint32_t s = (uint32_t)(h >> 8) & mask;
+            while (vals[s]) s = (s + 1) & mask;
+            keys[s] = h; vals[s] = v; ++occ;
+        }
+        void grow() {
+            std::vector<uint64_t> ok = std::move(keys); std::vector<uint32_t> ov = std::move(vals);
+            const uint32_t osz = size; reset(size << 1);
+            for (uint32_t i = 0; i < osz; ++i) if (ov[i]) reput_(ok[i], ov[i]);
+        }
+        inline void upsert(uint64_t h, int32_t cid) {
+            if (size == 0) reset(256);
+            if ((occ + 1) * 10 >= size * 7) grow();
+            uint32_t s = (uint32_t)(h >> 8) & mask;
+            while (vals[s]) {
+                if (keys[s] == h) {                            // seen before → mark multi if new genus
+                    const uint32_t v = vals[s];
+                    if (!(v & 0x80000000u) && (int32_t)((v & 0x7fffffffu) - 1) != cid) vals[s] = v | 0x80000000u;
+                    return;
+                }
+                s = (s + 1) & mask;
+            }
+            keys[s] = h; vals[s] = (uint32_t)(cid + 1); ++occ;  // first sighting
+        }
+    };
+    std::vector<DiagShard> shards(NSH);
     std::atomic<size_t> next{0}, done{0};
     auto worker = [&]() {
         std::vector<std::vector<uint64_t>> buckets(NSH);
@@ -217,12 +248,7 @@ void cladesplit_build(const std::filesystem::path& tsv,
             for (int sidx = 0; sidx < NSH; ++sidx) {
                 if (buckets[sidx].empty()) continue;
                 std::lock_guard<std::mutex> lk(shards[sidx].mu);
-                auto& m = shards[sidx].m;
-                for (uint64_t h : buckets[sidx]) {
-                    auto& e = m[h];
-                    if (e.second == 0)                        e = { cid, 1 };
-                    else if (e.second == 1 && e.first != cid) e.second = 2;
-                }
+                for (uint64_t h : buckets[sidx]) shards[sidx].upsert(h, cid);
             }
             if (size_t d = ++done; d % 1000 == 0) spdlog::info("cladesplit build: {}/{}", d, recs.size());
         }
@@ -234,8 +260,11 @@ void cladesplit_build(const std::filesystem::path& tsv,
     std::vector<std::pair<uint64_t, int32_t>> diag;
     size_t total_mm = 0;
     for (auto& sh : shards) {
-        total_mm += sh.m.size();
-        for (const auto& [h, e] : sh.m) if (e.second == 1) diag.push_back({ h, e.first });
+        total_mm += sh.occ;
+        for (uint32_t s = 0; s < sh.size; ++s) {
+            const uint32_t v = sh.vals[s];
+            if (v && !(v & 0x80000000u)) diag.push_back({ sh.keys[s], (int32_t)((v & 0x7fffffffu) - 1) });
+        }
     }
     std::sort(diag.begin(), diag.end());
     spdlog::info("cladesplit build: {} clades, {} aamers, {} genus-diagnostic ({:.1f}%)",
@@ -246,62 +275,69 @@ void cladesplit_build(const std::filesystem::path& tsv,
     // SCC is NOT the diagnostic set (a prevalence-core aamer may be shared across genera).
     // It is derived per genus from its own genomes' aamer MULTIPLICITY: prevalent AND
     // single-copy. Only genera with >= kSccMinRefs get an SCC set; others -> core_dup NA.
-    // ceiling: <what breaks> holding every participating genome's count map in RAM does not
-    //          scale to full GTDB; upgrade: stream per-genus (one genus resident at a time).
-    std::unordered_map<int32_t, std::vector<size_t>> genus_recs;
+    // Streamed one genus at a time, parallel across genera: peak RAM is
+    // O(refs-per-genus x threads), not O(all genomes). This replaces the previous
+    // gcounts(recs.size()) materialisation that held every participating genome's
+    // count map resident and did not scale to full GTDB.
+    std::vector<std::vector<size_t>> genus_recs(clade_names.size());
     for (size_t i = 0; i < recs.size(); ++i) if (rec_cid[i] >= 0) genus_recs[rec_cid[i]].push_back(i);
-    std::vector<char> participates(recs.size(), 0);
-    for (auto& [cid, idxs] : genus_recs)
-        if (idxs.size() >= kSccMinRefs) for (size_t i : idxs) participates[i] = 1;
-    std::vector<std::unordered_map<uint64_t, uint32_t>> gcounts(recs.size());
-    {
-        std::atomic<size_t> gi{0}, gdone{0};
-        auto gw = [&]() {
-            size_t i;
-            while ((i = gi.fetch_add(1)) < recs.size()) {
-                if (!participates[i]) continue;
-                std::string fasta;
-                try { fasta = load_fasta(recs[i].file_path); } catch (const std::exception&) { continue; }
-                gcounts[i] = aamer_counts(fasta, cfg);
-                if (size_t d = ++gdone; d % 500 == 0) spdlog::info("cladesplit scc: counted {}", d);
-            }
-        };
-        std::vector<std::thread> gp;
-        for (unsigned t = 0; t < nt; ++t) gp.emplace_back(gw);
-        for (auto& th : gp) th.join();
-    }
+
     struct SccOut { int32_t clade; float ceiling; std::vector<uint64_t> hashes; };
     std::vector<SccOut> scc_out;
-    for (auto& [cid, idxs] : genus_recs) {
-        if (idxs.size() < kSccMinRefs) continue;
-        std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> pm;  // hash -> (present, multi)
-        uint32_t N = 0;
-        for (size_t i : idxs) {
-            if (gcounts[i].empty()) continue;
-            ++N;
-            for (auto& [h, c] : gcounts[i]) { auto& e = pm[h]; ++e.first; if (c >= 2) ++e.second; }
+    std::mutex scc_mu;
+    std::atomic<size_t> gnext{0}, gdone{0};
+    auto scc_worker = [&]() {
+        size_t cid;
+        while ((cid = gnext.fetch_add(1)) < genus_recs.size()) {
+            const auto& idxs = genus_recs[cid];
+            if (idxs.size() < kSccMinRefs) continue;
+            // Load only this genus's genomes — resident for this genus alone, then freed.
+            std::vector<std::unordered_map<uint64_t, uint32_t>> cg;
+            cg.reserve(idxs.size());
+            for (size_t i : idxs) {
+                std::string fasta;
+                try { fasta = load_fasta(recs[i].file_path); } catch (const std::exception&) { continue; }
+                cg.push_back(aamer_counts(fasta, cfg));
+            }
+            std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> pm;  // hash -> (present, multi)
+            uint32_t N = 0;
+            for (auto& c : cg) {
+                if (c.empty()) continue;
+                ++N;
+                for (auto& [h, cnt] : c) { auto& e = pm[h]; ++e.first; if (cnt >= 2) ++e.second; }
+            }
+            if (N < kSccMinRefs) continue;
+            const uint32_t need_prev = (uint32_t)std::ceil(kSccPrevalence * N);
+            std::unordered_set<uint64_t> scc;
+            for (auto& [h, e] : pm)
+                if (e.first >= need_prev && e.second <= (uint32_t)std::floor(kSccMultiFrac * e.first)) scc.insert(h);
+            if (scc.empty()) continue;
+            std::vector<float> cds;
+            for (auto& c : cg) if (!c.empty()) cds.push_back(core_dup_of(c, scc));
+            std::sort(cds.begin(), cds.end());
+            const float med = cds[cds.size() / 2];
+            std::vector<float> ad(cds.size());
+            for (size_t k = 0; k < cds.size(); ++k) ad[k] = std::fabs(cds[k] - med);
+            std::sort(ad.begin(), ad.end());
+            const float mad = ad[ad.size() / 2];
+            const float ceiling = med + 20.0f * mad;
+            std::vector<uint64_t> sv(scc.begin(), scc.end());
+            std::sort(sv.begin(), sv.end());
+            std::lock_guard<std::mutex> lk(scc_mu);
+            spdlog::info("cladesplit scc: genus '{}' refs={} SCC={} ceiling={:.5f} (median={:.5f} MAD={:.5f})",
+                         clade_names[cid], N, sv.size(), ceiling, med, mad);
+            scc_out.push_back({ (int32_t)cid, ceiling, std::move(sv) });
+            if (size_t d = ++gdone; d % 200 == 0) spdlog::info("cladesplit scc: {} genera done", d);
         }
-        if (N < kSccMinRefs) continue;
-        const uint32_t need_prev = (uint32_t)std::ceil(kSccPrevalence * N);
-        std::unordered_set<uint64_t> scc;
-        for (auto& [h, e] : pm)
-            if (e.first >= need_prev && e.second <= (uint32_t)std::floor(kSccMultiFrac * e.first)) scc.insert(h);
-        if (scc.empty()) continue;
-        std::vector<float> cds;
-        for (size_t i : idxs) { if (!gcounts[i].empty()) cds.push_back(core_dup_of(gcounts[i], scc)); }
-        std::sort(cds.begin(), cds.end());
-        const float med = cds[cds.size() / 2];
-        std::vector<float> ad(cds.size());
-        for (size_t k = 0; k < cds.size(); ++k) ad[k] = std::fabs(cds[k] - med);
-        std::sort(ad.begin(), ad.end());
-        const float mad = ad[ad.size() / 2];
-        const float ceiling = med + 20.0f * mad;
-        std::vector<uint64_t> sv(scc.begin(), scc.end());
-        std::sort(sv.begin(), sv.end());
-        spdlog::info("cladesplit scc: genus '{}' refs={} SCC={} ceiling={:.5f} (median={:.5f} MAD={:.5f})",
-                     clade_names[cid], N, sv.size(), ceiling, med, mad);
-        scc_out.push_back({ cid, ceiling, std::move(sv) });
+    };
+    {
+        std::vector<std::thread> gp;
+        for (unsigned t = 0; t < nt; ++t) gp.emplace_back(scc_worker);
+        for (auto& th : gp) th.join();
     }
+    // Deterministic on-disk order (parallel completion order is nondeterministic).
+    std::sort(scc_out.begin(), scc_out.end(),
+              [](const SccOut& a, const SccOut& b) { return a.clade < b.clade; });
 
     AppendWriter w;
     w.create(out);
