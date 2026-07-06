@@ -869,6 +869,7 @@ struct ArchiveBuilder::Impl {
             std::vector<uint64_t> aamers;                  // sorted-unique k=8 protein aamers (worker-computed)
             std::vector<uint64_t> fmh;                     // FracMinHash hashes, ≥1kb contigs (worker-computed)
             float contam_dup_excess = NAN;                 // SCC core_dup excess (worker-computed; fasta is freed before finalize)
+            float contam_dup_mass   = NAN;                 // Phase-1: non-saturating SCC dup mass (worker-computed; not serialized in Phase-1)
         };
 
         // Task queue (all tasks submitted upfront; poison-pill sentinel at end)
@@ -1089,9 +1090,11 @@ struct ArchiveBuilder::Impl {
                                            std::move(aamers), std::move(fmh)};
                         // SCC core_dup excess — score here (FASTA alive); finalize_genus reads
                         // the stored value (item.fasta is freed by flush_staging_buf before it runs).
-                        if (build_contam_panel)
-                            d.item->contam_dup_excess =
-                                build_contam_panel->score(d.item->fasta).core_dup_excess;
+                        if (build_contam_panel) {
+                            const auto cds = build_contam_panel->score(d.item->fasta);
+                            d.item->contam_dup_excess = cds.core_dup_excess;
+                            d.item->contam_dup_mass   = cds.core_dup_mass;
+                        }
                     } catch (const std::exception& ex) {
                         spdlog::warn("Skipping {}: {}", t.record->accession, ex.what());
                     }

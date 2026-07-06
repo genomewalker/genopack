@@ -610,6 +610,24 @@ PassAResult run_pass_a(ICheckReader& pack,
                     nrb_p90 = nrb_ref[idx];
                 }
 
+                // Phase-1 relative-conspecific-containment: median + MAD of the genus
+                // OPH-containment distribution (c0_all). Only when the genus is saturated
+                // with ≥10 members and MAD>0; else abstain (NaN). c0_all was mutated by the
+                // p90 nth_element above, so recompute the order statistics from scratch here.
+                float c0_median = NAN, c0_mad = 0.0f;
+                const bool acc_ok =
+                    !tq.empty() && tq.front().q.support_tier == SupportTier::GenusSaturated &&
+                    c0_all.size() >= 10;
+                if (acc_ok) {
+                    std::vector<float> tmp = c0_all;
+                    const size_t mid = tmp.size() / 2;
+                    std::nth_element(tmp.begin(), tmp.begin() + mid, tmp.end());
+                    c0_median = tmp[mid];
+                    for (float& v : tmp) v = std::fabs(v - c0_median);
+                    std::nth_element(tmp.begin(), tmp.begin() + mid, tmp.end());
+                    c0_mad = 1.4826f * tmp[mid];
+                }
+
                 for (auto& tqr : tq) {
                     if (!tqr.m->gid) continue;
                     auto it = gs.sample_pos.find(tqr.m->gid);
@@ -620,6 +638,12 @@ PassAResult run_pass_a(ICheckReader& pack,
                     if (nrb_p90 > 0.0f && qnrb > 0)
                         tqr.q.completeness_sketch_fill = std::clamp(
                             static_cast<float>(qnrb) / nrb_p90, 0.0f, 1.5f);
+                    if (acc_ok && c0_mad > 0.0f && !std::isnan(tlk[0])) {
+                        const float c0_query = 1.0f - tlk[0];
+                        if (c0_median > 0.0f)
+                            tqr.q.accessory_ratio = c0_query / c0_median;
+                        tqr.q.accessory_z = (c0_query - c0_median) / c0_mad;
+                    }
                 }
             }
         }

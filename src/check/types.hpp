@@ -49,6 +49,10 @@ static constexpr uint8_t PROT_NOVEL_GENUS_FALLBACK = 0x4;
 
 struct GenomeQuality {
     float completeness_cluster_relative = NAN;
+    // Phase-1 relative-conspecific-containment estimators (OPH-containment, NOT pangenome-union).
+    // Computed only in the no-GSTX path when the genus is GenusSaturated with ≥10 members; NaN otherwise (abstain).
+    float accessory_ratio               = NAN;  // c0_query / median(c0_all)
+    float accessory_z                   = NAN;  // (c0_query - median) / (1.4826 * MAD)
     float completeness_sketch_fill      = NAN;
     float completeness_fragmentation    = NAN;
     float completeness_post_decontam    = NAN;
@@ -80,6 +84,7 @@ struct GenomeQuality {
     float    fmh_minority_fraction         = NAN;  // FMH k=21,c=125 minority bp / scored_bp
     float    contamination_cross_genus     = NAN;  // fraction bp where any foreign genus fits better than assigned
     float    contamination_duplication     = NAN;  // .csp diagnostic-aamer duplication fraction (build-time; CheckM2-aligned)
+    float    contamination_core_dup_mass   = NAN;  // Phase-1: non-saturating SCC dup mass Σ(c-1)/Σc (build/score-time only)
 
     // Marker-panel completeness (protein k-mer based; NAN if no .mrk file supplied)
     float    marker_completeness         = NAN;  // present / expected markers

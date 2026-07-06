@@ -55,6 +55,10 @@ struct CladeSplitScore {
     // genus has no SCC set). core_dup = SCC aamers seen >=2x / SCC aamers present.
     float    core_dup            = NAN;  // raw SCC duplication fraction
     float    core_dup_excess     = NAN;  // clamp01((core_dup - genus_ceiling)/genus_ceiling): 0=clean, ->1 contaminated
+    // Non-saturating duplication mass: surplus copies / total SCC copies. Unlike core_dup
+    // (a presence fraction that saturates ~1.0 once every SCC family has ≥2 copies),
+    // this scales with the number of extra copies, so it keeps rising past 50% mixture.
+    float    core_dup_mass       = NAN;  // Σ(c-1)/Σc over SCC count map; 0=clean, unbounded-ish
 };
 
 // Build a panel from a TSV (accession, file_path, taxonomy[, ...]); writes `out`.

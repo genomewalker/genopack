@@ -33,9 +33,11 @@ namespace {
 // contig-coherence (fiedler) are near-independent failure modes — a complete-but-chimeric
 // bin is still a poor representative, and additive mixing would let high completeness mask
 // contamination. NaN completeness → 0.5 neutral prior; NaN contamination/fiedler → no penalty.
-//   comp_eff already encodes the cr_unreliable insight, so sparse-reference MAGs are not crushed.
-//   cont_factor: rational decay centred on 0.05 (=0.5 there, =0.2 at 0.10) — a smooth analog of
-//     the old HQ/MQ contamination cliffs, so ranking stays stable across them.
+//   comp_eff is intrinsic completeness (see completeness_effective), so cluster_relative never
+//   crushes a complete genome that merely covers little of a diverse genus pangenome.
+//   cont_factor: rational decay with the knee at 0.10 (5% → ≈0.8, 10% → 0.5) — a smooth analog
+//     of the old HQ/MQ contamination cliffs, aligned to CheckM2's <5% HQ cutoff instead of
+//     halving the score at 5%, so ranking stays stable across them.
 //   coh_penalty: bounded ≤50% cut, engaged only for HIGH fiedler_split (>0.5, = chimera/bin-split);
 //     capped rather than a hard gate because the fiedler threshold is uncalibrated (no test coverage).
 //     NB: high fiedler_oph_split = poorly-connected contig graph = split; low = coherent (score_bin.cpp).
@@ -43,7 +45,8 @@ float compute_quality_score(float comp_eff, float cont_val, float fiedler_split)
     const float C = std::isnan(comp_eff) ? 0.5f : comp_eff;
     const float X = std::isnan(cont_val) ? 0.0f : cont_val;
     const float s = std::isnan(fiedler_split) ? 0.0f : fiedler_split;
-    const float xr = X / 0.05f;
+    // knee at 0.10: 5% cont → cont_factor ≈0.8, 10% → 0.5 (was /0.05f: 5% → 0.5)
+    const float xr = X / 0.10f;
     const float cont_factor = 1.0f / (1.0f + xr * xr);
     float ramp = (s - 0.5f) / 0.4f;
     ramp = ramp < 0.0f ? 0.0f : (ramp > 1.0f ? 1.0f : ramp);
@@ -51,18 +54,56 @@ float compute_quality_score(float comp_eff, float cont_val, float fiedler_split)
     return C * cont_factor * coh_penalty;
 }
 
+// Intrinsic completeness_effective for tier/score, kept identical between the QCOL
+// (quality_tier_u8) and TSV paths. INTRINSIC completeness only: single-copy/prevalence
+// core recovery (aamer_core, CheckM2-aligned) is the primary signal; post_decontam
+// (bp-retention after the contig contamination scan) is the fallback.
+//   completeness_cluster_relative is NOT intrinsic completeness — it is the fraction of the
+//   genus PANGENOME a genome covers. A finished isolate in a diverse genus recovers ~100% of
+//   its own core but only a small slice of the genus accessory pangenome, so a low cluster_relative
+//   there is genus diversity, not missing sequence. It must never by itself drive comp_eff down.
+//   It is admitted only as a SOFT CORROBORATOR: when the intrinsic signal is ALSO low
+//   (genuine agreement that the genome is partial) AND contamination is quiet, geomean(intrinsic, cr)
+//   lets a real strain-partial genome settle below the intrinsic estimate. When intrinsic
+//   completeness is high, cr is ignored (its low value is diversity, not incompleteness).
+float completeness_effective(const GenomeQuality& q) {
+    const float ac = q.completeness_aamer_core;
+    const float pd = q.completeness_post_decontam;
+    const float cr = q.completeness_cluster_relative;
+    // Intrinsic estimate: prefer the CheckM2-aligned genus-core coverage, then bp-retention.
+    const float intrinsic = !std::isnan(ac) ? ac : pd;
+    if (std::isnan(intrinsic))
+        return cr;  // no intrinsic signal at all → cluster_relative is the only completeness proxy
+    // Soft corroboration: only when intrinsic ALSO reads incomplete does cr pull it down.
+    // A high-intrinsic genome keeps its estimate regardless of a low (diverse-genus) cr.
+    if (intrinsic < 0.90f && !std::isnan(cr) && cr < intrinsic && (intrinsic - cr) > 0.30f)
+        return std::sqrt(intrinsic * cr);
+    return intrinsic;
+}
+
+// contamination_duplication is core_dup_excess (cladesplit.cpp:605-606): a RELATIVE SCC
+// core-dup excess (core_dup - ceiling)/ceiling, NOT a CheckM2-style fraction. Measured
+// ~8× hot vs CheckM2 (mean 8.06% vs 1.05%), so scale it into the CheckM2 fraction range
+// before it enters the aggregate/score. Scale factor 1/8; NaN preserved.
+constexpr float kDupToContamScale = 0.125f;   // ÷8: relative SCC-dup excess → CheckM2 fraction
+float duplication_contamination(float v) {
+    return std::isnan(v) ? NAN : v * kDupToContamScale;
+}
+
 // Single contamination determinant: NA-safe max over every observable contamination axis.
 // HQ used to hinge on the FMH minority axis alone, so a missing (NA) FMH call was scored as
 // zero contamination and a genuinely dirty genome slipped through HQ (GCMeta_00156701: fmh
 // NA, CheckM2 12.2%). Taking the max over all axes and ignoring NA means no single absent
-// axis can lower the score. All axes are [0,1] minority/outlier fractions (mixture util.hpp:81,
-// spe/rho = u8/255 pass_b.cpp:196-198, duplication/contig_outlier_adj fractions types.hpp:70,81)
-// except tnf_excess (dist/ref-1 ratio, builder.cpp:1415) which is clamped into the same range.
+// axis can lower the score. All axes are [0,1] minority/outlier fractions
+// (spe/rho = u8/255 pass_b.cpp:196-198, duplication scaled via duplication_contamination,
+// contig_outlier_adj fraction types.hpp:81) except tnf_excess (dist/ref-1 ratio,
+// builder.cpp:1415) which is clamped into the same range.
 // cross_genus is deliberately excluded — it is a hard chimera veto handled at the call site.
+// contamination_mixture is EXCLUDED — see note at its (removed) acc() site below.
 //   contamination_tnf_minor is the near-clade detector (util.cpp: BIC-free TNF-GMM minority
 //   mass, multi-contig guarded) — catches same-species/genus mergers that stay k-mer-similar
 //   so fmh/cross_genus read ~0 but a compositional minority still exists.
-//   observed: FMH/mixture/tnf_minor/contig_outlier_adj/spe/rho/duplication carry a NAN sentinel
+//   observed: FMH/tnf_minor/contig_outlier_adj/spe/rho/duplication carry a NAN sentinel
 //     when unmeasured, so any non-NAN one proves contamination was actually observed. leakage and
 //     tnf_excess default to 0.0f when unmeasured (indistinguishable from clean), so they raise
 //     the max but never by themselves establish observability. When observed stays false, no
@@ -83,15 +124,32 @@ float contamination_aggregate(const GenomeQuality& q, bool& observed) {
         if (c > m) m = c;
     };
     acc(q.fmh_minority_fraction);
-    acc(q.contamination_mixture);
+    // contamination_mixture is EXCLUDED from gating: BIC-selected K=2 minority mass with no
+    // separation or multi-contig guard (util.cpp:850-853), r=-0.011 vs CheckM2. Stays a
+    // reported TSV diagnostic only.
     acc(q.contamination_tnf_minor);
     acc(q.contamination_contig_outlier_adj);
     acc(q.contamination_spe);
     acc(q.contamination_rho_outlier);
-    acc(q.contamination_duplication);
+    acc(duplication_contamination(q.contamination_duplication));   // scale-corrected (÷8)
     acc_max(q.contamination_leakage);
     acc_max(q.contamination_tnf_excess);
     return m;
+}
+
+// Count how many TRUSTED contamination axes fire above their observability floor. Mixture is
+// excluded (see contamination_aggregate). An LQ contamination demotion requires >=2 of these
+// firing; a lone axis (cv >= 0.10) may only cap at MQ — kills single-axis false positives that
+// demoted 1.84M CheckM2-HQ genomes to LQ. cross_genus is handled separately as a hard veto.
+int trusted_contam_axes(const GenomeQuality& q) {
+    auto fires = [](float v, float thr) { return !std::isnan(v) && v >= thr; };
+    return fires(q.fmh_minority_fraction,             0.10f)
+         + fires(q.contamination_tnf_minor,           0.10f)
+         + fires(q.contamination_contig_outlier_adj,  0.05f)
+         + fires(q.contamination_spe,                 0.10f)
+         + fires(q.contamination_rho_outlier,         0.10f)
+         + fires(duplication_contamination(q.contamination_duplication), 0.05f)
+         + fires(q.contamination_leakage,             0.02f);
 }
 
 // Cross-genus chimera veto: a bin whose contigs fit a foreign genus better than the assigned
@@ -233,47 +291,24 @@ void write_qual_to_archive(const std::filesystem::path& gpk_path,
             const bool aamer_only = std::isnan(q.completeness_post_decontam) &&
                                     std::isnan(q.completeness_cluster_relative) &&
                                     !std::isnan(q.completeness_aamer_core);
-            const float _pd = q.completeness_post_decontam;
-            const float _cr = q.completeness_cluster_relative;
-            const float _ac = q.completeness_aamer_core;
-            // cr_unreliable: cluster_relative near zero means centroid sparsity in a diverse
-            // genus, not low completeness. Safe to bypass geomean and use pd directly when:
-            //   (a) classic: pd≥0.90 + ac≥0.90 + cr<0.50 (original guard), OR
-            //   (b) degenerate cr<0.05 + all contamination axes quiet — a clean genome at
-            //       cr=0.02 is centroid-geometry noise, not misassignment; but if ANY
-            //       contamination signal fires, low cr IS a misbin fingerprint and must stand, OR
-            //   (c) no marker-core data (ac NaN) + contamination quiet — MAGs from undersampled
-            //       biomes (marine/soil/wastewater) have sparse reference clusters; a low cr there
-            //       reflects a bad comparator, not incomplete sequence. Without ac to fall back on,
-            //       geomean(pd,cr) mislabeled ~1.2M otherwise-clean MAGs as LQ in the r232_v5 audit.
-            const bool cont_quiet_cr =
-                (std::isnan(q.fmh_minority_fraction)        || q.fmh_minority_fraction        < 0.10f) &&
-                (std::isnan(q.contamination_mixture)        || q.contamination_mixture        < 0.10f) &&
-                (std::isnan(q.contamination_leakage)        || q.contamination_leakage        < 0.02f) &&
-                (std::isnan(q.contamination_contig_outlier) || q.contamination_contig_outlier < 0.05f) &&
-                (std::isnan(q.contamination_contig_split)   || q.contamination_contig_split   < 0.05f);
-            const bool cr_unreliable = !std::isnan(_pd) && _pd >= 0.90f
-                                    && !std::isnan(_cr) && _cr < 0.50f
-                                    && ((!std::isnan(_ac) && _ac >= 0.90f)
-                                        || (_cr < 0.05f && cont_quiet_cr)
-                                        || (std::isnan(_ac) && cont_quiet_cr));
-            const float ce = cr_unreliable ? _pd
-                           : (!std::isnan(_pd) && !std::isnan(_cr) && std::fabs(_pd - _cr) > 0.30f)
-                           ? std::sqrt(_pd * _cr)
-                           : (!std::isnan(_pd) ? _pd : (!std::isnan(_cr) ? _cr : _ac));
+            const float ce = completeness_effective(q);
             const float fmh = !std::isnan(q.fmh_minority_fraction) ? q.fmh_minority_fraction : NAN;
             const bool leakage_fires = (q.contamination_leakage >= 0.02f);
             const int nsig =
                 (!std::isnan(fmh)                          && fmh                          >= 0.10f) +
-                (!std::isnan(q.contamination_mixture)      && q.contamination_mixture      >= 0.10f) +
                 (!std::isnan(q.contamination_contig_outlier) && q.contamination_contig_outlier >= 0.05f) +
                 (!std::isnan(q.contamination_contig_split) && q.contamination_contig_split >= 0.05f) +
                 leakage_fires;
             bool cont_observed = false;
             const float cv = contamination_aggregate(q, cont_observed);
+            // An LQ contamination demotion requires >=2 corroborating trusted axes (kills
+            // single-axis false positives). With only one axis firing, a high aggregate may
+            // cap the tier at MQ but must not push it to LQ on contamination grounds alone.
+            const int ntrusted = trusted_contam_axes(q);
             const char* t = "LQ";
             if (!std::isnan(ce) && ce >= 0.90f && cv < 0.05f) t = "HQ";
             else if (!std::isnan(ce) && ce >= 0.50f && cv < 0.10f) t = "MQ";
+            else if (!std::isnan(ce) && ce >= 0.50f && ntrusted < 2) t = "MQ";
             // fiedler_oph_split has no validated threshold or test coverage (audited 2026-07-02);
             // require at least one corroborating contamination/split signal before trusting it
             // alone to override an otherwise-clean comp/cont verdict.
@@ -586,7 +621,24 @@ int cmd_check(const std::filesystem::path& pack_path,
            "\tcontamination_rho_outlier\tcontamination_cross_genus\tcontamination_contig_split"
            "\tcontamination_duplication\tmarker_present_bits"
            "\tqual_flags\tsupport_tier\tinterval_width"
-           "\tcontamination_contig_outlier_adj\tassembly_tier\n";
+           "\tcontamination_contig_outlier_adj\tassembly_tier"
+           // pangenome_fraction: honest alias of completeness_cluster_relative — the fraction of
+           // the genus pangenome (union aamer content across genus members) this genome covers,
+           // i.e. accessory-genome breadth / pangenome representativeness. NOT genome completeness
+           // and deliberately NOT an input to quality_score/quality_tier. Interpretable only when
+           // support_tier == GenusSaturated; in a Sparse/Singleton genus the denominator is tiny
+           // so the fraction saturates near 1 trivially.
+           "\tpangenome_fraction"
+           // Phase-1 estimators (in-memory only, no QUAL/format bump): non-saturating SCC
+           // duplication mass (build/score-time; NA in pure check where the .csp panel isn't
+           // loaded) and relative-conspecific OPH-containment ratio/z (no-GSTX GenusSaturated only).
+           "\tcore_dup_mass\taccessory_ratio\taccessory_z"
+           // Phase-1 completeness ESTIMATOR (in-memory + TSV only, no QUAL/format bump).
+           // completeness_marker = present/expected single-copy markers — the CheckM2-style
+           // fraction that tracks fraction-of-genome (declines with fragmentation), unlike the
+           // presence-saturating completeness_aamer_core. marker_n_present/expected are the raw
+           // counts behind it. NA when no --markers panel or no genus marker calibration.
+           "\tcompleteness_marker\tmarker_n_present\tmarker_n_expected\n";
 
     auto tier_str = [](SupportTier t) -> const char* {
         switch (t) {
@@ -614,24 +666,7 @@ int cmd_check(const std::filesystem::path& pack_path,
         const bool aamer_only = std::isnan(q.completeness_post_decontam) &&
                                 std::isnan(q.completeness_cluster_relative) &&
                                 !std::isnan(q.completeness_aamer_core);
-        const float _pd2 = q.completeness_post_decontam;
-        const float _cr2 = q.completeness_cluster_relative;
-        const float _ac2 = q.completeness_aamer_core;
-        const bool cont_quiet_cr2 =
-            (std::isnan(q.fmh_minority_fraction)        || q.fmh_minority_fraction        < 0.10f) &&
-            (std::isnan(q.contamination_mixture)        || q.contamination_mixture        < 0.10f) &&
-            (std::isnan(q.contamination_leakage)        || q.contamination_leakage        < 0.02f) &&
-            (std::isnan(q.contamination_contig_outlier) || q.contamination_contig_outlier < 0.05f) &&
-            (std::isnan(q.contamination_contig_split)   || q.contamination_contig_split   < 0.05f);
-        const bool cr2_unreliable = !std::isnan(_pd2) && _pd2 >= 0.90f
-                                 && !std::isnan(_cr2) && _cr2 < 0.50f
-                                 && ((!std::isnan(_ac2) && _ac2 >= 0.90f)
-                                     || (_cr2 < 0.05f && cont_quiet_cr2)
-                                     || (std::isnan(_ac2) && cont_quiet_cr2));
-        const float comp_eff = cr2_unreliable ? _pd2
-                             : (!std::isnan(_pd2) && !std::isnan(_cr2) && std::fabs(_pd2 - _cr2) > 0.30f)
-                             ? std::sqrt(_pd2 * _cr2)
-                             : (!std::isnan(_pd2) ? _pd2 : (!std::isnan(_cr2) ? _cr2 : _ac2));
+        const float comp_eff = completeness_effective(q);
         const float fmh_cont = !std::isnan(q.fmh_minority_fraction) ? q.fmh_minority_fraction : NAN;
         // Count independent contamination signals that fire. FMH alone is insufficient because
         // it captures HGT/mobile elements as "foreign" k-mers (leakage disagrees for genuine HGT).
@@ -640,7 +675,6 @@ int cmd_check(const std::filesystem::path& pack_path,
         const bool leak_fires = (q.contamination_leakage >= 0.02f);
         const int cont_signals =
             (!std::isnan(fmh_cont)                         && fmh_cont                         >= 0.10f) +
-            (!std::isnan(q.contamination_mixture)          && q.contamination_mixture          >= 0.10f) +
             (!std::isnan(q.contamination_contig_outlier)   && q.contamination_contig_outlier   >= 0.05f) +
             (!std::isnan(q.contamination_contig_split)     && q.contamination_contig_split     >= 0.05f) +
             leak_fires;
@@ -648,9 +682,13 @@ int cmd_check(const std::filesystem::path& pack_path,
         // NA-safe contamination aggregate (mirrors QCOL): max over all observable axes.
         bool cont_observed = false;
         const float cont_val = contamination_aggregate(q, cont_observed);
+        // An LQ contamination demotion requires >=2 corroborating trusted axes (mirrors QCOL):
+        // one axis firing may cap at MQ but must not push to LQ on contamination grounds alone.
+        const int ntrusted = trusted_contam_axes(q);
         const char* qtier = "LQ";
         if (!std::isnan(comp_eff) && comp_eff >= 0.90f && cont_val < 0.05f) qtier = "HQ";
         else if (!std::isnan(comp_eff) && comp_eff >= 0.50f && cont_val < 0.10f) qtier = "MQ";
+        else if (!std::isnan(comp_eff) && comp_eff >= 0.50f && ntrusted < 2) qtier = "MQ";
         // fiedler_oph_split has no validated threshold or test coverage (audited 2026-07-02);
         // require at least one corroborating contamination/split signal before trusting it
         // alone to override an otherwise-clean comp/cont verdict.
@@ -711,7 +749,14 @@ int cmd_check(const std::filesystem::path& pack_path,
             << tier_str(q.support_tier) << '\t'
             << q.interval_width << '\t'
             << fmt(q.contamination_contig_outlier_adj) << '\t'
-            << assembly_tier << '\n';
+            << assembly_tier << '\t'
+            << fmt(q.completeness_cluster_relative) << '\t'
+            << fmt(q.contamination_core_dup_mass) << '\t'
+            << fmt(q.accessory_ratio) << '\t'
+            << fmt(q.accessory_z) << '\t'
+            << fmt(q.marker_completeness) << '\t'
+            << (q.marker_n_expected >= 0 ? std::to_string(q.marker_n_present) : std::string("NA")) << '\t'
+            << (q.marker_n_expected >= 0 ? std::to_string(q.marker_n_expected) : std::string("NA")) << '\n';
     }
     spdlog::info("check: TSV written to {}", output.string());
     return 0;

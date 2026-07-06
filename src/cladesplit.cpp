@@ -449,6 +449,9 @@ std::string fmt_line(const std::string& acc, const CladeSplitScore& s, const Cla
     // core_dup / core_dup_excess: "NA" when the majority genus has no SCC set (v2 panel or underpopulated genus).
     if (std::isnan(s.core_dup)) l += "NA\tNA";
     else { std::snprintf(num, sizeof(num), "%.6g\t%.6g", s.core_dup, s.core_dup_excess); l += num; }
+    l += '\t';
+    if (std::isnan(s.core_dup_mass)) l += "NA";
+    else { std::snprintf(num, sizeof(num), "%.6g", s.core_dup_mass); l += num; }
     l += '\n';
     return l;
 }
@@ -480,7 +483,7 @@ void cladesplit_score_tsv(const std::filesystem::path& tsv,
     for (unsigned t = 0; t < nt; ++t) pool.emplace_back(worker);
     for (auto& th : pool) th.join();
     std::ofstream o(out);
-    o << "accession\tminority_fraction\tredundancy_fraction\tmajority_clade\tminority_clade\tn_votes\tcore_dup\tcore_dup_excess\n";
+    o << "accession\tminority_fraction\tredundancy_fraction\tmajority_clade\tminority_clade\tn_votes\tcore_dup\tcore_dup_excess\tcore_dup_mass\n";
     for (const auto& l : lines) if (!l.empty()) o << l;
     spdlog::info("cladesplit score: wrote {}", out.string());
 }
@@ -545,7 +548,7 @@ void cladesplit_score_gpk(const std::filesystem::path& gpk,
             }
         });
     std::ofstream o(out);
-    o << "accession\tminority_fraction\tredundancy_fraction\tmajority_clade\tminority_clade\tn_votes\tcore_dup\tcore_dup_excess\n";
+    o << "accession\tminority_fraction\tredundancy_fraction\tmajority_clade\tminority_clade\tn_votes\tcore_dup\tcore_dup_excess\tcore_dup_mass\n";
     for (const auto& l : lines) if (!l.empty()) o << l;
     spdlog::info("cladesplit score-gpk: wrote {}", out.string());
 }
@@ -599,8 +602,12 @@ CladeSplitScore CladeSplitPanel::score(std::string_view fasta, const CladeSplitC
         std::unordered_map<uint64_t, uint32_t> sc_cnt;
         for (uint64_t h : ms) if (sset.count(h)) ++sc_cnt[h];
         uint32_t present = (uint32_t)sc_cnt.size(), dup = 0;
-        for (const auto& [h, c] : sc_cnt) if (c >= 2) ++dup;
+        uint64_t sum_cnt = 0, surplus = 0;
+        for (const auto& [h, c] : sc_cnt) { if (c >= 2) ++dup; sum_cnt += c; surplus += (c - 1); }
         s.core_dup = present ? (float)dup / (float)present : 0.0f;
+        // Non-saturating duplication mass (Phase-1 estimator): total surplus copies over
+        // total SCC copies. Rises with mixture fraction instead of saturating at ~1.0.
+        s.core_dup_mass = sum_cnt ? (float)surplus / (float)sum_cnt : 0.0f;
         const float ceil_ = sit->second.ceiling;
         float ex = ceil_ > 0.0f ? (s.core_dup - ceil_) / ceil_ : 0.0f;
         s.core_dup_excess = ex < 0.0f ? 0.0f : (ex > 1.0f ? 1.0f : ex);
