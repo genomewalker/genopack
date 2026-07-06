@@ -1654,6 +1654,9 @@ struct ArchiveBuilder::Impl {
                         // -> check decodes NA -> observability cap.
                         pending_qrs[ii].contamination_duplication_u16 =
                             QualRecord::encode_dup(buf[ii].contam_dup_excess);
+                        // Phase-2: non-saturating SCC dup mass stored raw (NAN = not scored;
+                        // core_dup_mass is unbounded-ish so a u16 fraction would clip it).
+                        pending_qrs[ii].contamination_core_dup_mass = buf[ii].contam_dup_mass;
                     }
                 }
             }

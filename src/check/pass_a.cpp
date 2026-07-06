@@ -316,6 +316,9 @@ PassAResult run_pass_a(ICheckReader& pack,
                     q.contamination_leakage         = r.contamination_leakage;
                     q.leakage_residual              = r.leakage_residual;
                     q.contamination_duplication     = QualRecord::decode_dup(r.contamination_duplication_u16);
+                    // Phase-2 estimators (raw float; NAN for old-stride packs via reader upcast).
+                    q.contamination_core_dup_mass   = r.contamination_core_dup_mass;
+                    q.accessory_ratio               = r.accessory_ratio;
                     if (r.sketch_fill_u8 > 0)
                         q.completeness_sketch_fill  = r.sketch_fill_u8 / 200.0f;
                     qual_cache_hit = true;

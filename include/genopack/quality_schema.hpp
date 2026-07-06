@@ -95,6 +95,8 @@ inline constexpr const char* MARKER_SCG       = "marker_scg";       // GTDB bac1
 inline constexpr const char* ML               = "ml";              // CheckM2 gradient-boost/NN
 // contamination methods
 inline constexpr const char* DUPLICATION      = "duplication";     // redundancy_fraction
+inline constexpr const char* CORE_DUP_MASS    = "core_dup_mass";   // Phase-2: non-saturating SCC dup mass Σ(c-1)/Σc
+inline constexpr const char* ACCESSORY_RATIO  = "accessory_ratio"; // Phase-2: c0_query / median(c0_all)
 inline constexpr const char* LEAKAGE          = "leakage";
 inline constexpr const char* TNF_EXCESS       = "tnf_excess";
 inline constexpr const char* MIXTURE          = "mixture";

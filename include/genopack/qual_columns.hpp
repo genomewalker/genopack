@@ -61,6 +61,10 @@ inline const std::vector<QcolField>& qcol_fields() {
         {qual_axis::COMPLETENESS,  qual_method::SKETCH_FILL,      Unit::Fraction01, ColDType::U8,  offsetof(QualRecord, sketch_fill_u8)},
         {qual_axis::CONTAMINATION, qual_method::DUPLICATION,      Unit::Fraction01, ColDType::U16, offsetof(QualRecord, contamination_duplication_u16)},
         {qual_axis::SUPPORT,       qual_method::QUALITY_TIER,     Unit::Count,      ColDType::U8,  offsetof(QualRecord, quality_tier_u8)},
+        // Phase-2 estimators (F32 byte-transpose; NAN sentinel preserved, so old QCOL sections
+        // that lack these columns materialize back to make_empty's NAN default).
+        {qual_axis::CONTAMINATION, qual_method::CORE_DUP_MASS,    Unit::Ratio,      ColDType::F32, offsetof(QualRecord, contamination_core_dup_mass)},
+        {qual_axis::COMPLETENESS,  qual_method::ACCESSORY_RATIO,  Unit::Ratio,      ColDType::F32, offsetof(QualRecord, accessory_ratio)},
     };
     return F;
 }

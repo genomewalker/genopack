@@ -88,13 +88,23 @@ float completeness_effective(const GenomeQuality& q) {
     return intrinsic;
 }
 
-// contamination_duplication is core_dup_excess (cladesplit.cpp:605-606): a RELATIVE SCC
-// core-dup excess (core_dup - ceiling)/ceiling, NOT a CheckM2-style fraction. Measured
-// ~8× hot vs CheckM2 (mean 8.06% vs 1.05%), so scale it into the CheckM2 fraction range
-// before it enters the aggregate/score. Scale factor 1/8; NaN preserved.
-constexpr float kDupToContamScale = 0.125f;   // ÷8: relative SCC-dup excess → CheckM2 fraction
-float duplication_contamination(float v) {
-    return std::isnan(v) ? NAN : v * kDupToContamScale;
+// Duplication contamination in CheckM2 units. Phase-2: prefer the non-saturating SCC dup
+// MASS (contamination_core_dup_mass = Σ(c-1)/Σc, cladesplit.cpp:610) over the saturating
+// EXCESS. The mass tracks true contamination linearly on the spike panel: measured means
+// 0.031/0.056/0.136/0.198 at true CheckM2 0.05/0.10/0.20/0.30. A least-squares line
+// (slope 1.449, intercept 0.010) maps mass → CheckM2 fraction with residuals
+// 0.055/0.091/0.207/0.297 — a calibrated graded term replacing the ad-hoc ÷8 hack.
+//   When core_dup_mass is unavailable (old-stride pack / no SCC set → NaN), fall back to
+// the legacy excess ÷8 so v3 packs and unscored genera keep a duplication signal.
+constexpr float kDupMassSlope     = 1.448954f;  // spike-panel OLS: core_dup_mass → CheckM2 contam
+constexpr float kDupMassIntercept = 0.009998f;
+constexpr float kDupToContamScale = 0.125f;     // legacy ÷8 fallback for excess when mass is NaN
+float duplication_contamination(float excess, float mass) {
+    if (!std::isnan(mass)) {
+        const float c = kDupMassSlope * mass + kDupMassIntercept;
+        return c < 0.0f ? 0.0f : c;
+    }
+    return std::isnan(excess) ? NAN : excess * kDupToContamScale;
 }
 
 // Single contamination determinant: NA-safe max over every observable contamination axis.
@@ -138,7 +148,7 @@ float contamination_aggregate(const GenomeQuality& q, bool& observed) {
     acc(q.contamination_contig_outlier_adj);
     acc(q.contamination_spe);
     acc(q.contamination_rho_outlier);
-    acc(duplication_contamination(q.contamination_duplication));   // scale-corrected (÷8)
+    acc(duplication_contamination(q.contamination_duplication, q.contamination_core_dup_mass)); // calibrated graded term
     acc_max(q.contamination_leakage);
     acc_max(q.contamination_tnf_excess);
     return m;
@@ -155,7 +165,7 @@ int trusted_contam_axes(const GenomeQuality& q) {
          + fires(q.contamination_contig_outlier_adj,  0.05f)
          + fires(q.contamination_spe,                 0.10f)
          + fires(q.contamination_rho_outlier,         0.10f)
-         + fires(duplication_contamination(q.contamination_duplication), 0.05f)
+         + fires(duplication_contamination(q.contamination_duplication, q.contamination_core_dup_mass), 0.05f)
          + fires(q.contamination_leakage,             0.02f);
 }
 
@@ -275,6 +285,10 @@ void write_qual_to_archive(const std::filesystem::path& gpk_path,
         r.scale_kink                    = q.scale_kink;
         r.completeness_aamer_core        = q.completeness_aamer_core;
         r.completeness_aamer_family_core = q.completeness_aamer_family_core;
+        // Phase-2 estimators re-persisted so a QCOL write-back keeps the build/check value
+        // (raw float; NAN = not scored). Without this a zero-init record would wipe them.
+        r.contamination_core_dup_mass    = q.contamination_core_dup_mass;
+        r.accessory_ratio                = q.accessory_ratio;
 
         r.qual_flags                    = q.qual_flags;
         // Mark GCOV scoring as complete. Set whenever pass-B ran for this genome

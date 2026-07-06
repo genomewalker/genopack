@@ -49,7 +49,10 @@ struct QualRecord {
     uint8_t  qscore_lo;                     //  1  low byte of continuous quality ∈ [0,1] × 65534 + 1; 0 = not scored
     uint8_t  qscore_hi;                     //  1  high byte (split into two u8 to keep quality_tier_u8 at a fixed offset)
     uint8_t  _reserved[1];                  //  1  reserved for future fields
-    // total = 96
+    // total = 96 (kV4Stride — old readers stop here)
+    float    contamination_core_dup_mass;   //  4  Phase-2: non-saturating SCC dup mass Σ(c-1)/Σc; NAN = not scored
+    float    accessory_ratio;               //  4  Phase-2: c0_query / median(c0_all); NAN = not scored
+    // total = 104
 
     // contamination_duplication encode/decode (0 reserved as not-scored sentinel,
     // so a genuinely-clean 0.0 stays distinguishable from an unscored genome).
@@ -145,10 +148,12 @@ struct QualRecord {
         r.quality_tier_u8                = QTIER_NOT_SET;
         r.qscore_lo                      = 0; // 0 = not scored
         r.qscore_hi                      = 0;
+        r.contamination_core_dup_mass    = NAN; // Phase-2: default not-scored (also the old-pack upcast default)
+        r.accessory_ratio                = NAN;
         return r;
     }
 };
-static_assert(sizeof(QualRecord) == 96);
+static_assert(sizeof(QualRecord) == 104);
 
 // ── Writer ────────────────────────────────────────────────────────────────────
 
@@ -208,6 +213,7 @@ public:
     static constexpr uint64_t kOldStride    = 48; // pre-v2 layout without contamination_mixture
     static constexpr uint64_t kMediumStride = 64; // pre-v3 layout without chargaff/spectral/scale_kink
     static constexpr uint64_t kV3Stride     = 80; // v3 layout without completeness_aamer_core
+    static constexpr uint64_t kV4Stride     = 96; // v4 layout without core_dup_mass/accessory_ratio
 
     void open(const uint8_t* data, uint64_t offset, uint64_t size) {
         if (size < sizeof(QualHeader))
@@ -218,12 +224,14 @@ public:
             throw std::runtime_error("QUAL: bad magic");
 
         const uint64_t stride = header_->record_stride;
-        if (stride != sizeof(QualRecord) && stride != kOldStride && stride != kMediumStride && stride != kV3Stride)
+        if (stride != sizeof(QualRecord) && stride != kOldStride && stride != kMediumStride
+            && stride != kV3Stride && stride != kV4Stride)
             throw std::runtime_error("QUAL: unknown record_stride " + std::to_string(stride)
                                      + " — rebuild required");
         old_layout_    = (stride == kOldStride);
         medium_layout_ = (stride == kMediumStride);
         v3_layout_     = (stride == kV3Stride);
+        v4_layout_     = (stride == kV4Stride);
 
         const uint64_t end = header_->records_offset
             + static_cast<uint64_t>(header_->n_records) * stride;
@@ -241,13 +249,14 @@ public:
         if (!data_) return;
         const uint64_t stride = header_->record_stride;
         for (uint32_t i = 0; i < header_->n_records; ++i) {
-            if (!old_layout_ && !medium_layout_ && !v3_layout_) {
+            if (!old_layout_ && !medium_layout_ && !v3_layout_ && !v4_layout_) {
                 cb(*reinterpret_cast<const QualRecord*>(base_ + i * stride));
             } else {
                 QualRecord r = QualRecord::make_empty(0);
                 uint64_t copy_sz = old_layout_ ? kOldStride
                                  : medium_layout_ ? kMediumStride
-                                 : kV3Stride;
+                                 : v3_layout_ ? kV3Stride
+                                 : kV4Stride;
                 __builtin_memcpy(&r, base_ + i * stride, copy_sz);
                 cb(r);
             }
@@ -261,6 +270,7 @@ private:
     bool              old_layout_    = false;
     bool              medium_layout_ = false;
     bool              v3_layout_     = false;
+    bool              v4_layout_     = false;
 };
 
 } // namespace genopack
