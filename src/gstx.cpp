@@ -1,6 +1,7 @@
 #include <genopack/gstx.hpp>
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <numeric>
 #include <stdexcept>
 
@@ -41,7 +42,9 @@ void GstxWriter::add_genus(std::string_view genus,
                             const float*     p90,
                             const float*     tnf_mu,
                             const uint32_t*  kmer_sizes,
-                            float            nrb_p90)
+                            float            nrb_p90,
+                            const float*     median,
+                            const float*     mad)
 {
     GstxEntry e{};
     e.genus_hash  = hash_genus(genus);
@@ -49,8 +52,14 @@ void GstxWriter::add_genus(std::string_view genus,
     e.n_k_stored  = static_cast<uint8_t>(std::min(n_k, GSTX_MAX_K));
     e.flags       = tnf_mu ? 0x1u : 0x0u;
 
+    for (uint32_t ki = 0; ki < GSTX_MAX_K; ++ki) {
+        e.median_containment[ki] = std::numeric_limits<float>::quiet_NaN();
+        e.mad_containment[ki]    = std::numeric_limits<float>::quiet_NaN();
+    }
     for (uint32_t ki = 0; ki < e.n_k_stored; ++ki) {
         e.p90_containment[ki] = p90[ki];
+        if (median) e.median_containment[ki] = median[ki];
+        if (mad)    e.mad_containment[ki]    = mad[ki];
         if (ki < consensus.size() && consensus[ki].size() == GSTX_BINS)
             std::memcpy(e.consensus[ki], consensus[ki].data(),
                         GSTX_BINS * sizeof(uint16_t));
@@ -145,22 +154,31 @@ void GstxReader::open(const uint8_t* data, uint64_t offset, uint64_t size) {
 
     if (header_->magic != SEC_GSTX)
         throw std::runtime_error("GSTX: bad magic");
-    if (header_->entry_stride != sizeof(GstxEntry))
+    // Dual-read: accept the current stride (dispersion bump, median/mad present) and the
+    // legacy stride (median/mad absent → has_dispersion_ false). Any other stride is a
+    // genuinely incompatible layout and must be rebuilt.
+    if (header_->entry_stride == sizeof(GstxEntry)) {
+        has_dispersion_ = true;
+    } else if (header_->entry_stride == GSTX_STRIDE_LEGACY) {
+        has_dispersion_ = false;
+    } else {
         throw std::runtime_error("GSTX: entry_stride mismatch — rebuild required");
+    }
+    entry_stride_ = header_->entry_stride;
     if (header_->sketch_size != GSTX_BINS)
         throw std::runtime_error("GSTX: sketch_size mismatch");
 
     const uint64_t entries_end = header_->entries_offset
-        + static_cast<uint64_t>(header_->n_genera) * sizeof(GstxEntry);
+        + static_cast<uint64_t>(header_->n_genera) * entry_stride_;
     const uint64_t buckets_end = header_->buckets_offset
         + static_cast<uint64_t>(header_->n_buckets) * sizeof(uint32_t);
 
     if (entries_end > size || buckets_end > size)
         throw std::runtime_error("GSTX section truncated");
 
-    entries_   = reinterpret_cast<const GstxEntry*>(data_ + header_->entries_offset);
-    buckets_   = reinterpret_cast<const uint32_t*>(data_ + header_->buckets_offset);
-    n_buckets_ = header_->n_buckets;
+    entries_base_ = data_ + header_->entries_offset;
+    buckets_      = reinterpret_cast<const uint32_t*>(data_ + header_->buckets_offset);
+    n_buckets_    = header_->n_buckets;
 }
 
 const GstxEntry* GstxReader::lookup(std::string_view genus) const {
@@ -172,7 +190,8 @@ const GstxEntry* GstxReader::lookup(std::string_view genus) const {
     for (;;) {
         const uint32_t idx = buckets_[slot];
         if (idx == EMPTY) return nullptr;
-        if (entries_[idx].genus_hash == h) return &entries_[idx];
+        const GstxEntry& e = entry_at(idx);
+        if (e.genus_hash == h) return &e;
         slot = (slot + 1) & mask;
     }
 }

@@ -40,7 +40,15 @@ static_assert(sizeof(GstxHeader) == 72);
 
 // Fixed-stride entry; the open-addressing table stores uint32_t indices into this array.
 // genus_hash == 0 means empty slot (genus "" has hash remapped to 1 to avoid clash).
-struct GstxEntry {          // 60576 bytes
+//
+// FORMAT NOTE (dispersion bump): median_containment/mad_containment are APPENDED at the
+// end of the entry. Every field before them keeps its byte offset, so an old-layout entry
+// (written before the bump) reinterpreted through this struct is valid for all prefix
+// fields; only median/mad are absent. The GstxHeader::entry_stride discriminates the two
+// layouts (GSTX_STRIDE_LEGACY vs sizeof(GstxEntry)); the reader indexes entries by the
+// on-disk stride and exposes has_dispersion() so callers never read median/mad from an
+// old pack. This mirrors the .csp v2→v3 dual-magic reader.
+struct GstxEntry {
     uint64_t genus_hash;    // FNV-1a of genus string; 0 = empty slot
     uint32_t n_members;
     uint16_t flags;         // bit 0: has_tnf
@@ -50,12 +58,20 @@ struct GstxEntry {          // 60576 bytes
     float    nrb_p90;                     // p90 of n_real_bins at k=0 across genus members
     float    tnf_mu[136];                 // L2-normalised TNF centroid
     uint16_t consensus[GSTX_MAX_K][GSTX_BINS]; // majority-vote sig per bin
+    // ── dispersion bump (appended; absent in GSTX_STRIDE_LEGACY packs) ──
+    float    median_containment[GSTX_MAX_K]; // median member OPH-containment per k
+    float    mad_containment[GSTX_MAX_K];    // 1.4826·MAD of member OPH-containment per k
 };
-static_assert(sizeof(GstxEntry) ==
+
+// Byte size of the entry as written before the dispersion bump (median/mad absent).
+static constexpr uint64_t GSTX_STRIDE_LEGACY =
     8 + 4 + 2 + 1 + 1 +
     GSTX_MAX_K * 4 + 4 +
     136 * 4 +
-    GSTX_MAX_K * GSTX_BINS * 2);
+    static_cast<uint64_t>(GSTX_MAX_K) * GSTX_BINS * 2;
+static_assert(GSTX_STRIDE_LEGACY == 60576);
+static_assert(sizeof(GstxEntry) ==
+    GSTX_STRIDE_LEGACY + GSTX_MAX_K * 4 + GSTX_MAX_K * 4);
 
 // ── Writer ────────────────────────────────────────────────────────────────────
 
@@ -72,7 +88,9 @@ public:
                    const float*     p90,          // float[n_k]
                    const float*     tnf_mu,       // float[136] or nullptr
                    const uint32_t*  kmer_sizes,   // uint32_t[n_k]
-                   float            nrb_p90 = 0.0f);
+                   float            nrb_p90 = 0.0f,
+                   const float*     median = nullptr, // float[n_k] or nullptr → NaN
+                   const float*     mad    = nullptr);// float[n_k] or nullptr → NaN
 
     // Write GSTX section to w; returns the SectionDesc to add to the TOC.
     SectionDesc finalize(AppendWriter& w, uint64_t section_id);
@@ -103,24 +121,41 @@ public:
         return (header_ && ki < 4) ? header_->kmer_sizes[ki] : 0;
     }
 
+    // True when the pack was written with the dispersion bump (median/mad present).
+    // Old packs (GSTX_STRIDE_LEGACY) return false → median/mad are absent; callers must
+    // not read GstxEntry::median_containment/mad_containment from them.
+    bool has_dispersion() const { return has_dispersion_; }
+
     // Returns nullptr if genus not found or reader not open.
     const GstxEntry* lookup(std::string_view genus) const;
 
     // Iterate all entries (valid and empty slots filtered out).
     void scan(const std::function<void(const GstxEntry&)>& cb) const {
         if (!data_) return;
-        for (uint32_t i = 0; i < header_->n_genera; ++i)
-            if (entries_[i].genus_hash != 0) cb(entries_[i]);
+        for (uint32_t i = 0; i < header_->n_genera; ++i) {
+            const GstxEntry& e = entry_at(i);
+            if (e.genus_hash != 0) cb(e);
+        }
     }
 
 private:
     static uint64_t hash_genus(std::string_view s) noexcept;
 
-    const uint8_t*    data_      = nullptr;
-    const GstxHeader* header_    = nullptr;
-    const GstxEntry*  entries_   = nullptr;
-    const uint32_t*   buckets_   = nullptr;
-    uint32_t          n_buckets_ = 0;
+    // Stride-aware entry access: on old packs entry_stride_ < sizeof(GstxEntry), so we
+    // index by the on-disk stride. All fields up to consensus[] share offsets across
+    // layouts; median/mad are only valid when has_dispersion_ is true.
+    const GstxEntry& entry_at(uint32_t i) const {
+        return *reinterpret_cast<const GstxEntry*>(
+            entries_base_ + static_cast<uint64_t>(i) * entry_stride_);
+    }
+
+    const uint8_t*    data_          = nullptr;
+    const GstxHeader* header_        = nullptr;
+    const uint8_t*    entries_base_  = nullptr;
+    uint64_t          entry_stride_  = 0;
+    bool              has_dispersion_ = false;
+    const uint32_t*   buckets_       = nullptr;
+    uint32_t          n_buckets_     = 0;
 };
 
 } // namespace genopack

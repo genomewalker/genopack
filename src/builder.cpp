@@ -1280,6 +1280,10 @@ struct ArchiveBuilder::Impl {
 
             // Pass 2: containment vs consensus → exact p90 (all data in RAM)
             float p90[GSTX_MAX_K] = {};
+            // Robust dispersion of the same member-containment vector p90 comes from:
+            // median and 1.4826·MAD per k. NaN sentinel = not computed (empty genus).
+            float med_c[GSTX_MAX_K] = {NAN, NAN, NAN};
+            float mad_c[GSTX_MAX_K] = {NAN, NAN, NAN};
             std::vector<float> cont0_v;
             cont0_v.reserve(buf.size());
             if (nk > 0) {
@@ -1319,6 +1323,16 @@ struct ArchiveBuilder::Impl {
                     }
                 }
                 if (!c.empty()) {
+                    // median + 1.4826·MAD (compute before nth_element reorders for p90).
+                    std::vector<float> t = c;
+                    const size_t mid = t.size() / 2;
+                    std::nth_element(t.begin(), t.begin() + mid, t.end());
+                    const float med = t[mid];
+                    med_c[ki] = med;
+                    for (float& v : t) v = std::fabs(v - med);
+                    std::nth_element(t.begin(), t.begin() + mid, t.end());
+                    mad_c[ki] = 1.4826f * t[mid];
+
                     size_t idx = static_cast<size_t>(0.9f * c.size());
                     if (idx >= c.size()) idx = c.size() - 1;
                     std::nth_element(c.begin(), c.begin() + idx, c.end());
@@ -1362,7 +1376,8 @@ struct ArchiveBuilder::Impl {
                                       cand, p90,
                                       has_tnf ? tnf_mu : nullptr,
                                       ksizes,
-                                      nrb_p90_gstx);
+                                      nrb_p90_gstx,
+                                      med_c, mad_c);
             }
 
             // Per-genome quality records + long-contig profiles for GCOV scoring.

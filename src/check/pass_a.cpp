@@ -441,6 +441,10 @@ PassAResult run_pass_a(ICheckReader& pack,
                     if (ki == 0) nrb[bidx] = sk.n_real_bins;
                 });
 
+            // Dispersion bump: median/mad are only present in new-format GSTX packs.
+            const GstxReader* gstx_rd   = pack.gstx_reader();
+            const bool gstx_dispersion  = gstx_rd && gstx_rd->has_dispersion();
+
             for (int tidx = 0; tidx < n_tgt; ++tidx) {
                 const GlobalTarget& gt  = gstx_targets[tidx];
                 const GstxEntry*    gst = gt.gstx_e;
@@ -450,6 +454,23 @@ PassAResult run_pass_a(ICheckReader& pack,
                 if (gst->nrb_p90 > 0.0f && nrb[tidx] > 0)
                     q.completeness_sketch_fill = std::clamp(
                         static_cast<float>(nrb[tidx]) / gst->nrb_p90, 0.0f, 1.5f);
+
+                // Phase-1 relative-conspecific-containment via pre-baked GSTX dispersion.
+                // Mirrors the no-GSTX path (accessory_ratio/accessory_z from c0 median+MAD),
+                // but reads the median/mad baked into the entry at build time. Gated on
+                // GenusSaturated, present dispersion, mad>0, ≥10 members, and a real leakage.
+                if (gstx_dispersion &&
+                    q.support_tier == SupportTier::GenusSaturated &&
+                    gst->n_members >= 10 && !std::isnan(tlk[0])) {
+                    const float med = gst->median_containment[0];
+                    const float mad = gst->mad_containment[0];
+                    if (!std::isnan(med) && !std::isnan(mad) && mad > 0.0f) {
+                        const float c0_query = 1.0f - tlk[0];
+                        if (med > 0.0f)
+                            q.accessory_ratio = c0_query / med;
+                        q.accessory_z = (c0_query - med) / mad;
+                    }
+                }
             }
             spdlog::info("check pass-A: {} targets scored via single GSTX pass",
                          gstx_targets.size());
