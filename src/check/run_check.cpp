@@ -55,9 +55,10 @@ float compute_quality_score(float comp_eff, float cont_val, float fiedler_split)
 }
 
 // Intrinsic completeness_effective for tier/score, kept identical between the QCOL
-// (quality_tier_u8) and TSV paths. INTRINSIC completeness only: single-copy/prevalence
-// core recovery (aamer_core, CheckM2-aligned) is the primary signal; post_decontam
-// (bp-retention after the contig contamination scan) is the fallback.
+// (quality_tier_u8) and TSV paths. INTRINSIC completeness only: fraction-tracking
+// marker_completeness (present/expected SCG, genus-calibrated) is the primary signal, with
+// aamer_core (CheckM2-aligned but presence-saturating) then post_decontam (bp-retention after
+// the contig contamination scan) as fallbacks when marker_completeness is unavailable.
 //   completeness_cluster_relative is NOT intrinsic completeness — it is the fraction of the
 //   genus PANGENOME a genome covers. A finished isolate in a diverse genus recovers ~100% of
 //   its own core but only a small slice of the genus accessory pangenome, so a low cluster_relative
@@ -67,11 +68,17 @@ float compute_quality_score(float comp_eff, float cont_val, float fiedler_split)
 //   lets a real strain-partial genome settle below the intrinsic estimate. When intrinsic
 //   completeness is high, cr is ignored (its low value is diversity, not incompleteness).
 float completeness_effective(const GenomeQuality& q) {
+    const float mc = q.marker_completeness;
     const float ac = q.completeness_aamer_core;
     const float pd = q.completeness_post_decontam;
     const float cr = q.completeness_cluster_relative;
-    // Intrinsic estimate: prefer the CheckM2-aligned genus-core coverage, then bp-retention.
-    const float intrinsic = !std::isnan(ac) ? ac : pd;
+    // Intrinsic estimate priority: fraction-tracking marker_completeness (present/expected SCG,
+    // genus-calibrated; slope ≈0.49 vs CheckM2's 0.86 on the fragmentation panel) first. Fall back
+    // to aamer_core when marker_completeness is NaN — it is only populated on the pass-B route, so
+    // QCOL-cache genomes (marker_completeness_u8==0 → NaN) must still get a sane estimate. aamer_core
+    // saturates (0.047 dynamic range: 1.00/0.97/0.95 at true 1.0/0.7/0.5) but never NaN when scored;
+    // post_decontam (bp-retention) is the last resort.
+    const float intrinsic = !std::isnan(mc) ? mc : (!std::isnan(ac) ? ac : pd);
     if (std::isnan(intrinsic))
         return cr;  // no intrinsic signal at all → cluster_relative is the only completeness proxy
     // Soft corroboration: only when intrinsic ALSO reads incomplete does cr pull it down.
