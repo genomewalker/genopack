@@ -592,14 +592,23 @@ int cmd_check(const std::filesystem::path& pack_path,
         // value from the QUAL cache in ALL modes — pass_a skips it under --recompute (cache
         // ptr nulled) and a fresh scan never fills it, which otherwise drops the axis to NA
         // and lets a same-species-contaminated genome climb back to HQ under --scan-all.
+        // Both dup axes are build-time-only: the legacy u16 contamination_duplication and
+        // the non-saturating contamination_core_dup_mass (Σ(c-1)/Σc, cladesplit). Without
+        // restoring the latter, --recompute would rewrite QUAL with core_dup_mass=NaN and
+        // silently destroy the primary graded contamination estimator.
         for (auto& [acc, q] : quality) {
-            if (!std::isnan(q.contamination_duplication)) continue;
+            const bool need_dup      = std::isnan(q.contamination_duplication);
+            const bool need_dup_mass = std::isnan(q.contamination_core_dup_mass);
+            if (!need_dup && !need_dup_mass) continue;
             auto idit = acc_to_id.find(acc);
             if (idit == acc_to_id.end()) continue;
             auto cit = qual_cache.find(idit->second);
-            if (cit != qual_cache.end())
+            if (cit == qual_cache.end()) continue;
+            if (need_dup)
                 q.contamination_duplication =
                     QualRecord::decode_dup(cit->second.contamination_duplication_u16);
+            if (need_dup_mass)
+                q.contamination_core_dup_mass = cit->second.contamination_core_dup_mass;
         }
 
         const uint64_t core_model_hash =
