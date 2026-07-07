@@ -81,9 +81,11 @@ float completeness_effective(const GenomeQuality& q) {
     const float intrinsic = !std::isnan(mc) ? mc : (!std::isnan(ac) ? ac : pd);
     if (std::isnan(intrinsic))
         return cr;  // no intrinsic signal at all → cluster_relative is the only completeness proxy
-    // Soft corroboration: only when intrinsic ALSO reads incomplete does cr pull it down.
-    // A high-intrinsic genome keeps its estimate regardless of a low (diverse-genus) cr.
-    if (intrinsic < 0.90f && !std::isnan(cr) && cr < intrinsic && (intrinsic - cr) > 0.30f)
+    // Soft corroboration: only when intrinsic ALSO reads genuinely partial (below the MQ line)
+    // does cr pull it down. A genome with a supported intrinsic (≥0.50, MQ-complete) keeps its
+    // estimate regardless of a low (diverse-genus) cr — a low cr there is diversity, not missing
+    // sequence, and must never geomean-crush an MQ genome below the MQ threshold.
+    if (intrinsic < 0.50f && !std::isnan(cr) && cr < intrinsic && (intrinsic - cr) > 0.30f)
         return std::sqrt(intrinsic * cr);
     return intrinsic;
 }
