@@ -113,6 +113,9 @@ public:
 
     SectionDesc finalize(AppendWriter& writer, uint64_t section_id);
 
+    // Rows accumulated so far (== genomes finalize() will write).
+    size_t n_added() const { return ids_.size(); }
+
 private:
     uint32_t sketch_size_;
     uint32_t kmer_size_;
@@ -152,6 +155,9 @@ public:
     SectionDesc finalize(AppendWriter& writer, uint64_t section_id);
 
     const std::vector<uint32_t>& kmer_sizes() const { return kmer_sizes_; }
+
+    // Rows accumulated so far (== genomes finalize() will write).
+    size_t n_added() const { return ids_.size(); }
 
 private:
     std::vector<uint32_t>              kmer_sizes_;

@@ -515,6 +515,10 @@ struct ArchiveBuilder::Impl {
                 bool meta_ok = (mf != nullptr);
                 size_t genomes_restored = 0;
                 std::vector<char> processed_rows(total_records, 0);
+                // Restored genomes grouped by their shard section, so their sketches can be
+                // rebuilt from the archive's stored sequences (the interrupted run's SKCH spill
+                // is gone). Without this they ship resolvable-but-sketchless.
+                std::vector<std::pair<SectionDesc, std::vector<GenomeId>>> restored_shards;
 
                 while (meta_ok && genomes_restored < ck_genome_count) {
                     ShardCkptHdr shdr{};
@@ -534,6 +538,7 @@ struct ArchiveBuilder::Impl {
                     sd.aux1             = 0;
                     std::memset(sd.checksum, 0, sizeof(sd.checksum));
                     toc.add_section(sd);
+                    if (cfg.build_sketch) restored_shards.push_back({sd, {}});
                     shard_id_to_section_id[shdr.shard_id] = shdr.section_id;
 
                     for (uint32_t gi = 0; gi < shdr.n_genomes && meta_ok; ++gi) {
@@ -565,6 +570,7 @@ struct ArchiveBuilder::Impl {
                         meta.oph_fingerprint   = gf.oph_fingerprint;
                         meta.date_added        = gf.date_added;
                         catalog_rows.push_back(meta);
+                        if (cfg.build_sketch) restored_shards.back().second.push_back(gf.genome_id);
 
                         gidx_infos.push_back({gf.genome_id,
                                               static_cast<ShardId>(gf.shard_id),
@@ -586,6 +592,60 @@ struct ArchiveBuilder::Impl {
                 if (mf) std::fclose(mf);
 
                 if (meta_ok && genomes_restored == ck_genome_count) {
+                    // Rebuild sketches for restored genomes from the archive's stored sequences,
+                    // matching the main build's params (k, size, syncmer s, seeds). Their catalog
+                    // rows exist but their SKCH rows were lost with the interrupted run's spill.
+                    if (cfg.build_sketch) {
+                        MmapFileReader pmm;
+                        pmm.open(partial_path);
+                        const uint64_t seed1 = cfg.sketch_seed, seed2 = cfg.sketch_seed + 1;
+                        for (const auto& [sd, gids] : restored_shards) {
+                            if (gids.empty()) continue;
+                            ShardReader shard;
+                            shard.open(pmm.data(), sd.file_offset, sd.compressed_size);
+                            const int ng = static_cast<int>(gids.size());
+                            std::vector<std::vector<OPHDualSketchResult>> mk(ng);
+                            std::vector<OPHDualSketchResult>              s1(ng);
+                            #pragma omp parallel for schedule(dynamic, 1)
+                            for (int j = 0; j < ng; ++j) {
+                                std::string fa = shard.fetch_genome(gids[j]);
+                                if (fa.empty()) continue;
+                                if (multi_k_sketch)
+                                    mk[j] = sketch_oph_dual_multik(fa.data(), fa.size(),
+                                        std::span<const int>(cfg.sketch_kmer_sizes),
+                                        cfg.sketch_size, cfg.sketch_syncmer_s, seed1, seed2);
+                                else
+                                    s1[j] = sketch_oph_dual_from_buffer(fa.data(), fa.size(),
+                                        cfg.sketch_kmer_size, cfg.sketch_size,
+                                        cfg.sketch_syncmer_s, seed1, seed2);
+                            }
+                            for (int j = 0; j < ng; ++j) {
+                                if (multi_k_sketch) {
+                                    auto& sks = mk[j];
+                                    if (sks.empty())
+                                        throw std::runtime_error("resume re-sketch failed for genome "
+                                                                 + std::to_string(gids[j]));
+                                    std::vector<std::vector<uint16_t>> g1, g2;
+                                    std::vector<std::vector<uint64_t>> gm;
+                                    std::vector<uint32_t>              gn;
+                                    for (auto& s : sks) {
+                                        g1.push_back(std::move(s.signature1));
+                                        g2.push_back(std::move(s.signature2));
+                                        gm.push_back(std::move(s.real_bins_bitmask));
+                                        gn.push_back(s.n_real_bins);
+                                    }
+                                    skch_writer_mk->add(gids[j], sks[0].genome_length, g1, g2, gn, gm);
+                                } else {
+                                    auto& s = s1[j];
+                                    if (s.signature1.empty())
+                                        throw std::runtime_error("resume re-sketch failed for genome "
+                                                                 + std::to_string(gids[j]));
+                                    skch_writer->add(gids[j], s.signature1, s.signature2,
+                                                     s.n_real_bins, s.genome_length, s.real_bins_bitmask);
+                                }
+                            }
+                        }
+                    }
                     // Truncate .gpk to the checkpoint byte offset
                     if (::truncate(partial_path.c_str(), static_cast<off_t>(ck_byte_offset)) != 0)
                         throw std::runtime_error("checkpoint resume: truncate failed: " +
@@ -2123,6 +2183,18 @@ struct ArchiveBuilder::Impl {
                 kw.add(gid, prof);
             SectionDesc kmrx_sd = kw.finalize(mw, next_section_id++);
             toc.add_section(kmrx_sd);
+        }
+
+        // Invariant: every catalogued genome must have a sketch row. A resume that
+        // restored catalog entries without re-sketching would otherwise ship silently
+        // sketchless genomes (resolvable via ACCX/GIDX but absent from SKCH).
+        if (cfg.build_sketch) {
+            const size_t skch_rows = skch_writer_mk ? skch_writer_mk->n_added()
+                                   : (skch_writer ? skch_writer->n_added() : catalog_rows.size());
+            if (skch_rows != catalog_rows.size())
+                throw std::runtime_error("SKCH/catalog mismatch: " + std::to_string(skch_rows)
+                    + " sketch rows vs " + std::to_string(catalog_rows.size())
+                    + " catalog genomes — sketchless genomes would ship");
         }
 
         // Write SKCH section (OPH sketches)
