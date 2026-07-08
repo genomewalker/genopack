@@ -2550,7 +2550,8 @@ static int cmd_repack(const std::string& input, const std::string& output,
 }
 
 // ── genopack verify ──────────────────────────────────────────────────────────
-static int cmd_verify(const std::string& archive_path, bool verbose, bool strict) {
+static int cmd_verify(const std::string& archive_path, bool verbose, bool strict,
+                      bool coverage_only) {
     MmapFileReader mmap;
     mmap.open(archive_path);
     if (mmap.size() < sizeof(TailLocator))
@@ -2589,6 +2590,81 @@ static int cmd_verify(const std::string& archive_path, bool verbose, bool strict
         bool ok = verify_checksum(toc_bytes, tail->toc_size, offsetof(TocHeader, checksum));
         if (!ok) { spdlog::error("verify: TocHeader.checksum MISMATCH"); ++failures; }
         else if (verbose) spdlog::info("verify: TocHeader.checksum OK");
+    }
+
+    // ── Semantic coverage: cross-check per-genome/per-genus sections vs the catalog ──
+    // Header/id-index counts only (SectionDesc.item_count, SKCH header n_genomes) — O(sections),
+    // no data scan, runs in seconds even on NFS. This is what plain checksum verify misses: a
+    // resume that restores catalog rows without re-sketching passes checksums but ships
+    // sketchless genomes (SKCH rows < catalog). Runs before the byte-level checksums so a
+    // coverage gap is reported immediately.
+    {
+        const uint64_t n_cat = toc.header.live_genome_count;
+        spdlog::info("verify: catalog: {} genomes", n_cat);
+
+        auto type_rows = [&](uint32_t t) {
+            uint64_t rows = 0; int n = 0;
+            for (const auto& sd : toc.sections) if (sd.type == t) { rows += sd.item_count; ++n; }
+            return std::pair<uint64_t, int>{rows, n};
+        };
+
+        // SKCH (headline): total rows across ALL sections (reindex-patched packs have >1),
+        // with per-k coverage. Every k must independently cover the whole catalog.
+        auto skch = toc.find_by_type(SEC_SKCH);
+        if (!skch.empty()) {
+            uint64_t rows = 0;
+            std::map<uint32_t, uint64_t> per_k;
+            for (const auto* sd : skch) {
+                SkchReader r; r.open(mmap.data(), sd->file_offset, sd->compressed_size);
+                rows += r.n_genomes();
+                for (uint32_t i = 0; i < r.n_kmer_sizes(); ++i) per_k[r.kmer_size_at(i)] += r.n_genomes();
+            }
+            std::string klist;
+            bool per_k_ok = true;
+            for (const auto& [k, c] : per_k) {
+                if (!klist.empty()) klist += ',';
+                klist += std::to_string(k) + ":" + std::to_string(c);
+                if (c != n_cat) per_k_ok = false;
+            }
+            if (rows == n_cat && per_k_ok)
+                spdlog::info("verify: SKCH {}/{} genomes, k=[{}] ✓", rows, n_cat, klist);
+            else {
+                spdlog::error("verify: SKCH {}/{} genomes — {} sketchless, k=[{}] ✗",
+                              rows, n_cat, (n_cat > rows ? n_cat - rows : 0), klist);
+                ++failures;
+            }
+        }
+
+        // Per-genome index sections rebuilt for every catalogued genome — must match exactly.
+        struct CovCheck { uint32_t type; const char* name; };
+        for (const CovCheck& c : {CovCheck{SEC_GIDX, "GIDX"}, CovCheck{SEC_ACCX, "ACCX"},
+                                  CovCheck{SEC_CATL, "CATL"}, CovCheck{SEC_QCOL, "QUAL"}}) {
+            auto [rows, n] = type_rows(c.type);
+            if (n == 0) continue;
+            if (rows == n_cat)
+                spdlog::info("verify: {} {}/{} ✓", c.name, rows, n_cat);
+            else {
+                spdlog::error("verify: {} {}/{} — {} missing ✗", c.name, rows, n_cat,
+                              (n_cat > rows ? n_cat - rows : rows - n_cat));
+                ++failures;
+            }
+        }
+
+        // Per-genus / optional compute sections: report presence + coverage count (not a hard gate —
+        // genus micro-clustering and sparse genera legitimately reduce per-genus counts).
+        if (auto [g, n] = type_rows(SEC_GSTX); n > 0)
+            spdlog::info("verify: GSTX present, {} genera", g);
+        for (const CovCheck& c : {CovCheck{SEC_PCORE, "PCORE"}, CovCheck{SEC_CORE, "CORE"},
+                                  CovCheck{SEC_GAMI, "GAMI"}, CovCheck{SEC_GCOV, "GCOV"}}) {
+            auto [rows, n] = type_rows(c.type);
+            if (n > 0) spdlog::info("verify: {} present, {} entries", c.name, rows);
+        }
+    }
+
+    if (coverage_only) {
+        if (failures == 0) spdlog::info("verify: coverage OK");
+        else spdlog::error("verify: {} coverage failure(s)", failures);
+        return failures == 0 ? 0 : 1;
     }
 
     // --- Verify every section's content checksum (SectionDesc.checksum) ---
@@ -2638,10 +2714,10 @@ static int cmd_verify(const std::string& archive_path, bool verbose, bool strict
     }
 
     if (failures == 0)
-        spdlog::info("verify: {} section(s) content-checked, {} skipped (no checksum)",
+        spdlog::info("verify: {} section(s) content-checked, {} skipped (no checksum); coverage OK",
                      n_checked, n_zero);
     else
-        spdlog::error("verify: {} checksum failure(s)", failures);
+        spdlog::error("verify: {} failure(s) (checksum and/or coverage)", failures);
 
     return failures == 0 ? 0 : 1;
 }
@@ -3859,9 +3935,12 @@ int main(int argc, char** argv) {
     bool verify_strict = false;
     verify_cmd->add_flag("--strict", verify_strict,
         "Treat sections without a content checksum (index/metadata or >512MB) as failures");
+    bool verify_coverage_only = false;
+    verify_cmd->add_flag("--coverage-only", verify_coverage_only,
+        "Only run the section-coverage cross-check vs the catalog (skip byte-level checksums; seconds)");
     verify_cmd->callback([&]() {
         try {
-            std::exit(cmd_verify(verify_path, verify_verbose, verify_strict));
+            std::exit(cmd_verify(verify_path, verify_verbose, verify_strict, verify_coverage_only));
         } catch (const std::exception& e) {
             spdlog::error("verify: {}", e.what());
             std::exit(1);
