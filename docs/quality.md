@@ -4,12 +4,26 @@
 sketch geometry, aggregates them into a continuous quality score and an HQ/MQ/LQ
 tier, and writes both a TSV and a 104-byte-per-genome `QUAL` section
 (`include/genopack/qual.hpp:13-156`). All axes are derived from OPH containment,
-conserved-k-mer (aamer) coverage, TNF geometry, and single-copy-core duplication —
-no external tool is called at runtime. CheckM2 is the calibration yardstick, not a
-dependency (see [CheckM2 alignment](#checkm2-alignment)).
+aamer coverage, TNF geometry, and single-copy-core duplication — no external tool
+is called at runtime. CheckM2 is the calibration yardstick, not a dependency (see
+[CheckM2 alignment](#checkm2-alignment)).
 
 The signals below are the columns of the `check` TSV
 (`src/check/run_check.cpp:644-673`).
+
+## Terms
+
+| Term | Definition |
+|------|------------|
+| **aamer** | An amino-acid **k=8** k-mer. Query DNA is 6-frame translated (`translate_6frame`); inter-stop segments of ≥ 8 AA yield the k-mers. Build-side aamers come from protein input (GTDB-Tk MSA). A GUNC-style protein-k-mer signal, **not** a nucleotide k-mer (`include/genopack/aamer.hpp:13-18`, `cladesplit.hpp:15-19`). |
+| **OPH** | One-permutation hash — the MinHash sketch stored in SKCH (`include/genopack/skch.hpp`). |
+| **SCC** | Single-copy core — aamers prevalent across a genus and single-copy where present (`cladesplit.hpp:27-30`). |
+| **TNF** | Tetranucleotide frequency — the 136-dim k=4 composition profile. |
+| **CCO** | Contig contamination outlier — per-contig T²/SPE exceedance fraction (requires GCOV). |
+| **SPE** | Squared prediction error — the PCA-residual half of the T²/SPE outlier pair. |
+| **FMH** (FracMinHash) | Fractional MinHash — the minority-fraction contamination axis. |
+| **GSTX** | Per-genus sketch-statistics section: OPH consensus, p90 completeness, containment dispersion (median/MAD). |
+| **Fiedler** | Second-smallest Laplacian eigenvalue (algebraic connectivity) of the contig graph — the uncalibrated coherence term (see below). |
 
 ---
 
@@ -21,16 +35,19 @@ fraction of the genome recovered, not the fraction of a genus pangenome covered.
 
 ### Intrinsic estimate priority
 
-```
-intrinsic = marker_completeness            if scored
-          else completeness_aamer_core     if scored
-          else completeness_post_decontam
-```
+$$
+\mathrm{intrinsic} =
+\begin{cases}
+\mathrm{marker\_completeness} & \text{if scored} \\
+\mathrm{completeness\_aamer\_core} & \text{else if scored} \\
+\mathrm{completeness\_post\_decontam} & \text{otherwise}
+\end{cases}
+$$
 
 | Estimator | Meaning | Notes |
 |-----------|---------|-------|
-| `marker_completeness` | present / expected single-copy genus markers (CheckM2-aligned, genus-calibrated) | primary signal; fraction-tracking, declines with fragmentation (`run_check.cpp:75-77`) |
-| `completeness_aamer_core` | genus CORE conserved-k-mer recovery | fallback; presence-**saturating** (small dynamic range near 1.0), never NaN when scored (`run_check.cpp:78-80`, `qual.hpp:44`) |
+| `marker_completeness` (QualRecord field; TSV column `completeness_marker`) | present / expected single-copy genus markers (CheckM2-aligned, genus-calibrated) | primary signal; fraction-tracking, declines with fragmentation. Field: `types.hpp:90`; TSV header: `run_check.cpp:673` |
+| `completeness_aamer_core` | fraction of the genus prevalence-core aamer set (amino-acid 8-mers) recovered | fallback; presence-**saturating** (small dynamic range near 1.0), never NaN when scored (`run_check.cpp:78-80`, `qual.hpp:44`) |
 | `completeness_post_decontam` | bp retained after the contig contamination scan | last resort |
 
 `marker_completeness` is populated only on the pass-B marker route; QCOL-cache
@@ -47,14 +64,16 @@ not missing sequence. It must never drive `completeness_effective` down on its o
 
 It is admitted only as a soft corroborator (`run_check.cpp:82-90`):
 
-```
-if isnan(intrinsic):                        return cluster_relative   # no intrinsic signal at all
-if intrinsic < 0.50
-   and cluster_relative < intrinsic
-   and (intrinsic - cluster_relative) > 0.30:
-                                            return sqrt(intrinsic * cluster_relative)
-else:                                       return intrinsic
-```
+$$
+\mathrm{comp\_eff} =
+\begin{cases}
+\mathrm{cr} & \text{if intrinsic is NaN} \\[2pt]
+\sqrt{\mathrm{intrinsic}\cdot \mathrm{cr}} & \text{if } \mathrm{intrinsic} < 0.50 \ \wedge\ \mathrm{cr} < \mathrm{intrinsic} \ \wedge\ (\mathrm{intrinsic}-\mathrm{cr}) > 0.30 \\[2pt]
+\mathrm{intrinsic} & \text{otherwise}
+\end{cases}
+$$
+
+where $\mathrm{cr} = $ `completeness_cluster_relative`.
 
 The geomean pulls the estimate down only when the intrinsic signal **already**
 reads genuinely partial (below the MQ line of 0.50) and `cluster_relative` sits
@@ -100,21 +119,25 @@ capped at MQ (`run_check.cpp:733`).
 computed at build time over the single-copy-core (SCC) aamer set of the placed
 (majority) genus (`src/cladesplit.cpp:600-610`):
 
-```
-core_dup_mass = Σ(count - 1) / Σ(count)      over SCC aamers present in the genome
-```
+$$
+\mathrm{core\_dup\_mass} = \frac{\sum_i (c_i - 1)}{\sum_i c_i}
+$$
 
-where `count` is the copy number of each SCC aamer. It rises with the mixture
+where $c_i$ is the copy number of SCC aamer $i$ present in the genome (sum over
+present SCC aamers). It rises with the mixture
 fraction instead of saturating near 1.0, and is NaN when the majority genus has no
 SCC set (underpopulated / novel), which defers to the observability cap.
 
 `duplication_contamination` maps it into CheckM2 contamination units by a
 spike-panel OLS fit (`run_check.cpp:99-108`):
 
-```
-if core_dup_mass is scored:  c = 1.448954 * core_dup_mass + 0.009998   (clamped ≥ 0)
-else (old-stride pack):      c = core_dup_excess * 0.125               (legacy ÷8 fallback)
-```
+$$
+c_{\mathrm{dup}} =
+\begin{cases}
+\max\!\left(0,\ 1.448954 \cdot \mathrm{core\_dup\_mass} + 0.009998\right) & \text{if core\_dup\_mass scored} \\[2pt]
+0.125 \cdot \mathrm{core\_dup\_excess} & \text{otherwise (legacy, saturating)}
+\end{cases}
+$$
 
 The legacy `excess ÷ 8` term is saturating; the mass-based term replaces it when
 available (constants `kDupMassSlope`/`kDupMassIntercept`/`kDupToContamScale`,
@@ -149,15 +172,17 @@ build time (`src/check/pass_a.cpp:641-669`). Over the genus OPH-containment
 distribution `c0_all` (only when the genus is `GenusSaturated` with ≥ 10 members
 and MAD > 0; else NaN):
 
-```
-c0_query   = 1 - leakage[0]
-c0_median  = median(c0_all)
-c0_mad     = 1.4826 * median(|c0_all - c0_median|)
-accessory_ratio = c0_query / c0_median
-accessory_z     = (c0_query - c0_median) / c0_mad
-```
+$$
+c_{0,\mathrm{query}} = 1 - \mathrm{leakage}[0], \qquad
+\mathrm{MAD} = \operatorname{median}\big(\lvert c_{0,\mathrm{all}} - \operatorname{median}(c_{0,\mathrm{all}})\rvert\big)
+$$
 
-The `1.4826` factor rescales the MAD to a standard-deviation-equivalent for a
+$$
+\mathrm{accessory\_ratio} = \frac{c_{0,\mathrm{query}}}{\operatorname{median}(c_{0,\mathrm{all}})}, \qquad
+\mathrm{accessory\_z} = \frac{c_{0,\mathrm{query}} - \operatorname{median}(c_{0,\mathrm{all}})}{1.4826 \cdot \mathrm{MAD}}
+$$
+
+The $1.4826$ factor rescales the MAD to a standard-deviation-equivalent for a
 normal reference. `accessory_z` is a reported diagnostic (not an input to the
 score or tier).
 
@@ -173,20 +198,23 @@ Multiplicative because completeness, contamination, and contig coherence are
 near-independent failure modes — additive mixing would let high completeness mask
 contamination.
 
-```
-C           = comp_eff        (0.5 neutral prior if NaN)
-X           = contamination   (0 if NaN)
-s           = fiedler         (0 if NaN)
-cont_factor = 1 / (1 + (X / 0.10)^2)          # knee at 0.10: 5% → ≈0.80, 10% → 0.50
-ramp        = clamp((s - 0.5) / 0.4, 0, 1)
-coh_penalty = 1 - 0.5 * ramp                  # ≤ 50% cut, engaged only for s > 0.5
-score       = C * cont_factor * coh_penalty
-```
+Let $C = \mathrm{comp\_eff}$ (0.5 neutral prior if NaN), $X = $ contamination (0 if
+NaN), and $s = $ fiedler split (0 if NaN). Then:
 
-The contamination knee at 0.10 is a smooth analog of the old HQ/MQ cliffs, aligned
-to CheckM2's < 5% HQ cutoff. The coherence penalty is bounded (≤ 50%) rather than a
-hard gate because the fiedler threshold is uncalibrated (no test coverage,
-`run_check.cpp:41-43`).
+$$
+\mathrm{cont\_factor} = \frac{1}{1 + (X/0.10)^2}, \qquad
+\mathrm{coh\_penalty} = 1 - 0.5\cdot\operatorname{clamp}\!\left(\frac{s-0.5}{0.4},\,0,\,1\right)
+$$
+
+$$
+\mathrm{score} = C \cdot \mathrm{cont\_factor} \cdot \mathrm{coh\_penalty}
+$$
+
+The contamination knee at $0.10$ gives $\mathrm{cont\_factor} \approx 0.80$ at
+$X=0.05$ and $0.50$ at $X=0.10$ — a smooth analog of the old HQ/MQ cliffs aligned
+to CheckM2's < 5% HQ cutoff. The coherence penalty is bounded ($\le 50\%$) rather
+than a hard gate, and engages only for $s > 0.5$, because the fiedler threshold is
+uncalibrated (no test coverage, `run_check.cpp:41-43`).
 
 ### Tier chain
 

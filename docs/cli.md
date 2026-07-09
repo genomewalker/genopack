@@ -41,6 +41,16 @@ The output `mydb.gpk` is a directory containing `toc.bin` plus section files. De
 | `--sketch-kmers` | `16,21,31` | Comma list (e.g. `16,21,31`) → multi-k SKCH in a single pass |
 | `--sketch-size` | 10000 | Number of OPH bins |
 | `--sketch-syncmer` | `-1` (auto: `s=k/3`) | Open syncmer prefilter `s` (0 disables) |
+| `--gstx` / `--no-gstx` | on | Build GSTX genus-stats index (`--no-gstx` to disable) |
+| `--pcore` / `--no-pcore` | on | Build the dense PCORE per-genus small-contig reference (needed for small-contig contamination; dominant build cost and on-disk size). `--no-pcore` to disable |
+| `--pcore-frac` | 100 | FMH subsampling factor `N` for PCORE aamer extraction (keep 1/N aamers). Lower = denser; 1 = keep all. Overridden by `GENOPACK_AAMER_FRAC` or a `--markers` panel |
+| `--tier` | off | Emit a `.ptier` side-channel file for later `genopack tier merge` (records every `(aamer_hash, genus_hash)` pair for a global IDF tier table). Implies `--pcore` |
+| `--micro-genus-threshold` | 0 (auto) | Min genomes for a genus to get its own shard + GSTX/GCOV/FMHR consensus model; smaller genera are bin-packed and unmodeled. Auto: 4 (≤50k genomes), 8 (≤500k), 16 (≤2M), else 32 |
+| `--markers` | auto | Path to `markers.mrk` for build-time marker completeness scoring. Auto-resolved from `$GENOPACK_DATA/markers.mrk` or the install share dir |
+| `--contam-panel` | auto | Path to contamination `.csp` panel for build-time intra-genome duplication scoring. Auto-resolved from `$GENOPACK_DATA/contamination.csp` or the install share dir; absent → axis skipped |
+| `--from-gpk` | unset | Rebuild from an existing `.gpk`: stream decoded sequence from its shards instead of opening per-genome FASTA files. Mutually exclusive with `-i` |
+| `--tmpdir` | `/scratch` or `/tmp` | Directory for PCORE/SKCH spill files; use a fast local NVMe path |
+| `--thin` | off | Ingest-only preset: write sequences, sketches, TAXN/GIDX/CIDX only; skip compute sections (GSTX/GCOV/CORE/PCORE/GAMI). Do not combine with `--taxon-group` |
 | `--coordinator` | unset | NFS manifest coordinator: `manifest_dir:/output.gpk` |
 | `-v / --verbose` | off | Verbose progress |
 
@@ -60,7 +70,7 @@ genopack merge part1.gpk part2.gpk part3.gpk -o merged.gpk
 |------|---------|-------------|
 | `-l / --list` | | Text file with one `.gpk` path per line |
 | `-o / --output` | required | Output path |
-| *(no thread option)* | — | Merge is single-threaded; parallelism comes from having parts pre-built |
+| *(no thread option)* | — | No thread flag: merge copies each input part concurrently via `std::async` + `pwrite` (one task per part), so parallelism scales with the number of input archives |
 
 ---
 

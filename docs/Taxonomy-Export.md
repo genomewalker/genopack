@@ -198,7 +198,7 @@ def get_node(mm, n_nodes, pool_base, taxid: int):
     base = 32
     while lo < hi:
         mid = (lo + hi) // 2
-        t = struct.unpack_from("<I", mm, base + mid * 24)[0]
+        t = struct.unpack_from("<Q", mm, base + mid * 24)[0]  # taxid is uint64_t; "<I" truncates GTDB concept_ids (bit 63)
         if t < taxid:   lo = mid + 1
         elif t > taxid: hi = mid
         else:

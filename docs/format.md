@@ -10,8 +10,8 @@ A `.gpk` archive is a **directory of seekable section files** plus a `toc.bin` e
 
 <div class="fmt-box">
   <div class="fmt-row">
-    <span class="fmt-name">FileHeader<span class="fmt-sub">magic · version · UUID · created_ts · generation</span></span>
-    <span class="fmt-size">128 B</span>
+    <span class="fmt-name">FileHeader<span class="fmt-sub">magic · version · UUID · created_ts · flags · endian_abi_tag · build_params_hash · generation · shard-set identity · dir back-anchor</span></span>
+    <span class="fmt-size">256 B</span>
   </div>
   <div class="fmt-row">
     <span class="fmt-name">SHRD × N<span class="fmt-sub">compressed genome shards — each generation appended, old shards untouched</span></span>
@@ -81,20 +81,33 @@ A `.gpk` archive is a **directory of seekable section files** plus a `toc.bin` e
 
 ---
 
-## `FileHeader` — 128 bytes
+## `FileHeader` — 256 bytes
+
+Offsets 0..39 are byte-identical to the older GPK2 header (magic/version/uuid/created_at/flags). The former GPK2 `reserved[88]` region now holds named GPK3 fields followed by a smaller reserved tail. A `static_assert(sizeof(FileHeader) == 256)` enforces the size.
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
-| 0 | 4 B | `magic` | `GPK2` (`0x324B5047`) |
-| 4 | 2 B | `version_major` | Breaking format change (current: `2`) |
+| 0 | 4 B | `magic` | `GPK3` (`0x334B5047`) |
+| 4 | 2 B | `version_major` | Breaking format change (`FORMAT_MAJOR` = `3`) |
 | 6 | 2 B | `version_minor` | Backward-compatible extension (current: `0`) |
 | 8 | 8 B | `file_uuid_lo` | Archive UUID low 64 bits (stable across generations) |
 | 16 | 8 B | `file_uuid_hi` | Archive UUID high 64 bits |
 | 24 | 8 B | `created_at_unix` | Unix timestamp of initial build |
-| 32 | 8 B | `flags` | Reserved flags (0) |
-| 40 | 88 B | _reserved_ | Zero-padded |
+| 32 | 8 B | `flags` | Header flags; bit 0 = `FH_FLAG_STATS_STALE` (derived genus/quality sections dropped by merge) |
+| 40 | 8 B | `endian_abi_tag` | `== ENDIAN_ABI_TAG` byte-order / ABI canary |
+| 48 | 8 B | `build_params_hash` | BPRM `params_hash` (cross-section param link) |
+| 56 | 8 B | `generation` | Durable generation, bumped on each seal |
+| 64 | 8 B | `shard_set_uuid_lo` | Shard-set identity low 64 bits |
+| 72 | 8 B | `shard_set_uuid_hi` | Shard-set identity high 64 bits |
+| 80 | 4 B | `shard_id` | Durable shard id, assigned at first seal |
+| 84 | 4 B | `_pad0` | |
+| 88 | 8 B | `dir_back_offset` | Header-side anchor → directory (torn-tail recovery) |
+| 96 | 8 B | `dir_back_size` | Directory byte size |
+| 104 | 16 B | `dir_back_xxh128` | Directory content hash |
+| 120 | 8 B | `dir_back_generation` | Front/back agreement check |
+| 128 | 128 B | _reserved_ | Zero-padded to 256 |
 
-> **Note:** `generation` is in `TocHeader`, not `FileHeader`.
+> **Note:** `generation` is present in **both** `FileHeader` (offset 56, durable) and `TocHeader`.
 
 ---
 
@@ -286,21 +299,28 @@ genome_id  ->  (section_id, dir_index, catl_row_index)
 
 The TOC is an uncompressed array of `SectionDesc` records written directly after a `TocHeader`.
 
-### `SectionDesc`
+### `SectionDesc` — 112 bytes
+
+Offsets 0..79 are byte-identical to the older GPK2 descriptor; the three GPK3 fields (`derivation_hash`, `semantic_schema_hash`, `header_size`) are appended. A `static_assert(sizeof(SectionDesc) == 112)` enforces the size.
 
 ```cpp
 struct SectionDesc {
-    uint32_t type;              // section magic (e.g. SEC_SHRD)
-    uint16_t version;
+    uint32_t type;                  // section magic (e.g. SEC_SHRD)
+    uint16_t version;               // per-section schema version (enforced)
     uint16_t flags;
-    uint64_t section_id;        // unique, monotonically increasing
-    uint64_t file_offset;
+    uint64_t section_id;            // unique, monotonically increasing
+    uint64_t file_offset;           // bounds-checked at directory load
     uint64_t compressed_size;
     uint64_t uncompressed_size;
-    uint64_t item_count;        // genomes in a shard, rows in a catalog, etc.
-    uint64_t aux0;              // type-specific (shard_id for SHRD)
+    uint64_t item_count;            // genomes in a shard, rows in a catalog, etc.
+    uint64_t aux0;                  // type-specific (shard_id for SHRD)
     uint64_t aux1;
-    uint8_t  checksum[16];
+    uint8_t  checksum[16];          // content_xxh128
+    // ── GPK3 fields ──
+    uint64_t derivation_hash;       // content-addressed reuse key; 0 = SOURCE/unset
+    uint64_t semantic_schema_hash;  // ordering/hash/collation identity; 0 = unset
+    uint16_t header_size;           // section preamble size (tolerate growth); 0 = legacy
+    uint8_t  reserved2[14];         // pad to 112
 };
 ```
 
@@ -329,7 +349,7 @@ Stores L2-normalised k=4 canonical tetranucleotide frequency vectors (136 dimens
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
-| 0 | 32 B | `KmrxHeader` | magic, n_genomes, flags |
+| 0 | 32 B | `KmrxHeader` | magic, n_genomes, k (=4), n_features (=136), index_offset, data_offset |
 | 32 | n × 8 B | `genome_ids[n]` | Sorted ascending; binary search for O(log n) lookup |
 | 32 + n×8 | n × 544 B | `profiles[n][136]` | Parallel to `genome_ids`; stored uncompressed |
 
@@ -343,7 +363,7 @@ Embeds a serialised [hnswlib](https://github.com/nmslib/hnswlib) index blob. Def
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
-| 0 | 64 B | `HnswSectionHeader` | magic, n_elements, M, efConstruction |
+| 0 | 64 B | `HnswSectionHeader` | magic, version, n_elements, dim (=136), M, ef_construction, index_offset, index_size, label_map_offset (+ 16 B reserved) |
 | 64 | variable | hnswlib blob | Serialised hnswlib index |
 | 64 + blob | n × 8 B | `label_map[n]` | Translates hnswlib internal label `i` to `genome_id` |
 
@@ -481,7 +501,7 @@ All multi-byte integers are little-endian; section payloads are 8-byte aligned (
 | `GRTB` | RTBL | Rep table (one entry per representative) |
 | `G2RM` | G2RM | `uint32_t rep_id[n_genomes]` (sentinels: `0xFFFFFFFE` unclustered, `0xFFFFFFFF` tombstoned) |
 | `GEMB` | EMBD | Rep-only embedding matrix (default f16 × dim, typically 256) |
-| `GCST` | CSTAT| Optional per-cluster QC statistics |
+| `GCST` | CSTAT| **Reserved / not implemented.** Magic and `has_cstats`/`cstat_offset` slots exist, but the geodesic writer hardcodes `has_cstats = 0` (and `cstat_offset = 0xFFFFFFFF`) and no reader parses it. |
 | `GTOC` | TOC  | Section descriptor table |
 
 Sections may be zstd-compressed (`flags & 1`); the reader decompresses transparently and the TOC carries both compressed and uncompressed sizes.

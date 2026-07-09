@@ -52,6 +52,16 @@ The output `mydb.gpk` is a directory containing `toc.bin` and section files. Def
 | `--sketch-kmers` | `16,21,31` | Comma list (e.g. `16,21,31`) → multi-k SKCH in one pass |
 | `--sketch-size` | 10000 | Number of OPH bins |
 | `--sketch-syncmer` | `-1` (auto: `s=k/3`) | Open syncmer prefilter `s` (0 disables) |
+| `--gstx` / `--no-gstx` | on | Build GSTX genus-stats index |
+| `--pcore` / `--no-pcore` | on | Build the dense PCORE per-genus small-contig reference (dominant build cost; needed for small-contig contamination) |
+| `--pcore-frac` | 100 | FMH subsampling factor `N` for PCORE (keep 1/N aamers; lower = denser) |
+| `--tier` | off | Emit a `.ptier` side-channel for `genopack tier merge`; implies `--pcore` |
+| `--micro-genus-threshold` | 0 (auto) | Min genomes for a genus to get its own shard + consensus model (auto scales with corpus size) |
+| `--markers` | auto | Path to `markers.mrk` for build-time marker completeness scoring |
+| `--contam-panel` | auto | Path to contamination `.csp` panel for build-time duplication scoring |
+| `--from-gpk` | unset | Rebuild from an existing `.gpk` instead of `-i` FASTA inputs |
+| `--tmpdir` | `/scratch` or `/tmp` | Directory for PCORE/SKCH spill files |
+| `--thin` | off | Ingest-only preset: sequences + sketches + TAXN/GIDX/CIDX; skip compute sections |
 | `--coordinator` | unset | NFS manifest coordinator: `manifest_dir:/output.gpk` |
 | `-v / --verbose` | off | Verbose progress |
 
