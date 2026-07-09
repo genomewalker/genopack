@@ -132,7 +132,6 @@ static int cmd_build(const std::string& input_tsv, const std::string& output_dir
     if (thin) {
         no_gstx          = true;    // GSTX deferred to enrich
         cfg.build_gcov   = false;   // GCOV deferred to enrich
-        cfg.build_core   = false;
         cfg.thin_archive = true;
         // PCORE + GAMI stay enabled — computed once during NFS pass
     }
@@ -189,7 +188,7 @@ static int cmd_build(const std::string& input_tsv, const std::string& output_dir
         ArchiveBuilder builder(output_dir, cfg);
         builder.add_from_tsv(input_tsv);
         builder.finalize();
-        if (cfg.build_pcore || cfg.build_core)
+        if (cfg.build_pcore)
             cmd_gami_build(output_dir, threads);
         return 0;
     }
@@ -311,7 +310,7 @@ static int cmd_build(const std::string& input_tsv, const std::string& output_dir
                     /*build_gstx=*/true, /*build_qual=*/true,
                     /*build_gcov=*/cfg.build_gcov);
     }
-    if (cfg.build_pcore || cfg.build_core)
+    if (cfg.build_pcore)
         cmd_gami_build(output_dir, threads);
 
     // Cleanup temp parts only after a fully successful merge.
@@ -1402,23 +1401,12 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
         }
 
         // 2. Determine which genomes need sketching.
-        //    Multi-k: covered if any existing v2 section has_kmer_size for ALL requested ks.
-        //    Single-k: covered if exists in a matching section (same k, same size).
-        auto params_match_single = [&](const SkchReader& r) {
-            return r.kmer_size()  == sk_kmer_size
-                && r.sketch_size() == sk_sketch_size;
-        };
-        std::vector<const SkchReader*> matching_readers;
-        for (const auto& r : skch_readers) {
-            if (force) continue;
-            if (multi_k) {
-                bool has_all = true;
-                for (int k : skch_kmers) if (!r.has_kmer_size(static_cast<uint32_t>(k))) { has_all = false; break; }
-                if (has_all && r.sketch_size() >= sk_sketch_size) matching_readers.push_back(&r);
-            } else {
-                if (params_match_single(r)) matching_readers.push_back(&r);
-            }
-        }
+        //    Forward-only: reindex --skch produces a SINGLE coalesced SKCH by
+        //    rewriting every live genome's sketch into one fresh section; the
+        //    pre-existing SKCH section(s) are dropped from new_toc below. No
+        //    incremental "missing-only" append — every genome is (re)sketched so
+        //    exactly one SKCH section remains (no stale/duplicate sections).
+        std::vector<const SkchReader*> matching_readers;  // intentionally empty → all genomes rewritten
 
         struct MissingGenome { GenomeId gid; uint32_t shard_section_id; };
         std::vector<MissingGenome> missing;
@@ -1904,6 +1892,9 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
         if (force && need_gstx && s.type == SEC_GSTX) continue;
         if (force && need_qual && s.type == SEC_QUAL) continue;
         if (force && need_gcov && (s.type == SEC_GCOV || s.type == SEC_FCOV || s.type == SEC_FMHR)) continue;
+        // Coalesce SKCH: --skch rewrites all sketches into one section, so drop
+        // every pre-existing SKCH section (forward-only single-section invariant).
+        if (need_skch && s.type == SEC_SKCH) continue;
         new_toc.add_section(s);
     }
 
@@ -3850,7 +3841,7 @@ int main(int argc, char** argv) {
     reindex_cmd->add_flag("--txdb", reindex_txdb, "Build taxonomy tree (TXDB) from TAXN lineage strings");
     reindex_cmd->add_option("--cidx", reindex_cidx_tsv, "Build contig accession index (CIDX) from build TSV (accession<TAB>taxonomy<TAB>file_path)");
     reindex_cmd->add_option("--cidx-threads", reindex_cidx_threads, "Threads for parallel FASTA decompression (default: 8)");
-    reindex_cmd->add_flag("--skch", reindex_skch, "Compute OPH sketches for genomes missing from existing SKCH sections");
+    reindex_cmd->add_flag("--skch", reindex_skch, "Rewrite all OPH sketches into a single coalesced SKCH section (drops any pre-existing SKCH sections)");
     reindex_cmd->add_option("--skch-threads", reindex_skch_threads, "Threads for parallel sketch computation (default: 8)");
     reindex_cmd->add_option("--sketch-kmer", reindex_skch_kmer, "OPH k-mer size for single-k SKCH section (default: inherit from existing or 16)");
     reindex_cmd->add_option("--sketch-kmers", reindex_skch_kmers_str,
@@ -3905,7 +3896,6 @@ int main(int argc, char** argv) {
         "Start an NFS manifest coordinator. Workers connect via 'genopack build --coordinator'. "
         "Creates the output .gpk file, allocates write offsets for workers, writes unified TOC.");
     std::string coord_output;
-    std::filesystem::path coord_ntdb;
     std::string coord_nfs_dir;
     int coord_workers = 0;
     coord_cmd->add_option("-o,--output", coord_output, "Output .gpk file path")->required();
@@ -3914,13 +3904,9 @@ int main(int argc, char** argv) {
     coord_cmd->add_option("--nfs-dir", coord_nfs_dir,
         "NFS manifest directory for coordination. "
         "Workers use '--coordinator this_dir:/output.gpk'.")->required();
-    coord_cmd->add_option("--ntdb", coord_ntdb,
-        "Directory containing NCBI nodes.dmp + names.dmp. "
-        "If provided, the coordinator embeds the full NCBI tree as a NTDB section "
-        "in the final archive before writing the TOC.");
     coord_cmd->callback([&]() {
         genopack::CoordinatorServer srv;
-        srv.run_nfs(coord_nfs_dir, coord_output, coord_workers, coord_ntdb,
+        srv.run_nfs(coord_nfs_dir, coord_output, coord_workers,
                     [](size_t n) { spdlog::info("coordinator-nfs: {} sections collected", n); });
         std::exit(0);
     });

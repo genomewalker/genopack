@@ -148,7 +148,7 @@ The columnar binary export produces four files:
 
 ## Similarity (library only)
 
-There is no `genopack similar` CLI. KMRX k=4 cosine similarity and the optional HNSW ANN index are exposed through the C++ API:
+There is no `genopack similar` CLI. KMRX k=4 cosine similarity is exposed through the C++ API:
 
 ```cpp
 genopack::ArchiveReader reader; reader.open("mydb.gpk");
@@ -156,7 +156,7 @@ const float* p = reader.kmer_profile_by_accession("GCA_000008085.1");
 auto hits = reader.find_similar_by_accession("GCA_000008085.1", 20);
 ```
 
-`find_similar` uses the HNSW section if present; otherwise it falls back to a linear KMRX scan. HNSW is not built by default — use the C++ `ArchiveBuilder` API to opt in.
+`find_similar` performs a linear KMRX cosine scan.
 
 ---
 
@@ -237,15 +237,12 @@ Every CLI command that takes an archive path also accepts a directory containing
 
 ```bash
 # Coordinator: allocates write offsets, assembles final TOC
-genopack coordinator -o /nfs/output.gpk --nfs-dir /nfs/manifest/ --workers 4 \
-    --ntdb /path/to/ncbi_taxdump/
+genopack coordinator -o /nfs/output.gpk --nfs-dir /nfs/manifest/ --workers 4
 
 # Workers: build to local scratch, transfer sections via NFS manifest
 genopack build -i part_N.tsv -o /scratch/part_N.gpk -t 24 -z 6 \
     --coordinator /nfs/manifest/:/nfs/output.gpk
 ```
-
-`--ntdb` makes the coordinator embed the NCBI tree as an NTDB section in the final archive.
 
 To produce a single merged archive from parts:
 

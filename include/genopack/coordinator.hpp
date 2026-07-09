@@ -22,7 +22,6 @@ public:
     void run_nfs(const std::filesystem::path& manifest_dir,
                  const std::filesystem::path& output_path,
                  int      expected_workers,
-                 const std::filesystem::path& taxdump_dir = {},
                  const std::function<void(size_t)>& on_progress = {});
 };
 

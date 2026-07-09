@@ -19,7 +19,7 @@ enum class SectionClass { Source, Index, Derived };
 inline SectionClass section_class(uint32_t type) {
     switch (type) {
         case SEC_SHRD: case SEC_CATL:
-        case SEC_NTDB: case SEC_TXDB: case SEC_GTAX:
+        case SEC_TXDB:
         case SEC_XQAL:                       // externally ingested quality — ground truth
         case SEC_PROF:                       // user-authored reporting/fusion policy
             return SectionClass::Source;     // ground truth / policy, reusable verbatim

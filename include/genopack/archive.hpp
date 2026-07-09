@@ -316,7 +316,6 @@ struct ArchiveBuilderConfig {
     bool     build_sketch        = false;  // compute OPH sketches and write SKCH section
     bool     build_gstx          = true;   // build GSTX genus-stats index (needs taxonomy_group + build_sketch)
     bool     build_gcov          = true;   // build GCOV per-genus covariance eigenbasis (needs build_gstx)
-    bool     build_core          = true;   // build SEC_CORE per-genus prevalence cores (needs markers_path)
     bool     build_pcore         = true;   // build SEC_PCORE dense per-genus reference (small-contig
                                            // contamination). ON by default: most contamination lives in
                                            // small contigs and only the dense per-genus union resolves it.

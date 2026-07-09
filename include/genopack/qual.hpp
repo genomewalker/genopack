@@ -8,8 +8,8 @@
 
 namespace genopack {
 
-// On-disk per-genome quality record (80 bytes, POD).
-// Layout is fixed; add fields by shrinking _reserved only.
+// On-disk per-genome quality record (104 bytes, POD).
+// Single fixed layout; add fields by shrinking _reserved only.
 struct QualRecord {
     uint64_t genome_id;                     //  8
     float    completeness_cluster_relative; //  4
@@ -40,7 +40,6 @@ struct QualRecord {
     uint8_t  cross_genus_u8;             //  1  contamination_cross_genus × 255; 0=clean
     uint8_t  sketch_fill_u8;             //  1  completeness_sketch_fill × 200 (200=100%, >200 allowed up to 255)
     uint16_t contamination_duplication_u16; //  2  redundancy_fraction: 0=not scored, else round(f*65534)+1
-    // total = 80 (v3 layout — kV3Stride)
     float    completeness_aamer_core;        //  4  CORE aamer coverage [0,1]; NAN = not scored
     float    completeness_aamer_family_core; //  4  FCORE aamer coverage [0,1]; NAN = not scored
     uint16_t fmh_minority_u16;              //  2  fmh_minority_fraction × 65535 (rounded); 0=not scored/clean
@@ -49,7 +48,6 @@ struct QualRecord {
     uint8_t  qscore_lo;                     //  1  low byte of continuous quality ∈ [0,1] × 65534 + 1; 0 = not scored
     uint8_t  qscore_hi;                     //  1  high byte (split into two u8 to keep quality_tier_u8 at a fixed offset)
     uint8_t  _reserved[1];                  //  1  reserved for future fields
-    // total = 96 (kV4Stride — old readers stop here)
     float    contamination_core_dup_mass;   //  4  Phase-2: non-saturating SCC dup mass Σ(c-1)/Σc; NAN = not scored
     float    accessory_ratio;               //  4  Phase-2: c0_query / median(c0_all); NAN = not scored
     // total = 104
@@ -210,11 +208,6 @@ private:
 
 class QualReader {
 public:
-    static constexpr uint64_t kOldStride    = 48; // pre-v2 layout without contamination_mixture
-    static constexpr uint64_t kMediumStride = 64; // pre-v3 layout without chargaff/spectral/scale_kink
-    static constexpr uint64_t kV3Stride     = 80; // v3 layout without completeness_aamer_core
-    static constexpr uint64_t kV4Stride     = 96; // v4 layout without core_dup_mass/accessory_ratio
-
     void open(const uint8_t* data, uint64_t offset, uint64_t size) {
         if (size < sizeof(QualHeader))
             throw std::runtime_error("QUAL section too small");
@@ -223,15 +216,13 @@ public:
         if (header_->magic != SEC_QUAL)
             throw std::runtime_error("QUAL: bad magic");
 
+        // Single fixed layout: the on-disk stride must equal the current record size.
+        // No legacy-layout upcast — a mismatched pack is a hard error (rebuild).
         const uint64_t stride = header_->record_stride;
-        if (stride != sizeof(QualRecord) && stride != kOldStride && stride != kMediumStride
-            && stride != kV3Stride && stride != kV4Stride)
-            throw std::runtime_error("QUAL: unknown record_stride " + std::to_string(stride)
-                                     + " — rebuild required");
-        old_layout_    = (stride == kOldStride);
-        medium_layout_ = (stride == kMediumStride);
-        v3_layout_     = (stride == kV3Stride);
-        v4_layout_     = (stride == kV4Stride);
+        if (stride != sizeof(QualRecord))
+            throw std::runtime_error("QUAL: record_stride " + std::to_string(stride)
+                                     + " != " + std::to_string(sizeof(QualRecord))
+                                     + " — rebuild required (legacy QUAL layouts unsupported)");
 
         const uint64_t end = header_->records_offset
             + static_cast<uint64_t>(header_->n_records) * stride;
@@ -242,35 +233,18 @@ public:
 
     bool is_open() const { return data_ != nullptr; }
     uint32_t n_records() const { return header_ ? header_->n_records : 0; }
-    bool is_old_layout() const { return old_layout_; }
 
-    // Linear scan. Old 48- and 64-byte records are upcast: new fields default to NAN/0.
+    // Linear scan over the fixed 104-byte records.
     void scan(const std::function<void(const QualRecord&)>& cb) const {
         if (!data_) return;
-        const uint64_t stride = header_->record_stride;
-        for (uint32_t i = 0; i < header_->n_records; ++i) {
-            if (!old_layout_ && !medium_layout_ && !v3_layout_ && !v4_layout_) {
-                cb(*reinterpret_cast<const QualRecord*>(base_ + i * stride));
-            } else {
-                QualRecord r = QualRecord::make_empty(0);
-                uint64_t copy_sz = old_layout_ ? kOldStride
-                                 : medium_layout_ ? kMediumStride
-                                 : v3_layout_ ? kV3Stride
-                                 : kV4Stride;
-                __builtin_memcpy(&r, base_ + i * stride, copy_sz);
-                cb(r);
-            }
-        }
+        for (uint32_t i = 0; i < header_->n_records; ++i)
+            cb(*reinterpret_cast<const QualRecord*>(base_ + i * sizeof(QualRecord)));
     }
 
 private:
-    const uint8_t*    data_          = nullptr;
-    const QualHeader* header_        = nullptr;
-    const uint8_t*    base_          = nullptr;
-    bool              old_layout_    = false;
-    bool              medium_layout_ = false;
-    bool              v3_layout_     = false;
-    bool              v4_layout_     = false;
+    const uint8_t*    data_   = nullptr;
+    const QualHeader* header_ = nullptr;
+    const uint8_t*    base_   = nullptr;
 };
 
 } // namespace genopack

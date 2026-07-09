@@ -40,13 +40,7 @@ A `.gpk` archive is a **directory of seekable section files** plus a `toc.bin` e
     <span class="fmt-name">SKCH<span class="fmt-sub">OPH (one-permutation hash) sketches — V4 seekable, dual-seed, multi-k</span></span>
   </div>
   <div class="fmt-row">
-    <span class="fmt-name">NTDB<span class="fmt-sub">embedded NCBI taxonomy (nodes.dmp + names.dmp) — optional</span></span>
-  </div>
-  <div class="fmt-row">
     <span class="fmt-name" style="font-style:italic;font-weight:400">KMRX<span class="fmt-sub">optional — float[n × 136] L2-normalised k=4 tetranucleotide profiles (library-only)</span></span>
-  </div>
-  <div class="fmt-row">
-    <span class="fmt-name" style="font-style:italic;font-weight:400">HNSW<span class="fmt-sub">optional — hnswlib serialised blob + label map (library-only, not built by default)</span></span>
   </div>
   <div class="fmt-row">
     <span class="fmt-name">TOMB<span class="fmt-sub">tombstone records for soft-deleted genomes</span></span>
@@ -74,9 +68,7 @@ A `.gpk` archive is a **directory of seekable section files** plus a `toc.bin` e
 | `TAXN` | Taxonomy strings | FNV-1a hash table: accession to lineage string |
 | `TXDB` | Taxonomy tree | Parsed taxid/parent/rank/name nodes + acc-to-taxid table |
 | `SKCH` | OPH sketches | One-permutation hash signatures (V4 seekable; dual-seed; multi-k) |
-| `NTDB` | NCBI taxdump | Embedded `nodes.dmp` + `names.dmp` (zstd) for offline taxid resolution |
 | `KMRX` | K-mer profiles | *Library-only.* float[n × 136] L2-normalised k=4 tetranucleotide frequencies |
-| `HNSW` | HNSW index | *Library-only, optional.* hnswlib serialised blob + label map |
 | `TOMB` | Tombstone | Soft-deleted genome_id records |
 
 ---
@@ -355,20 +347,6 @@ Stores L2-normalised k=4 canonical tetranucleotide frequency vectors (136 dimens
 
 ---
 
-## HNSW section
-
-> **Library-only / optional.** Not built by default. There is no `genopack` CLI to build or query HNSW; readers (e.g. `ArchiveReader::find_similar`) accelerate cosine-similarity search if a section is present and fall back to linear scan otherwise.
-
-Embeds a serialised [hnswlib](https://github.com/nmslib/hnswlib) index blob. Default build parameters: M=16, efConstruction=200.
-
-| Offset | Size | Field | Description |
-|--------|------|-------|-------------|
-| 0 | 64 B | `HnswSectionHeader` | magic, version, n_elements, dim (=136), M, ef_construction, index_offset, index_size, label_map_offset (+ 16 B reserved) |
-| 64 | variable | hnswlib blob | Serialised hnswlib index |
-| 64 + blob | n × 8 B | `label_map[n]` | Translates hnswlib internal label `i` to `genome_id` |
-
----
-
 ## SKCH section (V4 seekable)
 
 Stores one-permutation-hash (OPH) MinHash signatures used for fast Jaccard estimation. V4 is dual-seed (two parallel sketches per genome at independent seeds), supports multiple k-mer sizes in a single section, and is laid out as zstd-compressed seekable frames so a reader can stream a single frame without decompressing the whole section.
@@ -429,30 +407,6 @@ Each decompressed frame is **planar by k-mer size**:
 ```
 
 `genome_ids[]` is uncompressed, so a reader can binary-search a target genome, compute the frame index, then decompress that frame only.
-
----
-
-## NTDB section
-
-Optional. Embeds the raw NCBI taxdump (`nodes.dmp` + `names.dmp`) as two consecutive zstd-compressed blobs so an archive can resolve NCBI taxids fully offline (e.g. on a compute node without `/cvmfs` or network).
-
-### `NtdbHeader` — 64 bytes
-
-| Offset | Size | Field | Description |
-|---|---|---|---|
-| 0  | 4 B  | `magic`            | `SEC_NTDB` |
-| 4  | 2 B  | `version`          | 1 |
-| 6  | 2 B  | `flags`            | Reserved |
-| 8  | 8 B  | `taxdump_date`     | `YYYYMMDD` (0 if unknown) |
-| 16 | 8 B  | `nodes_raw_size`   | Uncompressed size of `nodes.dmp` |
-| 24 | 8 B  | `nodes_zstd_size`  | Compressed size; blob immediately follows the header |
-| 32 | 8 B  | `names_raw_size`   | Uncompressed size of `names.dmp` |
-| 40 | 8 B  | `names_zstd_size`  | Compressed size; blob follows the nodes blob |
-| 48 | 16 B | _reserved_         | Zero-padded |
-
-Section layout: `[NtdbHeader (64 B)] [zstd(nodes.dmp)] [zstd(names.dmp)]`.
-
-Built by `genopack coordinator --ntdb DIR` or via library `NtdbWriter`. Read with `NtdbReader::nodes_dmp()` / `names_dmp()` (decompresses on demand).
 
 ---
 

@@ -187,7 +187,7 @@ void batch_find_contig_genome_ids(const std::string_view* accs,
 
 ### Similarity & contig lookup
 
-> Library-only. There is no `genopack similar` or `genopack cidx` CLI; these are exposed through `ArchiveReader` and accelerated by optional KMRX/HNSW sections (not built by default).
+> Library-only. There is no `genopack similar` or `genopack cidx` CLI; these are exposed through `ArchiveReader` and use the optional KMRX section (not built by default).
 
 ```cpp
 // Pointer to float[136] L2-normalised k=4 profile, nullptr if not stored
@@ -195,7 +195,7 @@ const float* kmer_profile(GenomeId id) const;
 const float* kmer_profile_by_accession(std::string_view accession) const;
 
 // Up to k most similar genomes by cosine similarity.
-// HNSW-accelerated when an HNSW section is present; linear-scan fallback otherwise.
+// Linear KMRX cosine scan.
 std::vector<std::pair<GenomeId, float>>
 find_similar(GenomeId id, size_t k = 10) const;
 

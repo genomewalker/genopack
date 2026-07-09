@@ -33,8 +33,6 @@ TAXN                - FNV-1a hash table: accession string → full lineage strin
 TXDB                - full taxonomy tree (taxid/parent/rank/name nodes + acc→taxid table)
 SKCH × N            - OPH sketches: dual-seed sigs + occupancy masks, seekable zstd frames
 KMRX (optional)     - float[n × 136] L2-normalised k=4 tetranucleotide profiles
-HNSW (optional)     - hnswlib serialised blob for cosine ANN over KMRX (library only)
-NTDB (optional)     - embedded NCBI nodes.dmp/names.dmp tree (set by `coordinator --ntdb`)
 GSTX (optional)     - per-genus sketch stats: TNF centroid, p90 completeness, OPH consensus
 GCOV (optional)     - per-genus biological covariance (Ledoit-Wolf TNF, eigenvectors, SPE thresholds)
 FCOV (optional)     - per-family biological covariance (same layout as GCOV, keyed by family hash)
@@ -212,8 +210,7 @@ Every CLI command that takes an archive path also accepts a directory containing
 For disconnected nodes with local scratch, use the NFS coordinator instead:
 
 ```bash
-genopack coordinator -o /nfs/output.gpk --nfs-dir /nfs/manifest/ --workers 4 \
-    --ntdb /path/to/ncbi_taxdump/
+genopack coordinator -o /nfs/output.gpk --nfs-dir /nfs/manifest/ --workers 4
 genopack build -i part_N.tsv -o /scratch/part_N.gpk -t 24 -z 6 \
     --coordinator /nfs/manifest/:/nfs/output.gpk
 ```

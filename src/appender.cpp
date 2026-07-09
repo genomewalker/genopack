@@ -333,14 +333,6 @@ struct ArchiveAppender::Impl {
                 SectionDesc kmrx_sd = kw.finalize(writer, next_section_id++);
                 new_toc.add_section(kmrx_sd);
             }
-            // HNSW is a global ANN graph and cannot be incrementally updated.
-            // After append:
-            //   - similar ACC_NEW works immediately (ACC_NEW has a KMRX profile and
-            //     can query the existing HNSW to find older genomes).
-            //   - similar ACC_BASE does NOT return ACC_NEW until the index is rebuilt.
-            // Run 'genopack reindex --hnsw' to rebuild the full similarity index.
-            // This is intentional: cheap incremental writes, explicit expensive reindex.
-
             next_genome_id_ = gid;
         }
 

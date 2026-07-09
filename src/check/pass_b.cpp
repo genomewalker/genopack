@@ -291,36 +291,34 @@ void run_pass_b(ICheckReader& pack,
     // memory is GMI (~5–15 GB) + host/family unions for flagged genera (~20 GB).
     int      foreign_k = 0, foreign_min_seg = 0;
     uint64_t foreign_frac_max = UINT64_MAX;
+    // PCORE-only: the legacy per-genus CORE section is no longer a fallback.
+    // A pack carrying only the legacy CORE is a hard error (rebuild for PCORE).
     const bool use_pcore = pack.has_pcore();
+    if (!use_pcore && pack.has_core())
+        throw std::runtime_error(
+            "check pass-B: PCORE section missing (legacy CORE present) — "
+            "rebuild the pack with `genopack pcore`; the CORE fallback has been removed");
     if (use_pcore) {
         const PcoreReader* pr = pack.pcore_reader();
         foreign_k = pr->k(); foreign_min_seg = pr->min_seg_aa(); foreign_frac_max = pr->frac_max_hash();
-    } else if (pack.has_core()) {
-        const CoreReader* cr = pack.core_reader();
-        foreign_k = cr->k(); foreign_min_seg = cr->min_seg_aa(); foreign_frac_max = cr->frac_max_hash();
     }
 
-    // Materialize helpers — defined outside the CORE/PCORE guard so both the
+    // Materialize helpers — defined outside the PCORE guard so both the
     // per-genus refset build loop and the scan callback can capture them via [&].
-    // Return an empty OwnedSpan (valid()==false) when no section is present.
+    // Return an empty OwnedSpan (valid()==false) when no PCORE section is present.
     auto materialize_genus = [&](const std::string& g) -> OwnedSpan {
         OwnedSpan o;
         if (use_pcore) { PcoreView v = pack.pcore_for_genus(g); if (v.valid()) v.materialize(o.aamers, o.prevf); }
-        else if (pack.has_core()) { CoreView v = pack.core_for_genus(g); if (v.valid()) o.aamers.assign(v.aamers, v.aamers + v.n_aamers); }
         return o;
     };
     auto materialize_family = [&](const std::string& f) -> OwnedSpan {
         OwnedSpan o;
         if (use_pcore) { PcoreView v = pack.pcore_for_family(f); if (v.valid()) v.materialize(o.aamers, o.prevf); }
-        else if (pack.has_core()) { CoreView v = pack.core_for_family(f); if (v.valid()) o.aamers.assign(v.aamers, v.aamers + v.n_aamers); }
         return o;
     };
-    const uint32_t n_entries = use_pcore ? pack.pcore_reader()->n_entries()
-                             : (pack.has_core() ? pack.core_reader()->n_genera() : 0u);
+    const uint32_t n_entries = use_pcore ? pack.pcore_reader()->n_entries() : 0u;
     auto entry_hash_at = [&](uint32_t i) -> uint64_t {
-        if (use_pcore) return pack.pcore_reader()->key_hash_at(i);
-        if (pack.has_core()) return pack.core_reader()->genus_hash_at(i);
-        return 0u;
+        return use_pcore ? pack.pcore_reader()->key_hash_at(i) : 0u;
     };
 
     // GMI: the multiplicity index that drives foreign-aamer scoring.
@@ -351,10 +349,10 @@ void run_pass_b(ICheckReader& pack,
         const uint32_t k = std::max(2u, n_entries / 500u);
         return static_cast<uint8_t>(k < 255u ? k : 255u);
     }();
-    if (!preloaded_gmi && gmi.empty() && (use_pcore || pack.has_core()) && !flagged_genus.empty()) {
+    if (!preloaded_gmi && gmi.empty() && use_pcore && !flagged_genus.empty()) {
         const int gmi_par = std::min(threads, 8);
         // Exact prescan eliminates all rehash transients.
-        gmi.reserve(use_pcore ? pack.pcore_reader()->total_union_aamers() : 64'000'000ULL);
+        gmi.reserve(pack.pcore_reader()->total_union_aamers());
         // Batched parallel decode → sequential insert avoids atomic/mutex on GMI.
         std::vector<OwnedSpan> buf(gmi_par);
         for (uint32_t bs = 0; bs < n_entries; bs += static_cast<uint32_t>(gmi_par)) {
@@ -365,7 +363,6 @@ void run_pass_b(ICheckReader& pack,
                 buf[bi] = OwnedSpan{};
                 const uint64_t gh = entry_hash_at(bs + static_cast<uint32_t>(bi));
                 if (use_pcore) { PcoreView v = pack.pcore_reader()->lookup(gh); if (v.valid()) v.materialize(buf[bi].aamers, buf[bi].prevf); }
-                else if (pack.has_core()) { CoreView v = pack.core_reader()->lookup(gh); if (v.valid()) buf[bi].aamers.assign(v.aamers, v.aamers + v.n_aamers); }
             }
             for (int bi = 0; bi < bsz; ++bi) {
                 for (uint64_t h : buf[bi].aamers) gmi.increment(h);
@@ -376,9 +373,9 @@ void run_pass_b(ICheckReader& pack,
         spdlog::info("check pass-B: GMI built: {} M unique aamers, {} entries, {:.1f} GB",
                      gmi.count() / 1'000'000, n_entries, gmi.bytes() / 1e9);
     }
-    // Host and family unions: built only when PCORE/CORE present and genera are flagged.
+    // Host and family unions: built only when PCORE present and genera are flagged.
     // Required for host-specific aamer classification in score_contig_foreign_indexed.
-    if ((use_pcore || pack.has_core()) && !flagged_genus.empty()) {
+    if (use_pcore && !flagged_genus.empty()) {
         const int gmi_par = std::min(threads, 8);
         std::unordered_set<std::string> unique_genera, unique_families;
         for (const auto& acc : to_scan) {
@@ -680,34 +677,10 @@ void run_pass_b(ICheckReader& pack,
                             completeness_aamer_core        = cached_coverage(gcore, core_qmers);
                             completeness_aamer_family_core = cached_coverage(fcore, core_qmers);
                         }
-                    } else {
-                        CoreView gcore = (pack.has_core() && genus_s)  ? pack.core_for_genus(*genus_s)   : CoreView{};
-                        CoreView fcore = (pack.has_fcore() && family_s) ? pack.core_for_family(*family_s) : CoreView{};
-                        if (gcore.valid() || fcore.valid()) {
-                            const CoreReader* cr = pack.has_core() ? pack.core_reader() : pack.fcore_reader();
-                            thread_local std::vector<uint64_t> core_qmers;
-                            core_qmers.clear();
-                            for (const auto& c : contigs)
-                                extract_aamers_dna_into(c.seq, cr->k(), cr->min_seg_aa(),
-                                                        cr->frac_max_hash(), core_qmers);
-                            std::sort(core_qmers.begin(), core_qmers.end());
-                            core_qmers.erase(std::unique(core_qmers.begin(), core_qmers.end()),
-                                             core_qmers.end());
-                            auto coverage = [&](const CoreView& cv) -> float {
-                                if (!cv.valid()) return NAN;
-                                uint32_t inter = 0;
-                                size_t qi = 0, kj = 0;
-                                while (qi < core_qmers.size() && kj < cv.n_aamers) {
-                                    if      (core_qmers[qi] < cv.aamers[kj]) ++qi;
-                                    else if (core_qmers[qi] > cv.aamers[kj]) ++kj;
-                                    else { ++inter; ++qi; ++kj; }
-                                }
-                                return static_cast<float>(inter) / static_cast<float>(cv.n_aamers);
-                            };
-                            completeness_aamer_core        = coverage(gcore);
-                            completeness_aamer_family_core = coverage(fcore);
-                        }
                     }
+                    // No PCORE reference → intrinsic aamer completeness is unavailable
+                    // (both columns stay NAN). A legacy CORE-only pack already errored at
+                    // pass-B setup; the CORE/FCORE fallback path has been removed.
                 }
 
                 const GcovReader* fcov_rd    = pack.fcov_reader();

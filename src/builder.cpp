@@ -126,11 +126,10 @@ static BprmHeader make_bprm_header_from_cfg(const ArchiveBuilderConfig& cfg) {
     if (cfg.build_gcov)            bf |= BPRM_F_GCOV;
     if (cfg.taxonomy_group)        bf |= BPRM_F_TAXGROUP;
     if (!cfg.markers_path.empty()) bf |= BPRM_F_MARKERS;
-    if (cfg.build_core)            bf |= BPRM_F_CORE;
     if (cfg.thin_archive)          bf |= BPRM_F_THIN;
     bp.build_flags = bf;
     bp.micro_genus_threshold = cfg.micro_genus_threshold;
-    bp.core_theta            = cfg.build_core ? cfg.core_theta : 0.0f;
+    bp.core_theta            = cfg.build_pcore ? cfg.core_theta : 0.0f;
     bp.magic       = SEC_BPRM;
     bp.version     = 1;
     bp.header_size = sizeof(BprmHeader);
@@ -414,7 +413,7 @@ struct ArchiveBuilder::Impl {
         // active combiners). Only modeled genera (≥ micro threshold) participate.
         std::unordered_map<std::string, uint32_t> genus_total;
         uint32_t cc_micro_threshold = 0;
-        if (cfg.taxonomy_group && (cfg.build_core || cfg.build_pcore)) {
+        if (cfg.taxonomy_group && cfg.build_pcore) {
             const char grank = cfg.taxonomy_rank.empty() ? 'g' : cfg.taxonomy_rank[0];
             for (const auto& rec : pending)
                 for (const auto& [k, v] : rec.extra_fields)
@@ -1108,7 +1107,7 @@ struct ArchiveBuilder::Impl {
                         // must match the prior in-drain walks exactly for model-hash parity.
                         std::vector<uint64_t> aamers, fmh;
                         {
-                            const bool want_aamers = cfg.build_core || cfg.build_pcore;
+                            const bool want_aamers = cfg.build_pcore;
                             uint64_t fmax = UINT64_MAX;
                             if (want_aamers) {
                                 const char* af = std::getenv("GENOPACK_AAMER_FRAC");
@@ -1225,11 +1224,9 @@ struct ArchiveBuilder::Impl {
                 genus_futs.end());
         };
         // Mutexes protecting each writer from concurrent finalize_genus calls.
+        // core_writer_mx guards the (shared) PCORE writer during finalize.
         std::mutex gstx_writer_mx, gcov_writer_mx, fmhr_writer_mx,
                    core_writer_mx, qual_writer_mx;
-        // Per-genus prevalence cores (SEC_CORE). Reuses the per-genome marker
-        // aamers (chunk_aamers) already extracted below — zero extra FASTA passes.
-        CoreWriter build_core_w(AAMER_K, /*min_seg_aa=*/8, cfg.core_theta);
         // SEC_PCORE: unified DENSE per-genus aamer reference (every aamer + member
         // count). The prev>=ceil(theta*n) slice reproduces CORE; the full set is the
         // dense reference the small-contig foreign-contamination channel needs. Built
@@ -1543,14 +1540,11 @@ struct ArchiveBuilder::Impl {
                 GenusAccum genus_acc, family_acc;
                 std::vector<uint64_t> fmh_all;
                 const bool do_markers = build_mrk_rd && build_mrk_rd->has_merged_pool();
-                const bool need_aamers = do_markers || cfg.build_core || cfg.build_pcore;
-                GenusAamerCounter local_counter;
-                if (accum_holder && !*accum_holder) *accum_holder = std::make_unique<GenusAamerCounter>();
-                GenusAamerCounter* const ctr = accum_holder ? accum_holder->get() : &local_counter;
-                const bool cross_chunk = (accum_holder != nullptr);
+                const bool need_aamers = do_markers || cfg.build_pcore;
                 const bool aamers_capped = (cfg.genus_member_cap > 0) && accum_member_ids
                     && accum_member_ids->size() >= cfg.genus_member_cap;
                 (void)need_aamers;
+                (void)accum_holder;
 
                 for (size_t ii = 0; ii < buf.size(); ++ii) {
                     genus_acc.add_genome(all_profiles[ii]);
@@ -1558,22 +1552,13 @@ struct ArchiveBuilder::Impl {
                     fmh_all.insert(fmh_all.end(), buf[ii].fmh.begin(), buf[ii].fmh.end());
                 }
 
-                if (!aamers_capped && (cfg.build_core || cfg.build_pcore)) {
+                if (!aamers_capped && cfg.build_pcore) {
                     const uint64_t gkh_spill = GcovWriter::hash_genus(genus_key);
-                    std::vector<const std::vector<uint64_t>*> ptrs;
-                    ptrs.reserve(buf.size());
                     for (size_t ii = 0; ii < buf.size(); ++ii) {
                         if (buf[ii].aamers.empty()) continue;
-                        if (cfg.build_core) {
-                            ptrs.push_back(&buf[ii].aamers);
-                            if (accum_member_ids) accum_member_ids->push_back(buf[ii].genome_id);
-                        }
-                        if (cfg.build_pcore) {
-                            pcore_spiller.add_member(gkh_spill);
-                            pcore_spiller.add_genome(gkh_spill, buf[ii].aamers);
-                        }
+                        pcore_spiller.add_member(gkh_spill);
+                        pcore_spiller.add_genome(gkh_spill, buf[ii].aamers);
                     }
-                    if (cfg.build_core && !ptrs.empty()) ctr->add_chunk(ptrs);
                 }
 
                 const uint32_t n_mem = static_cast<uint32_t>(buf.size());
@@ -1593,17 +1578,6 @@ struct ArchiveBuilder::Impl {
                     fmh_all.erase(std::unique(fmh_all.begin(), fmh_all.end()), fmh_all.end());
                     std::lock_guard<std::mutex> lk(fmhr_writer_mx);
                     build_fmhr_w.add(GcovWriter::hash_genus(genus_key), std::move(fmh_all));
-                }
-
-                if (!cross_chunk && cfg.build_core && !local_counter.empty()) {
-                    std::vector<uint64_t> aamers; std::vector<uint32_t> counts;
-                    local_counter.finalize_sorted(aamers, counts);
-                    const uint64_t gkh = GcovWriter::hash_genus(genus_key);
-                    std::vector<uint64_t> member_ids;
-                    member_ids.reserve(pending_qrs.size());
-                    for (const auto& qr : pending_qrs) member_ids.push_back(qr.genome_id);
-                    std::lock_guard<std::mutex> lk(core_writer_mx);
-                    build_core_w.add_sorted(gkh, aamers, counts, n_mem, member_ids);
                 }
 
                 // Score contigs and populate outlier fields.
@@ -1840,21 +1814,10 @@ struct ArchiveBuilder::Impl {
             staging_raw_bytes = 0;
         };
 
-        // Emit one full-density CORE/PCORE for a genus once all its members have been
-        // folded into bucket.genus_counter (the cross-chunk aggregation), then free it.
-        auto emit_core_pcore = [&](const std::string& key, TaxonBucket& b) {
-            if (b.model_emitted || !b.genus_counter || b.genus_counter->empty()) return;
-            if (cfg.build_core) {
-                std::vector<uint64_t> aamers; std::vector<uint32_t> counts;
-                b.genus_counter->finalize_sorted(aamers, counts);
-                const uint64_t gkh = GcovWriter::hash_genus(key);
-                // n_mem = members actually FOLDED (capped); the ceil(theta*n) core slice
-                // and prevalences are relative to sampled members.
-                const uint32_t n_mem = static_cast<uint32_t>(b.member_ids.size());
-                std::lock_guard<std::mutex> lk(core_writer_mx);
-                build_core_w.add_sorted(gkh, aamers, counts, n_mem, b.member_ids);
-            }
-            // PCORE is handled by pcore_spiller.finalize() after all genomes drain.
+        // Free a genus's cross-chunk bucket state once all its members have drained.
+        // PCORE is handled by pcore_spiller.finalize() after all genomes drain.
+        auto emit_core_pcore = [&](const std::string& /*key*/, TaxonBucket& b) {
+            if (b.model_emitted) return;
             b.model_emitted = true;
             b.genus_counter.reset();
             std::vector<uint64_t>().swap(b.member_ids);
@@ -1893,7 +1856,7 @@ struct ArchiveBuilder::Impl {
                         flush_staging_buf(b.items, &b.genus_counter, &b.member_ids);
                         b.raw_bytes = 0; b.aamer_bytes = 0;
                     };
-                    const bool genus_done = (cfg.build_core || cfg.build_pcore)
+                    const bool genus_done = cfg.build_pcore
                         && genus_total.count(key) && bucket.arrived >= genus_total[key]
                         && genus_total[key] >= cc_micro_threshold;
                     // Micro-genus complete: all expected genomes arrived, no CORE/PCORE model.
@@ -2252,12 +2215,6 @@ struct ArchiveBuilder::Impl {
                                                        cfg.fmh_k, cfg.fmh_c);
                 toc.add_section(sd);
                 spdlog::info("FMHR: {} genera", build_fmhr_w.n_genera());
-            }
-            if (cfg.build_core && build_core_w.n_genera() > 0) {
-                SectionDesc sd = build_core_w.finalize(mw, next_section_id++, build_pcore_frac_max);
-                toc.add_section(sd);
-                spdlog::info("CORE: {} genera, model_hash={:#018x}",
-                             build_core_w.n_genera(), sd.aux0);
             }
             if (cfg.build_pcore && build_pcore_w.n_entries() > 0) {
                 SectionDesc sd = build_pcore_w.finalize(mw, next_section_id++, build_pcore_frac_max);

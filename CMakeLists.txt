@@ -129,8 +129,6 @@ add_library(genopack_lib STATIC
   src/mem_delta.cpp
   src/ncbi_taxdb.cpp
   src/coordinator.cpp
-  src/ntdb.cpp
-  src/gtax.cpp
   src/sim.cpp
   src/calibrate/calibrate.cpp
 )

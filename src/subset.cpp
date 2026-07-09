@@ -600,8 +600,8 @@ void subset_archive(const std::filesystem::path& input_gpk,
             new_toc.add_section(qcol_write(mw, next_section_id++, std::move(kept)));
     }
 
-    // TXDB / CIDX / HNSW — copy raw bytes (genome_id indexed, unaffected by reshard)
-    for (uint32_t type : {SEC_TXDB, SEC_CIDX, SEC_HNSW}) {
+    // TXDB / CIDX — copy raw bytes (genome_id indexed, unaffected by reshard)
+    for (uint32_t type : {SEC_TXDB, SEC_CIDX}) {
         for (auto* sd : src_toc.find_by_type(type)) {
             uint64_t new_offset = mw.current_offset();
             mw.append(src_mmap.data() + sd->file_offset, sd->compressed_size);

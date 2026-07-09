@@ -1,6 +1,5 @@
 #include "genopack/coordinator.hpp"
 #include "genopack/mmap_file.hpp"
-#include "genopack/ntdb.hpp"
 #include "genopack/toc.hpp"
 
 #include <spdlog/spdlog.h>
@@ -138,7 +137,6 @@ void CoordinatorServer::run_nfs(
     const std::filesystem::path& manifest_dir,
     const std::filesystem::path& output_path,
     int expected_workers,
-    const std::filesystem::path& taxdump_dir,
     const std::function<void(size_t)>& on_progress)
 {
     if (expected_workers <= 0)
@@ -258,24 +256,7 @@ void CoordinatorServer::run_nfs(
     spdlog::info("coordinator-nfs: all {} workers done, {} sections collected",
                  expected_workers, all_sections.size());
 
-    // Finalize: optional NTDB + unified TOC
-    if (!taxdump_dir.empty() &&
-        std::filesystem::exists(taxdump_dir / "nodes.dmp") &&
-        std::filesystem::exists(taxdump_dir / "names.dmp"))
-    {
-        writer.seek_to(next_offset);
-        writer.align(8);
-        uint64_t ntdb_section_id = all_sections.size() + 1;
-        NtdbWriter ntdb;
-        ntdb.load(taxdump_dir);
-        SectionDesc ntdb_desc = ntdb.finalize(writer, ntdb_section_id);
-        all_sections.push_back(ntdb_desc);
-        next_offset = writer.current_offset();
-        spdlog::info("coordinator-nfs: NTDB written ({} bytes compressed)", ntdb_desc.compressed_size);
-    } else if (!taxdump_dir.empty()) {
-        spdlog::warn("coordinator-nfs: --ntdb dir missing nodes.dmp/names.dmp, skipping NTDB");
-    }
-
+    // Finalize: unified TOC
     writer.seek_to(next_offset);
     writer.align(8);
 

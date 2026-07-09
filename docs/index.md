@@ -50,7 +50,6 @@ if (g) std::cout << g->fasta;
 | **Taxonomy** | Per-accession lineage strings (TAXN) + full tree (TXDB); NCBI taxdump + columnar binary export |
 | **OPH sketches (SKCH v4)** | Dual-seed (42, 43) one-permutation-hash signatures over one or more k; seekable zstd frames (16 384 genomes/frame) |
 | **k=4 profiles** | 136-dim L2-normalised tetranucleotide vectors (KMRX); cosine similarity via library API |
-| **HNSW index** | Optional hnswlib serialised blob over KMRX (library only; not built by default) |
 | **Taxonomy repack** | Re-shard by genus/family for fast per-taxon NFS access |
 | **Distributed build** | Split TSV across N nodes; merge with parallel `pwrite` or coordinate via NFS manifest |
 | **Append / tombstone** | Add genomes or soft-delete without full rebuild |

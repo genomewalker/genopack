@@ -5,7 +5,6 @@
 #include <genopack/catalog.hpp>
 #include <genopack/format.hpp>
 #include <genopack/gidx.hpp>
-#include <genopack/hnsw_section.hpp>
 #include <genopack/kmrx.hpp>
 #include <genopack/mmap_file.hpp>
 #include <genopack/shard.hpp>
@@ -133,7 +132,6 @@ void merge_archives(const std::vector<std::filesystem::path>& inputs,
     };
 
     std::vector<ShrdJob>     shrd_jobs;
-    std::vector<BulkCopyJob> hnsw_jobs;
     std::vector<BulkCopyJob> kmrx_jobs;
     uint64_t shrd_end_offset = sizeof(FileHeader);
     uint64_t next_section_id = 1;
@@ -154,26 +152,9 @@ void merge_archives(const std::vector<std::filesystem::path>& inputs,
         }
     }
 
-    // Plan HNSW+KMRX bulk copies (placed immediately after SHRD sections)
-    // The label_map / genome_ids arrays are patched in-place with the gid_offset.
-    uint64_t hnsw_pos = shrd_end_offset;
-    for (size_t i = 0; i < archives.size(); ++i) {
-        const SectionDesc* best = nullptr;
-        for (const auto* sd : archives[i].toc.find_by_type(SEC_HNSW))
-            if (!best || sd->section_id > best->section_id) best = sd;
-        if (!best) continue;
-        BulkCopyJob job;
-        job.archive_idx   = i;
-        job.sd            = best;
-        job.out_offset    = hnsw_pos;
-        job.new_sd        = *best;
-        job.new_sd.section_id  = next_section_id++;
-        job.new_sd.file_offset = hnsw_pos;
-        job.gid_offset    = gid_offsets[i];
-        hnsw_jobs.push_back(job);
-        hnsw_pos += best->compressed_size;
-    }
-    uint64_t kmrx_pos = hnsw_pos;
+    // Plan KMRX bulk copies (placed immediately after SHRD sections)
+    // The genome_ids array is patched in-place with the gid_offset.
+    uint64_t kmrx_pos = shrd_end_offset;
     for (size_t i = 0; i < archives.size(); ++i) {
         const SectionDesc* best = nullptr;
         for (const auto* sd : archives[i].toc.find_by_type(SEC_KMRX))
@@ -396,25 +377,6 @@ void merge_archives(const std::vector<std::filesystem::path>& inputs,
 
     spdlog::info("Merge: {} shards, {} genomes collected", shrd_jobs.size(), all_metas.size());
 
-    // Copy HNSW sections — patch label_map genome IDs in-place, no rebuild.
-    // The body is mutated by gid_offset, so recompute content_xxh128 over the
-    // patched bytes (these sit before meta_start_offset, so the metadata
-    // checksum pass below skips them — like SHRD, they must be hashed here).
-    for (auto& job : hnsw_jobs) {
-        const auto& a = archives[job.archive_idx];
-        std::vector<uint8_t> buf(job.sd->compressed_size);
-        std::memcpy(buf.data(), a.mmap.data() + job.sd->file_offset, job.sd->compressed_size);
-        if (job.gid_offset > 0) {
-            auto* hdr = reinterpret_cast<HnswSectionHeader*>(buf.data());
-            auto* lm  = reinterpret_cast<uint64_t*>(buf.data() + hdr->label_map_offset);
-            for (uint32_t j = 0; j < hdr->n_elements; ++j)
-                lm[j] += job.gid_offset;
-        }
-        writer.write_at(job.out_offset, buf.data(), buf.size());
-        checksum_of(buf.data(), buf.size(), job.new_sd.checksum);
-        spdlog::info("  Copied HNSW from archive {}: {} elements", job.archive_idx, job.sd->item_count);
-    }
-
     // Copy KMRX sections — patch sorted genome_ids array in-place, no rebuild.
     for (auto& job : kmrx_jobs) {
         const auto& a = archives[job.archive_idx];
@@ -434,12 +396,10 @@ void merge_archives(const std::vector<std::filesystem::path>& inputs,
     TocWriter toc_out;
     for (const auto& job : shrd_jobs)
         toc_out.add_section(job.new_sd);
-    for (const auto& job : hnsw_jobs)
-        toc_out.add_section(job.new_sd);
     for (const auto& job : kmrx_jobs)
         toc_out.add_section(job.new_sd);
 
-    // Flush all async shard/HNSW/KMRX writes to NFS before writing metadata.
+    // Flush all async shard/KMRX writes to NFS before writing metadata.
     writer.flush();
 
     // Write all metadata to a LOCAL temp file first.

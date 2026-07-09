@@ -271,9 +271,9 @@ genopack taxdump mydb.gpk -f columnar -o ./taxonomy/
 
 ## Similarity search and contig lookup (library-only)
 
-There is no `genopack similar` or `genopack cidx` CLI. KMRX/HNSW similarity search and CIDX contig→genome lookup are exposed through the C++ API only:
+There is no `genopack similar` or `genopack cidx` CLI. KMRX similarity search and CIDX contig→genome lookup are exposed through the C++ API only:
 
-- `ArchiveReader::find_similar(...)` / `find_similar_by_accession(...)` — KMRX cosine similarity, HNSW-accelerated when an HNSW section is present, linear-scan fallback otherwise.
+- `ArchiveReader::find_similar(...)` / `find_similar_by_accession(...)` — linear KMRX cosine similarity scan.
 - `ArchiveReader::find_contig_genome_id(accession)` — CIDX binary search, ~150M queries/s/core.
 
 See [API → Similarity & contig lookup](api.md#similarity--contig-lookup).
@@ -328,8 +328,7 @@ Runs two checks. First, **semantic coverage**: cross-checks per-genome/per-genus
 NFS-coordinated assembly mode for distributed builds. Workers run `genopack build` with `--coordinator <manifest_dir>:<output.gpk>`; the coordinator process waits for the expected number of worker manifests, then merges parts into a single archive.
 
 ```bash
-genopack coordinator -o mydb.gpk --workers 64 --nfs-dir /shared/manifests/ \
-    [--ntdb /path/to/ncbi/taxdump/]
+genopack coordinator -o mydb.gpk --workers 64 --nfs-dir /shared/manifests/
 ```
 
 | Flag | Default | Description |
@@ -337,4 +336,3 @@ genopack coordinator -o mydb.gpk --workers 64 --nfs-dir /shared/manifests/ \
 | `-o / --output` | required | Final merged archive path |
 | `--workers` | required | Expected number of worker manifests |
 | `--nfs-dir` | required | Shared directory where workers drop manifests |
-| `--ntdb` | unset | NCBI `nodes.dmp` + `names.dmp` directory; embeds an NTDB section for offline taxid resolution |
