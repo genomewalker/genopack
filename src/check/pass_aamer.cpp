@@ -49,10 +49,20 @@ void run_pass_aamer(ICheckReader& pack,
         PcoreView v = pack.pcore_for_genus(gvec[i]);
         if (v.valid()) v.core_into(gcore_buf[i]);
     }
+    // Family cores: prefer the inline SEC_FCORE section (a CoreReader whose entries are
+    // already the prevalence core — count >= ceil(theta*n)). Fall back to the PCORE
+    // family tier (added post-hoc by `genopack pcore`) for packs built without inline
+    // FCORE. Both yield a sorted core-aamer vector for coverage().
+    const bool use_fcore_section = pack.has_fcore();
     #pragma omp parallel for schedule(dynamic, 1) num_threads(load_par)
     for (size_t i = 0; i < fvec.size(); ++i) {
-        PcoreView v = pack.pcore_for_family(fvec[i]);
-        if (v.valid()) v.core_into(fcore_buf[i]);
+        if (use_fcore_section) {
+            CoreView v = pack.core_for_family(fvec[i]);
+            if (v.valid()) fcore_buf[i].assign(v.aamers, v.aamers + v.n_aamers);
+        } else {
+            PcoreView v = pack.pcore_for_family(fvec[i]);
+            if (v.valid()) v.core_into(fcore_buf[i]);
+        }
     }
     std::unordered_map<std::string, const std::vector<uint64_t>*> genus_core_ptr, family_core_ptr;
     for (size_t i = 0; i < gvec.size(); ++i)

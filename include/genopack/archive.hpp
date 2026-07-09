@@ -321,6 +321,11 @@ struct ArchiveBuilderConfig {
                                            // small contigs and only the dense per-genus union resolves it.
                                            // Memory is bounded (spilled to $GENOPACK_SPILL_DIR); on-disk
                                            // size is large (~10-50x CORE). Disable with --no-pcore.
+    bool     build_fcore         = true;   // build SEC_FCORE per-FAMILY prevalence cores inline (genus-core
+                                           // fallback for singleton/degenerate genera). Valid now that the
+                                           // partition step keys on FAMILY rank (a family is part-local), so
+                                           // per-part family aggregation is exact. Reuses PCORE theta/params.
+                                           // Disable with --no-fcore. Needs the FCOV family grouping (build_gcov).
     bool     build_tier          = false;  // emit a .ptier side-channel file alongside the .gpk;
                                            // used post-build by `genopack tier merge` to compute the
                                            // global IDF tier table. Enabled with --tier.

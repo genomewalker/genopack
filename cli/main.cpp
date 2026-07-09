@@ -117,7 +117,8 @@ static int cmd_build(const std::string& input_tsv, const std::string& output_dir
                      bool thin        = false,
                      std::string tmpdir = {},
                      bool build_tier  = false,
-                     uint32_t pcore_frac = 100) {
+                     uint32_t pcore_frac = 100,
+                     bool build_fcore = true) {
     ArchiveBuilder::Config cfg;
     const bool explicit_codec = no_dict || ref_dict || delta || mem_delta;
     cfg.io_threads                        = static_cast<size_t>(std::max(1, threads));
@@ -137,6 +138,7 @@ static int cmd_build(const std::string& input_tsv, const std::string& output_dir
     }
     cfg.build_gstx                        = !no_gstx;
     cfg.build_pcore                       = build_pcore;
+    cfg.build_fcore                       = build_fcore;
     cfg.build_tier                        = build_tier && build_pcore;
     cfg.pcore_frac                        = pcore_frac > 0 ? pcore_frac : 100u;
     cfg.tmpdir                            = tmpdir;
@@ -2706,7 +2708,7 @@ int main(int argc, char** argv) {
     bool build_no_dict = false, build_ref_dict = false, build_delta = false;
     bool build_mem_delta = true, build_verbose = false, build_no_cidx = true;
     bool build_2bit = true, build_kmer_nn = true, build_taxon_group = true;
-    bool build_sketch = true, build_pcore = true, build_tier = false;
+    bool build_sketch = true, build_pcore = true, build_fcore = true, build_tier = false;
     uint32_t build_pcore_frac = 100;
     int build_sketch_kmer = 16, build_sketch_size = 10000, build_sketch_syncmer = -1;
     std::string build_taxon_rank = "g";
@@ -2747,6 +2749,10 @@ int main(int argc, char** argv) {
         "(default: ON — small-contig contamination needs the dense per-genus union). The union is ~10-50x CORE "
         "and is the dominant cost; memory is bounded (spilled to $GENOPACK_SPILL_DIR) but on-disk size is large. "
         "Use --no-pcore to disable.");
+    build->add_flag("--fcore,!--no-fcore", build_fcore, "Build SEC_FCORE per-family prevalence cores inline "
+        "(default: ON). The genus-core fallback for singleton/degenerate genera: family-level completeness "
+        "when a genome's genus core is too thin. Valid because the partition step keys on FAMILY rank "
+        "(a family is part-local). Needs the FCOV family grouping (implied by GCOV). Use --no-fcore to disable.");
     build->add_option("--sketch-kmer", build_sketch_kmer, "OPH sketch k-mer size (default: 16)");
     build->add_option("--sketch-kmers", build_sketch_kmers_str, "Comma-separated k-mer sizes for multi-k SKCH (default: 16,21,31)");
     build->add_option("--sketch-size", build_sketch_size, "Number of OPH bins (default: 10000)");
@@ -2816,7 +2822,7 @@ int main(int argc, char** argv) {
                                 build_no_gstx, build_markers, build_from_gpk,
                                 build_micro_genus_threshold,
                                 build_contam_panel, build_pcore, build_thin, build_tmpdir,
-                                build_tier, build_pcore_frac);
+                                build_tier, build_pcore_frac, build_fcore);
             if (rc != 0) std::exit(rc);
             std::string hostname = "worker";
             {
@@ -2848,7 +2854,7 @@ int main(int argc, char** argv) {
                              build_no_gstx, build_markers, build_from_gpk,
                              build_micro_genus_threshold,
                              build_contam_panel, build_pcore, build_thin, build_tmpdir,
-                             build_tier, build_pcore_frac));
+                             build_tier, build_pcore_frac, build_fcore));
     });
 
     // genopack enrich — compute GSTX/GCOV/CORE/PCORE/GAMI from a thin archive
@@ -3304,18 +3310,20 @@ int main(int argc, char** argv) {
 
     // genopack taxonomy partition -i <tsv> -n N -o <dir> [-r g|f]
     auto* tax_part = tax_cmd->add_subcommand("partition",
-        "Partition TSV into N genus-balanced parts using LPT bin-packing. "
-        "All genomes of the same genus land in the same part, sorted by taxonomy within each part.");
+        "Partition TSV into N taxonomy-balanced parts using LPT bin-packing. "
+        "All genomes of the same rank taxon (family by default) land in the same part, "
+        "sorted by taxonomy within each part. Family-coherent parts let the build emit "
+        "family-level sections (FCORE/FCOV) inline, since a family never spans parts.");
     std::filesystem::path tax_part_input, tax_part_output;
     int tax_part_n = 1;
-    std::string tax_part_rank = "g";
+    std::string tax_part_rank = "f";
     tax_part->add_option("-i,--input", tax_part_input,
         "Input TSV (accession TAB taxonomy TAB file_path)")->required()->check(CLI::ExistingFile);
     tax_part->add_option("-n,--parts", tax_part_n, "Number of output parts")->required();
     tax_part->add_option("-o,--output-dir", tax_part_output,
         "Output directory for part_0.tsv ... part_N-1.tsv")->required();
     tax_part->add_option("-r,--rank", tax_part_rank,
-        "Rank to partition by: g=genus (default), f=family")->default_val("g");
+        "Rank to partition by: f=family (default), g=genus")->default_val("f");
     tax_part->callback([&]() {
         if (tax_part_n <= 0) { spdlog::error("--parts must be >= 1"); std::exit(1); }
         std::filesystem::create_directories(tax_part_output);
@@ -4087,7 +4095,8 @@ int main(int argc, char** argv) {
     fcore_cmd->add_option("archive", fcore_pack, "Path to .gpk archive or directory of parts")->required();
     fcore_cmd->add_option("-t,--threads", fcore_threads, "Parallel shard readers (default: 8)");
     fcore_cmd->add_option("--theta", fcore_theta,
-        "Prevalence threshold override (default: inherit the CORE section's theta)");
+        "Prevalence threshold override (default: inherit PCORE's theta, or CORE's for "
+        "legacy packs; required if the pack carries neither section)");
     fcore_cmd->add_option("--min-members", fcore_min_members,
         "Skip families with fewer than this many genomes (default: 2)");
     fcore_cmd->add_option("--members", fcore_members,

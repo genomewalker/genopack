@@ -133,17 +133,33 @@ int cmd_fcore(const std::filesystem::path& pack_path, int threads,
     for (const auto& gp : gpks) {
         ArchiveReader ar;
         ar.open(gp);
-        if (!ar.has_core()) {
-            spdlog::warn("fcore: {} has no CORE section; skipping (build genus cores first)",
+        // Aamer params (k, min_seg_aa, frac_max, theta) are inherited from PCORE — the
+        // dense per-genus reference the default build carries. SEC_CORE was dropped from
+        // the default build (be1b440), so PCORE is the source of truth; fall back to CORE
+        // for legacy packs that still carry it. theta_override (--theta) always wins.
+        int      k, min_seg;
+        uint64_t frac_max;
+        float    theta;
+        if (ar.has_pcore()) {
+            const PcoreReader* pr = ar.pcore_reader();
+            k = pr->k(); min_seg = pr->min_seg_aa();
+            frac_max = pr->frac_max_hash(); theta = pr->theta();
+        } else if (ar.has_core()) {
+            const CoreReader* cr = ar.core_reader();
+            k = cr->k(); min_seg = cr->min_seg_aa();
+            frac_max = cr->frac_max_hash(); theta = cr->theta();
+        } else if (theta_override > 0.0f) {
+            // No section to inherit from, but the caller pinned --theta: use build
+            // defaults for the extraction params (AAMER_K, min_seg 8, keep-all FMH).
+            k = AAMER_K; min_seg = 8; frac_max = UINT64_MAX; theta = theta_override;
+        } else {
+            spdlog::warn("fcore: {} has neither PCORE nor CORE and no --theta; skipping "
+                         "(need PCORE/CORE for aamer params, or pass --theta)",
                          gp.filename().string());
             ar.close();
             continue;
         }
-        const CoreReader* cr = ar.core_reader();
-        const int      k        = cr->k();
-        const int      min_seg  = cr->min_seg_aa();
-        const uint64_t frac_max = cr->frac_max_hash();
-        const float    theta    = theta_override > 0.0f ? theta_override : cr->theta();
+        if (theta_override > 0.0f) theta = theta_override;
 
         // acc -> family (only genomes with a resolvable family).
         std::unordered_map<std::string, std::string> acc_family;
