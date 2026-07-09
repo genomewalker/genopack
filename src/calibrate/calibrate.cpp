@@ -245,11 +245,10 @@ std::vector<float> fit_ols(const std::vector<std::vector<float>>& X,
 
 // ── Feature names (must match order used in run_calibrate) ───────────────────
 // Isotonic axis is features[0] — completeness_aamer_core (genus prevalence-core
-// coverage, the validated intrinsic completeness signal). self_coherence + others
-// are OLS residual features.
+// coverage, the validated intrinsic completeness signal). The rest are OLS
+// residual features.
 static const std::vector<std::string> k_completeness_features = {
     "completeness_aamer_core",         // [0] isotonic axis
-    "self_coherence",
     "contamination_leakage",
     "gc_pct",
     "log1p_genome_length",
@@ -428,8 +427,6 @@ int run_calibrate(const std::string& archive_path,
         auto meta = ar.genome_meta(r.genome_id);
         if (!meta) return;
 
-        const float sc  = (std::isnan(r.self_coherence) || r.self_coherence == 0.0f)
-                          ? 0.0f : r.self_coherence;
         const float cl  = std::isnan(r.contamination_leakage) ? 0.0f : r.contamination_leakage;
         const float cte = std::isnan(r.contamination_tnf_excess) ? 0.0f : r.contamination_tnf_excess;
         const float gc  = static_cast<float>(meta->gc_pct_x100) / 10000.0f;
@@ -439,7 +436,7 @@ int run_calibrate(const std::string& archive_path,
         std::vector<float> cf;  // completeness features (axis = aamer_core)
         auto ac = aamer_core.find(r.genome_id);
         if (ac != aamer_core.end()) {
-            cf = {ac->second, sc, cl, gc, lgl, lnc, 1.0f};
+            cf = {ac->second, cl, gc, lgl, lnc, 1.0f};
             comp_feat_all[r.genome_id] = cf;
         }
         std::vector<float> kf;  // contamination features (axis = leakage)
@@ -505,7 +502,7 @@ int run_calibrate(const std::string& archive_path,
         return {std::move(iso), std::move(ols_w), rmse};
     };
 
-    // ── Completeness model (isotonic axis: self_coherence) ────────────────────
+    // ── Completeness model (isotonic axis: completeness_aamer_core) ───────────
     std::vector<std::pair<float,float>> comp_iso_xy;
     std::vector<std::vector<float>>     comp_X;
     std::vector<float>                  comp_y;

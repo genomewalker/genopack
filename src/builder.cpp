@@ -923,7 +923,6 @@ struct ArchiveBuilder::Impl {
             std::string fasta;
             OPHDualSketchResult sketch;                    // populated when build_sketch (single-k)
             std::vector<OPHDualSketchResult> sketches_mk;  // populated when multi_k_sketch
-            AllSignals signals;                            // intrinsic per-genome signals (worker-computed)
             std::vector<ContigProfile> long_profiles;      // long-contig TNF profiles for GCOV (worker-computed)
             std::vector<uint64_t> aamers;                  // sorted-unique k=8 protein aamers (worker-computed)
             std::vector<uint64_t> fmh;                     // FracMinHash hashes, ≥1kb contigs (worker-computed)
@@ -1095,10 +1094,8 @@ struct ArchiveBuilder::Impl {
                                     seed1, seed2);
                             }
                         }
-                        // Per-genome intrinsic quality (Fiedler/spectral) + long-contig TNF
-                        // profiles are consensus-INDEPENDENT — compute them HERE in the parallel
-                        // worker (this was the single-threaded drain bottleneck, ~5 genomes/s).
-                        AllSignals signals = compute_all_signals(fasta);
+                        // Long-contig TNF profiles are consensus-INDEPENDENT — compute them HERE
+                        // in the parallel worker (this was the single-threaded drain bottleneck).
                         std::vector<ContigProfile> lprof =
                             compute_long_contig_profiles(fasta, GCOV_MIN_LONG_BP);
                         // One per-contig dewrap walk → aamers (sort+unique) + FMH hashes. Both
@@ -1145,7 +1142,7 @@ struct ArchiveBuilder::Impl {
                         }
                         d.item = ChunkItem{*t.record, t.gid, t.input_row_index,
                                            stats, std::move(fasta), std::move(sk), std::move(sks_mk),
-                                           std::move(signals), std::move(lprof),
+                                           std::move(lprof),
                                            std::move(aamers), std::move(fmh)};
                         // SCC core_dup excess — score here (FASTA alive); finalize_genus reads
                         // the stored value (item.fasta is freed by flush_staging_buf before it runs).
@@ -1450,12 +1447,6 @@ struct ArchiveBuilder::Impl {
             for (const auto& item : buf) {
                 auto qr               = QualRecord::make_empty(item.genome_id);
                 qr.support_tier       = 0; // GenusSaturated
-                qr.interval_width     = 0.05f;
-                qr.chromosome_skew_closure    = item.stats.gc_skew_closure;
-                qr.completeness_fragmentation =
-                    item.stats.n_contigs <= 1 ? 1.0f
-                    : 1.0f / (1.0f + 0.333f * std::log2f(
-                        static_cast<float>(item.stats.n_contigs)));
 
                 float cont[GSTX_MAX_K] = {};
                 for (int ki = 0; ki < nk && ki < (int)item.sketches_mk.size(); ++ki) {
@@ -1477,8 +1468,6 @@ struct ArchiveBuilder::Impl {
                     const float c2_pred = std::exp(beta * k2);
                     qr.contamination_leakage =
                         std::max(0.0f, c2_pred - cont[2]) / std::max(c2_pred, 0.01f);
-                    const float r0=lc0-beta*k0, r1=lc1-beta*k1, r2=lc2-beta*k2;
-                    qr.leakage_residual = std::sqrt((r0*r0 + r1*r1 + r2*r2) / 2.0f);
                 } else if (nk >= 2 && cont[0] >= 0.01f && cont[1] >= 0.01f) {
                     const float beta = (k0*std::log(cont[0]) + k1*std::log(cont[1])) / (k0*k0 + k1*k1);
                     const float c1_pred = std::exp(beta * k1);
@@ -1502,21 +1491,7 @@ struct ArchiveBuilder::Impl {
                         compute_completeness_post_decontam(item.fasta, tnf_mu);
                 }
 
-                {
-                    const AllSignals& sig = item.signals;
-                    qr.self_coherence        = sig.self_coherence;
-                    qr.chargaff_parity        = sig.chargaff_parity;
-                    qr.spectral_gap           = sig.spectral_gap;
-                    qr.scale_kink             = sig.scale_kink;
-                    qr.contamination_mixture  = sig.contamination_mixture;
-                    qr.mixture_sources        = static_cast<int16_t>(sig.mixture_sources);
-                    qr.n_mix_windows          = sig.n_mix_windows;
-                    qr.fiedler_u16            = static_cast<uint16_t>(
-                        std::min(1.0f, std::isnan(sig.fiedler_value) ? 0.0f : sig.fiedler_value) * 65535.0f);
-                    if (sig.mix_no_data)
-                        qr.qual_flags |= QualRecord::QUAL_FLAG_MIX_NO_DATA;
-                    qr.qual_flags |= QualRecord::QUAL_FLAG_BUILD_SIGNALS;
-                }
+                qr.qual_flags |= QualRecord::QUAL_FLAG_BUILD_SIGNALS;
 
                 all_profiles.push_back(std::move(item.long_profiles));
                 pending_qrs.push_back(std::move(qr));
@@ -1624,7 +1599,6 @@ struct ArchiveBuilder::Impl {
                         qr.contig_outlier_u8  = enc(cco_bp);
                         qr.spe_outlier_u8     = enc(spe_bp);
                         qr.rho_outlier_u8     = enc(rho_bp);
-                        qr.sibling_outlier_u8 = enc(sib_bp);
                     }
                 }
 
@@ -1678,13 +1652,6 @@ struct ArchiveBuilder::Impl {
                                                  / static_cast<float>(n_expected);
                                 qr.marker_completeness_u8 = static_cast<uint8_t>(
                                     std::clamp(comp, 0.0f, 1.0f) * 254.0f + 1.0f);
-                            }
-                            if (redun_n > 0) {
-                                const float redun = redun_sum / static_cast<float>(redun_n);
-                                const float clamped = std::min(0.09999f, redun);
-                                qr.marker_redundancy_u16 = static_cast<uint16_t>(
-                                    clamped / 0.1f * 65534.0f);
-                                qr.qual_flags |= QualRecord::QUAL_FLAG_MARKER_SCORED;
                             }
                         }
                     }

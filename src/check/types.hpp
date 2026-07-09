@@ -53,34 +53,17 @@ struct GenomeQuality {
     // Computed only in the no-GSTX path when the genus is GenusSaturated with ≥10 members; NaN otherwise (abstain).
     float accessory_ratio               = NAN;  // c0_query / median(c0_all)
     float accessory_z                   = NAN;  // (c0_query - median) / (1.4826 * MAD)
-    float completeness_sketch_fill      = NAN;
-    float completeness_fragmentation    = NAN;
     float completeness_post_decontam    = NAN;
     float completeness_aamer_core        = NAN;  // genus prevalence-core coverage (intrinsic; CheckM2-aligned)
     float completeness_aamer_family_core = NAN;  // family prevalence-core coverage (genus-core fallback; SEC_FCORE)
     float contamination_leakage    = 0.0f;
     float contamination_tnf_excess = 0.0f;
-    float chromosome_skew_closure = NAN;
-    float leakage_residual        = NAN;
-    float self_coherence          = NAN;
-    float chargaff_parity         = NAN;
-    float spectral_gap            = NAN;
-    float scale_kink              = NAN;
-    float contamination_mixture   = NAN;
     float contamination_tnf_minor = NAN;  // near-clade TNF-GMM minority mass (BIC-free, multi-contig guarded)
-    int   mixture_sources         = 1;
-    uint16_t n_mix_windows        = 0;
-    float    fiedler_value              = NAN;
     float    contamination_contig_outlier = NAN;
     float    contamination_contig_outlier_adj = NAN; // CCO minus per-genus clean-genome baseline
     float    contamination_spe              = NAN;
-    float    contamination_sibling_outlier  = NAN;
     float    contamination_rho_outlier      = NAN;  // ρ* Mahalanobis outlier fraction
     float    contamination_contig_split     = NAN;  // per-contig containment split minority fraction
-    float    contamination_self_outlier    = NAN;  // self-containment z-score outlier fraction
-    float    fiedler_oph_split             = NAN;  // sketch Fiedler 1−λ₂/2 of pairwise OPH Jaccard
-    float    fiedler_tnf_bimod             = NAN;  // TNF-kernel v₂ normalized max-gap bimodality
-    float    fiedler_tnf_gap               = NAN;  // TNF-kernel λ₃−λ₂ eigengap
     float    fmh_minority_fraction         = NAN;  // FMH k=21,c=125 minority bp / scored_bp
     float    contamination_cross_genus     = NAN;  // fraction bp where any foreign genus fits better than assigned
     float    contamination_duplication     = NAN;  // .csp diagnostic-aamer duplication fraction (build-time; CheckM2-aligned)
@@ -88,9 +71,6 @@ struct GenomeQuality {
 
     // Marker-panel completeness (protein k-mer based; NAN if no .mrk file supplied)
     float    marker_completeness         = NAN;  // present / expected markers
-    float    marker_redundancy           = NAN;  // markers with ≥2 contig votes / expected
-    float    marker_redundancy_z         = NAN;  // (observed - genus_median) / (1.4826 * MAD_eff)
-    float    marker_joint_contamination  = NAN;  // markers with both native+cross_genus votes / expected
     int      marker_n_present            = -1;   // raw present count
     int      marker_n_expected           = -1;   // expected marker count for this lineage
     // Per-SCG presence bitmask: bit i set if marker i had ≥1 contig vote.
@@ -102,7 +82,6 @@ struct GenomeQuality {
     float    sketch_breadth       = NAN; // NAN in check path (requires build-time consensus sketch)
     std::vector<ContigFlag> contig_flags;
     SupportTier support_tier   = SupportTier::GenusSaturated;
-    float       interval_width = 1.0f;
 };
 
 } // namespace genopack::check

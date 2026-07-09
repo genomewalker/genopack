@@ -1768,13 +1768,6 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
                         for (size_t mi = 0; mi < members.size(); ++mi) {
                             auto qr           = QualRecord::make_empty(members[mi].gid);
                             qr.support_tier   = 0;
-                            qr.interval_width = 0.05f;
-
-                            auto meta = ar.genome_meta_by_accession(members[mi].acc);
-                            uint32_t nc = meta ? meta->n_contigs : 0;
-                            qr.completeness_fragmentation =
-                                nc <= 1 ? 1.0f
-                                : 1.0f / (1.0f + 0.333f * std::log2f(static_cast<float>(nc)));
 
                             float cont[GSTX_MAX_K] = {};
                             for (int ki = 0; ki < nk; ++ki)
@@ -1791,9 +1784,6 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
                                 const float c2_pred = std::exp(beta * k2);
                                 qr.contamination_leakage =
                                     std::max(0.0f, c2_pred - cont[2]) / std::max(c2_pred, 0.01f);
-                                const float r0=lc0-beta*k0, r1=lc1-beta*k1, r2=lc2-beta*k2;
-                                qr.leakage_residual = std::sqrt((r0*r0 + r1*r1 + r2*r2) / 2.0f);
-                                // sketch_breadth field repurposed → fmh_minority_u8/contig_split_u8 (check-time only)
                             } else if (nk >= 2 && cont[0] >= 0.01f && cont[1] >= 0.01f) {
                                 const float beta    = (k0*std::log(cont[0]) + k1*std::log(cont[1])) / (k0*k0 + k1*k1);
                                 const float c1_pred = std::exp(beta * k1);
@@ -1825,22 +1815,13 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
                 { decltype(cand) tmp; tmp.swap(cand); }   // free consensus sketches
                 { decltype(conts) tmp; tmp.swap(conts); } // free containment vectors
 
-                // Singletons: no cluster → NaN for all cluster-derived fields,
-                // but completeness_fragmentation is computable from n_contigs alone.
+                // Singletons: no cluster → NaN for all cluster-derived fields.
                 if (need_qual_check) {
                     for (size_t gi = 0; gi < n_genera; ++gi) {
                         if (genus_members[gi].size() != 1) continue;
                         const auto& m = genus_members[gi][0];
                         auto qr       = QualRecord::make_empty(m.gid);
                         qr.support_tier   = static_cast<uint8_t>(2); // Singleton
-                        qr.interval_width = 1.0f;
-                        auto meta = ar.genome_meta_by_accession(m.acc);
-                        if (meta) {
-                            uint32_t nc = meta->n_contigs;
-                            qr.completeness_fragmentation =
-                                nc <= 1 ? 1.0f
-                                : 1.0f / (1.0f + 0.333f * std::log2f(static_cast<float>(nc)));
-                        }
                         qual_writer_new.add(qr);
                     }
                 }

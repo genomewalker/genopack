@@ -165,22 +165,16 @@ void run_pass_b(ICheckReader& pack,
             auto it = qual_cache->find(meta->genome_id);
             if (it == qual_cache->end()) { to_scan.push_back(acc); continue; }
             const QualRecord& r = it->second;
-            const bool has_build_signals = (r.qual_flags & QualRecord::QUAL_FLAG_BUILD_SIGNALS) != 0;
-            const bool has_gcov_scored   = (r.qual_flags & QualRecord::QUAL_FLAG_GCOV_SCORED)   != 0;
-            if (std::isnan(r.chromosome_skew_closure) || std::isnan(r.completeness_post_decontam) ||
-                (!has_build_signals && r.self_coherence == 0.0f) ||
-                (fmhr_rd && r.fmh_minority_u8 == 0 && r.fmh_minority_u16 == 0 && !std::isnan(r.chromosome_skew_closure)) ||
+            const bool has_gcov_scored = (r.qual_flags & QualRecord::QUAL_FLAG_GCOV_SCORED) != 0;
+            if (std::isnan(r.completeness_post_decontam) ||
+                (fmhr_rd && r.fmh_minority_u8 == 0 && r.fmh_minority_u16 == 0) ||
                 (!cfg.markers_path.empty() && r.marker_completeness_u8 == 0) ||
                 !has_gcov_scored) {
                 to_scan.push_back(acc); continue;
             }
             auto& q = quality.at(acc);
-            q.chromosome_skew_closure    = r.chromosome_skew_closure;
+            q.qual_flags |= QualRecord::QUAL_FLAG_GCOV_SCORED;  // freshness check above guaranteed it
             q.completeness_post_decontam = r.completeness_post_decontam;
-            q.self_coherence             = r.self_coherence;
-            q.chargaff_parity            = r.chargaff_parity;
-            q.spectral_gap               = r.spectral_gap;
-            q.scale_kink                 = r.scale_kink;
             // No FMHR section -> the FMH axis is unavailable; degrade to NaN so
             // cache-served genomes match the FASTA-scan path (which leaves it NaN)
             // and the axis-fallback flag fires consistently.
@@ -194,14 +188,8 @@ void run_pass_b(ICheckReader& pack,
                 ? r.contig_outlier_u16 / 65535.0f
                 : r.contig_outlier_u8  / 255.0f;
             q.contamination_spe             = r.spe_outlier_u8     / 255.0f;
-            q.contamination_sibling_outlier = r.sibling_outlier_u8 / 255.0f;
             q.contamination_rho_outlier     = r.rho_outlier_u8     / 255.0f;
             q.contamination_cross_genus     = r.cross_genus_u8     / 255.0f;
-            if (r.sketch_fill_u8 > 0)
-                q.completeness_sketch_fill = r.sketch_fill_u8 / 200.0f;
-            q.contamination_mixture = r.contamination_mixture;
-            q.mixture_sources       = r.mixture_sources;
-            q.n_mix_windows         = r.n_mix_windows;
             if (!std::isnan(r.completeness_aamer_core))
                 q.completeness_aamer_core        = r.completeness_aamer_core;
             if (!std::isnan(r.completeness_aamer_family_core))
@@ -959,7 +947,6 @@ void run_pass_b(ICheckReader& pack,
                 // Fallback: within-genome median/MAD z-score (when no GCOV entry).
                 float contamination_contig_outlier  = NAN;
                 float contamination_spe             = NAN;
-                float contamination_sibling_outlier = NAN;
                 float contamination_rho_outlier     = NAN;
                 float contamination_cross_genus     = NAN;
                 if (gcov_entry && gcov_rd && gcov_scored_bp > 0) {
@@ -971,9 +958,6 @@ void run_pass_b(ICheckReader& pack,
                         static_cast<float>(rho_out_bp) / static_cast<float>(gcov_scored_bp);
                     contamination_cross_genus =
                         static_cast<float>(cross_genus_bp) / static_cast<float>(gcov_scored_bp);
-                    if (fcov_entry)
-                        contamination_sibling_outlier =
-                            static_cast<float>(sibling_out_bp) / static_cast<float>(gcov_scored_bp);
                 } else if (centroid) {
                     static thread_local std::vector<std::pair<float,uint32_t>> scored;
                     scored.clear();
@@ -1017,8 +1001,6 @@ void run_pass_b(ICheckReader& pack,
                 // (two separate genomic loci → contamination signal).
                 // Works for both full-AA k=8 (legacy) and Dayhoff-6 k=12 syncmer pools.
                 float marker_completeness        = NAN;
-                float marker_redundancy          = NAN;
-                float marker_joint_contamination = NAN;
                 int   marker_n_present = -1, marker_n_expected = -1;
                 if (mrk_rd && mrk_rd->has_merged_pool() && git != flagged_genus.end()) {
                     const uint64_t genus_hash = GcovWriter::hash_genus(git->second);
@@ -1133,29 +1115,13 @@ void run_pass_b(ICheckReader& pack,
                             // loaded — subtract mobile-element markers from ne before dividing
                             // so completeness is not penalised for absent MGE-associated markers.
                             marker_completeness        = static_cast<float>(marker_n_present) / ne;
-                            marker_redundancy          = static_cast<float>(redundant_n) / ne;
-                            marker_joint_contamination = static_cast<float>(joint_n) / ne;
                         }
                     }
-                }
-
-                // Joint: marker_joint_contamination already assigned inside scoring block above.
-
-                // Z-score marker_redundancy against per-genus calibration.
-                float marker_redundancy_z = NAN;
-                if (!std::isnan(marker_redundancy) && mrk_rd && git != flagged_genus.end()) {
-                    const uint64_t genus_hash = GcovWriter::hash_genus(git->second);
-                    const auto* ce = mrk_rd->lookup_redun_calib(genus_hash);
-                    marker_redundancy_z = MarkerReader::redun_zscore(marker_redundancy, ce);
                 }
 
                 const auto t_c5 = Clock::now(); s_marker_ns.fetch_add((t_c5-t_c4).count(), std::memory_order_relaxed);
                 // Per-contig containment split against GSTX family-member consensus sketches.
                 float contamination_contig_split = NAN;
-                float contamination_self_outlier = NAN;
-                float fiedler_oph_val            = NAN;
-                float fiedler_tnf_bimod_val      = NAN;
-                float fiedler_tnf_gap_val        = NAN;
                 {
                     const auto t_gstx0 = Clock::now();
                     if (gstx_rd) {
@@ -1181,10 +1147,6 @@ void run_pass_b(ICheckReader& pack,
                                 pgh = GcovWriter::hash_genus(git->second);
                             auto csr = score_bin_containment(seqs, pgh, cands, *gstx_rd);
                             contamination_contig_split = csr.minority_fraction;
-                            contamination_self_outlier = csr.self_outlier_fraction;
-                            fiedler_oph_val            = csr.fiedler_oph;
-                            fiedler_tnf_bimod_val      = csr.fiedler_tnf_bimod;
-                            fiedler_tnf_gap_val        = csr.fiedler_tnf_gap;
                         }
                     }
                     s_gstx_ns.fetch_add((Clock::now()-t_gstx0).count(), std::memory_order_relaxed);
@@ -1240,39 +1202,21 @@ void run_pass_b(ICheckReader& pack,
                     std::lock_guard<std::mutex> lk(quality_mtx);
                     s_lock_ns.fetch_add((Clock::now()-t_lock0).count(), std::memory_order_relaxed);
                     auto& q = quality.at(acc);
-                    q.chromosome_skew_closure    = skew_score;
                     q.completeness_post_decontam = completeness_post;
                     q.completeness_aamer_core    = completeness_aamer_core;
                     q.completeness_aamer_family_core = completeness_aamer_family_core;
-                    q.self_coherence             = sig.self_coherence;
-                    q.chargaff_parity            = sig.chargaff_parity;
-                    q.spectral_gap               = sig.spectral_gap;
-                    q.scale_kink                 = sig.scale_kink;
-                    q.contamination_mixture      = sig.contamination_mixture;
                     q.contamination_tnf_minor    = sig.contamination_tnf_minor;
-                    q.mixture_sources            = sig.mixture_sources;
-                    q.n_mix_windows              = sig.n_mix_windows;
-                    q.fiedler_value                   = sig.fiedler_value;
                     q.contamination_contig_outlier    = contamination_contig_outlier;
                     q.contamination_spe               = contamination_spe;
-                    q.contamination_sibling_outlier   = contamination_sibling_outlier;
                     q.contamination_rho_outlier       = contamination_rho_outlier;
                     q.contamination_cross_genus       = contamination_cross_genus;
                     q.contamination_contig_split      = contamination_contig_split;
-                    q.contamination_self_outlier      = contamination_self_outlier;
-                    q.fiedler_oph_split               = fiedler_oph_val;
-                    q.fiedler_tnf_bimod               = fiedler_tnf_bimod_val;
-                    q.fiedler_tnf_gap                 = fiedler_tnf_gap_val;
                     q.fmh_minority_fraction           = fmh_minority;
                     q.marker_completeness             = marker_completeness;
-                    q.marker_redundancy               = marker_redundancy;
-                    q.marker_redundancy_z             = marker_redundancy_z;
-                    q.marker_joint_contamination      = marker_joint_contamination;
                     q.marker_n_present                = marker_n_present;
                     q.marker_n_expected               = marker_n_expected;
-
-                    if (sig.mix_no_data)
-                        q.qual_flags |= QualRecord::QUAL_FLAG_MIX_NO_DATA;
+                    // pass-B FASTA scan ran → GCOV contamination axes (contig_outlier/spe/rho) valid.
+                    q.qual_flags |= QualRecord::QUAL_FLAG_GCOV_SCORED;
                     q.contig_flags               = std::move(flags);
                     s_mixture_ns.fetch_add((Clock::now()-t_c5).count(), std::memory_order_relaxed);
                     s_genome_ns.fetch_add((Clock::now()-t_genome_start).count(), std::memory_order_relaxed);

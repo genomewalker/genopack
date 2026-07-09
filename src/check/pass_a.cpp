@@ -20,11 +20,6 @@ float percentile_90(std::vector<uint64_t> lengths) {
     return static_cast<float>(lengths[std::min(idx, lengths.size() - 1)]);
 }
 
-float fragmentation_score(uint32_t n) {
-    if (n <= 1) return 1.0f;
-    return 1.0f / (1.0f + 0.333f * std::log2f(static_cast<float>(n)));
-}
-
 float oas_alpha(float trS, float trS2, int n, int p) {
     float num = (1.0f - 2.0f / p) * trS2 + trS * trS;
     float den = (static_cast<float>(n) + 1.0f - 2.0f / p) * (trS2 - trS * trS / p);
@@ -79,8 +74,6 @@ void apply_leakage_scores(GenomeQuality& q,
             const float beta    = (k0*lc0 + k1*lc1 + k2*lc2) / (k0*k0 + k1*k1 + k2*k2);
             const float c2_pred = std::exp(beta * k2);
             q.contamination_leakage = std::max(0.0f, c2_pred - c2) / std::max(c2_pred, 0.01f);
-            const float r0=lc0-beta*k0, r1=lc1-beta*k1, r2=lc2-beta*k2;
-            q.leakage_residual = std::sqrt((r0*r0 + r1*r1 + r2*r2) / 2.0f);
         }
     } else if (n_k == 2 && !std::isnan(lk[0]) && !std::isnan(lk[1])) {
         const float c0 = 1.0f - lk[0], c1 = 1.0f - lk[1];
@@ -218,7 +211,6 @@ PassAResult run_pass_a(ICheckReader& pack,
     // ── Phase 1: TNF + genus metadata (CPU-bound, parallel, no SKCH I/O) ──────
     struct GenusSlot {
         SupportTier      tier;
-        float            interval_width;
         float            S_c;
         const GstxEntry* gstx_e = nullptr;
         bool             has_tnf = false;
@@ -237,9 +229,6 @@ PassAResult run_pass_a(ICheckReader& pack,
         sl.tier = (genus.empty() || genus == "g__") ? SupportTier::Singleton
                 : (n < min_genus_size)              ? SupportTier::GenusSparse
                                                     : SupportTier::GenusSaturated;
-        sl.interval_width = (sl.tier == SupportTier::GenusSaturated) ? 0.05f
-                          : (sl.tier == SupportTier::GenusSparse)    ? 0.20f
-                                                                      : 0.50f;
 
         std::vector<uint64_t> lengths;
         lengths.reserve(n);
@@ -303,7 +292,6 @@ PassAResult run_pass_a(ICheckReader& pack,
         for (const MemberMeta* m : targets) {
             GenomeQuality q;
             q.support_tier   = sl.tier;
-            q.interval_width = sl.interval_width;
 
             // When a QUAL cache is provided, load sketch-derived scores from it.
             // TNF and fragmentation are always recomputed (cheap, no I/O).
@@ -314,13 +302,10 @@ PassAResult run_pass_a(ICheckReader& pack,
                     const QualRecord& r = it->second;
                     q.completeness_cluster_relative = r.completeness_cluster_relative;
                     q.contamination_leakage         = r.contamination_leakage;
-                    q.leakage_residual              = r.leakage_residual;
                     q.contamination_duplication     = QualRecord::decode_dup(r.contamination_duplication_u16);
                     // Phase-2 estimators (raw float; NAN for old-stride packs via reader upcast).
                     q.contamination_core_dup_mass   = r.contamination_core_dup_mass;
                     q.accessory_ratio               = r.accessory_ratio;
-                    if (r.sketch_fill_u8 > 0)
-                        q.completeness_sketch_fill  = r.sketch_fill_u8 / 200.0f;
                     qual_cache_hit = true;
                 }
             }
@@ -333,7 +318,6 @@ PassAResult run_pass_a(ICheckReader& pack,
                     std::clamp(static_cast<float>(m->len) / sl.S_c, 0.0f, 1.5f);
             }
 
-            q.completeness_fragmentation = fragmentation_score(m->nctg);
             if (sl.has_tnf) {
                 const float* p = pack.kmer_profile_by_accession(m->acc);
                 if (p) {
@@ -451,9 +435,6 @@ PassAResult run_pass_a(ICheckReader& pack,
                 const float* tlk        = &lk[static_cast<size_t>(tidx) * GSTX_MAX_K];
                 auto& q = genus_tq[gt.gi][gt.tq_idx].q;
                 apply_leakage_scores(q, tlk, n_k, avail_k.data(), gst->p90_containment[0]);
-                if (gst->nrb_p90 > 0.0f && nrb[tidx] > 0)
-                    q.completeness_sketch_fill = std::clamp(
-                        static_cast<float>(nrb[tidx]) / gst->nrb_p90, 0.0f, 1.5f);
 
                 // Phase-1 relative-conspecific-containment via pre-baked GSTX dispersion.
                 // Mirrors the no-GSTX path (accessory_ratio/accessory_z from c0 median+MAD),
@@ -658,10 +639,6 @@ PassAResult run_pass_a(ICheckReader& pack,
                     if (it == gs.sample_pos.end()) continue;
                     const float* tlk = &gs.sample_lk[static_cast<size_t>(it->second) * GSTX_MAX_K];
                     apply_leakage_scores(tqr.q, tlk, n_k, avail_k.data(), p90_c0);
-                    const uint32_t qnrb = gs.sample_nrb[it->second];
-                    if (nrb_p90 > 0.0f && qnrb > 0)
-                        tqr.q.completeness_sketch_fill = std::clamp(
-                            static_cast<float>(qnrb) / nrb_p90, 0.0f, 1.5f);
                     if (acc_ok && c0_mad > 0.0f && !std::isnan(tlk[0])) {
                         const float c0_query = 1.0f - tlk[0];
                         if (c0_median > 0.0f)
