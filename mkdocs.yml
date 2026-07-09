@@ -53,5 +53,6 @@ nav:
   - Getting Started: getting-started.md
   - API Reference: api.md
   - CLI Reference: cli.md
+  - Quality Scoring: quality.md
   - Format: format.md
   - Changelog: changelog.md
