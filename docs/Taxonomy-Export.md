@@ -1,6 +1,6 @@
 # Taxonomy Export
 
-`genopack taxdump` exports the taxonomy stored in a `.gpk` archive to two formats: NCBI-compatible taxdump and a high-performance columnar binary.
+`genopack taxdump` exports the taxonomy stored in a `.gpk` archive to two formats: NCBI-compatible taxdump and a columnar binary.
 
 ## Usage
 
@@ -190,7 +190,7 @@ def load_taxnodes(path):
     magic, version, n_nodes, name_pool_size = struct.unpack_from("<IIII", mm, 0)
     assert magic == 0x4E545047
     nodes_base = 32
-    pool_base  = nodes_base + n_nodes * 16
+    pool_base  = nodes_base + n_nodes * 24
     return mm, n_nodes, pool_base
 
 def get_node(mm, n_nodes, pool_base, taxid: int):
@@ -198,7 +198,7 @@ def get_node(mm, n_nodes, pool_base, taxid: int):
     base = 32
     while lo < hi:
         mid = (lo + hi) // 2
-        t = struct.unpack_from("<I", mm, base + mid * 16)[0]
+        t = struct.unpack_from("<I", mm, base + mid * 24)[0]
         if t < taxid:   lo = mid + 1
         elif t > taxid: hi = mid
         else:

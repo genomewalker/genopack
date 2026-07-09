@@ -1,6 +1,6 @@
 # genopack
 
-A high-performance single-file genome archive format for large-scale microbial genome collections. Stores millions of FASTA genomes with compressed shards, fast accession lookup, taxonomy, multi-k OPH sketches, and a full taxonomy tree — all in one seekable `.gpk` archive (a directory containing `toc.bin` plus section files) or a multipart set of `part_*.gpk` archives read transparently as one.
+A single-file genome archive format for large-scale microbial genome collections. Stores millions of FASTA genomes with compressed shards, fast accession lookup, taxonomy, multi-k OPH sketches, and a full taxonomy tree — all in one seekable `.gpk` archive (a directory containing `toc.bin` plus section files) or a multipart set of `part_*.gpk` archives read transparently as one.
 
 ## Features
 
@@ -11,12 +11,12 @@ A high-performance single-file genome archive format for large-scale microbial g
 - **OPH sketches (SKCH v4)** — dual-seed (42, 43) one-permutation-hash signatures over one or more k-mer sizes, stored as seekable zstd frames (16 384 genomes per frame), so a `sketch_for_ids` query decompresses only the frames it touches
 - **Contig index (CIDX)** — FNV-1a sorted array mapping every contig accession → genome_id; batch lookup at ~150M queries/s
 - **Taxonomy storage** — full NCBI/GTDB taxonomy tree (TXDB) + per-accession lineage strings (TAXN)
-- **Taxonomy export** — NCBI taxdump (`names.dmp`/`nodes.dmp`/`acc2taxid.dmp`) and high-performance columnar binary (`acc2taxid.bin`/`taxnodes.bin`) plus TSV sidecars
+- **Taxonomy export** — NCBI taxdump (`names.dmp`/`nodes.dmp`/`acc2taxid.dmp`) and columnar binary (`acc2taxid.bin`/`taxnodes.bin`) plus TSV sidecars
 - **k=4 tetranucleotide profiles (KMRX)** — 136-dim L2-normalised float vectors for cosine similarity (library API; no CLI)
 - **Taxonomy repack** — re-shard by genus/family for 10–13× faster per-taxon NFS access
 - **Distributed build** — split TSV across N nodes, build parts in parallel, merge or coordinate via NFS manifest
 - **Append and tombstone** — add genomes or mark deleted without full rebuild
-- **Quality scoring (`genopack check`)** — per-genome completeness and contamination signals (QUAL section): cluster-relative completeness, leakage, TNF excess, chromosome skew closure, Fiedler eigenvalue, contig-level Mahalanobis outlier (CCO), SPE, sibling outlier (family-vs-genus), marker-gene completeness/redundancy, FracMinHash minority fraction, and more
+- **Quality scoring (`genopack check`)** — per-genome completeness and contamination signals (QUAL section): cluster-relative completeness, leakage, TNF excess, chromosome skew closure, Fiedler eigenvalue, contig-level Mahalanobis outlier (CCO), SPE, sibling outlier (family-vs-genus), marker-gene completeness/redundancy, FracMinHash minority fraction
 - **Covariance sections (GCOV/FCOV)** — per-genus and per-family TNF covariance matrices built in one pass at build time or via `genopack gcov`; used by `check` for contamination detection
 - **`.gpd` derep archives** — read derep state produced by [geodesic](https://github.com/genomewalker/geodesic) via `DerepView`: O(1) `accession → rep_id`, O(1) `rep_id → embedding`, with staleness detection against the source pack
 
@@ -39,7 +39,7 @@ GSTX (optional)     - per-genus sketch stats: TNF centroid, p90 completeness, OP
 GCOV (optional)     - per-genus biological covariance (Ledoit-Wolf TNF, eigenvectors, SPE thresholds)
 FCOV (optional)     - per-family biological covariance (same layout as GCOV, keyed by family hash)
 FMHR (optional)     - per-genus FracMinHash reference sketches (k=21, c=125)
-QUAL (optional)     - per-genome quality records (80 B each): completeness, contamination, flags
+QUAL (optional)     - per-genome quality records (104 B each): completeness, contamination, flags
 TOMB                - tombstones for soft-deleted genomes
 TailLocator (64 B)  - fixed footer at end of toc.bin pointing to the TOC offset
 ```
@@ -70,7 +70,7 @@ cmake --build build --parallel
 genopack build -i genomes.tsv -o mydb.gpk -t 24 -z 6
 ```
 
-The output `mydb.gpk` is a directory containing `toc.bin` and section files. Defaults: per-taxon shard grouping (`--taxon-group`, genus rank), kmer-NN sort within shards, OPH sketches (k=16, sketch size 10 000), CIDX contig index. Disable individual stages with `--no-taxon-group`, `--no-kmer-sort`, `--no-sketch`, `--no-cidx`. Use `--sketch-kmers 16,21,31` to build a multi-k SKCH section in one pass.
+The output `mydb.gpk` is a directory containing `toc.bin` and section files. Defaults: per-taxon shard grouping (`--taxon-group`, genus rank), kmer-NN sort within shards, OPH sketches (k=16, sketch size 10 000). The CIDX contig index is opt-in (`--cidx`). Disable default stages with `--no-taxon-group`, `--no-kmer-sort`, `--no-sketch`. Use `--sketch-kmers 16,21,31` to build a multi-k SKCH section in one pass.
 
 ### Archive statistics
 
@@ -299,8 +299,8 @@ and FMHR (per-genus FracMinHash references) simultaneously.
 | Column | Description |
 |--------|-------------|
 | `quality_tier` | `HQ` / `MQ` / `LQ` (completeness + contamination thresholds) |
-| `completeness_effective` | max(marker_completeness, completeness_cluster_relative) |
-| `completeness_cluster_relative` | OPH-sketch cluster-relative completeness |
+| `completeness_effective` | Intrinsic completeness: `marker_completeness`, else `completeness_aamer_core`, else `completeness_post_decontam`. `completeness_cluster_relative` corroborates (geomean) only when intrinsic < 0.50 and sits > 0.30 above it |
+| `completeness_cluster_relative` | Fraction of the genus pangenome covered (accessory breadth) — not intrinsic completeness |
 | `contamination_leakage` | Minimizer mass leakage outside expected genus range |
 | `contamination_tnf_excess` | TNF Mahalanobis distance from genus centroid |
 | `contamination_contig_outlier` | Fraction bp where T² or SPE > 95th percentile (requires GCOV) |

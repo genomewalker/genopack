@@ -1,6 +1,6 @@
 # Contig Index (CIDX)
 
-The CIDX section maps contig accession strings (e.g. `NZ_JAVJIU010000001.1`) to the `genome_id` of the containing assembly. This enables efficient lookup from any reference sequence seen in metagenomic alignments to the genome record in the archive.
+The CIDX section maps contig accession strings (e.g. `NZ_JAVJIU010000001.1`) to the `genome_id` of the containing assembly. It maps any reference sequence seen in metagenomic alignments back to its genome record in the archive.
 
 ## Section layout
 

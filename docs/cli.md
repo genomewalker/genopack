@@ -18,7 +18,7 @@ Build a new archive from a TSV.
 genopack build -i genomes.tsv -o mydb.gpk [options]
 ```
 
-The output `mydb.gpk` is a directory containing `toc.bin` plus section files. Defaults: per-taxon shard grouping (`--taxon-group`, genus rank), kmer-NN sort within shards, OPH sketches (`--sketch`, k=16, sketch size 10 000), CIDX contig index, auto codec.
+The output `mydb.gpk` is a directory containing `toc.bin` plus section files. Defaults: per-taxon shard grouping (`--taxon-group`, genus rank), kmer-NN sort within shards, OPH sketches (`--sketch`, k=16, sketch size 10 000), auto codec. The CIDX contig index is opt-in (`--cidx`).
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -32,7 +32,7 @@ The output `mydb.gpk` is a directory containing `toc.bin` plus section files. De
 | `--delta` | off | Compress non-reference blobs against first genome via zstd prefix |
 | `--mem-delta` / `--no-mem-delta` | on | k=31 k-mer seeded exact-match encoding for highly similar shard groups |
 | `--2bit` / `--no-2bit` | on | Pack nucleotides to 2 bits/base before zstd (~1.5–2× extra compression) |
-| `--no-cidx` / `--cidx` | on (skip) | Skip CIDX contig index; pass `--cidx` to build it |
+| `--cidx` / `--no-cidx` | off (skip) | Build CIDX contig index (off by default; pass `--cidx` to build it) |
 | `--kmer-sort` / `--no-kmer-sort` | on | Sort genomes within each shard by kmer4 NN chain |
 | `--taxon-group` / `--no-taxon-group` | on | Group genomes into per-taxon shards (requires taxonomy column) |
 | `--taxon-rank` | `g` | Rank for grouping (`g` = genus, `f` = family) |
@@ -299,14 +299,16 @@ Typical uses: an archive built with `--no-cidx` later wants contig lookup (`--ci
 ## `verify`
 
 ```bash
-genopack verify mydb.gpk [--verbose]
+genopack verify mydb.gpk [--strict] [--coverage-only] [--verbose]
 ```
 
-Checks archive integrity: TailLocator checksum, TocHeader checksum, and per-shard checksums. Exits 0 if all checks pass, non-zero on any failure.
+Runs two checks. First, **semantic coverage**: cross-checks per-genome/per-genus section row counts against the catalog from the TOC only (no data scan) — SKCH (per k, every k must cover the whole catalog), QUAL, GIDX, ACCX, CATL rows must equal the genome count; GSTX and other compute sections are reported as presence + coverage, not gated. Second, **byte-level checksums**: TailLocator, TocHeader, and per-section XXH128 content checksums. Exits 0 if all checks pass, non-zero on any failure.
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `archive` | required | Archive directory to verify |
+| `--strict` | off | Fail if any section lacks a content checksum |
+| `--coverage-only` | off | Run only the section-coverage cross-check; skip byte-level checksums (seconds) |
 | `--verbose` | off | Print OK lines in addition to failures |
 
 ---

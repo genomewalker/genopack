@@ -1,6 +1,6 @@
 # genopack
 
-**High-performance single-file genome archive for large-scale microbial collections.**
+**Single-file genome archive for large-scale microbial collections.**
 
 genopack stores millions of FASTA genomes with compressed shards, O(1) accession and genome-id lookup, full taxonomy, multi-k OPH sketches, and tetranucleotide profiles — all in one seekable `.gpk` archive (a directory containing `toc.bin` + section files) or a multipart set of `part_*.gpk` archives read transparently via `ArchiveSetReader`.
 

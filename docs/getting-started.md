@@ -29,7 +29,7 @@ GCA_000006945.2	/data/GCA_000006945.2.fna.gz	99.1	0.1	d__Bacteria;p__Proteobacte
 genopack build -i genomes.tsv -o mydb.gpk -t 24 -z 6
 ```
 
-The output `mydb.gpk` is a directory containing `toc.bin` and section files. Defaults: per-taxon shard grouping (genus rank), kmer-NN sort within each shard, OPH sketches (k=16, sketch size 10 000), CIDX contig index, auto codec.
+The output `mydb.gpk` is a directory containing `toc.bin` and section files. Defaults: per-taxon shard grouping (genus rank), kmer-NN sort within each shard, OPH sketches (k=16, sketch size 10 000), auto codec. The CIDX contig index is opt-in (`--cidx`).
 
 | Flag | Default | Description |
 |------|---------|-------------|
