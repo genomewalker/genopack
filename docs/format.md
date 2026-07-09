@@ -458,7 +458,7 @@ Built by `genopack coordinator --ntdb DIR` or via library `NtdbWriter`. Read wit
 
 # `.gpd` — Geodesic Derep Archive Format v1
 
-A `.gpd` file is the on-disk artefact produced by [geodesic](https://github.com/genomewalker/geodesic) when it dereplicates a genopack archive set. It is a **single file** (not a directory) and is consumed read-only by genopack via the `DerepView` API. The format is designed to (a) be cheap to mmap, (b) reuse genopack's accession universe verbatim, and (c) detect staleness against the source pack without re-running derep.
+A `.gpd` file is the on-disk artefact produced by [geodesic](https://github.com/genomewalker/geodesic) when it dereplicates a genopack archive set. It is a **single file** (not a directory) and is consumed read-only by genopack via the `DerepView` API. The format is cheap to mmap, reuses genopack's accession universe verbatim, and detects staleness against the source pack without re-running derep.
 
 ## File layout
 

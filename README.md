@@ -141,7 +141,7 @@ genopack taxdump mydb.gpk -f taxdump -o ./taxdump/
 genopack taxdump mydb.gpk -f columnar -o ./taxonomy/
 ```
 
-The columnar binary export is designed for applications that need taxonomy without linking genopack:
+The columnar binary export is for applications that need taxonomy without linking genopack:
 
 | File | Size (GTDB r226 reps) | Description |
 |------|----------------------|-------------|
@@ -156,7 +156,7 @@ The columnar binary export is designed for applications that need taxonomy witho
 genopack repack mydb.gpk mydb_taxon.gpk -t 24 -z 6 -m 32
 ```
 
-Reads only shard directory headers in a fast first pass (~minutes), then a single sequential decompression pass routes each genome to its taxonomy group. The result allows tools like `geodesic` to read only the shards for a target taxon instead of the entire archive.
+Reads only shard directory headers in a fast first pass (~minutes), then a single sequential decompression pass routes each genome to its taxonomy group. Tools like `geodesic` then read only the shards for a target taxon, not the whole archive.
 
 ### Merge archives
 

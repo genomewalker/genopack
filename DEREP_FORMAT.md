@@ -92,9 +92,9 @@ struct GpdSectionDesc {
 //   GpdSectionDesc descs[n_sections]
 ```
 
-Sections may be compressed (`flags & 1`). The reader transparently
-decompresses on first access; the file header above gives uncompressed
-sizes so the reader can pre-size buffers.
+Sections may be compressed (`flags & 1`). The reader decompresses on
+first access; the file header above gives uncompressed sizes so the
+reader can pre-size buffers.
 
 ## HDR section (always present, always uncompressed)
 
@@ -150,9 +150,8 @@ recomputes it from the current pack to validate.
 ## ASTR section — accession string pool
 
 Concatenated accession strings, sorted ASCIIbetically, no separators
-(offsets give boundaries). Includes **all** genomes from the source set
-(reps + members + unclustered + tombstoned-at-derep-time? **no, only
-live at derep time**).
+(offsets give boundaries). Includes **all** genomes live at derep
+time — reps + members + unclustered. Excludes tombstoned-at-derep-time.
 
 Compressed with zstd if `flags & 1`. Payload after decompression is the
 raw concatenated bytes.
@@ -459,8 +458,8 @@ For each part_idx in 0..n_parts:
         else: level = max(level, Mismatch)
 ```
 
-For efficiency, the simple version recomputes the hash. A future
-optimization can compare incremental Bloom filters or a Merkle tree.
+The simple version recomputes the hash. A future optimization could
+compare incremental Bloom filters or a Merkle tree.
 
 ## Versioning
 

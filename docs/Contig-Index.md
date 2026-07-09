@@ -1,6 +1,6 @@
 # Contig Index (CIDX)
 
-The CIDX section maps contig accession strings (e.g. `NZ_JAVJIU010000001.1`) to the `genome_id` of the containing assembly. It maps any reference sequence seen in metagenomic alignments back to its genome record in the archive.
+The CIDX section maps contig accession strings (e.g. `NZ_JAVJIU010000001.1`) to the `genome_id` of the containing assembly, resolving reference sequences seen in metagenomic alignments back to their genome record.
 
 ## Section layout
 
@@ -31,7 +31,7 @@ struct CidxEntry {
 
 ## Build integration
 
-CIDX is built when `--cidx` is passed to `genopack build` (off by default; use `--cidx` to opt in). For each genome, the builder parses every `>header` line in the FASTA and records the first whitespace-delimited token as the contig accession:
+CIDX is built when `--cidx` is passed to `genopack build` (off by default). For each genome, the builder parses every `>header` line in the FASTA and records the first whitespace-delimited token as the contig accession:
 
 ```
 >NZ_JAVJIU010000001.1 Christiangramia sp. SM2212 ...

@@ -39,7 +39,7 @@ output_dir/
 | species | species |
 | (intermediate) | no rank |
 
-**Root node** — the root `taxid=1` is self-referential (`parent=1`) per NCBI convention.
+**Root node** — `taxid=1` is self-referential (`parent=1`) per NCBI convention.
 
 **Taxids** — synthetic integer identifiers assigned by the TXDB builder. They are stable within an archive but are not NCBI taxids.
 
