@@ -220,10 +220,11 @@ alignas(16) static constexpr int8_t DIB2HI[16] = {
     -128,-128,-128,-128,-128,  9, 12, 15,-128,-128,-128,-128,-128,-128,-128,-128};
 
 // Encode 16 ASCII DNA bytes → 0(A),1(C),2(G),3(T/U) or 0xFF (invalid/ambiguous).
-// Clears bits {7,5} to normalise case (a→A, t→T, u→U) then does exact comparison.
+// Clears bit 5 only to normalise case (a→A, t→T, u→U) then does exact comparison.
 static inline __m128i enc16(const __m128i v) noexcept {
-    // 0x5F = 0101 1111: clears bits 7 and 5 → maps acgtu → ACGTU, N/other unchanged
-    const __m128i upr  = _mm_and_si128(v, _mm_set1_epi8(0x5F));
+    // 0xDF = 1101 1111: clears bit 5 only → maps acgtu → ACGTU, high-bit bytes
+    // (e.g. 0xC1) keep bit 7 and stay rejected — matches the scalar DNA_ENC table.
+    const __m128i upr  = _mm_and_si128(v, _mm_set1_epi8((char)0xDF));
     const __m128i isA  = _mm_cmpeq_epi8(upr, _mm_set1_epi8('A'));
     const __m128i isC  = _mm_cmpeq_epi8(upr, _mm_set1_epi8('C'));
     const __m128i isG  = _mm_cmpeq_epi8(upr, _mm_set1_epi8('G'));
@@ -261,17 +262,22 @@ static inline __m128i codon8(const __m128i idx6) noexcept {
 // Returns 8-bit mask: bit i set → out[i] is a valid AA (not stop/ambiguous).
 // Caller must ensure p[0..23] are all readable.
 static inline unsigned xlate8(const char* p, uint8_t* out) noexcept {
-    const __m128i lo = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
-    const __m128i hi = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + 8));
-    const __m128i b0 = enc16(_mm_or_si128(
-        _mm_shuffle_epi8(lo, _mm_load_si128(reinterpret_cast<const __m128i*>(DIB0LO))),
-        _mm_shuffle_epi8(hi, _mm_load_si128(reinterpret_cast<const __m128i*>(DIB0HI)))));
-    const __m128i b1 = enc16(_mm_or_si128(
-        _mm_shuffle_epi8(lo, _mm_load_si128(reinterpret_cast<const __m128i*>(DIB1LO))),
-        _mm_shuffle_epi8(hi, _mm_load_si128(reinterpret_cast<const __m128i*>(DIB1HI)))));
-    const __m128i b2 = enc16(_mm_or_si128(
-        _mm_shuffle_epi8(lo, _mm_load_si128(reinterpret_cast<const __m128i*>(DIB2LO))),
-        _mm_shuffle_epi8(hi, _mm_load_si128(reinterpret_cast<const __m128i*>(DIB2HI)))));
+    // Encode ONCE per input vector, then deinterleave the encoded bytes.
+    // enc16 is per-byte so it commutes with the shuffle permutation: this turns
+    // 3 enc16 (15 cmpeq) into 2 (10 cmpeq). The -128 shuffle indices zero inactive
+    // lanes 8..15 (to 0x00 here vs 0xFF before) — those lanes are unused (storel
+    // writes only 0..7, brk mask is &0xFF), so output on lanes 0..7 is identical.
+    const __m128i elo = enc16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
+    const __m128i ehi = enc16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p + 8)));
+    const __m128i b0 = _mm_or_si128(
+        _mm_shuffle_epi8(elo, _mm_load_si128(reinterpret_cast<const __m128i*>(DIB0LO))),
+        _mm_shuffle_epi8(ehi, _mm_load_si128(reinterpret_cast<const __m128i*>(DIB0HI))));
+    const __m128i b1 = _mm_or_si128(
+        _mm_shuffle_epi8(elo, _mm_load_si128(reinterpret_cast<const __m128i*>(DIB1LO))),
+        _mm_shuffle_epi8(ehi, _mm_load_si128(reinterpret_cast<const __m128i*>(DIB1HI))));
+    const __m128i b2 = _mm_or_si128(
+        _mm_shuffle_epi8(elo, _mm_load_si128(reinterpret_cast<const __m128i*>(DIB2LO))),
+        _mm_shuffle_epi8(ehi, _mm_load_si128(reinterpret_cast<const __m128i*>(DIB2HI))));
     // Ambiguous: any base has bit7 set (0xFF in signed = negative)
     const __m128i amb  = _mm_cmpgt_epi8(_mm_setzero_si128(),
                                          _mm_or_si128(_mm_or_si128(b0, b1), b2));
@@ -286,6 +292,52 @@ static inline unsigned xlate8(const char* p, uint8_t* out) noexcept {
     const __m128i stop = _mm_cmpeq_epi8(aa, _mm_set1_epi8(0x7F));
     const __m128i brk  = _mm_or_si128(stop, amb);
     _mm_storel_epi64(reinterpret_cast<__m128i*>(out), aa);
+    return (~static_cast<unsigned>(_mm_movemask_epi8(brk))) & 0xFFu;
+}
+
+// Dual forward+reverse-complement translate of 8 codons at p[0..23].
+// Shares ONE enc16 pass (and the b0/b1/b2 deinterleave) between both strands:
+//   forward codon index  = 16*b0 + 4*b1 + b2
+//   RC codon index       = 63 - (16*b2 + 4*b1 + b0)   (BASE_COMP is x->3-x, i.e. ^3)
+// out_fwd[0..7] = raw forward AA bytes (0..19 / 0x7F stop) — mask decides validity,
+//   byte-identical to xlate8's output; forward caller path is unchanged.
+// out_rc[0..7]  = RC AA bytes with break lanes (RC-stop OR ambiguous) set to 0xFF
+//   (== AA_STOP sentinel) so the RC segment scan can read the array directly.
+// Returns the forward valid mask (same contract as xlate8); RC breaks are in out_rc.
+static inline unsigned xlate8_dual(const char* p, uint8_t* out_fwd, uint8_t* out_rc) noexcept {
+    const __m128i elo = enc16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
+    const __m128i ehi = enc16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p + 8)));
+    const __m128i b0 = _mm_or_si128(
+        _mm_shuffle_epi8(elo, _mm_load_si128(reinterpret_cast<const __m128i*>(DIB0LO))),
+        _mm_shuffle_epi8(ehi, _mm_load_si128(reinterpret_cast<const __m128i*>(DIB0HI))));
+    const __m128i b1 = _mm_or_si128(
+        _mm_shuffle_epi8(elo, _mm_load_si128(reinterpret_cast<const __m128i*>(DIB1LO))),
+        _mm_shuffle_epi8(ehi, _mm_load_si128(reinterpret_cast<const __m128i*>(DIB1HI))));
+    const __m128i b2 = _mm_or_si128(
+        _mm_shuffle_epi8(elo, _mm_load_si128(reinterpret_cast<const __m128i*>(DIB2LO))),
+        _mm_shuffle_epi8(ehi, _mm_load_si128(reinterpret_cast<const __m128i*>(DIB2HI))));
+    const __m128i amb = _mm_cmpgt_epi8(_mm_setzero_si128(),
+                                        _mm_or_si128(_mm_or_si128(b0, b1), b2));
+    const __m128i b0s = _mm_and_si128(b0, _mm_set1_epi8(3));
+    const __m128i b1s = _mm_and_si128(b1, _mm_set1_epi8(3));
+    const __m128i b2s = _mm_and_si128(b2, _mm_set1_epi8(3));
+    // Forward: idx = 16*b0 + 4*b1 + b2
+    const __m128i idx = _mm_add_epi8(
+        _mm_add_epi8(_mm_slli_epi16(b0s, 4), _mm_slli_epi16(b1s, 2)), b2s);
+    const __m128i aa   = codon8(idx);
+    const __m128i stop = _mm_cmpeq_epi8(aa, _mm_set1_epi8(0x7F));
+    const __m128i brk  = _mm_or_si128(stop, amb);
+    _mm_storel_epi64(reinterpret_cast<__m128i*>(out_fwd), aa);
+    // RC: rev = 16*b2 + 4*b1 + b0 ; rc_idx = 63 - rev = 63 ^ rev (rev in 0..63)
+    const __m128i rev = _mm_add_epi8(
+        _mm_add_epi8(_mm_slli_epi16(b2s, 4), _mm_slli_epi16(b1s, 2)), b0s);
+    const __m128i rcidx = _mm_xor_si128(rev, _mm_set1_epi8(63));
+    const __m128i rcaa  = codon8(rcidx);
+    const __m128i rcstop = _mm_cmpeq_epi8(rcaa, _mm_set1_epi8(0x7F));
+    const __m128i rcbrk  = _mm_or_si128(rcstop, amb);
+    // break lanes -> 0xFF sentinel; valid lanes -> AA (0..19)
+    const __m128i rcout = _mm_blendv_epi8(rcaa, _mm_set1_epi8(-1), rcbrk);
+    _mm_storel_epi64(reinterpret_cast<__m128i*>(out_rc), rcout);
     return (~static_cast<unsigned>(_mm_movemask_epi8(brk))) & 0xFFu;
 }
 
@@ -308,41 +360,126 @@ inline void translate_6frame(std::string_view seq, int min_aa_len, Cb&& cb) {
     // Thread-local AA segment buffer: eliminates 6 per-call heap allocations.
     thread_local std::vector<uint8_t> seg;
 
-    // Forward frames 0-2
+#ifdef __AVX2__
+    // Folded 6-frame: the forward SIMD pass ALSO derives the reverse-complement
+    // codons from the SAME enc16/deinterleave (xlate8_dual), so 6 translation
+    // passes collapse to 3. RC frame rf shares the triplet boundaries of forward
+    // frame ff=(n-rf)%3 (length-dependent — never hardcoded), so RC frame rf's AA
+    // array is exactly forward frame ff's codons walked BACKWARD. We materialise
+    // rc_arr[rf] (0xFF = stop/ambiguous break sentinel) during the forward pass,
+    // then emit RC segments after all forward frames — preserving the original
+    // callback order (fwd 0,1,2 then rc 3,4,5).
+    thread_local std::vector<uint8_t> rc_arr[3];
+
+    // One segment buffer sized to the max codons in any frame (<= n/3), written
+    // through a raw cursor: no per-AA capacity checks, no per-segment clear cost.
+    const int cap = (n / 3) + 1;
+    seg.resize(cap);
+    uint8_t* const segp = seg.data();
+
     for (int frame = 0; frame < 3; ++frame) {
-        seg.clear();
+        uint8_t* cur = segp;                          // segment write cursor
         int seg_nt_start = frame;
         const int ncod = (n - frame) / 3;
+        const int rf = ((n - frame) % 3 + 3) % 3;   // paired RC frame
+        rc_arr[rf].resize(ncod > 0 ? ncod : 0);
+        uint8_t* rp = ncod > 0 ? rc_arr[rf].data() : nullptr;
         const char* base = s + frame;
         int c = 0;
 
-#ifdef __AVX2__
-        uint8_t tmp[8];
+        uint8_t tmp[8], rtmp[8];
         // SIMD loop: 8 codons per iteration.
         // Loop guard: c+8 <= ncod ensures bytes base[c*3..c*3+23] are all in-bounds
         // (since (c+8)*3 <= ncod*3 <= n-frame, so frame+(c+8)*3 <= n).
         for (; c + 8 <= ncod; c += 8) {
-            const unsigned vmask = aamer_detail::xlate8(base + c * 3, tmp);
+            const unsigned vmask = aamer_detail::xlate8_dual(base + c * 3, tmp, rtmp);
+            std::copy(rtmp, rtmp + 8, rp + c);        // stash RC codons for this frame
             if (vmask == 0xFFu) {
-                seg.insert(seg.end(), tmp, tmp + 8);
+                // all 8 valid → single 8-byte store into the cursor (cur+8 <= cap)
+                _mm_storel_epi64(reinterpret_cast<__m128i*>(cur),
+                                 _mm_loadl_epi64(reinterpret_cast<const __m128i*>(tmp)));
+                cur += 8;
                 continue;
             }
             for (int j = 0; j < 8; ++j) {
                 if (vmask & (1u << j)) {
-                    seg.push_back(tmp[j]);
+                    *cur++ = tmp[j];
                 } else {
                     const int nt = frame + (c + j) * 3;
-                    if ((int)seg.size() >= min_aa_len)
-                        cb(frame, seg.data(), (int)seg.size(), seg_nt_start, nt);
-                    seg.clear();
+                    const int len = (int)(cur - segp);
+                    if (len >= min_aa_len)
+                        cb(frame, segp, len, seg_nt_start, nt);
+                    cur = segp;
                     seg_nt_start = nt + 3;
                 }
             }
         }
-#endif
 
-        // Scalar tail (remainder after SIMD, or full loop when !AVX2)
-        for (int i = frame + c * 3; i + 2 < n; i += 3) {
+        // Scalar tail (remainder after SIMD): emit forward AND fill rc_arr[rf].
+        for (int i = frame + c * 3, cc = c; i + 2 < n; i += 3, ++cc) {
+            const uint8_t b0 = DNA_ENC[(uint8_t)s[i]];
+            const uint8_t b1 = DNA_ENC[(uint8_t)s[i+1]];
+            const uint8_t b2 = DNA_ENC[(uint8_t)s[i+2]];
+            if (b0 == 0xFF || b1 == 0xFF || b2 == 0xFF) {
+                rp[cc] = 0xFF;                          // ambiguous breaks both strands
+                const int len = (int)(cur - segp);
+                if (len >= min_aa_len)
+                    cb(frame, segp, len, seg_nt_start, i);
+                cur = segp;
+                seg_nt_start = i + 3;
+                continue;
+            }
+            // RC codon = complement+reverse of forward bases: (3^b2,3^b1,3^b0).
+            // CODON11 stores AA_STOP (0xFF) for stops, which is our break sentinel.
+            rp[cc] = CODON11[(3 ^ b2) * 16 + (3 ^ b1) * 4 + (3 ^ b0)];
+            const uint8_t aa = CODON11[b0 * 16 + b1 * 4 + b2];
+            if (aa == AA_STOP) {
+                const int len = (int)(cur - segp);
+                if (len >= min_aa_len)
+                    cb(frame, segp, len, seg_nt_start, i);
+                cur = segp;
+                seg_nt_start = i + 3;
+            } else {
+                *cur++ = aa;
+            }
+        }
+        const int flen = (int)(cur - segp);
+        if (flen >= min_aa_len)
+            cb(frame, segp, flen, seg_nt_start, n);
+    }
+
+    // Reverse-complement frames 3-5, emitted from the stashed arrays. RC codons
+    // emerge in reverse of forward order, so walk each frame's array BACKWARD.
+    for (int rf = 0; rf < 3; ++rf) {
+        const int ncod = (int)rc_arr[rf].size();
+        if (ncod == 0) continue;
+        const int ff = ((n - rf) % 3 + 3) % 3;         // producing forward frame
+        const uint8_t* rp = rc_arr[rf].data();
+        uint8_t* cur = segp;
+        int seg_rc_end = n - rf;                        // = (n-1-rf) + 1
+        for (int cc = ncod - 1; cc >= 0; --cc) {
+            const int pos_start = ff + 3 * cc;          // fwd-strand start of triplet
+            const uint8_t a = rp[cc];
+            if (a == 0xFF) {                            // stop or ambiguous → break
+                const int len = (int)(cur - segp);
+                if (len >= min_aa_len)
+                    cb(3 + rf, segp, len, n - seg_rc_end, n - pos_start);
+                cur = segp;
+                seg_rc_end = pos_start;
+            } else {
+                *cur++ = a;
+            }
+        }
+        const int rlen = (int)(cur - segp);
+        if (rlen >= min_aa_len)
+            cb(3 + rf, segp, rlen, n - seg_rc_end, n);
+    }
+#else
+    // Scalar fallback (no AVX2): original independent forward + RC passes.
+    for (int frame = 0; frame < 3; ++frame) {
+        seg.clear();
+        int seg_nt_start = frame;
+        for (int i = frame; i + 2 < n; i += 3) {
             const uint8_t b0 = DNA_ENC[(uint8_t)s[i]];
             const uint8_t b1 = DNA_ENC[(uint8_t)s[i+1]];
             const uint8_t b2 = DNA_ENC[(uint8_t)s[i+2]];
@@ -366,9 +503,6 @@ inline void translate_6frame(std::string_view seq, int min_aa_len, Cb&& cb) {
         if ((int)seg.size() >= min_aa_len)
             cb(frame, seg.data(), (int)seg.size(), seg_nt_start, n);
     }
-
-    // Reverse complement frames 3-5 (scalar backward scan — faster than SIMD RC on
-    // this workload: small contigs dominate, precompute overhead exceeds SIMD gain).
     for (int frame = 0; frame < 3; ++frame) {
         seg.clear();
         const int rc_start = n - 1 - frame;
@@ -400,6 +534,7 @@ inline void translate_6frame(std::string_view seq, int min_aa_len, Cb&& cb) {
         if ((int)seg.size() >= min_aa_len)
             cb(3+frame, seg.data(), (int)seg.size(), n - seg_rc_end, n);
     }
+#endif
 }
 
 // Forward-only 3-frame translation (frames 0-2). Identical to the forward half of
@@ -411,8 +546,14 @@ inline void translate_3frame_fwd(std::string_view seq, int min_aa_len, Cb&& cb) 
     const char* s = seq.data();
     thread_local std::vector<uint8_t> seg;
 
+    // Cursor-based segment buffer (see translate_6frame): one resize, no per-AA
+    // capacity checks, single 8-byte store on the all-valid fast path.
+    const int cap = (n / 3) + 1;
+    seg.resize(cap);
+    uint8_t* const segp = seg.data();
+
     for (int frame = 0; frame < 3; ++frame) {
-        seg.clear();
+        uint8_t* cur = segp;
         int seg_nt_start = frame;
         const int ncod = (n - frame) / 3;
         const char* base = s + frame;
@@ -423,17 +564,20 @@ inline void translate_3frame_fwd(std::string_view seq, int min_aa_len, Cb&& cb) 
         for (; c + 8 <= ncod; c += 8) {
             const unsigned vmask = aamer_detail::xlate8(base + c * 3, tmp);
             if (vmask == 0xFFu) {
-                seg.insert(seg.end(), tmp, tmp + 8);
+                _mm_storel_epi64(reinterpret_cast<__m128i*>(cur),
+                                 _mm_loadl_epi64(reinterpret_cast<const __m128i*>(tmp)));
+                cur += 8;
                 continue;
             }
             for (int j = 0; j < 8; ++j) {
                 if (vmask & (1u << j)) {
-                    seg.push_back(tmp[j]);
+                    *cur++ = tmp[j];
                 } else {
                     const int nt = frame + (c + j) * 3;
-                    if ((int)seg.size() >= min_aa_len)
-                        cb(frame, seg.data(), (int)seg.size(), seg_nt_start, nt);
-                    seg.clear();
+                    const int len = (int)(cur - segp);
+                    if (len >= min_aa_len)
+                        cb(frame, segp, len, seg_nt_start, nt);
+                    cur = segp;
                     seg_nt_start = nt + 3;
                 }
             }
@@ -445,24 +589,27 @@ inline void translate_3frame_fwd(std::string_view seq, int min_aa_len, Cb&& cb) 
             const uint8_t b1 = DNA_ENC[(uint8_t)s[i+1]];
             const uint8_t b2 = DNA_ENC[(uint8_t)s[i+2]];
             if (b0 == 0xFF || b1 == 0xFF || b2 == 0xFF) {
-                if ((int)seg.size() >= min_aa_len)
-                    cb(frame, seg.data(), (int)seg.size(), seg_nt_start, i);
-                seg.clear();
+                const int len = (int)(cur - segp);
+                if (len >= min_aa_len)
+                    cb(frame, segp, len, seg_nt_start, i);
+                cur = segp;
                 seg_nt_start = i + 3;
                 continue;
             }
             const uint8_t aa = CODON11[b0 * 16 + b1 * 4 + b2];
             if (aa == AA_STOP) {
-                if ((int)seg.size() >= min_aa_len)
-                    cb(frame, seg.data(), (int)seg.size(), seg_nt_start, i);
-                seg.clear();
+                const int len = (int)(cur - segp);
+                if (len >= min_aa_len)
+                    cb(frame, segp, len, seg_nt_start, i);
+                cur = segp;
                 seg_nt_start = i + 3;
             } else {
-                seg.push_back(aa);
+                *cur++ = aa;
             }
         }
-        if ((int)seg.size() >= min_aa_len)
-            cb(frame, seg.data(), (int)seg.size(), seg_nt_start, n);
+        const int flen = (int)(cur - segp);
+        if (flen >= min_aa_len)
+            cb(frame, segp, flen, seg_nt_start, n);
     }
 }
 
