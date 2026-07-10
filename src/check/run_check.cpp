@@ -62,7 +62,6 @@ float compute_quality_score(float comp_eff, float cont_val) {
 float completeness_effective(const GenomeQuality& q) {
     const float mc = q.marker_completeness;
     const float ac = q.completeness_aamer_core;
-    const float fc = q.completeness_aamer_family_core;
     const float pd = q.completeness_post_decontam;
     const float cr = q.completeness_cluster_relative;
     // Intrinsic estimate priority: fraction-tracking marker_completeness (present/expected SCG,
@@ -70,13 +69,9 @@ float completeness_effective(const GenomeQuality& q) {
     // to aamer_core when marker_completeness is NaN — it is only populated on the pass-B route, so
     // QCOL-cache genomes (marker_completeness_u8==0 → NaN) must still get a sane estimate. aamer_core
     // saturates (0.047 dynamic range: 1.00/0.97/0.95 at true 1.0/0.7/0.5) but never NaN when scored.
-    // aamer_family_core is the genus-core fallback: a singleton/1-member genus has a degenerate
-    // prevalence-core (every aamer is trivially present), so its genus aamer_core is NaN — the
-    // family-level core (built across the family's genera) is the real completeness reference there.
     // post_decontam (bp-retention) is the last resort.
     const float intrinsic = !std::isnan(mc) ? mc
-                          : (!std::isnan(ac) ? ac
-                          : (!std::isnan(fc) ? fc : pd));
+                          : (!std::isnan(ac) ? ac : pd);
     if (std::isnan(intrinsic))
         return cr;  // no intrinsic signal at all → cluster_relative is the only completeness proxy
     // Soft corroboration: only when intrinsic ALSO reads genuinely partial (below the MQ line)
@@ -202,8 +197,7 @@ std::vector<std::filesystem::path> collect_gpk_paths(const std::filesystem::path
 void write_qual_to_archive(const std::filesystem::path& gpk_path,
                            const std::unordered_map<std::string, GenomeQuality>& quality,
                            const std::unordered_map<std::string, GenomeId>& acc_to_id,
-                           uint64_t core_model_hash,
-                           uint64_t fcore_model_hash)
+                           uint64_t core_model_hash)
 {
     int lock_fd = ::open(gpk_path.c_str(), O_RDWR);
     if (lock_fd < 0)
@@ -261,7 +255,6 @@ void write_qual_to_archive(const std::filesystem::path& gpk_path,
         else
             r.marker_completeness_u8 = 0;
         r.completeness_aamer_core        = q.completeness_aamer_core;
-        r.completeness_aamer_family_core = q.completeness_aamer_family_core;
         // Phase-2 estimators re-persisted so a QCOL write-back keeps the build/check value
         // (raw float; NAN = not scored). Without this a zero-init record would wipe them.
         r.contamination_core_dup_mass    = q.contamination_core_dup_mass;
@@ -308,19 +301,9 @@ void write_qual_to_archive(const std::filesystem::path& gpk_path,
         if (it == acc_to_id.end()) continue;
         aamer_core_cov.emplace(it->second, q.completeness_aamer_core);
     }
-    // AAMER_FAMILY_CORE intrinsic completeness (genus-core fallback) → its own column.
-    std::unordered_map<uint64_t, float> aamer_family_cov;
-    for (const auto& [acc, q] : quality) {
-        if (std::isnan(q.completeness_aamer_family_core)) continue;
-        auto it = acc_to_id.find(acc);
-        if (it == acc_to_id.end()) continue;
-        aamer_family_cov.emplace(it->second, q.completeness_aamer_family_core);
-    }
     QcolExtraColumns extra;
     extra.core_model_hash = core_model_hash;
     if (!aamer_core_cov.empty()) extra.aamer_genus_core = &aamer_core_cov;
-    extra.family_core_model_hash = fcore_model_hash;
-    if (!aamer_family_cov.empty()) extra.aamer_family_core = &aamer_family_cov;
 
     // SEC_QCONTIG — per-contig overlay: persist pass_b's per-contig flags so a
     // consumer can see which contigs drive each genome's contamination score.
@@ -533,8 +516,6 @@ int cmd_check(const std::filesystem::path& pack_path,
 
         const uint64_t core_model_hash =
             ar.core_reader() ? ar.core_reader()->core_model_hash() : 0;
-        const uint64_t fcore_model_hash =
-            ar.fcore_reader() ? ar.fcore_reader()->core_model_hash() : 0;
         ar.close();
 
         // Contamination-axis provenance: when the FMH minority axis is absent
@@ -545,7 +526,7 @@ int cmd_check(const std::filesystem::path& pack_path,
             if (std::isnan(q.fmh_minority_fraction))
                 q.qual_flags |= QualRecord::QUAL_FLAG_FMH_AXIS_ABSENT;
 
-        write_qual_to_archive(gp, quality, acc_to_id, core_model_hash, fcore_model_hash);
+        write_qual_to_archive(gp, quality, acc_to_id, core_model_hash);
 
         for (auto& [acc, q] : quality)
             all_quality.emplace(acc, std::move(q));
@@ -562,7 +543,6 @@ int cmd_check(const std::filesystem::path& pack_path,
     tsv << "accession\tquality_tier\tquality_score\tcompleteness_effective\tcompleteness_cluster_relative"
            "\tcompleteness_post_decontam"
            "\tcompleteness_aamer_core"
-           "\tcompleteness_aamer_family_core"
            "\tfmh_contamination"
            "\tcontamination_leakage\tcontamination_tnf_excess"
            "\tcontamination_contig_outlier\tcontamination_spe"
@@ -630,7 +610,6 @@ int cmd_check(const std::filesystem::path& pack_path,
             << fmt(q.completeness_cluster_relative) << '\t'
             << fmt(q.completeness_post_decontam) << '\t'
             << fmt(q.completeness_aamer_core) << '\t'
-            << fmt(q.completeness_aamer_family_core) << '\t'
             << fmt(fmh_cont) << '\t'
             << fmt(q.contamination_leakage) << '\t'
             << fmt(q.contamination_tnf_excess) << '\t'

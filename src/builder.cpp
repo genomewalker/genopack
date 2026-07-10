@@ -11,7 +11,6 @@
 #include <genopack/markers.hpp>
 #include <genopack/aamer.hpp>
 #include <genopack/cladesplit.hpp>
-#include <genopack/core_section.hpp>
 #include <genopack/pcore_spiller.hpp>
 #include <genopack/qual.hpp>
 #include <genopack/qual_columns.hpp>
@@ -1104,7 +1103,7 @@ struct ArchiveBuilder::Impl {
                         // must match the prior in-drain walks exactly for model-hash parity.
                         std::vector<uint64_t> aamers, fmh;
                         {
-                            const bool want_aamers = cfg.build_pcore || cfg.build_fcore;
+                            const bool want_aamers = cfg.build_pcore;
                             uint64_t fmax = UINT64_MAX;
                             if (want_aamers) {
                                 const char* af = std::getenv("GENOPACK_AAMER_FRAC");
@@ -1228,22 +1227,12 @@ struct ArchiveBuilder::Impl {
         // count). The prev>=ceil(theta*n) slice reproduces CORE; the full set is the
         // dense reference the small-contig foreign-contamination channel needs. Built
         // inline from the same chunk_aamers (zero extra passes); genus tier only here
-        // (the PCORE family tier is added post-hoc by `genopack pcore`; SEC_FCORE is
-        // now built inline below — see build_fcore_w).
+        // (the PCORE family tier is added post-hoc by `genopack pcore`).
         const std::filesystem::path spill_base = cfg.tmpdir.empty()
             ? std::filesystem::temp_directory_path()
             : std::filesystem::path(cfg.tmpdir);
         PcoreWriter build_pcore_w(AAMER_K, /*min_seg_aa=*/8, cfg.core_theta, cfg.tmpdir);
         PcoreSpillWriter pcore_spiller(spill_base, /*buf_tuples=*/4096);
-
-        // SEC_FCORE: per-FAMILY prevalence cores, built inline exactly like PCORE but
-        // grouped by family hash. Prevalence-core semantics match `genopack fcore`
-        // (aamer kept iff present in >= ceil(theta * n_family_members) members). Reuses
-        // PCORE's theta/min_seg/frac_max so family-core coverage is comparable to
-        // genus-core coverage. A SEPARATE spiller (distinct dir — the writer's spill
-        // filenames would otherwise collide with the genus PCORE spiller).
-        CoreWriter build_fcore_w(AAMER_K, /*min_seg_aa=*/8, cfg.core_theta, SEC_FCORE);
-        PcoreSpillWriter fcore_spiller(spill_base / "fcore_spill", /*buf_tuples=*/4096);
         if (cfg.build_tier && cfg.build_pcore) {
             const std::string tier_path = gpk_path_.string() + ".ptier";
             build_pcore_w.set_tier_sidechannel(tier_path);
@@ -1543,20 +1532,6 @@ struct ArchiveBuilder::Impl {
                         if (buf[ii].aamers.empty()) continue;
                         pcore_spiller.add_member(gkh_spill);
                         pcore_spiller.add_genome(gkh_spill, buf[ii].aamers);
-                    }
-                }
-
-                // SEC_FCORE: spill the SAME per-genome aamers keyed by FAMILY hash.
-                // Accumulates across this part's genus flushes (a family spans genera
-                // but is part-local under family-rank partitioning), then finalized into
-                // build_fcore_w after the drain. Not genus-capped: families aggregate
-                // across their genera, matching `genopack fcore`.
-                if (cfg.build_fcore && !family_key.empty()) {
-                    const uint64_t fkh_spill = GcovWriter::hash_genus(family_key);
-                    for (size_t ii = 0; ii < buf.size(); ++ii) {
-                        if (buf[ii].aamers.empty()) continue;
-                        fcore_spiller.add_member(fkh_spill);
-                        fcore_spiller.add_genome(fkh_spill, buf[ii].aamers);
                     }
                 }
 
@@ -2026,21 +2001,6 @@ struct ArchiveBuilder::Impl {
                 });
         }
 
-        // Sort + scan FCORE spill partitions; emit one prevalence core per family.
-        // add_sorted keeps aamers with count >= ceil(theta*n_mem) — identical to
-        // `genopack fcore`. Skip 1-member families (degenerate core = that genome),
-        // matching the fcore subcommand's default --min-members 2.
-        if (cfg.build_fcore && !fcore_spiller.empty()) {
-            spdlog::info("build: FCORE — sorting family spill partitions…");
-            fcore_spiller.finalize(std::max(1, static_cast<int>(n_workers) / 8),
-                [&](uint64_t fkh, std::vector<uint64_t>& aamers,
-                    std::vector<uint32_t>& counts, uint32_t n_mem) {
-                    if (n_mem < 2) return;
-                    std::lock_guard<std::mutex> lk(core_writer_mx);
-                    build_fcore_w.add_sorted(fkh, aamers, counts, n_mem, {});
-                });
-        }
-
         std::fclose(ckpt_meta_file);
         ckpt_meta_file = nullptr;
 
@@ -2228,13 +2188,6 @@ struct ArchiveBuilder::Impl {
                 spdlog::info("PCORE: {} genus references (dense), model_hash={:#018x}",
                              build_pcore_w.n_entries(), sd.aux0);
             }
-            if (cfg.build_fcore && build_fcore_w.n_genera() > 0) {
-                SectionDesc sd = build_fcore_w.finalize(mw, next_section_id++, build_pcore_frac_max);
-                toc.add_section(sd);
-                spdlog::info("FCORE: {} family cores, model_hash={:#018x}",
-                             build_fcore_w.n_genera(), build_fcore_w.core_model_hash());
-            }
-
         }
 
         // BPRM — self-describing build parameters (mandatory, one per archive).

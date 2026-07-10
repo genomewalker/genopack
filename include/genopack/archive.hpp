@@ -218,16 +218,8 @@ public:
     CoreView core_for_genus(std::string_view genus) const;
     const CoreReader* core_reader() const;
 
-    // SEC_FCORE — per-family prevalence cores. The genus-core fallback: when a query
-    // genome's genus has no (or too sparse a) CORE, family-core coverage is a coarser
-    // but more universally-available intrinsic completeness reference. Built post-hoc
-    // by `genopack fcore`. core_for_family returns invalid (valid()==false) if absent.
-    bool has_fcore() const;
-    CoreView core_for_family(std::string_view family) const;
-    const CoreReader* fcore_reader() const;
-
     // SEC_PCORE — unified prevalence-annotated per-genus aamer reference (dense: every
-    // aamer + u8 prevalence). Supersedes CORE/FCORE; dense enough for small-contig
+    // aamer + u8 prevalence). Supersedes CORE; dense enough for small-contig
     // foreign detection. Built by `genopack pcore`. Invalid view if genus absent.
     bool has_pcore() const;
     PcoreView pcore_for_genus(std::string_view genus) const;
@@ -321,11 +313,6 @@ struct ArchiveBuilderConfig {
                                            // small contigs and only the dense per-genus union resolves it.
                                            // Memory is bounded (spilled to $GENOPACK_SPILL_DIR); on-disk
                                            // size is large (~10-50x CORE). Disable with --no-pcore.
-    bool     build_fcore         = true;   // build SEC_FCORE per-FAMILY prevalence cores inline (genus-core
-                                           // fallback for singleton/degenerate genera). Valid now that the
-                                           // partition step keys on FAMILY rank (a family is part-local), so
-                                           // per-part family aggregation is exact. Reuses PCORE theta/params.
-                                           // Disable with --no-fcore. Needs the FCOV family grouping (build_gcov).
     bool     build_tier          = false;  // emit a .ptier side-channel file alongside the .gpk;
                                            // used post-build by `genopack tier merge` to compute the
                                            // global IDF tier table. Enabled with --tier.

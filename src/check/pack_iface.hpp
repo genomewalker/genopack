@@ -34,9 +34,6 @@ struct ICheckReader {
     virtual bool has_core() const = 0;
     virtual CoreView core_for_genus(std::string_view genus) const = 0;
     virtual const CoreReader* core_reader() const = 0;
-    virtual bool has_fcore() const = 0;
-    virtual CoreView core_for_family(std::string_view family) const = 0;
-    virtual const CoreReader* fcore_reader() const = 0;
     virtual bool has_pcore() const = 0;
     virtual PcoreView pcore_for_genus(std::string_view genus) const = 0;
     virtual PcoreView pcore_for_family(std::string_view family) const = 0;
@@ -118,11 +115,6 @@ public:
         return ar_.fmhr_reader();
     }
     bool has_core() const override { return ar_.has_core(); }
-    bool has_fcore() const override { return ar_.has_fcore(); }
-    CoreView core_for_family(std::string_view family) const override {
-        return ar_.core_for_family(family);
-    }
-    const CoreReader* fcore_reader() const override { return ar_.fcore_reader(); }
     bool has_pcore() const override { return ar_.has_pcore(); }
     PcoreView pcore_for_genus(std::string_view genus) const override {
         return ar_.pcore_for_genus(genus);

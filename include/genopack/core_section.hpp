@@ -58,11 +58,8 @@ struct CoreView {
 // ── Writer ────────────────────────────────────────────────────────────────────
 class CoreWriter {
 public:
-    // section_type is SEC_CORE (per-genus, default) or SEC_FCORE (per-family). It
-    // only changes the on-disk magic + TOC type; the layout is identical, so one
-    // CoreReader reads either (mirrors GcovWriter emitting GCOV and FCOV).
-    CoreWriter(uint32_t k, uint32_t min_seg_aa, float theta, uint32_t section_type = SEC_CORE)
-        : k_(k), min_seg_aa_(min_seg_aa), theta_(theta), section_type_(section_type) {}
+    CoreWriter(uint32_t k, uint32_t min_seg_aa, float theta)
+        : k_(k), min_seg_aa_(min_seg_aa), theta_(theta) {}
 
     // Build a prevalence core from per-member sorted-unique aamer sets and add it.
     // Keeps aamers present in >= ceil(theta * n_members) members. No-op if the
@@ -102,7 +99,6 @@ private:
     };
     uint32_t k_, min_seg_aa_;
     float    theta_;
-    uint32_t section_type_ = SEC_CORE;
     std::vector<Entry> entries_;
 
     static uint32_t next_pow2(uint32_t v) noexcept {
@@ -120,7 +116,7 @@ public:
             throw std::runtime_error("CORE section too small");
         data_   = data + offset;
         header_ = reinterpret_cast<const CoreHeader*>(data_);
-        if (header_->magic != SEC_CORE && header_->magic != SEC_FCORE)
+        if (header_->magic != SEC_CORE)
             throw std::runtime_error("CORE: bad magic");
         const uint64_t ent_end = header_->entries_offset
             + static_cast<uint64_t>(header_->n_genera) * sizeof(CoreEntry);

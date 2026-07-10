@@ -86,7 +86,6 @@ inline constexpr const char* INTERVAL       = "interval";
 namespace qual_method {
 // completeness methods
 inline constexpr const char* AAMER_GENUS_CORE = "aamer_genus_core"; // genus prevalence core
-inline constexpr const char* AAMER_FAMILY_CORE = "aamer_family_core"; // family prevalence core (genus-core fallback)
 inline constexpr const char* CLUSTER_RELATIVE = "cluster_relative"; // OPH containment vs genus
 inline constexpr const char* SKETCH_FILL      = "sketch_fill";
 inline constexpr const char* FRAGMENTATION    = "fragmentation";

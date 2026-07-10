@@ -98,8 +98,6 @@ struct ArchiveReader::Impl {
     // CORE reader: per-genus prevalence cores (zero-copy into mmap)
     CoreReader core_;
     bool       has_core_ = false;
-    CoreReader fcore_;            // per-family prevalence cores (genus-core fallback)
-    bool       has_fcore_ = false;
     PcoreReader pcore_;           // unified dense per-genus aamer ref (+ prevalence)
     bool       has_pcore_ = false;
     // GAMI v2: precomputed GMI (exact sorted pairs, zstd-compressed)
@@ -413,23 +411,6 @@ struct ArchiveReader::Impl {
             }
         }
 
-        // Load FCORE section (per-family cores; highest section_id wins, zero-copy).
-        {
-            uint64_t best_id = 0;
-            const SectionDesc* best_sd = nullptr;
-            for (auto* sd : toc_.find_by_type(SEC_FCORE)) {
-                if (sd->section_id > best_id) { best_id = sd->section_id; best_sd = sd; }
-            }
-            if (best_sd) {
-                try {
-                    fcore_.open(mmap_.data(), best_sd->file_offset, best_sd->compressed_size);
-                    has_fcore_ = true;
-                } catch (const std::exception& ex) {
-                    spdlog::warn("FCORE section unreadable ({}); rebuild with `genopack fcore`", ex.what());
-                }
-            }
-        }
-
         // Load PCORE section (unified dense per-genus aamer ref; highest id wins).
         {
             uint64_t best_id = 0;
@@ -689,8 +670,6 @@ struct ArchiveReader::Impl {
             has_fmhr_             = false;
             core_                 = CoreReader{};
             has_core_             = false;
-            fcore_                = CoreReader{};
-            has_fcore_            = false;
             pcore_                = PcoreReader{};
             has_pcore_            = false;
             gami_v2_data_         = nullptr;
@@ -1501,17 +1480,6 @@ CoreView ArchiveReader::core_for_genus(std::string_view genus) const {
 
 const CoreReader* ArchiveReader::core_reader() const {
     return impl_->has_core_ ? &impl_->core_ : nullptr;
-}
-
-bool ArchiveReader::has_fcore() const { return impl_->has_fcore_; }
-
-CoreView ArchiveReader::core_for_family(std::string_view family) const {
-    if (!impl_->has_fcore_) return {};
-    return impl_->fcore_.lookup(GcovWriter::hash_genus(family));
-}
-
-const CoreReader* ArchiveReader::fcore_reader() const {
-    return impl_->has_fcore_ ? &impl_->fcore_ : nullptr;
 }
 
 bool ArchiveReader::has_pcore() const { return impl_->has_pcore_; }

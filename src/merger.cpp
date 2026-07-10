@@ -187,7 +187,7 @@ void merge_archives(const std::vector<std::filesystem::path>& inputs,
     // header so readers and downstream tools know the genus stats are stale.
     bool dropped_quality = false;
     for (const auto& a : archives) {
-        for (uint32_t qt : {SEC_GSTX, SEC_GCOV, SEC_FCOV, SEC_FMHR, SEC_QUAL, SEC_CORE, SEC_FCORE, SEC_PCORE, SEC_QCOL, SEC_XQAL, SEC_CQAL, SEC_PROF, SEC_QCONTIG})
+        for (uint32_t qt : {SEC_GSTX, SEC_GCOV, SEC_FCOV, SEC_FMHR, SEC_QUAL, SEC_CORE, SEC_PCORE, SEC_QCOL, SEC_XQAL, SEC_CQAL, SEC_PROF, SEC_QCONTIG})
             if (!a.toc.find_by_type(qt).empty()) { dropped_quality = true; break; }
         if (dropped_quality) break;
     }

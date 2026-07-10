@@ -55,7 +55,6 @@ struct GenomeQuality {
     float accessory_z                   = NAN;  // (c0_query - median) / (1.4826 * MAD)
     float completeness_post_decontam    = NAN;
     float completeness_aamer_core        = NAN;  // genus prevalence-core coverage (intrinsic; CheckM2-aligned)
-    float completeness_aamer_family_core = NAN;  // family prevalence-core coverage (genus-core fallback; SEC_FCORE)
     float contamination_leakage    = 0.0f;
     float contamination_tnf_excess = 0.0f;
     float contamination_tnf_minor = NAN;  // near-clade TNF-GMM minority mass (BIC-free, multi-contig guarded)

@@ -124,7 +124,7 @@ SectionDesc CoreWriter::finalize(AppendWriter& w, uint64_t section_id, uint64_t 
     const uint64_t section_start = w.current_offset();
 
     CoreHeader hdr{};
-    hdr.magic           = section_type_;
+    hdr.magic           = SEC_CORE;
     hdr.n_genera        = n;
     hdr.n_buckets       = n_buckets;
     hdr.k               = k_;
@@ -149,7 +149,7 @@ SectionDesc CoreWriter::finalize(AppendWriter& w, uint64_t section_id, uint64_t 
 
     const uint64_t section_end = w.current_offset();
     SectionDesc sd{};
-    sd.type              = section_type_;
+    sd.type              = SEC_CORE;
     sd.version           = 1;
     sd.flags             = 0;
     sd.section_id        = section_id;

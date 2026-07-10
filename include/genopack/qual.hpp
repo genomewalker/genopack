@@ -17,7 +17,6 @@ struct QualRecord {
     float    contamination_leakage;         //  4
     float    contamination_tnf_excess;      //  4
     float    completeness_aamer_core;        //  4  CORE aamer coverage [0,1]; NAN = not scored
-    float    completeness_aamer_family_core; //  4  FCORE aamer coverage [0,1]; NAN = not scored
     float    contamination_core_dup_mass;   //  4  non-saturating SCC dup mass Σ(c-1)/Σc; NAN = not scored
     float    accessory_ratio;               //  4  c0_query / median(c0_all); NAN = not scored
     uint16_t contamination_duplication_u16; //  2  redundancy_fraction: 0=not scored, else round(f*65534)+1
@@ -34,7 +33,7 @@ struct QualRecord {
     uint8_t  quality_tier_u8;               //  1  LEGACY discrete tier; 0=not_set,1=LQ,2=MQ,3=HQ
     uint8_t  qscore_lo;                     //  1  low byte of continuous quality ∈ [0,1] × 65534 + 1; 0 = not scored
     uint8_t  qscore_hi;                     //  1  high byte (split so quality_tier_u8 keeps a fixed offset)
-    // total = 64 (57 bytes used + 7 tail pad to 8-byte alignment)
+    // total = 56 (53 bytes used + 3 tail pad to 8-byte alignment)
 
     // contamination_duplication encode/decode (0 reserved as not-scored sentinel,
     // so a genuinely-clean 0.0 stays distinguishable from an unscored genome).
@@ -97,14 +96,13 @@ struct QualRecord {
         r.contamination_leakage         = NAN;
         r.contamination_tnf_excess      = NAN;
         r.completeness_aamer_core        = NAN;
-        r.completeness_aamer_family_core = NAN;
         r.contamination_core_dup_mass    = NAN;  // default not-scored
         r.accessory_ratio                = NAN;
         r.quality_tier_u8                = QTIER_NOT_SET;
         return r;
     }
 };
-static_assert(sizeof(QualRecord) == 64);
+static_assert(sizeof(QualRecord) == 56);
 
 // ── Writer ────────────────────────────────────────────────────────────────────
 

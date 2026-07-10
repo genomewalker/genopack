@@ -197,7 +197,6 @@ add_executable(genopack
   src/check/run_check.cpp
   src/run_ingest.cpp
   src/run_report.cpp
-  src/run_fcore.cpp
   src/run_pcore.cpp
   src/run_gami.cpp
   src/run_tier.cpp

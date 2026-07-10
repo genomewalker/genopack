@@ -1,6 +1,6 @@
 #pragma once
 // ── SEC_PCORE — unified prevalence-annotated per-genus aamer reference ─────────
-// One per-genus reference that supersedes CORE (prevalence core) and FCORE: it
+// One per-genus reference that supersedes CORE (prevalence core): it
 // stores EVERY aamer seen in ≥1 member (the dense union) together with a per-aamer
 // member prevalence. From this single section a consumer derives, at query time:
 //   prevalence ≥ θ   → the conserved completeness core   (== old CORE; exact)

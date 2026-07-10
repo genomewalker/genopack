@@ -62,8 +62,6 @@ inline ColumnKey qcol_legacy_key(const QcolField& f) {
 struct QcolExtraColumns {
     uint64_t                                        core_model_hash = 0;
     const std::unordered_map<uint64_t, float>*      aamer_genus_core = nullptr; // genome_id -> coverage
-    uint64_t                                        family_core_model_hash = 0;
-    const std::unordered_map<uint64_t, float>*      aamer_family_core = nullptr; // genome_id -> coverage (FCORE)
 };
 
 // Build SEC_QCOL from per-genome QualRecords (legacy-field transpose, byte-exact)
@@ -109,19 +107,6 @@ inline SectionDesc qcol_write(AppendWriter& w, uint64_t section_id,
         cw.add_column<float>(k, vals, present);
     }
 
-    if (extra.aamer_family_core) {
-        std::vector<float>   vals(recs.size(), 0.0f);
-        std::vector<uint8_t> present(recs.size(), 0);
-        for (size_t i = 0; i < recs.size(); ++i) {
-            auto it = extra.aamer_family_core->find(recs[i].genome_id);
-            if (it != extra.aamer_family_core->end()) { vals[i] = it->second; present[i] = 1; }
-        }
-        ColumnKey k{qual_axis::COMPLETENESS, qual_tool::GENOPACK, qual_method::AAMER_FAMILY_CORE,
-                    Unit::Fraction01, /*version=*/1, /*ref_db=*/0,
-                    /*core_model=*/extra.family_core_model_hash, /*calib=*/0};
-        cw.add_column<float>(k, vals, present);
-    }
-
     return cw.finalize(w, section_id);
 }
 
@@ -141,11 +126,10 @@ inline void qcol_scan(const ColStoreReader& r,
     }
 
     // Extra columns stored with core_model_hash in key — find by method name.
-    int aamer_core_col = -1, aamer_family_col = -1;
+    int aamer_core_col = -1;
     for (uint32_t c = 0; c < r.n_columns(); ++c) {
         auto cv = r.column(c);
         if (cv.method == qual_method::AAMER_GENUS_CORE)  aamer_core_col   = static_cast<int>(c);
-        if (cv.method == qual_method::AAMER_FAMILY_CORE) aamer_family_col = static_cast<int>(c);
     }
 
     const uint32_t n = r.n_rows();
@@ -161,10 +145,6 @@ inline void qcol_scan(const ColStoreReader& r,
         if (aamer_core_col >= 0) {
             auto cv = r.column(static_cast<uint32_t>(aamer_core_col));
             if (cv.present(row)) q.completeness_aamer_core = cv.get<float>(row);
-        }
-        if (aamer_family_col >= 0) {
-            auto cv = r.column(static_cast<uint32_t>(aamer_family_col));
-            if (cv.present(row)) q.completeness_aamer_family_core = cv.get<float>(row);
         }
         cb(q);
     }

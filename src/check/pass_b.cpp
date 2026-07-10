@@ -192,8 +192,6 @@ void run_pass_b(ICheckReader& pack,
             q.contamination_cross_genus     = r.cross_genus_u8     / 255.0f;
             if (!std::isnan(r.completeness_aamer_core))
                 q.completeness_aamer_core        = r.completeness_aamer_core;
-            if (!std::isnan(r.completeness_aamer_family_core))
-                q.completeness_aamer_family_core = r.completeness_aamer_family_core;
         }
         if (to_scan.empty()) {
             spdlog::info("check pass-B: complete — all scores from QUAL cache");
@@ -327,7 +325,6 @@ void run_pass_b(ICheckReader& pack,
     std::unordered_map<std::string, IndexedSpan>         genus_host_index;
     std::unordered_map<std::string, IndexedSpan>         family_index_map;
     std::unordered_map<std::string, std::vector<uint64_t>> genus_core_cache;
-    std::unordered_map<std::string, std::vector<uint64_t>> family_core_cache;
     std::mutex eviction_mtx;
     std::unordered_map<std::string, std::atomic<int>> genus_refcount, family_refcount;
     const uint8_t foreign_K = [&]() -> uint8_t {
@@ -399,21 +396,13 @@ void run_pass_b(ICheckReader& pack,
         // Avoids O(G_flagged × T_per_genus) PFor re-decodes in the scan loop; reduces to O(G_flagged).
         if (use_pcore) {
             std::vector<std::vector<uint64_t>> gcore_buf(gvec.size());
-            std::vector<std::vector<uint64_t>> fcore_buf(fvec.size());
             #pragma omp parallel for schedule(dynamic,1) num_threads(gmi_par)
             for (size_t i = 0; i < gvec.size(); ++i) {
                 PcoreView v = pack.pcore_for_genus(gvec[i]);
                 if (v.valid()) v.core_into(gcore_buf[i]);
             }
-            #pragma omp parallel for schedule(dynamic,1) num_threads(gmi_par)
-            for (size_t i = 0; i < fvec.size(); ++i) {
-                PcoreView v = pack.pcore_for_family(fvec[i]);
-                if (v.valid()) v.core_into(fcore_buf[i]);
-            }
             genus_core_cache.reserve(gvec.size());
-            family_core_cache.reserve(fvec.size());
             for (size_t i = 0; i < gvec.size(); ++i) genus_core_cache[gvec[i]] = std::move(gcore_buf[i]);
-            for (size_t i = 0; i < fvec.size(); ++i) family_core_cache[fvec[i]] = std::move(fcore_buf[i]);
         }
         // Build 16-bit prefix indexes — replaces O(10M) merge-scan with O(~153) binary search.
         genus_host_index.reserve(genus_host_union.size());
@@ -625,24 +614,14 @@ void run_pass_b(ICheckReader& pack,
                 // query genome's aamers with the exact params the CORE section was
                 // built with (k / min_seg_aa / FracMinHash max). Validated to tie
                 // CheckM2 (RMSE ~5.1%) and ~280x faster than cluster-relative.
-                // Genus-core coverage is the primary signal; family-core coverage is
-                // the fallback for novel/sparse genera (SEC_FCORE). Both are recorded
-                // as DISTINCT columns — the reporting profile prefers genus, falls back
-                // to family, never silently substitutes. The query aamer set is the
-                // same for both (FCORE built with CORE's k/min_seg_aa/frac_max), so it
-                // is extracted once and intersected against each core.
-                float completeness_aamer_core        = NAN;  // genus
-                float completeness_aamer_family_core = NAN;  // family fallback
+                // Genus-core coverage is the intrinsic aamer completeness signal.
+                float completeness_aamer_core = NAN;  // genus
                 {
-                    auto famit = flagged_family.find(acc);
-                    const std::string* genus_s  = (git   != flagged_genus.end())  ? &git->second   : nullptr;
-                    const std::string* family_s = (famit != flagged_family.end()) ? &famit->second : nullptr;
+                    const std::string* genus_s = (git != flagged_genus.end()) ? &git->second : nullptr;
                     if (pack.has_pcore()) {
-                        auto gcit = genus_s  ? genus_core_cache.find(*genus_s)   : genus_core_cache.end();
-                        auto fcit = family_s ? family_core_cache.find(*family_s) : family_core_cache.end();
-                        const std::vector<uint64_t>* gcore = (gcit != genus_core_cache.end()  && !gcit->second.empty()) ? &gcit->second  : nullptr;
-                        const std::vector<uint64_t>* fcore = (fcit != family_core_cache.end() && !fcit->second.empty()) ? &fcit->second : nullptr;
-                        if (gcore || fcore) {
+                        auto gcit = genus_s ? genus_core_cache.find(*genus_s) : genus_core_cache.end();
+                        const std::vector<uint64_t>* gcore = (gcit != genus_core_cache.end() && !gcit->second.empty()) ? &gcit->second : nullptr;
+                        if (gcore) {
                             const PcoreReader* pr = pack.pcore_reader();
                             thread_local std::vector<uint64_t> core_qmers;
                             core_qmers.clear();
@@ -652,23 +631,16 @@ void run_pass_b(ICheckReader& pack,
                             std::sort(core_qmers.begin(), core_qmers.end());
                             core_qmers.erase(std::unique(core_qmers.begin(), core_qmers.end()),
                                              core_qmers.end());
-                            auto cached_coverage = [](const std::vector<uint64_t>* core,
-                                                      const std::vector<uint64_t>& qm) -> float {
-                                if (!core || core->empty()) return NAN;
-                                uint32_t inter = 0; size_t qi = 0;
-                                for (uint64_t a : *core) {
-                                    while (qi < qm.size() && qm[qi] < a) ++qi;
-                                    if (qi < qm.size() && qm[qi] == a) ++inter;
-                                }
-                                return static_cast<float>(inter) / static_cast<float>(core->size());
-                            };
-                            completeness_aamer_core        = cached_coverage(gcore, core_qmers);
-                            completeness_aamer_family_core = cached_coverage(fcore, core_qmers);
+                            uint32_t inter = 0; size_t qi = 0;
+                            for (uint64_t a : *gcore) {
+                                while (qi < core_qmers.size() && core_qmers[qi] < a) ++qi;
+                                if (qi < core_qmers.size() && core_qmers[qi] == a) ++inter;
+                            }
+                            completeness_aamer_core = static_cast<float>(inter) / static_cast<float>(gcore->size());
                         }
                     }
                     // No PCORE reference → intrinsic aamer completeness is unavailable
-                    // (both columns stay NAN). A legacy CORE-only pack already errored at
-                    // pass-B setup; the CORE/FCORE fallback path has been removed.
+                    // (stays NAN). A legacy CORE-only pack already errored at pass-B setup.
                 }
 
                 const GcovReader* fcov_rd    = pack.fcov_reader();
@@ -1204,7 +1176,6 @@ void run_pass_b(ICheckReader& pack,
                     auto& q = quality.at(acc);
                     q.completeness_post_decontam = completeness_post;
                     q.completeness_aamer_core    = completeness_aamer_core;
-                    q.completeness_aamer_family_core = completeness_aamer_family_core;
                     q.contamination_tnf_minor    = sig.contamination_tnf_minor;
                     q.contamination_contig_outlier    = contamination_contig_outlier;
                     q.contamination_spe               = contamination_spe;

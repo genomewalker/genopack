@@ -36,8 +36,7 @@ static constexpr uint32_t SEC_BPRM = 0x4D525042u; // "BPRM" - self-describing bu
 // live in separate sections and are never silently fused; CORE holds the
 // per-genus prevalence models the intrinsic columns reference.
 static constexpr uint32_t SEC_CORE = 0x45524F43u; // "CORE" - per-genus prevalence cores (content-hashed models)
-static constexpr uint32_t SEC_FCORE = 0x524F4346u;// "FCOR" - per-family prevalence cores (genus-core fallback for novel/sparse genera)
-static constexpr uint32_t SEC_PCORE = 0x524F4350u;// "PCOR" - unified per-genus aamer reference: ALL aamers + u8 prevalence (dense; supersedes CORE/FCORE)
+static constexpr uint32_t SEC_PCORE = 0x524F4350u;// "PCOR" - unified per-genus aamer reference: ALL aamers + u8 prevalence (dense; supersedes CORE)
 static constexpr uint32_t SEC_GAMI  = 0x494D4147u;// "GAMI" - global aamer multiplicity index: BlockedBloom of rare aamers (genus-count ≤ K), precomputed at build time
 static constexpr uint32_t SEC_QCOL = 0x4C4F4351u; // "QCOL" - intrinsic quality, columnar (genopack-computed)
 static constexpr uint32_t SEC_XQAL = 0x4C415158u; // "XQAL" - external quality, columnar (CheckM2/anvi'o/...)

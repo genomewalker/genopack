@@ -84,7 +84,7 @@ bool parse_policy(const std::string& name, Policy& out) {
 // methods rank after all listed ones; ties break toward the lower store index.
 int method_rank(const std::string& axis, const std::string& method) {
     static const std::vector<std::string> compl_order = {
-        qual_method::AAMER_GENUS_CORE, qual_method::AAMER_FAMILY_CORE,
+        qual_method::AAMER_GENUS_CORE,
         qual_method::CLUSTER_RELATIVE, qual_method::SKETCH_FILL, qual_method::MARKER_SCG,
         qual_method::ML, qual_method::FRAGMENTATION, qual_method::POST_DECONTAM};
     static const std::vector<std::string> contam_order = {
