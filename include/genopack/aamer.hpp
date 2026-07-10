@@ -173,13 +173,15 @@ inline void emit_aamers_frac(const uint8_t* seg, int len, int k,
     for (int j = 0; j < k; ++j) v |= (uint64_t)seg[j] << (j * 5);
     const int tail_shift = (k - 1) * 5;
     for (int i = 0; i + k <= len; ++i) {
-        if (!aamer_is_low_complexity(seg + i, k)) {
-            uint64_t h = v;
-            h ^= h >> 30; h *= 0xbf58476d1ce4e5b9ULL;
-            h ^= h >> 27; h *= 0x94d049bb133111ebULL;
-            h ^= h >> 31;
-            if (h <= max_hash) out.push_back(h);
-        }
+        // Hash-gate FIRST: the FMH subsample (h <= max_hash) rejects ~1-1/N of
+        // k-mers, so the low-complexity scan runs only on the ~1/N survivors.
+        // Output is identical (both predicates must hold; neither has side effects).
+        uint64_t h = v;
+        h ^= h >> 30; h *= 0xbf58476d1ce4e5b9ULL;
+        h ^= h >> 27; h *= 0x94d049bb133111ebULL;
+        h ^= h >> 31;
+        if (h <= max_hash && !aamer_is_low_complexity(seg + i, k))
+            out.push_back(h);
         if (i + k < len)
             v = ((v - (uint64_t)seg[i]) >> 5) | ((uint64_t)seg[i + k] << tail_shift);
     }

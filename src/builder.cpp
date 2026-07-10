@@ -1205,20 +1205,59 @@ struct ArchiveBuilder::Impl {
             ? std::filesystem::temp_directory_path().string()
             : cfg.tmpdir);
 
-        // ── Genus-finalization futures (Steps 4-5) ─────────────────────────────
-        // Each genus's GSTX/GCOV/QUAL block is dispatched to the thread pool so
-        // all n_workers threads stay busy while the main thread drains the queue.
-        std::vector<std::future<void>> genus_futs;
-        genus_futs.reserve(256);
-        auto reap_futs = [&]() {
-            genus_futs.erase(
-                std::remove_if(genus_futs.begin(), genus_futs.end(),
-                    [](std::future<void>& f) {
-                        return f.wait_for(std::chrono::seconds(0))
-                               == std::future_status::ready;
-                    }),
-                genus_futs.end());
-        };
+        // ── Genus-finalization pool (Steps 4-5) ────────────────────────────────
+        // Chunk-local GSTX/GCOV/QUAL blocks run on a *persistent, bounded* pool
+        // rather than a fresh std::async thread per genus. Two reasons:
+        //  1. Oversubscription: on a dedicated N-core node the N genome workers
+        //     already saturate the cores; spawning up to ~N/4 extra finalize
+        //     threads (the old cap) makes them steal cycles from the workers —
+        //     this is the 62→30 gen/s cliff once staging/flush starts. A small
+        //     fixed pool shares a bounded slice of the core budget instead.
+        //  2. Churn: a mega-corpus flushes thousands of genera; one pthread
+        //     create/join per flush is pure overhead a persistent pool removes.
+        // The bounded queue gives the same backpressure the old size-cap loop did.
+        struct FinalizePool {
+            std::vector<std::thread> ths;
+            std::queue<std::function<void()>> q;
+            std::mutex m; std::condition_variable cv_task, cv_space, cv_idle;
+            size_t inflight = 0, cap = 0; bool stop = false;
+            void start(size_t n, size_t queue_cap) {
+                cap = queue_cap;
+                for (size_t i = 0; i < n; ++i) ths.emplace_back([this]{
+                    for (;;) {
+                        std::function<void()> job;
+                        { std::unique_lock lk(m);
+                          cv_task.wait(lk, [&]{ return stop || !q.empty(); });
+                          if (q.empty()) { if (stop) return; else continue; }
+                          job = std::move(q.front()); q.pop(); ++inflight;
+                          cv_space.notify_one(); }
+                        job();
+                        { std::lock_guard lk(m); --inflight;
+                          if (q.empty() && inflight == 0) cv_idle.notify_all(); }
+                    }
+                });
+            }
+            void submit(std::function<void()> job) {
+                std::unique_lock lk(m);
+                cv_space.wait(lk, [&]{ return q.size() < cap; });
+                q.push(std::move(job)); cv_task.notify_one();
+            }
+            void drain() {
+                std::unique_lock lk(m);
+                cv_idle.wait(lk, [&]{ return q.empty() && inflight == 0; });
+            }
+            void shutdown() {
+                { std::lock_guard lk(m); stop = true; } cv_task.notify_all();
+                for (auto& t : ths) if (t.joinable()) t.join();
+                ths.clear();
+            }
+        } finalize_pool;
+        // Fixed, small budget (was: up to max(4,n_workers/4)=6 ephemeral async
+        // threads). A persistent 1/6-of-workers pool overlaps finalize with the
+        // drain while leaving the bulk of the cores to the genome workers; the
+        // bounded queue back-pressures if finalize ever falls behind.
+        const size_t n_finalize = std::clamp<size_t>(n_workers / 6, 2, 4);
+        finalize_pool.start(n_finalize, n_finalize + 2);
         // Mutexes protecting each writer from concurrent finalize_genus calls.
         // core_writer_mx guards the (shared) PCORE writer during finalize.
         std::mutex gstx_writer_mx, gcov_writer_mx, fmhr_writer_mx,
@@ -1532,6 +1571,11 @@ struct ArchiveBuilder::Impl {
                         if (buf[ii].aamers.empty()) continue;
                         pcore_spiller.add_member(gkh_spill);
                         pcore_spiller.add_genome(gkh_spill, buf[ii].aamers);
+                        // Track folded-member count so genus_member_cap engages: once a
+                        // genus has folded genus_member_cap members into the PCORE union it
+                        // saturates, and further members only inflate spill traffic. Without
+                        // this the cap check at fn entry always sees size()==0 and never fires.
+                        if (accum_member_ids) accum_member_ids->push_back(buf[ii].genome_id);
                     }
                 }
 
@@ -1761,17 +1805,13 @@ struct ArchiveBuilder::Impl {
                 // Cross-chunk: run inline so the counter accumulation is serialized.
                 finalize_genus(std::move(buf), accum_holder, accum_member_ids);
             } else {
-                // Chunk-local: cap in-flight tasks at 2×n_workers, then dispatch async.
-                reap_futs();
-                while (genus_futs.size() >= static_cast<size_t>(std::max(4ul, static_cast<size_t>(n_workers) / 4))) {
-                    genus_futs.front().wait();
-                    reap_futs();
-                }
-                auto buf_moved = std::move(buf);
-                genus_futs.push_back(std::async(std::launch::async,
-                    [buf_moved = std::move(buf_moved), &finalize_genus]() mutable {
-                        finalize_genus(std::move(buf_moved), nullptr, nullptr);
-                    }));
+                // Chunk-local: hand to the persistent bounded finalize pool. submit()
+                // blocks when the queue is full → same backpressure as the old cap.
+                auto buf_moved = std::make_shared<std::vector<ChunkItem>>(std::move(buf));
+                finalize_pool.submit(
+                    [buf_moved, &finalize_genus]() mutable {
+                        finalize_genus(std::move(*buf_moved), nullptr, nullptr);
+                    });
             }
 
 
@@ -1986,8 +2026,8 @@ struct ArchiveBuilder::Impl {
         io_writer.join();
 
         // Drain all in-flight genus-finalization tasks before writing metadata sections.
-        for (auto& f : genus_futs) f.wait();
-        genus_futs.clear();
+        finalize_pool.drain();
+        finalize_pool.shutdown();
 
         // Sort + scan all PCORE spill partitions; emit one add_sorted() per genus.
         if (cfg.build_pcore && !pcore_spiller.empty()) {
