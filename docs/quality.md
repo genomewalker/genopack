@@ -2,8 +2,8 @@
 
 `genopack check` computes per-genome completeness and contamination signals from
 sketch geometry, aggregates them into a continuous quality score and an HQ/MQ/LQ
-tier, and writes both a TSV and a 104-byte-per-genome `QUAL` section
-(`include/genopack/qual.hpp:13-156`). All axes are derived from OPH containment,
+tier, and writes both a TSV and a 56-byte-per-genome `QUAL` section
+(`include/genopack/qual.hpp`). All axes are derived from OPH containment,
 aamer coverage, TNF geometry, and single-copy-core duplication — no external tool
 is called at runtime. CheckM2 is the calibration yardstick, not a dependency (see
 [CheckM2 alignment](#checkm2-alignment)).
@@ -23,7 +23,6 @@ The signals below are the columns of the `check` TSV
 | **SPE** | Squared prediction error — the PCA-residual half of the T²/SPE outlier pair. |
 | **FMH** (FracMinHash) | Fractional MinHash — the minority-fraction contamination axis. |
 | **GSTX** | Per-genus sketch-statistics section: OPH consensus, p90 completeness, containment dispersion (median/MAD). |
-| **Fiedler** | Second-smallest Laplacian eigenvalue (algebraic connectivity) of the contig graph — the uncalibrated coherence term (see below). |
 
 ---
 
@@ -192,42 +191,34 @@ score or tier).
 
 ### Continuous score
 
-`compute_quality_score(comp_eff, contamination, fiedler)` replaces the discrete
-cutoffs with a multiplicative score in [0,1] (`src/check/run_check.cpp:44-55`).
-Multiplicative because completeness, contamination, and contig coherence are
-near-independent failure modes — additive mixing would let high completeness mask
-contamination.
+`compute_quality_score(comp_eff, cont_val)` replaces the discrete cutoffs with a
+multiplicative score in [0,1] (`src/check/run_check.cpp:40-47`). Multiplicative
+because completeness and contamination are near-independent failure modes —
+additive mixing would let high completeness mask contamination.
 
-Let $C = \mathrm{comp\_eff}$ (0.5 neutral prior if NaN), $X = $ contamination (0 if
-NaN), and $s = $ fiedler split (0 if NaN). Then:
+Let $C = \mathrm{comp\_eff}$ (0.5 neutral prior if NaN) and $X = $ contamination
+(0 if NaN). Then:
 
 $$
 \mathrm{cont\_factor} = \frac{1}{1 + (X/0.10)^2}, \qquad
-\mathrm{coh\_penalty} = 1 - 0.5\cdot\operatorname{clamp}\!\left(\frac{s-0.5}{0.4},\,0,\,1\right)
-$$
-
-$$
-\mathrm{score} = C \cdot \mathrm{cont\_factor} \cdot \mathrm{coh\_penalty}
+\mathrm{score} = C \cdot \mathrm{cont\_factor}
 $$
 
 The contamination knee at $0.10$ gives $\mathrm{cont\_factor} \approx 0.80$ at
 $X=0.05$ and $0.50$ at $X=0.10$ — a smooth analog of the old HQ/MQ cliffs aligned
-to CheckM2's < 5% HQ cutoff. The coherence penalty is bounded ($\le 50\%$) rather
-than a hard gate, and engages only for $s > 0.5$, because the fiedler threshold is
-uncalibrated (no test coverage, `run_check.cpp:41-43`).
+to CheckM2's < 5% HQ cutoff.
 
 ### Tier chain
 
-The HQ/MQ/LQ tier is a rule chain over `comp_eff`, the aggregate `cont_val`, the
-trusted-axis count, and the fiedler split (`src/check/run_check.cpp:721-733`).
-Applied in order, later rules override earlier ones:
+The HQ/MQ/LQ tier is a rule chain over `comp_eff`, the aggregate `cont_val`, and
+the trusted-axis count (`src/check/run_check.cpp:595-604`). Applied in order, later
+rules override earlier ones:
 
 ```
 qtier = LQ
 if comp_eff ≥ 0.90 and cont_val < 0.05:                     qtier = HQ
 elif comp_eff ≥ 0.50 and cont_val < 0.10:                   qtier = MQ
 elif comp_eff ≥ 0.50 and trusted_contam_axes < 2:           qtier = MQ   # single-axis rescue
-if fiedler_oph_split < 0.10 and cont_signals ≥ 1:           qtier = LQ
 if aamer_only and qtier == HQ:                              qtier = MQ   # saturating completeness only
 if cross_genus_chimera and qtier != LQ:                     qtier = LQ   # hard veto
 if qtier == HQ and contamination not observed:              qtier = MQ   # unconfirmed → cap at MQ
@@ -235,10 +226,7 @@ if qtier == HQ and contamination not observed:              qtier = MQ   # uncon
 
 - `cont_val` is `contamination_aggregate` (the NA-safe max above).
 - `trusted_contam_axes < 2` is the single-axis MQ rescue: one firing axis never
-  demotes to LQ.
-- `cont_signals` is a corroboration count (`fmh ≥ 0.10`, `contig_outlier ≥ 0.05`,
-  `contig_split ≥ 0.05`, `leakage ≥ 0.02`) required before the uncalibrated
-  fiedler-split rule may fire (`run_check.cpp:707-727`).
+  demotes to LQ (`run_check.cpp:152`).
 - `aamer_only` means completeness came from the saturating `aamer_core` fallback
   with no `post_decontam`/`cluster_relative` support — HQ is not granted on a
   saturating estimator alone.

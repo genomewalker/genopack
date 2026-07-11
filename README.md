@@ -16,7 +16,7 @@ A single-file genome archive format for large-scale microbial genome collections
 - **Taxonomy repack** — re-shard by genus/family for 10–13× faster per-taxon NFS access
 - **Distributed build** — split TSV across N nodes, build parts in parallel, merge or coordinate via NFS manifest
 - **Append and tombstone** — add genomes or mark deleted without full rebuild
-- **Quality scoring (`genopack check`)** — per-genome completeness and contamination signals (QUAL section): cluster-relative completeness, leakage, TNF excess, chromosome skew closure, Fiedler eigenvalue, contig-level Mahalanobis outlier (CCO), SPE, sibling outlier (family-vs-genus), marker-gene completeness/redundancy, FracMinHash minority fraction
+- **Quality scoring (`genopack check`)** — per-genome completeness and contamination signals (QUAL section): cluster-relative completeness, leakage, TNF excess, chromosome skew closure, contig-level Mahalanobis outlier (CCO), SPE, sibling outlier (family-vs-genus), marker-gene completeness/redundancy, FracMinHash minority fraction
 - **Covariance sections (GCOV/FCOV)** — per-genus and per-family TNF covariance matrices built in one pass at build time or via `genopack gcov`; used by `check` for contamination detection
 - **`.gpd` derep archives** — read derep state produced by [geodesic](https://github.com/genomewalker/geodesic) via `DerepView`: O(1) `accession → rep_id`, O(1) `rep_id → embedding`, with staleness detection against the source pack
 
@@ -302,8 +302,7 @@ and FMHR (per-genus FracMinHash references) simultaneously.
 | `contamination_tnf_excess` | TNF Mahalanobis distance from genus centroid |
 | `contamination_contig_outlier` | Fraction bp where T² or SPE > 95th percentile (requires GCOV) |
 | `contamination_spe` | SPE-based contig outlier fraction (requires GCOV) |
-| `contamination_sibling_outlier` | Genus-outlier AND family-inlier fraction (requires GCOV+FCOV) |
-| `fiedler_value` | Spectral bimodality score (high = two-component TNF distribution) |
+| `contamination_rho_outlier` | Genus-outlier AND family-inlier fraction (requires GCOV+FCOV) |
 | `marker_completeness` | Single-copy marker gene completeness (requires `--markers`) |
 | `marker_redundancy` | Single-copy marker gene redundancy (requires `--markers`) |
 
