@@ -1,9 +1,11 @@
 #include <genopack/gcov.hpp>
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <numeric>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace genopack {
 
@@ -21,6 +23,26 @@ SectionDesc GcovWriter::finalize(AppendWriter& w, uint64_t section_id, uint32_t 
         entries_ = std::move(sorted);
         entry_order_.clear();
     }
+
+    // Exactly one entry per genus. lookup() binds a genus_hash to whichever entry
+    // lands first on its probe chain, so a duplicate silently scores the whole genus
+    // against a model built from an arbitrary fraction of its members. Refuse to
+    // write a section that cannot be read back correctly.
+    {
+        std::unordered_set<uint64_t> seen;
+        seen.reserve(entries_.size() * 2);
+        for (const auto& e : entries_) {
+            if (seen.insert(e.genus_hash).second) continue;
+            char msg[192];
+            std::snprintf(msg, sizeof(msg),
+                "GCOV/FCOV finalize: genus_hash %#018lx finalized more than once "
+                "(%zu entries, %zu distinct) — each genus must be accumulated across "
+                "all chunks and finalized exactly once",
+                static_cast<unsigned long>(e.genus_hash), entries_.size(), seen.size());
+            throw std::runtime_error(msg);
+        }
+    }
+
     const uint32_t n = static_cast<uint32_t>(entries_.size());
     const uint32_t min_buckets = (n == 0) ? 1
         : static_cast<uint32_t>(static_cast<double>(n) / 0.7 + 1.0);

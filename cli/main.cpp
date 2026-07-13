@@ -34,6 +34,7 @@
 #include <genopack/format.hpp>
 #include <genopack/gidx.hpp>
 #include <genopack/qual.hpp>
+#include <genopack/qual_columns.hpp>
 #include <genopack/kmrx.hpp>
 #include <genopack/merger.hpp>
 #include <genopack/mmap_file.hpp>
@@ -688,6 +689,28 @@ static int rebuild_gcov_fmhr(const std::filesystem::path& gp, int threads) {
     const auto* tail    = mmap.ptr_at<TailLocator>(mmap.size() - sizeof(TailLocator));
     const uint64_t prev = tail->toc_offset;
     const uint64_t gen  = toc_r.header.generation + 1;
+
+    // QCOL's GCOV-derived columns (contig_outlier / spe / rho / cross_genus) were
+    // scored against the model we are about to replace — see upstream_types(SEC_QCOL)
+    // in derivation.hpp, which already declares SEC_GCOV an input. Rewriting GCOV
+    // without touching them leaves check() serving stale fractions from cache
+    // (pass_b.cpp:161-192 gates on QUAL_FLAG_GCOV_SCORED, not on derivation_hash),
+    // and only `--recompute` would paper over it. Clear the flag so those genomes are
+    // rescored against the new model.
+    std::vector<QualRecord> qrecs;
+    for (auto* sd : toc_r.find_by_type(SEC_QCOL)) {
+        ColStoreReader cr;
+        cr.open(mmap.data(), sd->file_offset, sd->compressed_size);
+        qcol_scan(cr, [&](const QualRecord& rec) { qrecs.push_back(rec); });
+    }
+    for (auto& r : qrecs) {
+        r.qual_flags &= ~QualRecord::QUAL_FLAG_GCOV_SCORED;
+        r.contig_outlier_u8  = 0;
+        r.contig_outlier_u16 = 0;
+        r.spe_outlier_u8     = 0;
+        r.rho_outlier_u8     = 0;
+        r.cross_genus_u8     = 0;
+    }
     mmap.close();
 
     AppendWriter aw;
@@ -700,13 +723,21 @@ static int rebuild_gcov_fmhr(const std::filesystem::path& gp, int threads) {
     SectionDesc fmhr_sd = fmhr_w.n_genera() > 0
         ? fmhr_w.finalize(aw, next_sid) : SectionDesc{};
 
+    SectionDesc qcol_sd{};
+    if (!qrecs.empty()) {
+        ++next_sid;
+        qcol_sd = qcol_write(aw, next_sid, std::move(qrecs));
+    }
+
     TocWriter new_toc;
     for (const auto& sd : toc_r.sections)
-        if (sd.type != SEC_GCOV && sd.type != SEC_FCOV && sd.type != SEC_FMHR)
+        if (sd.type != SEC_GCOV && sd.type != SEC_FCOV && sd.type != SEC_FMHR
+            && !(sd.type == SEC_QCOL && qcol_sd.type == SEC_QCOL))
             new_toc.add_section(sd);
     new_toc.add_section(gcov_sd);
     if (fcov_w.n_genera() > 0) new_toc.add_section(fcov_sd);
     if (fmhr_w.n_genera() > 0) new_toc.add_section(fmhr_sd);
+    if (qcol_sd.type == SEC_QCOL) new_toc.add_section(qcol_sd);
     aw.flush();
     stamp_section_checksums(gp.c_str(), new_toc.sections(), /*only_if_zero=*/true);
     new_toc.finalize(aw, gen,

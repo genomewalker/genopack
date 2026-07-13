@@ -149,6 +149,7 @@ public:
     size_t size() const { return records_.size(); }
 
     const std::vector<QualRecord>& records() const { return records_; }
+    std::vector<QualRecord>& records_mut() { return records_; }
     std::vector<QualRecord> take() { return std::move(records_); }
 
 private:

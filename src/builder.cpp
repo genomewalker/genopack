@@ -1199,6 +1199,16 @@ struct ArchiveBuilder::Impl {
 
         // In-memory GCOV/FCOV/FMHR writers populated during flush_staging_buf (one-pass).
         GcovWriter build_gcov_w, build_fcov_w;
+        // A genus spans as many chunks as it takes to fill the staging buffer, so its
+        // TNF profiles must accumulate ACROSS chunks and be finalized exactly once —
+        // GcovReader binds a genus_hash to a single entry, and a per-chunk finalize
+        // would leave every genome scored against one arbitrary chunk's model.
+        // Per-genome outlier fractions are therefore scored after the last chunk lands
+        // (see the GCOV/FCOV block near the end of build()); gcov_rows maps each
+        // accumulated genome back to its QUAL row.
+        std::unordered_map<std::string, GenusAccum>            gcov_acc, fcov_acc;
+        std::unordered_map<std::string, uint32_t>              gcov_members, fcov_members;
+        std::unordered_map<std::string, std::vector<uint32_t>> gcov_rows;
         // FmhrWriter spills per-genus FMH hash sets to disk to avoid accumulating
         // O(n_genomes × hashes_per_genome) in RAM throughout the build.
         FmhrWriter build_fmhr_w(cfg.tmpdir.empty()
@@ -1340,10 +1350,18 @@ struct ArchiveBuilder::Impl {
 
             std::string genus_key;
             std::string species_key;
+            std::string family_key;
             for (const auto& [k, v] : buf[0].record.extra_fields)
                 if (k == "taxonomy") {
                     genus_key   = extract_taxonomy_bucket(v, 'g');
                     species_key = extract_taxonomy_bucket(v, 's');
+                    auto fp = v.find("f__");
+                    if (fp != std::string::npos) {
+                        auto fe = v.find(';', fp + 3);
+                        family_key = v.substr(fp, fe == std::string::npos
+                                                   ? v.size() - fp : fe - fp);
+                        if (family_key == "f__") family_key.clear();
+                    }
                     break;
                 }
             const std::string& gstx_key = (!species_key.empty() && species_key != "__unclassified__")
@@ -1537,20 +1555,6 @@ struct ArchiveBuilder::Impl {
 
             // ── One-pass GCOV/FCOV/FMHR ──────────────────────────────────────
             if (cfg.build_gcov) {
-                std::string family_key;
-                for (const auto& [k, v] : buf[0].record.extra_fields)
-                    if (k == "taxonomy") {
-                        auto fp = v.find("f__");
-                        if (fp != std::string::npos) {
-                            auto fe = v.find(';', fp + 3);
-                            family_key = v.substr(fp, fe == std::string::npos
-                                                       ? v.size() - fp : fe - fp);
-                            if (family_key == "f__") family_key.clear();
-                        }
-                        break;
-                    }
-
-                GenusAccum genus_acc, family_acc;
                 std::vector<uint64_t> fmh_all;
                 const bool do_markers = build_mrk_rd && build_mrk_rd->has_merged_pool();
                 const bool need_aamers = do_markers || cfg.build_pcore;
@@ -1559,11 +1563,8 @@ struct ArchiveBuilder::Impl {
                 (void)need_aamers;
                 (void)accum_holder;
 
-                for (size_t ii = 0; ii < buf.size(); ++ii) {
-                    genus_acc.add_genome(all_profiles[ii]);
-                    if (!family_key.empty()) family_acc.add_genome(all_profiles[ii]);
+                for (size_t ii = 0; ii < buf.size(); ++ii)
                     fmh_all.insert(fmh_all.end(), buf[ii].fmh.begin(), buf[ii].fmh.end());
-                }
 
                 if (!aamers_capped && cfg.build_pcore) {
                     const uint64_t gkh_spill = GcovWriter::hash_genus(genus_key);
@@ -1579,70 +1580,11 @@ struct ArchiveBuilder::Impl {
                     }
                 }
 
-                const uint32_t n_mem = static_cast<uint32_t>(buf.size());
-                GcovEntry ge{}, fe{};
-                bool fcov_ok = false;
-                {
-                    std::lock_guard<std::mutex> lk(gcov_writer_mx);
-                    ge = finalize_and_add_genus(genus_key, n_mem, genus_acc, build_gcov_w);
-                    if (!family_key.empty()) {
-                        fe = finalize_and_add_genus(family_key, n_mem, family_acc, build_fcov_w);
-                        fcov_ok = (fe.flags & GCOV_FLAG_VALID) != 0;
-                    }
-                }
-
                 if (!fmh_all.empty()) {
                     std::sort(fmh_all.begin(), fmh_all.end());
                     fmh_all.erase(std::unique(fmh_all.begin(), fmh_all.end()), fmh_all.end());
                     std::lock_guard<std::mutex> lk(fmhr_writer_mx);
                     build_fmhr_w.add(GcovWriter::hash_genus(genus_key), std::move(fmh_all));
-                }
-
-                // Score contigs and populate outlier fields.
-                const bool genus_ok = (ge.flags & GCOV_FLAG_VALID) != 0;
-                for (size_t ii = 0; ii < pending_qrs.size(); ++ii) {
-                    auto& qr        = pending_qrs[ii];
-                    const auto& cps = all_profiles[ii];
-                    qr.qual_flags  |= QualRecord::QUAL_FLAG_GCOV_SCORED;
-                    if (!genus_ok || cps.empty()) continue;
-
-                    uint32_t cco_bp=0, spe_bp=0, rho_bp=0, sib_bp=0, scored_bp=0;
-                    for (const auto& cp : cps) {
-                        scored_bp += cp.bp;
-                        float xmu[136];
-                        for (int d=0;d<136;++d) xmu[d] = cp.p[d] - ge.mu[d];
-                        float mahal, spe_val;
-                        gcov_mahalanobis_spe(ge, xmu, &mahal, &spe_val);
-                        const float pct  = gcov_percentile(ge, mahal);
-                        const float spct = gcov_spe_percentile(ge, spe_val);
-                        const bool t2  = pct  >= kGcovOutlierPct;
-                        const bool spe = spct >= kGcovOutlierPct;
-                        if (t2 || spe) cco_bp += cp.bp;
-                        if (spe)       spe_bp += cp.bp;
-                        float rhod[16];
-                        for (int i=0;i<16;++i) rhod[i] = cp.rho[i] - ge.rho_mean[i];
-                        if (gcov_rho_percentile(ge, gcov_rho_distance(ge, rhod)) >= kGcovOutlierPct)
-                            rho_bp += cp.bp;
-                        if ((t2||spe) && fcov_ok) {
-                            float xmuf[136];
-                            for (int d=0;d<136;++d) xmuf[d] = cp.p[d] - fe.mu[d];
-                            float fmahal, fspe;
-                            gcov_mahalanobis_spe(fe, xmuf, &fmahal, &fspe);
-                            const float fp  = gcov_percentile(fe, fmahal);
-                            const float fsp = gcov_spe_percentile(fe, fspe);
-                            if (!(fp >= kGcovOutlierPct || fsp >= kGcovOutlierPct))
-                                sib_bp += cp.bp;
-                        }
-                    }
-                    if (scored_bp > 0) {
-                        auto enc = [&](uint32_t bp) {
-                            return static_cast<uint8_t>(
-                                std::min(255u, (bp * 255u) / scored_bp));
-                        };
-                        qr.contig_outlier_u8  = enc(cco_bp);
-                        qr.spe_outlier_u8     = enc(spe_bp);
-                        qr.rho_outlier_u8     = enc(rho_bp);
-                    }
                 }
 
                 // Marker completeness — reuse aamers collected in FMH loop.
@@ -1722,7 +1664,43 @@ struct ArchiveBuilder::Impl {
 
             {
                 std::lock_guard<std::mutex> lk(qual_writer_mx);
+                const uint32_t qbase = static_cast<uint32_t>(qual_writer.size());
+                // A genome with no long contigs is still GCOV-scored — its outlier
+                // fractions are simply all zero. Flag it here rather than in the
+                // end-of-build pass, which only walks genomes that made it into an
+                // accumulator; otherwise check() sees a stale flag and rescans it.
+                if (cfg.build_gcov)
+                    for (auto& qr : pending_qrs)
+                        qr.qual_flags |= QualRecord::QUAL_FLAG_GCOV_SCORED;
                 for (auto& qr : pending_qrs) qual_writer.add(qr);
+
+                // Fold this chunk into the genus/family accumulators under the same
+                // lock that hands out QUAL row indices, so gcov_rows[g][i] is exactly
+                // the QUAL row of the i-th genome in gcov_acc[g]'s CSR order.
+                // add_genome() skips genomes with no long contigs — do the same here.
+                // "__unclassified__" is not a genus — it is every genome the taxonomy
+                // could not place, pooled across all domains. A Gaussian fitted to that
+                // pool is meaningless, and its in-sample quantiles would make genuinely
+                // divergent genomes look typical. The offline gcov path already declines
+                // to model it (build_genus_stats.cpp:250,553); match it here, or a pack
+                // built with --gcov disagrees with the same pack after `genopack gcov`.
+                // These genomes keep GCOV_SCORED with zero outlier fractions, exactly as
+                // a genome with no long contigs does.
+                if (cfg.build_gcov && genus_key != "__unclassified__") {
+                    auto& ga = gcov_acc[genus_key];
+                    auto& gr = gcov_rows[genus_key];
+                    gcov_members[genus_key] += static_cast<uint32_t>(buf.size());
+                    for (size_t ii = 0; ii < all_profiles.size(); ++ii) {
+                        if (all_profiles[ii].empty()) continue;
+                        ga.add_genome(all_profiles[ii]);
+                        gr.push_back(qbase + static_cast<uint32_t>(ii));
+                    }
+                    if (!family_key.empty()) {
+                        auto& fa = fcov_acc[family_key];
+                        fcov_members[family_key] += static_cast<uint32_t>(buf.size());
+                        for (const auto& cps : all_profiles) fa.add_genome(cps);
+                    }
+                }
             }
         }; // end finalize_genus
 
@@ -2193,6 +2171,80 @@ struct ArchiveBuilder::Impl {
             spdlog::info("Writing GSTX: {} genera", gstx_writer.n_genera());
             SectionDesc gstx_sd = gstx_writer.finalize(mw, next_section_id++);
             toc.add_section(gstx_sd);
+        }
+
+        // ── GCOV/FCOV: finalize once per genus, then score ─────────────────────
+        // Every chunk of a genus has now been folded into gcov_acc[genus], so the
+        // model is built from all its members — not from whichever chunk happened to
+        // flush first. Scoring happens here (not in flush_staging_buf) because the
+        // model does not exist until the last chunk lands, and it must precede the
+        // QCOL write below since the outlier fractions live in the QUAL records.
+        // Keys are sorted so the section is byte-reproducible across runs.
+        if (cfg.build_gcov && cfg.build_gstx && !gcov_acc.empty()) {
+            auto sorted_keys = [](const auto& m) {
+                std::vector<std::string> ks;
+                ks.reserve(m.size());
+                for (const auto& kv : m) ks.push_back(kv.first);
+                std::sort(ks.begin(), ks.end());
+                return ks;
+            };
+            auto& qrecs = qual_writer.records_mut();
+
+            for (const auto& gk : sorted_keys(gcov_acc)) {
+                GenusAccum& acc  = gcov_acc[gk];
+                const GcovEntry ge = finalize_and_add_genus(gk, gcov_members[gk],
+                                                            acc, build_gcov_w);
+                const auto& rows    = gcov_rows[gk];
+                const bool genus_ok = (ge.flags & GCOV_FLAG_VALID) != 0;
+                const uint32_t ng   = acc.n_genomes_with_long();
+
+                // rows[gi] is the QUAL row of the gi-th genome in acc's CSR order.
+                // If that correspondence ever slips, the outlier fractions land on the
+                // wrong genomes — silently. Indexing below is unchecked, so check here.
+                if (rows.size() != ng)
+                    throw std::runtime_error("GCOV: " + gk + " has " + std::to_string(ng)
+                        + " accumulated genomes but " + std::to_string(rows.size())
+                        + " QUAL rows — accumulator/row correspondence broken");
+
+                for (uint32_t gi = 0; gi < ng; ++gi) {
+                    QualRecord& qr = qrecs.at(rows[gi]);
+                    if (!genus_ok) continue;
+
+                    uint32_t cco_bp = 0, spe_bp = 0, rho_bp = 0, scored_bp = 0;
+                    for (uint32_t ci = acc.genome_offsets[gi];
+                         ci < acc.genome_offsets[gi + 1]; ++ci) {
+                        const ProfileEntry& cp = acc.flat[ci];
+                        scored_bp += cp.bp;
+                        float xmu[136];
+                        for (int d = 0; d < 136; ++d) xmu[d] = cp.p[d] - ge.mu[d];
+                        float mahal, spe_val;
+                        gcov_mahalanobis_spe(ge, xmu, &mahal, &spe_val);
+                        const bool t2  = gcov_percentile(ge, mahal)       >= kGcovOutlierPct;
+                        const bool spe = gcov_spe_percentile(ge, spe_val) >= kGcovOutlierPct;
+                        if (t2 || spe) cco_bp += cp.bp;
+                        if (spe)       spe_bp += cp.bp;
+                        float rhod[16];
+                        for (int i = 0; i < 16; ++i) rhod[i] = cp.rho[i] - ge.rho_mean[i];
+                        if (gcov_rho_percentile(ge, gcov_rho_distance(ge, rhod)) >= kGcovOutlierPct)
+                            rho_bp += cp.bp;
+                    }
+                    if (scored_bp == 0) continue;
+                    auto enc = [&](uint32_t bp) {
+                        return static_cast<uint8_t>(std::min(255u, (bp * 255u) / scored_bp));
+                    };
+                    qr.contig_outlier_u8 = enc(cco_bp);
+                    qr.spe_outlier_u8    = enc(spe_bp);
+                    qr.rho_outlier_u8    = enc(rho_bp);
+                }
+                acc.flat.clear();
+                acc.flat.shrink_to_fit();
+            }
+            gcov_acc.clear();
+            gcov_rows.clear();
+
+            for (const auto& fk : sorted_keys(fcov_acc))
+                finalize_and_add_genus(fk, fcov_members[fk], fcov_acc[fk], build_fcov_w);
+            fcov_acc.clear();
         }
 
         // Write QCOL section (intrinsic quality, columnar — replaces flat QUAL).

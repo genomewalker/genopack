@@ -374,6 +374,9 @@ GcovWriter build_family_covariance(const ArchiveReader& ar, int threads) {
 
 GcovFcovFmhrResult build_gcov_fcov_fmhr(const ArchiveReader& ar, int threads) {
     static constexpr int K_FMH = 21, C_FMH = 125;
+    // Compact a genus's hash vector once it exceeds max(2 x last union, this). Floor keeps
+    // small genera from re-sorting on every genome.
+    static constexpr size_t kFmhrCompactMin = 1u << 20;
     static constexpr uint32_t FMH_MIN_BP  = 1000;
 
     // ── Step 1: scan taxonomy → per-genome (genus, family) ────────────────────
@@ -430,6 +433,7 @@ GcovFcovFmhrResult build_gcov_fcov_fmhr(const ArchiveReader& ar, int threads) {
     std::vector<std::mutex>             genus_mu(ng),    family_mu(nf);
     std::vector<std::vector<uint64_t>>  fmhr_hashes(ng);
     std::vector<std::mutex>             fmhr_mu(ng);
+    std::vector<size_t>                 fmhr_mark(ng, kFmhrCompactMin);
 
     // ── Step 3: collect all accessions for a single shard scan ────────────────
     std::vector<std::string> all_accs;
@@ -486,9 +490,25 @@ GcovFcovFmhrResult build_gcov_fcov_fmhr(const ArchiveReader& ar, int threads) {
                                                 vecs[0].begin(), vecs[0].end());
                     }
                     if (!local_hashes.empty()) {
+                        std::sort(local_hashes.begin(), local_hashes.end());
+                        local_hashes.erase(std::unique(local_hashes.begin(), local_hashes.end()),
+                                           local_hashes.end());
                         std::lock_guard<std::mutex> lk(fmhr_mu[gi]);
-                        fmhr_hashes[gi].insert(fmhr_hashes[gi].end(),
-                                               local_hashes.begin(), local_hashes.end());
+                        auto& h = fmhr_hashes[gi];
+                        h.insert(h.end(), local_hashes.begin(), local_hashes.end());
+                        // A genus sketch is the UNION of its members', and members are
+                        // near-identical: g__Escherichia (612,699 genomes x ~40k hashes at
+                        // c=125) appends ~196 GB that collapses to a pangenome union of a few
+                        // million. Deduping only after the pass OOM-killed this at 200 GB.
+                        // Compact whenever the vector doubles past its last union size, so peak
+                        // tracks the union rather than the sum. Output is unchanged: the final
+                        // sort/unique below is idempotent.
+                        if (h.size() >= fmhr_mark[gi]) {
+                            std::sort(h.begin(), h.end());
+                            h.erase(std::unique(h.begin(), h.end()), h.end());
+                            h.shrink_to_fit();
+                            fmhr_mark[gi] = std::max<size_t>(2 * h.size(), kFmhrCompactMin);
+                        }
                     }
                 }
             }
@@ -521,6 +541,7 @@ FmhrWriter build_fmh_genus_section(const ArchiveReader& ar, int threads) {
     static constexpr int K_FMH = 21;
     static constexpr int C_FMH = 125;
     static constexpr uint32_t MIN_CONTIG_BP = 1000;
+    static constexpr size_t kFmhrCompactMin = 1u << 20;
 
     std::unordered_map<std::string, std::vector<std::string>> genus_to_accs;
     ar.scan_taxonomy([&](std::string_view acc, std::string_view tax) {
@@ -550,6 +571,9 @@ FmhrWriter build_fmh_genus_section(const ArchiveReader& ar, int threads) {
     for (auto& [genus, accs] : genera) {
         std::vector<uint64_t> all_hashes;
         std::mutex mu;
+        // See build_gcov_fcov_fmhr: a large genus appends hundreds of GB of near-duplicate
+        // member sketches that collapse to a small union. Compact as we go.
+        size_t mark = kFmhrCompactMin;
 
         auto collect = [&](std::string_view fasta) {
             const char* p = fasta.data(), *end = p + fasta.size();
@@ -580,6 +604,13 @@ FmhrWriter build_fmh_genus_section(const ArchiveReader& ar, int threads) {
                 if (!result.empty() && !result[0].empty()) {
                     std::lock_guard<std::mutex> lk(mu);
                     all_hashes.insert(all_hashes.end(), result[0].begin(), result[0].end());
+                    if (all_hashes.size() >= mark) {
+                        std::sort(all_hashes.begin(), all_hashes.end());
+                        all_hashes.erase(std::unique(all_hashes.begin(), all_hashes.end()),
+                                         all_hashes.end());
+                        all_hashes.shrink_to_fit();
+                        mark = std::max<size_t>(2 * all_hashes.size(), kFmhrCompactMin);
+                    }
                 }
             }
         };
