@@ -12,6 +12,8 @@ int cmd_check(const std::filesystem::path& pack_path,
               const std::filesystem::path& output,
               bool recompute = false,
               const std::filesystem::path& markers_path = {},
-              bool scan_all = false);
+              bool scan_all = false,
+              float cross_genus_margin = 0.0f,
+              const std::filesystem::path& dup_restore_path = {});
 
 } // namespace genopack::check

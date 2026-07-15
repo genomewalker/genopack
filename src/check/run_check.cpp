@@ -28,22 +28,15 @@ namespace genopack::check {
 
 namespace {
 
-// Continuous genome quality score in [0,1] for threshold-free ranking, replacing the
-// discrete HQ/MQ/LQ cutoffs. Multiplicative because completeness and contamination are
-// near-independent failure modes — additive mixing would let high completeness mask
-// contamination. NaN completeness → 0.5 neutral prior; NaN contamination → no penalty.
-//   comp_eff is intrinsic completeness (see completeness_effective), so cluster_relative never
-//   crushes a complete genome that merely covers little of a diverse genus pangenome.
-//   cont_factor: rational decay with the knee at 0.10 (5% → ≈0.8, 10% → 0.5) — a smooth analog
-//     of the old HQ/MQ contamination cliffs, aligned to CheckM2's <5% HQ cutoff instead of
-//     halving the score at 5%, so ranking stays stable across them.
-float compute_quality_score(float comp_eff, float cont_val) {
-    const float C = std::isnan(comp_eff) ? 0.5f : comp_eff;
-    const float X = std::isnan(cont_val) ? 0.0f : cont_val;
-    // knee at 0.10: 5% cont → cont_factor ≈0.8, 10% → 0.5 (was /0.05f: 5% → 0.5)
-    const float xr = X / 0.10f;
-    const float cont_factor = 1.0f / (1.0f + xr * xr);
-    return C * cont_factor;
+// Continuous genome quality score in [0,1] for threshold-free ranking. COMPLETENESS-ONLY:
+// contamination no longer folds into this score. The old multiplicative cont_factor was a
+// back-door gate -- a 0.10 knee halves the score on a signal whose PPV vs CheckM2 never exceeds
+// ~15%, silently reordering the catalog on noise. Contamination is now reported as three
+// separate channels (contamination_channels) and consumed by derep as an explicit D->S->G
+// tiebreak, so the ranking stays interpretable and the noisy channels can never override the
+// calibrated one. NaN completeness → 0.5 neutral prior.
+float compute_quality_score(float comp_eff) {
+    return std::isnan(comp_eff) ? 0.5f : comp_eff;
 }
 
 // Intrinsic completeness_effective for tier/score, kept identical between the QCOL
@@ -102,71 +95,122 @@ float duplication_contamination(float excess, float mass) {
     return std::isnan(excess) ? NAN : excess * kDupToContamScale;
 }
 
-// Single contamination determinant: NA-safe max over every observable contamination axis.
-// HQ used to hinge on the FMH minority axis alone, so a missing (NA) FMH call was scored as
-// zero contamination and a genuinely dirty genome slipped through HQ (GCMeta_00156701: fmh
-// NA, CheckM2 12.2%). Taking the max over all axes and ignoring NA means no single absent
-// axis can lower the score. All axes are [0,1] minority/outlier fractions
-// (spe/rho = u8/255 pass_b.cpp:196-198, duplication scaled via duplication_contamination,
-// contig_outlier_adj fraction types.hpp:81) except tnf_excess (dist/ref-1 ratio,
-// builder.cpp:1415) which is clamped into the same range.
-// cross_genus is deliberately excluded — it is a hard chimera veto handled at the call site.
-//   contamination_tnf_minor is the near-clade detector (util.cpp: BIC-free TNF-GMM minority
-//   mass, multi-contig guarded) — catches same-species/genus mergers that stay k-mer-similar
-//   so fmh/cross_genus read ~0 but a compositional minority still exists.
-//   observed: FMH/tnf_minor/contig_outlier_adj/spe/rho/duplication carry a NAN sentinel
-//     when unmeasured, so any non-NAN one proves contamination was actually observed. leakage and
-//     tnf_excess default to 0.0f when unmeasured (indistinguishable from clean), so they raise
-//     the max but never by themselves establish observability. When observed stays false, no
-//     axis was available → contamination is unconfirmed and HQ must be capped at MQ.
-float contamination_aggregate(const GenomeQuality& q, bool& observed) {
-    float m = 0.0f;
-    observed = false;
+// Reference-free contamination as THREE near-independent channels, replacing the old NA-safe MAX
+// over 7 axes. That MAX let the single noisiest of ~7 CORRELATED axes set the score: the four
+// geometry axes (rho/spe/contig_outlier_adj/tnf_minor) co-fire at 20-50x independence -- they are
+// ONE TNF/GCOV signal -- so a MAX counted that signal up to four times. The calibration (all
+// 9.53M genomes, CheckM2 as truth) showed the resulting gate at 6.9% PPV / 5.7% recall, demoting
+// 362,935 genomes to catch ~1,200 real contaminants. So:
+//   D = duplication_contamination(...)  -- the ONLY CheckM2-calibrated channel (marker duplication)
+//   S = fmh_minority_fraction           -- sketch minority (k-mer)
+//   G = median(present geometry axes)   -- the correlated geometry signal, collapsed to one vote
+// leakage is DROPPED (mathematically dead: max 0.005 << its 0.02 threshold; the alpha=1 forcing
+// is not worth refitting) and tnf_excess is DROPPED (default-0, untrusted, only ever entered
+// through the MAX). cross_genus stays out -- it is a ranker (PPV 2.8%), never a gate.
+// Contamination is REPORTED, never a discard gate (see quality_tier): a genome is LQ on
+// completeness alone, and these channels drive derep as a reliability-ordered tiebreak, so
+// genuine heterogeneity (prophage/plasmid/HGT island -- real signal CheckM2 rightly calls clean)
+// is preserved as evidence instead of deleted. `observed` is true iff any channel was measured.
+struct ContamChannels {
+    float D = NAN, S = NAN, G = NAN;
+    float display = NAN;   // noisy-OR union of present channels; TSV/human display ONLY
+    bool  observed = false;
+    int   geom_fired = 0;  // geometry axes over their per-axis threshold; channel counts iff >=2
+};
+
+ContamChannels contamination_channels(const GenomeQuality& q) {
     auto clamp01 = [](float v) { return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v); };
-    auto acc = [&](float v) {                         // NA-capable axes: establish observability
-        if (std::isnan(v)) return;
-        observed = true;
-        const float c = clamp01(v);
-        if (c > m) m = c;
+    ContamChannels c;
+
+    const float d = duplication_contamination(q.contamination_duplication, q.contamination_core_dup_mass);
+    if (!std::isnan(d)) { c.D = clamp01(d); c.observed = true; }
+    if (!std::isnan(q.fmh_minority_fraction)) { c.S = clamp01(q.fmh_minority_fraction); c.observed = true; }
+
+    // Geometry: median of the present axes so the one signal votes once, not four times. Per-axis
+    // fire thresholds (contig_outlier_adj 0.05, others 0.10) accumulate geom_fired; the channel is
+    // only trusted to have fired when >=2 of the 4 agree -- D5 in the calibration (require two
+    // channels to corroborate) was the WORST row, so a lone geometry axis must never carry weight.
+    const std::pair<float, float> geom[] = {
+        {q.contamination_rho_outlier,        0.10f},
+        {q.contamination_spe,                0.10f},
+        {q.contamination_contig_outlier_adj, 0.05f},
+        {q.contamination_tnf_minor,          0.10f},
     };
-    auto acc_max = [&](float v) {                     // default-0 axes: raise max only
-        if (std::isnan(v)) return;
-        const float c = clamp01(v);
-        if (c > m) m = c;
-    };
-    acc(q.fmh_minority_fraction);
-    acc(q.contamination_tnf_minor);
-    acc(q.contamination_contig_outlier_adj);
-    acc(q.contamination_spe);
-    acc(q.contamination_rho_outlier);
-    acc(duplication_contamination(q.contamination_duplication, q.contamination_core_dup_mass)); // calibrated graded term
-    acc_max(q.contamination_leakage);
-    acc_max(q.contamination_tnf_excess);
-    return m;
+    std::vector<float> present;
+    present.reserve(4);
+    for (const auto& [v, thr] : geom) {
+        if (std::isnan(v)) continue;
+        present.push_back(clamp01(v));
+        if (v >= thr) ++c.geom_fired;
+    }
+    if (!present.empty()) {
+        std::sort(present.begin(), present.end());
+        const size_t n = present.size();
+        c.G = (n & 1) ? present[n / 2] : 0.5f * (present[n / 2 - 1] + present[n / 2]);
+        c.observed = true;
+    }
+
+    // Display scalar: probabilistic union (noisy-OR) over PRESENT channels, for TSV/human reading
+    // only. Derep must use the D->S->G lexicographic priority, NEVER this scalar: noisy-OR inflates
+    // several weak channels into false corroboration (three 0.2s -> 0.49), and RMS would dilute the
+    // one calibrated channel against the silence of the others. Neither is a safe ordering key.
+    float keep = 1.0f; bool any = false;
+    for (float ch : {c.D, c.S, c.G})
+        if (!std::isnan(ch)) { keep *= (1.0f - ch); any = true; }
+    if (any) c.display = 1.0f - keep;
+    return c;
 }
 
-// Count how many TRUSTED contamination axes fire above their observability floor. Mixture is
-// excluded (see contamination_aggregate). An LQ contamination demotion requires >=2 of these
-// firing; a lone axis (cv >= 0.10) may only cap at MQ — kills single-axis false positives that
-// demoted 1.84M CheckM2-HQ genomes to LQ. cross_genus is handled separately as a hard veto.
-int trusted_contam_axes(const GenomeQuality& q) {
-    auto fires = [](float v, float thr) { return !std::isnan(v) && v >= thr; };
-    return fires(q.fmh_minority_fraction,             0.10f)
-         + fires(q.contamination_tnf_minor,           0.10f)
-         + fires(q.contamination_contig_outlier_adj,  0.05f)
-         + fires(q.contamination_spe,                 0.10f)
-         + fires(q.contamination_rho_outlier,         0.10f)
-         + fires(duplication_contamination(q.contamination_duplication, q.contamination_core_dup_mass), 0.05f)
-         + fires(q.contamination_leakage,             0.02f);
+// Diagnostic count of channels that fired (TSV only). Geometry counts as one channel and only
+// when >=2 of its axes agree. Not a tier input -- tiering is completeness-only (quality_tier).
+int contam_channels_fired(const ContamChannels& c) {
+    int n = 0;
+    if (!std::isnan(c.D) && c.D >= 0.05f) ++n;
+    if (!std::isnan(c.S) && c.S >= 0.10f) ++n;
+    if (c.geom_fired >= 2) ++n;
+    return n;
 }
 
-// Cross-genus chimera veto: a bin whose contigs fit a foreign genus better than the assigned
-// one is the most dangerous defect for a reference DB. Kept independent of the aggregate (a
-// chimera can look clean on every other axis, e.g. ZAHE052 cross_genus=1.0). >=0.10 of scored
-// bp cross-assigned = chimera, above the incidental-HGT range.
-bool cross_genus_chimera(const GenomeQuality& q) {
-    return !std::isnan(q.contamination_cross_genus) && q.contamination_cross_genus >= 0.10f;
+// The tier decision, shared by the QCOL (quality_tier_u8) and TSV paths so they can never drift.
+// COMPLETENESS-ONLY: contamination is no longer grounds to demote to LQ. The old gate demoted
+// 362,935 genomes at 6.9% PPV; decoupling removes every one of those wrongful discards and leaves
+// only the genuine-incompleteness floor (ce<0.50). Contamination survives one narrow role: the
+// single CheckM2-CALIBRATED channel (duplication, D) may cap HQ->MQ, so the top tier still means
+// "clean and complete". This cap NEVER forces LQ, so it cannot reintroduce wrongful discard -- it
+// only distinguishes HQ from MQ, and only on the one axis validated against CheckM2.
+const char* quality_tier(const GenomeQuality& q) {
+    const float ce = completeness_effective(q);
+    if (std::isnan(ce)) return "LQ";
+    if (ce >= 0.90f) {
+        // aamer_core is presence-saturating (0.047 dynamic range); it cannot support HQ alone.
+        const bool aamer_only = std::isnan(q.completeness_post_decontam) &&
+                                std::isnan(q.completeness_cluster_relative) &&
+                                !std::isnan(q.completeness_aamer_core);
+        if (aamer_only) return "MQ";
+        const float D = duplication_contamination(q.contamination_duplication,
+                                                  q.contamination_core_dup_mass);
+        if (!std::isnan(D) && D >= 0.05f) return "MQ";
+        return "HQ";
+    }
+    if (ce >= 0.50f) return "MQ";
+    return "LQ";
 }
+
+// cross_genus is a RANKER, not a gate. GTDB-Tk ground truth on a 2,036-genome stratified
+// sample (900 top-bin, 450 veto, 300 mid, 450 clean controls): it orders misplacement
+// correctly -- 23x enrichment over the clean baseline, monotonic in every bin -- but its
+// positive predictive value as a demotion rule is 2.8% at >=0.10 and only 20.4% even at a
+// saturated 1.0. It was demoting ~97 correctly-labelled genomes for every 3 misplaced ones.
+//
+// The reason is in pass_b.cpp:864-895: a contig is flagged when ANY of ~52 candidate foreign
+// Gaussians beats the host log-likelihood by more than cross_genus_lr_margin, which defaulted
+// to 0 -- an uncorrected maximum over 52 competitors. Whether a foreign model out-scores the
+// host is a GENOME-level property (the genome sits slightly off-centre inside its own
+// legitimate genus), so the winner beats the host on essentially every contig at once and the
+// statistic collapses to 0-or-1: 70% of the top bin sits at exactly 1.0000.
+//
+// So: no hard veto. Set a calibrated cross_genus_lr_margin to correct the multiple comparison,
+// and let the >=2-trusted-axes gate decide, like every other axis.
 
 std::vector<std::string> read_accession_list(const std::filesystem::path& p) {
     std::vector<std::string> result;
@@ -194,10 +238,80 @@ std::vector<std::filesystem::path> collect_gpk_paths(const std::filesystem::path
     return paths;
 }
 
+// Re-injection path for the build-time-only dup axes. Accepts either a genopack quality TSV
+// (contamination_duplication / core_dup_mass) or a `cladesplit score` TSV (core_dup /
+// core_dup_mass) -- both carry the axis keyed by accession, so a pack whose QUAL lost it can be
+// repaired without a full rebuild.
+std::unordered_map<std::string, std::pair<float, float>>
+read_dup_restore(const std::filesystem::path& tsv)
+{
+    std::ifstream in(tsv);
+    if (!in) throw std::runtime_error("check: cannot open --dup-restore: " + tsv.string());
+
+    std::string line;
+    if (!std::getline(in, line))
+        throw std::runtime_error("check: --dup-restore is empty: " + tsv.string());
+
+    int c_acc = -1, c_dup = -1, c_mass = -1, col = 0;
+    for (size_t p = 0; p <= line.size(); ) {
+        const size_t e = line.find('\t', p);
+        const std::string h = line.substr(p, (e == std::string::npos ? line.size() : e) - p);
+        if      (h == "accession")                 c_acc  = col;
+        else if (h == "contamination_duplication" ||
+                 h == "core_dup")                  c_dup  = col;
+        else if (h == "core_dup_mass" ||
+                 h == "contamination_core_dup_mass") c_mass = col;
+        ++col;
+        if (e == std::string::npos) break;
+        p = e + 1;
+    }
+    if (c_acc < 0 || (c_dup < 0 && c_mass < 0))
+        throw std::runtime_error("check: --dup-restore needs an 'accession' column plus at least "
+                                 "one of core_dup/contamination_duplication/core_dup_mass: " +
+                                 tsv.string());
+
+    auto parse = [](const std::string& s) -> float {
+        if (s.empty() || s == "NA" || s == "nan") return std::numeric_limits<float>::quiet_NaN();
+        try { return std::stof(s); }
+        catch (...) { return std::numeric_limits<float>::quiet_NaN(); }
+    };
+
+    std::unordered_map<std::string, std::pair<float, float>> out;
+    const int need = std::max({c_acc, c_dup, c_mass});
+    std::vector<std::string> f;
+    while (std::getline(in, line)) {
+        f.clear();
+        for (size_t p = 0; p <= line.size(); ) {
+            const size_t e = line.find('\t', p);
+            f.push_back(line.substr(p, (e == std::string::npos ? line.size() : e) - p));
+            if (e == std::string::npos) break;
+            p = e + 1;
+        }
+        if (static_cast<int>(f.size()) <= need) continue;
+        const float d = c_dup  >= 0 ? parse(f[c_dup])  : std::numeric_limits<float>::quiet_NaN();
+        const float m = c_mass >= 0 ? parse(f[c_mass]) : std::numeric_limits<float>::quiet_NaN();
+        if (std::isnan(d) && std::isnan(m)) continue;
+        out.emplace(f[c_acc], std::make_pair(d, m));
+    }
+    spdlog::info("check: --dup-restore loaded {} genomes with a dup axis from {}",
+                 out.size(), tsv.string());
+    return out;
+}
+
+// `prior` is the QUAL section this write supersedes (nullptr if the pack had none). A QUAL
+// section is a REPLACEMENT, not a delta: the reader takes the newest one only. So a run that
+// scores a subset (-g) and writes only what it scored silently deletes every genome it did not
+// touch -- a 2k-genome spot-check over a 953k pack destroyed 951k records exactly this way, and
+// because core_dup is build-time-only (see the restore block below), a later --recompute could
+// not rebuild them and wrote NaN over the primary contamination estimator. Two invariants now
+// make that unrepresentable: (1) records in `prior` but not in `quality` are carried forward, so
+// the section can only grow; (2) a write that would lower core_dup_mass coverage on genomes the
+// cache already had is refused outright rather than silently persisted.
 void write_qual_to_archive(const std::filesystem::path& gpk_path,
                            const std::unordered_map<std::string, GenomeQuality>& quality,
                            const std::unordered_map<std::string, GenomeId>& acc_to_id,
-                           uint64_t core_model_hash)
+                           uint64_t core_model_hash,
+                           const std::unordered_map<uint64_t, QualRecord>* prior)
 {
     int lock_fd = ::open(gpk_path.c_str(), O_RDWR);
     if (lock_fd < 0)
@@ -261,32 +375,33 @@ void write_qual_to_archive(const std::filesystem::path& gpk_path,
         r.accessory_ratio                = q.accessory_ratio;
         // qual_flags carry GCOV_SCORED (set in pass-B) / FMH_AXIS_ABSENT provenance.
         r.qual_flags                    = q.qual_flags;
-        // Encode the quality tier (mirrors TSV output logic).
-        {
-            const bool aamer_only = std::isnan(q.completeness_post_decontam) &&
-                                    std::isnan(q.completeness_cluster_relative) &&
-                                    !std::isnan(q.completeness_aamer_core);
-            const float ce = completeness_effective(q);
-            bool cont_observed = false;
-            const float cv = contamination_aggregate(q, cont_observed);
-            // An LQ contamination demotion requires >=2 corroborating trusted axes (kills
-            // single-axis false positives). With only one axis firing, a high aggregate may
-            // cap the tier at MQ but must not push it to LQ on contamination grounds alone.
-            const int ntrusted = trusted_contam_axes(q);
-            const char* t = "LQ";
-            if (!std::isnan(ce) && ce >= 0.90f && cv < 0.05f) t = "HQ";
-            else if (!std::isnan(ce) && ce >= 0.50f && cv < 0.10f) t = "MQ";
-            else if (!std::isnan(ce) && ce >= 0.50f && ntrusted < 2) t = "MQ";
-            if (aamer_only && t[0] == 'H') t = "MQ";
-            // Cross-genus chimera: hard veto, independent of the aggregate.
-            if (cross_genus_chimera(q) && t[0] != 'L') t = "LQ";
-            // HQ requires a positive, observed clean contamination axis. If nothing was
-            // observable, contamination is unconfirmed → cap at MQ, never HQ.
-            if (t[0] == 'H' && !cont_observed) t = "MQ";
-            r.quality_tier_u8 = QualRecord::encode_qtier(t);
-            r.set_quality_score(compute_quality_score(ce, cv));
-        }
+        // Tier (completeness-only) and score (completeness-only), shared with the TSV path.
+        r.quality_tier_u8 = QualRecord::encode_qtier(quality_tier(q));
+        r.set_quality_score(compute_quality_score(completeness_effective(q)));
         recs.push_back(r);
+    }
+
+    if (prior) {
+        std::unordered_map<uint64_t, size_t> written;
+        written.reserve(recs.size());
+        for (size_t i = 0; i < recs.size(); ++i) written.emplace(recs[i].genome_id, i);
+
+        size_t carried = 0, dup_lost = 0;
+        for (const auto& [gid, pr] : *prior) {
+            auto it = written.find(gid);
+            if (it == written.end()) { recs.push_back(pr); ++carried; continue; }
+            if (!std::isnan(pr.contamination_core_dup_mass) &&
+                std::isnan(recs[it->second].contamination_core_dup_mass)) ++dup_lost;
+        }
+        if (carried)
+            spdlog::info("check: carried {} cached QUAL records not rescored in this run", carried);
+        if (dup_lost)
+            throw std::runtime_error(
+                "check: refusing to write QUAL -- would drop build-time core_dup_mass on " +
+                std::to_string(dup_lost) + " genomes that already had it. core_dup is "
+                "build-time-only (SCC set lives in the .csp panel, not the pack) and cannot be "
+                "recomputed here. Re-run with --markers, or re-inject the axis with "
+                "--dup-restore <quality-or-cladesplit-score.tsv>.");
     }
 
     AppendWriter writer;
@@ -357,11 +472,16 @@ int cmd_check(const std::filesystem::path& pack_path,
               const std::filesystem::path& output,
               bool recompute,
               const std::filesystem::path& markers_path,
-              bool scan_all)
+              bool scan_all,
+              float cross_genus_margin,
+              const std::filesystem::path& dup_restore_path)
 {
     auto gpk_paths = collect_gpk_paths(pack_path);
     if (gpk_paths.empty())
         throw std::runtime_error("check: no .gpk files found at " + pack_path.string());
+
+    std::unordered_map<std::string, std::pair<float, float>> dup_restore;
+    if (!dup_restore_path.empty()) dup_restore = read_dup_restore(dup_restore_path);
 
     std::unordered_map<std::string, GenomeQuality> all_quality;
 
@@ -425,6 +545,7 @@ int cmd_check(const std::filesystem::path& pack_path,
         PassBConfig pb_cfg;
         pb_cfg.markers_path = markers_path.string();   // empty = marker scoring disabled
         pb_cfg.scan_all     = scan_all;
+        pb_cfg.cross_genus_lr_margin = cross_genus_margin;
         const auto* baseline_ptr = qual_cache.empty() ? nullptr : &qual_cache;
         run_pass_b(pack, pass_a, quality, pb_cfg, threads, qual_cache_ptr, baseline_ptr,
                    pack.has_gami_v2() ? &preloaded_gmi : nullptr,
@@ -499,20 +620,48 @@ int cmd_check(const std::filesystem::path& pack_path,
         // the non-saturating contamination_core_dup_mass (Σ(c-1)/Σc, cladesplit). Without
         // restoring the latter, --recompute would rewrite QUAL with core_dup_mass=NaN and
         // silently destroy the primary graded contamination estimator.
+        size_t dup_from_cache = 0, dup_from_tsv = 0, dup_missing = 0;
         for (auto& [acc, q] : quality) {
-            const bool need_dup      = std::isnan(q.contamination_duplication);
-            const bool need_dup_mass = std::isnan(q.contamination_core_dup_mass);
+            bool need_dup      = std::isnan(q.contamination_duplication);
+            bool need_dup_mass = std::isnan(q.contamination_core_dup_mass);
             if (!need_dup && !need_dup_mass) continue;
+
             auto idit = acc_to_id.find(acc);
-            if (idit == acc_to_id.end()) continue;
-            auto cit = qual_cache.find(idit->second);
-            if (cit == qual_cache.end()) continue;
-            if (need_dup)
-                q.contamination_duplication =
-                    QualRecord::decode_dup(cit->second.contamination_duplication_u16);
-            if (need_dup_mass)
-                q.contamination_core_dup_mass = cit->second.contamination_core_dup_mass;
+            if (idit != acc_to_id.end()) {
+                auto cit = qual_cache.find(idit->second);
+                if (cit != qual_cache.end()) {
+                    if (need_dup) {
+                        const float d = QualRecord::decode_dup(cit->second.contamination_duplication_u16);
+                        if (!std::isnan(d)) { q.contamination_duplication = d; need_dup = false; }
+                    }
+                    if (need_dup_mass && !std::isnan(cit->second.contamination_core_dup_mass)) {
+                        q.contamination_core_dup_mass = cit->second.contamination_core_dup_mass;
+                        need_dup_mass = false;
+                    }
+                    if (!need_dup || !need_dup_mass) ++dup_from_cache;
+                }
+            }
+
+            // Cache lost the axis (a prior subset/no-marker run overwrote QUAL): fall back to the
+            // external table. This is the only way back short of a full rebuild.
+            if ((need_dup || need_dup_mass) && !dup_restore.empty()) {
+                auto rit = dup_restore.find(acc);
+                if (rit != dup_restore.end()) {
+                    if (need_dup && !std::isnan(rit->second.first)) {
+                        q.contamination_duplication = rit->second.first;
+                        need_dup = false;
+                    }
+                    if (need_dup_mass && !std::isnan(rit->second.second)) {
+                        q.contamination_core_dup_mass = rit->second.second;
+                        need_dup_mass = false;
+                    }
+                    ++dup_from_tsv;
+                }
+            }
+            if (need_dup && need_dup_mass) ++dup_missing;
         }
+        spdlog::info("check: dup axis restored from cache={} tsv={} still-absent={}",
+                     dup_from_cache, dup_from_tsv, dup_missing);
 
         const uint64_t core_model_hash =
             ar.core_reader() ? ar.core_reader()->core_model_hash() : 0;
@@ -526,7 +675,8 @@ int cmd_check(const std::filesystem::path& pack_path,
             if (std::isnan(q.fmh_minority_fraction))
                 q.qual_flags |= QualRecord::QUAL_FLAG_FMH_AXIS_ABSENT;
 
-        write_qual_to_archive(gp, quality, acc_to_id, core_model_hash);
+        write_qual_to_archive(gp, quality, acc_to_id, core_model_hash,
+                              qual_cache.empty() ? nullptr : &qual_cache);
 
         for (auto& [acc, q] : quality)
             all_quality.emplace(acc, std::move(q));
@@ -566,7 +716,14 @@ int cmd_check(const std::filesystem::path& pack_path,
            // fraction that tracks fraction-of-genome (declines with fragmentation), unlike the
            // presence-saturating completeness_aamer_core. marker_n_present/expected are the raw
            // counts behind it. NA when no --markers panel or no genus marker calibration.
-           "\tcompleteness_marker\tmarker_n_present\tmarker_n_expected\n";
+           "\tcompleteness_marker\tmarker_n_present\tmarker_n_expected"
+           // Contamination is reported, not gated. The three near-independent channels feed
+           // derep's D->S->G lexicographic tiebreak: contam_D (duplication, the only
+           // CheckM2-calibrated channel), contam_S (fmh sketch), contam_G (median of the present
+           // correlated geometry axes -- one vote, not four). contam_score is the noisy-OR union
+           // for DISPLAY ONLY; channels_fired counts how many of the three fired (geometry only
+           // when >=2 of its axes agree). tnf_minor is emitted raw so contam_G is reconstructible.
+           "\tcontamination_tnf_minor\tcontam_D\tcontam_S\tcontam_G\tcontam_score\tchannels_fired\n";
 
     auto tier_str = [](SupportTier t) -> const char* {
         switch (t) {
@@ -581,28 +738,13 @@ int cmd_check(const std::filesystem::path& pack_path,
     };
 
     for (const auto& [acc, q] : all_quality) {
-        const bool aamer_only = std::isnan(q.completeness_post_decontam) &&
-                                std::isnan(q.completeness_cluster_relative) &&
-                                !std::isnan(q.completeness_aamer_core);
         const float comp_eff = completeness_effective(q);
         const float fmh_cont = !std::isnan(q.fmh_minority_fraction) ? q.fmh_minority_fraction : NAN;
-        // NA-safe contamination aggregate (mirrors QCOL): max over all observable axes.
-        bool cont_observed = false;
-        const float cont_val = contamination_aggregate(q, cont_observed);
-        // An LQ contamination demotion requires >=2 corroborating trusted axes (mirrors QCOL):
-        // one axis firing may cap at MQ but must not push to LQ on contamination grounds alone.
-        const int ntrusted = trusted_contam_axes(q);
-        const char* qtier = "LQ";
-        if (!std::isnan(comp_eff) && comp_eff >= 0.90f && cont_val < 0.05f) qtier = "HQ";
-        else if (!std::isnan(comp_eff) && comp_eff >= 0.50f && cont_val < 0.10f) qtier = "MQ";
-        else if (!std::isnan(comp_eff) && comp_eff >= 0.50f && ntrusted < 2) qtier = "MQ";
-        if (aamer_only && qtier[0] == 'H') qtier = "MQ";
-        // Cross-genus chimera: hard veto, independent of the aggregate.
-        if (cross_genus_chimera(q) && qtier[0] != 'L') qtier = "LQ";
-        // HQ requires a positive, observed clean contamination axis; if none was observable,
-        // contamination is unconfirmed → cap at MQ, never HQ.
-        if (qtier[0] == 'H' && !cont_observed) qtier = "MQ";
-        const float quality_score = compute_quality_score(comp_eff, cont_val);
+        // Contamination is reported (three channels), not gated: tier is completeness-only and
+        // identical to the QCOL path via the shared helper.
+        const ContamChannels cc = contamination_channels(q);
+        const char* qtier = quality_tier(q);
+        const float quality_score = compute_quality_score(comp_eff);
         tsv << acc << '\t'
             << qtier << '\t'
             << fmt(quality_score) << '\t'
@@ -646,7 +788,13 @@ int cmd_check(const std::filesystem::path& pack_path,
             << fmt(q.accessory_z) << '\t'
             << fmt(q.marker_completeness) << '\t'
             << (q.marker_n_expected >= 0 ? std::to_string(q.marker_n_present) : std::string("NA")) << '\t'
-            << (q.marker_n_expected >= 0 ? std::to_string(q.marker_n_expected) : std::string("NA")) << '\n';
+            << (q.marker_n_expected >= 0 ? std::to_string(q.marker_n_expected) : std::string("NA")) << '\t'
+            << fmt(q.contamination_tnf_minor) << '\t'
+            << fmt(cc.D) << '\t'
+            << fmt(cc.S) << '\t'
+            << fmt(cc.G) << '\t'
+            << fmt(cc.display) << '\t'
+            << contam_channels_fired(cc) << '\n';
     }
     spdlog::info("check: TSV written to {}", output.string());
     return 0;

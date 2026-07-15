@@ -3967,6 +3967,17 @@ int main(int argc, char** argv) {
     std::string check_markers;
     check_cmd->add_option("--markers", check_markers,
         "Path to markers .mrk DB; enables marker-based completeness/redundancy scoring");
+    float check_cross_margin = 0.0f;
+    check_cmd->add_option("--cross-genus-margin", check_cross_margin,
+        "log-LR margin a foreign genus must beat the host by for cross_genus to flag a contig. "
+        "0 (default) flags on ANY foreign LL > host LL -- an uncorrected max over ~52 candidate "
+        "genera, which saturates the statistic at 1.0. Raise to correct the multiple comparison.");
+    std::string check_dup_restore;
+    check_cmd->add_option("--dup-restore", check_dup_restore,
+        "Re-inject the build-time core_dup axis from a quality TSV (contamination_duplication/"
+        "core_dup_mass) or a `cladesplit score` TSV (core_dup/core_dup_mass). core_dup lives in "
+        "the .csp panel, not the pack, so check cannot recompute it -- if a prior run overwrote "
+        "QUAL without it, this is the way back short of a full rebuild.");
     check_cmd->callback([&]() {
         std::exit(genopack::check::cmd_check(
             check_pack,
@@ -3977,7 +3988,9 @@ int main(int argc, char** argv) {
             check_output.empty() ? std::filesystem::path{} : std::filesystem::path{check_output},
             check_recompute,
             check_markers.empty() ? std::filesystem::path{} : std::filesystem::path{check_markers},
-            check_scan_all));
+            check_scan_all,
+            check_cross_margin,
+            check_dup_restore.empty() ? std::filesystem::path{} : std::filesystem::path{check_dup_restore}));
     });
 
     // genopack ingest — attach external quality (CheckM2 / anvi'o) as SEC_XQAL
