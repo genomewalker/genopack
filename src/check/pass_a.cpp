@@ -63,30 +63,36 @@ void apply_leakage_scores(GenomeQuality& q,
         q.completeness_cluster_relative = std::clamp(
             (1.0f - lk[0]) / p90_c0, 0.0f, 1.5f);
 
-    // Slope-only OLS: log(C_k) = k * β (α=1 forced), β = Σ(k_i*log(c_i))/Σ(k_i²)
-    if (n_k >= 3 && !std::isnan(lk[0]) && !std::isnan(lk[1]) && !std::isnan(lk[2])) {
-        const float c0 = 1.0f - lk[0], c1 = 1.0f - lk[1], c2 = 1.0f - lk[2];
-        if (c0 >= 0.01f && c1 >= 0.01f && c2 >= 0.01f) {
-            const float k0 = static_cast<float>(avail_k[0]);
-            const float k1 = static_cast<float>(avail_k[1]);
-            const float k2 = static_cast<float>(avail_k[2]);
-            const float lc0 = std::log(c0), lc1 = std::log(c1), lc2 = std::log(c2);
-            const float beta    = (k0*lc0 + k1*lc1 + k2*lc2) / (k0*k0 + k1*k1 + k2*k2);
-            const float c2_pred = std::exp(beta * k2);
-            q.contamination_leakage = std::max(0.0f, c2_pred - c2) / std::max(c2_pred, 0.01f);
-        }
-    } else if (n_k == 2 && !std::isnan(lk[0]) && !std::isnan(lk[1])) {
-        const float c0 = 1.0f - lk[0], c1 = 1.0f - lk[1];
-        if (c0 >= 0.01f && c1 >= 0.01f) {
-            const float k0 = static_cast<float>(avail_k[0]);
-            const float k1 = static_cast<float>(avail_k[1]);
-            const float beta    = (k0*std::log(c0) + k1*std::log(c1)) / (k0*k0 + k1*k1);
-            const float c1_pred = std::exp(beta * k1);
-            q.contamination_leakage = std::max(0.0f, c1_pred - c1) / std::max(c1_pred, 0.01f);
-        }
-    } else if (n_k == 1 && !std::isnan(lk[0])) {
-        q.contamination_leakage = lk[0];
+    if (n_k == 1) {
+        if (!std::isnan(lk[0])) q.contamination_leakage = lk[0];
+        return;
     }
+
+    // Excess containment decay at the largest k, relative to a slope-only OLS
+    // (log C_k = k*beta, alpha=1 forced) fit on the SMALLER k only. The held-out k must not
+    // enter its own fit: at k=[16,21,31] the top k carries 961/1658 = 58% of the weight, so a
+    // fit including it predicts itself, the residual collapses, and max(0,.) clamps the rest to
+    // zero. That is what this was doing -- exactly 0.0 on 99.97% of 9.53 M genomes, global max
+    // 0.005, four times under its own 0.02 firing threshold. The axis could not fire, ever.
+    const int last = n_k - 1;
+    for (int i = 0; i <= last; ++i)
+        if (std::isnan(lk[i])) return;
+
+    const float c_last = 1.0f - lk[last];
+    if (c_last < 0.01f) return;
+
+    float num = 0.0f, den = 0.0f;
+    for (int i = 0; i < last; ++i) {
+        const float c = 1.0f - lk[i];
+        if (c < 0.01f) return;
+        const float k = static_cast<float>(avail_k[i]);
+        num += k * std::log(c);
+        den += k * k;
+    }
+    if (den <= 0.0f) return;
+
+    const float c_pred = std::exp((num / den) * static_cast<float>(avail_k[last]));
+    q.contamination_leakage = std::max(0.0f, c_pred - c_last) / std::max(c_pred, 0.01f);
 }
 
 } // namespace
