@@ -3963,7 +3963,7 @@ int main(int argc, char** argv) {
     check_cmd->add_option("--min-genus-size", check_min_genus_size, "Min genus members for saturated tier (default: 3)");
     check_cmd->add_option("--leakage-threshold", check_leakage_threshold, "Containment leakage threshold (default: 0.05)");
     check_cmd->add_flag("--recompute", check_recompute, "Ignore existing QUAL section and force full rescan");
-    check_cmd->add_flag("--scan-all", check_scan_all, "Force every genome through FASTA-level analysis (intrinsic completeness for all, not just flagged)");
+    check_cmd->add_flag("--scan-all", check_scan_all, "Force every genome through FASTA-level analysis (intrinsic completeness for all, not just flagged). Implied when --markers is given; use this to scan all without a marker panel (post-decontam/aamer only).");
     std::string check_markers;
     check_cmd->add_option("--markers", check_markers,
         "Path to markers .mrk DB; enables marker-based completeness/redundancy scoring");

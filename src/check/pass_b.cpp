@@ -132,9 +132,17 @@ void run_pass_b(ICheckReader& pack,
     };
     // needs_full_analysis: completeness or leakage triggered — run mixture+Fiedler window model.
     // tnf-only flagged genomes skip the expensive PCA/GMM pass (skip_mixture=true).
+    // Marker/aamer/post-decontam completeness is scored inside pass-B, so a genome that never enters
+    // here gets NaN and completeness_effective silently falls back to cluster_relative (r=0.10 across
+    // phyla). When --markers is supplied that fallback is never what the caller asked for, so score
+    // every genome. Validated on r232 (9.53M): flagged-only left marker at 34% and comp_eff vs CheckM2
+    // at slope 0.58; scoring all lifts marker to 99.4% and slope to 0.81, pooled bias ~0. The mixture
+    // GMM stays gated by needs_full_set below, so this pays the marker path (~2.3x), not the GMM.
+    const bool score_all_completeness = cfg.scan_all || !cfg.markers_path.empty();
     std::vector<std::string> flagged;
     std::unordered_set<std::string> needs_full_set;
-    flagged.reserve(pass_a.accessions.size() / 10);
+    flagged.reserve(score_all_completeness ? pass_a.accessions.size()
+                                           : pass_a.accessions.size() / 10);
     for (const auto& acc : pass_a.accessions) {
         auto it = quality.find(acc);
         if (it == quality.end()) continue;
@@ -143,7 +151,7 @@ void run_pass_b(ICheckReader& pack,
         const bool by_tnf         = q.contamination_tnf_excess > cfg.tnf_flag_threshold;
         const bool by_completeness = !std::isnan(q.completeness_cluster_relative) &&
                                      q.completeness_cluster_relative < cfg.completeness_flag_threshold;
-        if (cfg.scan_all || by_leakage || by_tnf || by_completeness) {
+        if (score_all_completeness || by_leakage || by_tnf || by_completeness) {
             flagged.push_back(acc);
             if (by_leakage || by_completeness)
                 needs_full_set.insert(acc);
