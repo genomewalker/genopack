@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.1.0 — 2026-07-18
+
+### Quality tier — contamination decoupled
+
+- **`quality_tier` is completeness-only.** The old NA-safe max over seven correlated contamination axes demoted 362,935 GTDB r232 genomes at 6.9% PPV against CheckM2; it is removed. LQ is now genuine incompleteness (`comp_eff < 0.50`) only. The single CheckM2-calibrated duplication channel `D` may cap HQ→MQ, and nothing forces LQ (`src/check/run_check.cpp:181-197`).
+- **`quality_score` is completeness-only** (`compute_quality_score(comp_eff)`), replacing the multiplicative completeness×contamination score.
+- GTDB r232 tiers: HQ 5,257,430 (55.16%), MQ 3,737,697 (39.22%), LQ 535,855 (5.62%); zero missing.
+
+### Contamination — three reported channels
+
+- `contamination_channels` reports D (duplication, the only CheckM2-calibrated axis), S (FracMinHash minority), G (median of the correlated geometry axes) — reported for dereplication's D→S→G tiebreak, never a discard gate.
+- New TSV columns: `contam_D`, `contam_S`, `contam_G`, `contam_score` (noisy-OR, display only), `channels_fired`, `contamination_tnf_minor`.
+
+### Completeness — marker scoring for all genomes
+
+- **`--markers` scores marker completeness for every genome** (`score_all_completeness = scan_all || markers given`), not only pass-A-flagged ones. Marker completeness populated for ~99% of GTDB r232 (was ~34%); validated against CheckM2 at slope 0.81, pooled bias ~0.
+- `completeness_effective` priority: `marker → aamer_core → post_decontam`, with `cluster_relative` admitted only as a soft corroborator.
+
+### Pack write-safety
+
+- `check` unions carried-forward QUAL records instead of overwriting them, and refuses to drop build-time `core_dup_mass` — a subset rescore can no longer silently delete untouched genomes.
+- New `--dup-restore` flag re-injects the build-time duplication axis from a quality or `cladesplit score` TSV.
+- `--scan-all` forces every genome through pass-B (implied by `--markers`).
+
 ## 1.0.0 — 2026-05-10
 
 - **Directory archive layout**: `.gpk` is now a directory of section files plus `toc.bin`. Single-file `.gpk` archives are no longer produced; section binary structures (CATL, GIDX, ACCX, …) are unchanged.
