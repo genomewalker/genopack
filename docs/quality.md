@@ -130,7 +130,7 @@ fraction instead of saturating near 1.0, and is NaN when the majority genus has 
 SCC set (underpopulated / novel), which defers to the observability cap.
 
 `duplication_contamination` maps it into CheckM2 contamination units by a
-spike-panel OLS fit (`run_check.cpp:99-108`):
+spike-panel OLS fit (`run_check.cpp:87-96`):
 
 $$
 c_{\mathrm{dup}} =
@@ -142,7 +142,7 @@ $$
 
 The legacy `excess ÷ 8` term is saturating; the mass-based term replaces it when
 available (constants `kDupMassSlope`/`kDupMassIntercept`/`kDupToContamScale`,
-`run_check.cpp:101-103`).
+`run_check.cpp:87-89`).
 
 ### Channels do not gate the tier
 
@@ -234,7 +234,8 @@ The axes are native sketch-geometry signals: OPH conspecific containment, aamer
 core/pangenome coverage, TNF Mahalanobis/GMM geometry, and single-copy-core
 duplication mass. CheckM2 is used only to calibrate and validate — the
 `core_dup_mass → contamination` map is a spike-panel OLS fit to CheckM2 units
-(`run_check.cpp:101-102`) and `marker_completeness` is described as CheckM2-aligned
-(`run_check.cpp:76`) — but no CheckM/CheckM2 model is loaded or run by `genopack
-check`. The score and tier thresholds (contamination knee 0.10, HQ < 0.05, MQ <
-0.10) mirror CheckM2's HQ/MQ contamination cutoffs.
+(`run_check.cpp:87-96`) and `marker_completeness` is genus-calibrated to be
+CheckM2-aligned — but no CheckM/CheckM2 model is loaded or run by `genopack
+check`. The one place a contamination signal meets a CheckM2-derived cutoff is the
+duplication cap `D ≥ 0.05` on HQ (`run_check.cpp:190-192`), mirroring CheckM2's
+5% HQ contamination line; the tier is otherwise completeness-only.

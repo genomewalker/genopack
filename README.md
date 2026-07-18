@@ -37,7 +37,7 @@ GSTX (optional)     - per-genus sketch stats: TNF centroid, p90 completeness, OP
 GCOV (optional)     - per-genus biological covariance (Ledoit-Wolf TNF, eigenvectors, SPE thresholds)
 FCOV (optional)     - per-family biological covariance (same layout as GCOV, keyed by family hash)
 FMHR (optional)     - per-genus FracMinHash reference sketches (k=21, c=125)
-QUAL (optional)     - per-genome quality records (104 B each): completeness, contamination, flags
+QUAL (optional)     - per-genome quality records (56 B each): completeness, contamination, flags
 TOMB                - tombstones for soft-deleted genomes
 TailLocator (64 B)  - fixed footer at end of toc.bin pointing to the TOC offset
 ```
