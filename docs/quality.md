@@ -29,7 +29,7 @@ The signals below are the columns of the `check` TSV
 ## Completeness
 
 `completeness_effective` is the single completeness value fed to the score and
-tier (`src/check/run_check.cpp:70-91`). It is an **intrinsic** estimate — the
+tier (`src/check/run_check.cpp:55-76`). It is an **intrinsic** estimate — the
 fraction of the genome recovered, not the fraction of a genus pangenome covered.
 
 ### Intrinsic estimate priority
@@ -49,8 +49,12 @@ $$
 | `completeness_aamer_core` | fraction of the genus prevalence-core aamer set (amino-acid 8-mers) recovered | fallback; presence-**saturating** (small dynamic range near 1.0), never NaN when scored (`run_check.cpp:78-80`, `qual.hpp:44`) |
 | `completeness_post_decontam` | bp retained after the contig contamination scan | last resort |
 
-`marker_completeness` is populated only on the pass-B marker route; QCOL-cache
-genomes fall through to `aamer_core` (`run_check.cpp:78-79`).
+`marker_completeness` is scored on the pass-B FASTA route. When `--markers` is
+supplied, **every** genome is routed through pass-B (`pass_b.cpp`,
+`score_all_completeness = scan_all || markers given`), so `marker_completeness` is
+populated catalog-wide (≈ 99% of GTDB r232) rather than only for pass-A-flagged
+genomes; a genome that still lacks it (no marker panel, or served from a stale
+QCOL cache) falls through to `aamer_core`.
 
 ### Cluster-relative corroborator
 
@@ -83,34 +87,32 @@ well below it — genuine agreement that sequence is missing. A supported intrin
 
 ## Contamination
 
-### Aggregate determinant
+### Three reported channels (D / S / G)
 
-`contamination_aggregate` is an NA-safe **max** over the trusted contamination
-axes (`src/check/run_check.cpp:130-157`). The max means no single absent (NaN)
-axis can lower the verdict, which is what a lone FMH signal used to do.
+Contamination is **reported, never a discard gate** — a genome is LQ on
+completeness alone (see [Tier chain](#tier-chain)). `contamination_channels`
+emits three near-independent channels (`src/check/run_check.cpp:114-163`),
+replacing the old NA-safe **max** over seven axes. Four of those axes (the
+geometry axes below) co-fire at 20–50× independence — they are one TNF/GCOV
+signal — so a max counted that signal up to four times; calibrated on all 9.53 M
+genomes with CheckM2 as truth, the resulting gate scored 6.9% PPV / 5.7% recall,
+demoting 362,935 genomes to catch ~1,200 real contaminants.
 
-Axes that establish observability (NaN when unmeasured — a non-NaN value proves
-contamination was actually observed):
+- **D** — `duplication_contamination(...)`, the **only** CheckM2-calibrated
+  channel (single-copy-core duplication mass, below).
+- **S** — `fmh_minority_fraction`, the FracMinHash k-mer minority mass.
+- **G** — the **median** of the present geometry axes
+  (`contamination_rho_outlier`, `contamination_spe`,
+  `contamination_contig_outlier_adj`, `contamination_tnf_minor`), collapsing the
+  one correlated signal to a single vote.
 
-- `fmh_minority_fraction` — FracMinHash minority mass
-- `contamination_tnf_minor` — TNF-GMM minority mass (near-clade / same-genus merger detector)
-- `contamination_contig_outlier_adj` — CCO, contig T²/SPE outlier bp fraction (requires GCOV)
-- `contamination_spe` — SPE contig outlier fraction
-- `contamination_rho_outlier` — correlation-outlier fraction
-- `duplication_contamination(...)` — calibrated single-copy-core duplication (below)
-
-Axes that raise the max but default to 0.0 when unmeasured (they cannot by
-themselves establish observability):
-
-- `contamination_leakage` — minimizer-mass leakage outside the expected genus range
-- `contamination_tnf_excess` — TNF Mahalanobis distance from the genus centroid
-
-`contamination_mixture` is **excluded** from gating: a BIC-selected K=2 minority
-mass with no separation or multi-contig guard, uncorrelated with CheckM2
-(`run_check.cpp:146-148`). It remains a reported TSV diagnostic only.
-
-When no observability axis is available, contamination is unconfirmed and HQ is
-capped at MQ (`run_check.cpp:733`).
+`leakage` is dropped (mathematically dead: max 0.005 ≪ its 0.02 threshold) and
+`tnf_excess` is dropped (default-0, untrusted). `contamination_mixture` (a
+BIC-selected K=2 minority mass, uncorrelated with CheckM2) and `cross_genus` are
+reported TSV diagnostics only, never gates. A `display` value — the noisy-OR
+union of the present channels — is emitted for the TSV/human view only;
+dereplication consumes the raw D/S/G channels as an explicit reliability-ordered
+**D → S → G** tiebreak (`run_check.cpp:104-113`).
 
 ### Duplication as a graded term
 
@@ -142,27 +144,27 @@ The legacy `excess ÷ 8` term is saturating; the mass-based term replaces it whe
 available (constants `kDupMassSlope`/`kDupMassIntercept`/`kDupToContamScale`,
 `run_check.cpp:101-103`).
 
-### The ≥2-axis rule
+### Channels do not gate the tier
 
-A single firing axis only caps the tier at MQ; an LQ contamination demotion
-requires at least two trusted axes to fire simultaneously, which kills single-axis
-false positives (`trusted_contam_axes`, `src/check/run_check.cpp:163-172`). Per-axis
-firing thresholds:
+Contamination is decoupled from the LQ tier entirely. The old gate demoted
+362,935 genomes at 6.9% PPV; removing it eliminates every one of those wrongful
+discards and leaves only the genuine-incompleteness floor (`comp_eff < 0.50`).
+Contamination retains **one** narrow role: the single CheckM2-calibrated channel,
+duplication **D**, may cap HQ → MQ (`D ≥ 0.05`), so the top tier still means
+"clean and complete". This cap never forces LQ.
 
-| Axis | Fires at |
+`contam_channels_fired` (`src/check/run_check.cpp:166-172`) counts channels over
+threshold and is reported for the TSV/derep view — it is **not** a tier input.
+`cross_genus` is a **ranker, not a gate**: on a 2,036-genome GTDB-Tk stratified
+sample its positive predictive value as a demotion rule is 2.8% at ≥ 0.10
+(`run_check.cpp:199-213`), so it never demotes. Per-channel report thresholds:
+
+| Channel / axis | Reports at |
 |------|----------|
-| `fmh_minority_fraction` | ≥ 0.10 |
-| `contamination_tnf_minor` | ≥ 0.10 |
-| `contamination_contig_outlier_adj` | ≥ 0.05 |
-| `contamination_spe` | ≥ 0.10 |
-| `contamination_rho_outlier` | ≥ 0.10 |
-| `duplication_contamination(...)` | ≥ 0.05 |
-| `contamination_leakage` | ≥ 0.02 |
-
-`cross_genus` is handled separately as a hard chimera veto: a genome with
-`contamination_cross_genus ≥ 0.10` (fraction of scored bp assigned to a foreign
-genus) is demoted to LQ regardless of every other axis
-(`cross_genus_chimera`, `run_check.cpp:178-180`).
+| `duplication_contamination(...)` (D) | ≥ 0.05 |
+| `fmh_minority_fraction` (S) | ≥ 0.10 |
+| `contamination_contig_outlier_adj` (G) | ≥ 0.05 |
+| `contamination_rho_outlier` / `contamination_spe` / `contamination_tnf_minor` (G) | ≥ 0.10 |
 
 ### accessory_z
 
@@ -191,45 +193,40 @@ score or tier).
 
 ### Continuous score
 
-`compute_quality_score(comp_eff, cont_val)` replaces the discrete cutoffs with a
-multiplicative score in [0,1] (`src/check/run_check.cpp:40-47`). Multiplicative
-because completeness and contamination are near-independent failure modes —
-additive mixing would let high completeness mask contamination.
-
-Let $C = \mathrm{comp\_eff}$ (0.5 neutral prior if NaN) and $X = $ contamination
-(0 if NaN). Then:
-
-$$
-\mathrm{cont\_factor} = \frac{1}{1 + (X/0.10)^2}, \qquad
-\mathrm{score} = C \cdot \mathrm{cont\_factor}
-$$
-
-The contamination knee at $0.10$ gives $\mathrm{cont\_factor} \approx 0.80$ at
-$X=0.05$ and $0.50$ at $X=0.10$ — a smooth analog of the old HQ/MQ cliffs aligned
-to CheckM2's < 5% HQ cutoff.
+`compute_quality_score(comp_eff)` is a threshold-free score in [0,1] equal to
+`comp_eff` itself (`src/check/run_check.cpp:38-40`; NaN → 0.5 neutral prior). It is
+**completeness-only** — contamination no longer folds into the score. The old
+multiplicative `cont_factor` was a back-door gate: a 0.10 knee halved the score on
+a signal whose PPV vs CheckM2 never exceeds ~15%, silently reordering the catalog
+on noise. Contamination is reported separately as the D/S/G channels above and
+consumed by dereplication as an explicit D → S → G tiebreak, so the ranking stays
+interpretable and the noisy channels can never override the calibrated one.
 
 ### Tier chain
 
-The HQ/MQ/LQ tier is a rule chain over `comp_eff`, the aggregate `cont_val`, and
-the trusted-axis count (`src/check/run_check.cpp:595-604`). Applied in order, later
-rules override earlier ones:
+The HQ/MQ/LQ tier is **completeness-only** (`src/check/run_check.cpp:181-197`),
+shared byte-for-byte between the QCOL (`quality_tier_u8`) and TSV paths so they
+cannot drift:
 
 ```
-qtier = LQ
-if comp_eff ≥ 0.90 and cont_val < 0.05:                     qtier = HQ
-elif comp_eff ≥ 0.50 and cont_val < 0.10:                   qtier = MQ
-elif comp_eff ≥ 0.50 and trusted_contam_axes < 2:           qtier = MQ   # single-axis rescue
-if aamer_only and qtier == HQ:                              qtier = MQ   # saturating completeness only
-if cross_genus_chimera and qtier != LQ:                     qtier = LQ   # hard veto
-if qtier == HQ and contamination not observed:              qtier = MQ   # unconfirmed → cap at MQ
+ce = completeness_effective(q)
+if ce is NaN or ce < 0.50:            LQ
+elif ce < 0.90:                       MQ
+else:  # ce ≥ 0.90
+    if aamer_only:                    MQ   # saturating completeness alone can't support HQ
+    elif D ≥ 0.05:                    MQ   # calibrated duplication caps HQ→MQ
+    else:                             HQ
 ```
 
-- `cont_val` is `contamination_aggregate` (the NA-safe max above).
-- `trusted_contam_axes < 2` is the single-axis MQ rescue: one firing axis never
-  demotes to LQ (`run_check.cpp:152`).
+- Contamination **never** demotes to LQ; the LQ floor is genuine incompleteness
+  (`ce < 0.50`) only. The old contamination gate (max-over-axes, cross_genus
+  veto, ≥2-axis rule) is gone.
 - `aamer_only` means completeness came from the saturating `aamer_core` fallback
   with no `post_decontam`/`cluster_relative` support — HQ is not granted on a
   saturating estimator alone.
+- `D` is `duplication_contamination(...)`, the only CheckM2-calibrated channel; it
+  is the sole contamination signal that touches the tier, and only to distinguish
+  HQ from MQ.
 
 ### CheckM2 alignment
 

@@ -295,7 +295,7 @@ and FMHR (per-genus FracMinHash references) simultaneously.
 
 | Column | Description |
 |--------|-------------|
-| `quality_tier` | `HQ` / `MQ` / `LQ` (completeness + contamination thresholds) |
+| `quality_tier` | `HQ` / `MQ` / `LQ` — **completeness-only** (`comp_eff`); contamination is decoupled and never demotes to LQ. Only the calibrated duplication channel `D` caps HQ→MQ (`run_check.cpp:181-197`) |
 | `completeness_effective` | Intrinsic completeness: `marker_completeness`, else `completeness_aamer_core`, else `completeness_post_decontam`. `completeness_cluster_relative` corroborates (geomean) only when intrinsic < 0.50 and sits > 0.30 above it |
 | `completeness_cluster_relative` | Fraction of the genus pangenome covered (accessory breadth) — not intrinsic completeness |
 | `contamination_leakage` | Minimizer mass leakage outside expected genus range |
