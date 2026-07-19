@@ -104,6 +104,7 @@ add_library(genopack_lib STATIC
   src/toc.cpp
   src/merger.cpp
   src/repack.cpp
+  src/subset.cpp
   src/kmrx.cpp
   src/skch.cpp
   src/gidx.cpp

@@ -26,6 +26,7 @@
 #include <omp.h>
 #endif
 #include <genopack/repack.hpp>
+#include <genopack/subset.hpp>
 #include <genopack/catalog.hpp>
 #include <genopack/cidx.hpp>
 #include <genopack/checksum.hpp>
@@ -2535,6 +2536,45 @@ static int cmd_taxdump(const std::string& archive_path,
 }
 
 // ── genopack repack ────────────────────────────────────────────────────────────
+static int cmd_subset(const std::string& input, const std::string& output,
+                      const std::string& acc_file, int threads) {
+    namespace fs = std::filesystem;
+    genopack::SubsetConfig cfg;
+    cfg.accessions = genopack::load_accession_set(acc_file);
+    cfg.threads    = threads > 0 ? static_cast<size_t>(threads) : 1;
+    if (cfg.accessions.empty()) {
+        spdlog::error("subset: no accessions loaded from {}", acc_file);
+        return 1;
+    }
+    fs::path in(input), out(output);
+    // A multipart pack is a DIRECTORY of part_*.gpk single-file archives; subset each into
+    // out/part_*.gpk. A single .gpk (regular file) is subset directly.
+    if (fs::is_directory(in)) {
+        std::vector<fs::path> parts;
+        for (const auto& e : fs::directory_iterator(in)) {
+            const auto n = e.path().filename().string();
+            if (n.rfind("part_", 0) == 0 && e.path().extension() == ".gpk" &&
+                fs::is_regular_file(e.path()))
+                parts.push_back(e.path());
+        }
+        std::sort(parts.begin(), parts.end());
+        if (parts.empty()) {
+            spdlog::error("subset: no part_*.gpk files found in {}", input);
+            return 1;
+        }
+        fs::create_directories(out);
+        for (const auto& p : parts) {
+            const fs::path po = out / p.filename();
+            spdlog::info("subset: {} -> {}", p.string(), po.string());
+            genopack::subset_archive(p, po, cfg);
+        }
+        spdlog::info("subset: {} parts written to {}", parts.size(), out.string());
+    } else {
+        genopack::subset_archive(in, out, cfg);
+    }
+    return 0;
+}
+
 static int cmd_repack(const std::string& input, const std::string& output,
                       int zstd_level, const std::string& taxonomy_rank,
                       int threads, int max_mem_gb, bool verbose) {
@@ -3882,6 +3922,22 @@ int main(int argc, char** argv) {
     });
 
     // genopack repack
+    auto* subset_cmd = app.add_subcommand("subset",
+        "Subset an archive to a set of accessions by COPYING the kept genomes' sections "
+        "(sequences, sketches, QUAL, taxonomy, KMRX) directly -- no source FASTA, no re-sketching, "
+        "original QUAL preserved. For a multipart directory, subsets each part_*.gpk. Genome IDs "
+        "are preserved (sparse); corpus-derived sections (GSTX/CIDX/HNSW) are dropped.");
+    std::string subset_input, subset_output, subset_acc;
+    int subset_threads = 1;
+    subset_cmd->add_option("input",  subset_input,  "Source .gpk archive or multipart directory")->required();
+    subset_cmd->add_option("output", subset_output, "Output .gpk (or directory, for a multipart source)")->required();
+    subset_cmd->add_option("--accessions-file", subset_acc,
+        "File of accessions to keep: one per line, or a TSV with an 'accession'/'name' column")->required();
+    subset_cmd->add_option("-t,--threads", subset_threads, "Threads for shard decompression")->default_val(1);
+    subset_cmd->callback([&]() {
+        std::exit(cmd_subset(subset_input, subset_output, subset_acc, subset_threads));
+    });
+
     auto* repack_cmd = app.add_subcommand("repack",
         "Re-shard an archive by taxonomy (genus by default) for fast per-taxon access on NFS. "
         "One sequential pass through the source archive; genome IDs are preserved.");

@@ -10,6 +10,7 @@
 #include <genopack/qual_columns.hpp>
 #include <genopack/section_checksum.hpp>
 #include <genopack/shard.hpp>
+#include <genopack/skch.hpp>
 #include <genopack/taxn.hpp>
 #include <genopack/toc.hpp>
 #include <genopack/txdb.hpp>
@@ -576,6 +577,60 @@ void subset_archive(const std::filesystem::path& input_gpk,
                 }
             }
             new_toc.add_section(kw.finalize(mw, next_section_id++));
+        }
+    }
+
+    // SKCH — re-frame kept genomes' sketches WITHOUT re-sketching. The stored OPH signatures
+    // (sig1/sig2/mask) are copied verbatim out of the source frames and re-emitted into new
+    // 16384-row V4 frames, so a reader of the output gets bit-identical signatures — no FASTA
+    // needed. sketch_for_ids_multi_k decompresses each touched frame once; num_threads=1 keeps
+    // add() sequential (SkchWriterMultiK spills to a tmpfile and is not concurrent-safe).
+    {
+        auto skch_secs = src_toc.find_by_type(SEC_SKCH);
+        if (!skch_secs.empty()) {
+            SkchReader sr;
+            sr.open(src_mmap.data(), skch_secs[0]->file_offset, skch_secs[0]->compressed_size);
+            const uint32_t sz = sr.sketch_size();
+            std::vector<uint32_t> ks;
+            for (uint32_t i = 0; i < sr.n_kmer_sizes(); ++i) ks.push_back(sr.kmer_size_at(i));
+            const size_t nk = ks.size();
+
+            std::vector<GenomeId> sorted(kept_gids.begin(), kept_gids.end());
+            std::sort(sorted.begin(), sorted.end());
+            const size_t nrows = sorted.size();
+
+            SkchWriterMultiK sw(ks, sz, sr.syncmer_s(), sr.seed1(), sr.seed2(),
+                                out_path.parent_path().string());
+
+            // Per-row buffers, flushed to the writer once all k callbacks for the row have
+            // arrived, then freed — bounds live sketch data to the in-flight frame window.
+            std::vector<uint64_t> glen(nrows, 0);
+            std::vector<uint32_t> kcnt(nrows, 0);
+            std::vector<std::vector<std::vector<uint16_t>>> s1(nrows), s2(nrows);
+            std::vector<std::vector<std::vector<uint64_t>>> mk(nrows);
+            std::vector<std::vector<uint32_t>>              nr(nrows);
+            for (size_t r = 0; r < nrows; ++r) {
+                s1[r].resize(nk); s2[r].resize(nk); mk[r].resize(nk); nr[r].assign(nk, 0);
+            }
+
+            size_t n_written = 0;
+            sr.sketch_for_ids_multi_k(sorted, sz,
+                [&](size_t row, uint32_t ki, const SketchResult& res) {
+                    glen[row] = res.genome_length;
+                    s1[row][ki].assign(res.sig,  res.sig  + sz);
+                    s2[row][ki].assign(res.sig2, res.sig2 + sz);
+                    mk[row][ki].assign(res.mask, res.mask + res.mask_words);
+                    nr[row][ki] = res.n_real_bins;
+                    if (++kcnt[row] == nk) {
+                        sw.add(sorted[row], glen[row], s1[row], s2[row], nr[row], mk[row]);
+                        ++n_written;
+                        s1[row].clear(); s2[row].clear(); mk[row].clear(); nr[row].clear();
+                    }
+                }, 1);
+
+            spdlog::info("Subset: SKCH re-framed {} of {} kept genomes ({} k-values, sz={})",
+                         n_written, nrows, nk, sz);
+            new_toc.add_section(sw.finalize(mw, next_section_id++));
         }
     }
 
