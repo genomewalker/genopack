@@ -18,6 +18,7 @@
 #include <omp.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <condition_variable>
 #include <cstring>
@@ -186,27 +187,47 @@ void subset_archive(const std::filesystem::path& input_gpk,
     std::vector<GenomeRecord> records;
     records.reserve(kept_gids.size());
 
-    for (size_t s = 0; s < src_shards.size(); ++s) {
-        const SectionDesc* sd = src_shards[s];
-        ShardReader shard;
-        shard.open(src_mmap.data(), sd->file_offset, sd->compressed_size);
+    // Parallel scan: each shard's directory is an independent read; src_shard_idx
+    // is stored per-record so scan order is irrelevant (Phase 2 re-sorts by oph).
+    // Threading overlaps NFS shard-directory fault latency across many in-flight
+    // requests — the single-threaded scan is otherwise NFS-latency-bound.
+    {
+        const int p1_threads = static_cast<int>(cfg.threads > 0 ? cfg.threads : 1);
+        std::vector<std::vector<GenomeRecord>> local(static_cast<size_t>(p1_threads));
+        std::atomic<size_t> scanned{0};
 
-        uint32_t dir_idx = 0;
-        for (auto* de = shard.dir_begin(); de != shard.dir_end(); ++de, ++dir_idx) {
-            GenomeId gid = static_cast<GenomeId>(de->genome_id);
-            if (!kept_gids.count(gid)) continue;
+        #pragma omp parallel num_threads(p1_threads)
+        {
+            std::vector<GenomeRecord>& out = local[static_cast<size_t>(omp_get_thread_num())];
+            #pragma omp for schedule(dynamic, 8)
+            for (size_t s = 0; s < src_shards.size(); ++s) {
+                const SectionDesc* sd = src_shards[s];
+                ShardReader shard;
+                shard.open(src_mmap.data(), sd->file_offset, sd->compressed_size);
 
-            auto meta_it = gid_to_meta.find(gid);
-            if (meta_it == gid_to_meta.end()) continue;
+                uint32_t dir_idx = 0;
+                for (auto* de = shard.dir_begin(); de != shard.dir_end(); ++de, ++dir_idx) {
+                    GenomeId gid = static_cast<GenomeId>(de->genome_id);
+                    if (!kept_gids.count(gid)) continue;
 
-            records.push_back({gid, de->oph_fingerprint,
-                               static_cast<uint32_t>(s), dir_idx,
-                               meta_it->second, 0u, 0u});
+                    auto meta_it = gid_to_meta.find(gid);
+                    if (meta_it == gid_to_meta.end()) continue;
+
+                    out.push_back({gid, de->oph_fingerprint,
+                                   static_cast<uint32_t>(s), dir_idx,
+                                   meta_it->second, 0u, 0u});
+                }
+
+                size_t d = scanned.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (d % 20000 == 0)
+                    spdlog::info("Phase 1: {}/{} shards scanned", d, src_shards.size());
+            }
         }
 
-        if ((s + 1) % 5000 == 0)
-            spdlog::info("Phase 1: {}/{} shards scanned, {} genomes indexed",
-                         s + 1, src_shards.size(), records.size());
+        size_t total = 0;
+        for (const auto& v : local) total += v.size();
+        records.reserve(total);
+        for (auto& v : local) records.insert(records.end(), v.begin(), v.end());
     }
     spdlog::info("Phase 1 complete: {} genomes", records.size());
 
