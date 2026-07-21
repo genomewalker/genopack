@@ -343,12 +343,50 @@ static int cmd_merge(const std::vector<std::string>& inputs,
 }
 
 // ── genopack extract ───────────────────────────────────────────────────────────
+// Collapse a genome's multi-contig FASTA into a single record whose sequence is
+// the contigs joined by runs of `npad` Ns. The N-run must exceed the longest
+// read so no read can align across a contig junction. Header becomes `accession`.
+// Returns "" if the input has no sequence.
+static std::string concat_contigs(const std::string& fasta,
+                                  const std::string& accession, int npad) {
+    std::string seq;
+    seq.reserve(fasta.size());
+    bool first = true;
+    const size_t n = fasta.size();
+    size_t i = 0;
+    while (i < n) {
+        size_t eol = fasta.find('\n', i);
+        if (eol == std::string::npos) eol = n;
+        if (fasta[i] == '>') {
+            if (!first) seq.append(static_cast<size_t>(npad), 'N');
+            first = false;
+        } else {
+            size_t e = eol;
+            if (e > i && fasta[e - 1] == '\r') --e;
+            seq.append(fasta, i, e - i);
+        }
+        i = eol + 1;
+    }
+    if (seq.empty()) return {};
+    std::string out;
+    out.reserve(seq.size() + seq.size() / 60 + accession.size() + 4);
+    out.push_back('>');
+    out.append(accession);
+    out.push_back('\n');
+    for (size_t p = 0; p < seq.size(); p += 60) {
+        out.append(seq, p, std::min<size_t>(60, seq.size() - p));
+        out.push_back('\n');
+    }
+    return out;
+}
+
 static int cmd_extract(const std::string& archive_dir,
                        const std::vector<std::string>& accessions,
                        const std::string& accessions_file,
                        float min_completeness, float max_contamination,
                        const std::string& out_fasta,
-                       const std::string& out_dir) {
+                       const std::string& out_dir,
+                       bool concat, int concat_npad) {
     ArchiveSetReader ar = open_archive_auto(archive_dir);
 
     ExtractQuery q;
@@ -382,7 +420,8 @@ static int cmd_extract(const std::string& archive_dir,
                 auto p = fs::path(out_dir) / (q.accessions[idx] + ".fa");
                 std::ofstream of(p);
                 if (!of) { spdlog::error("Cannot write: {}", p.string()); return; }
-                of << eg.fasta;
+                if (concat) of << concat_contigs(eg.fasta, q.accessions[idx], concat_npad);
+                else        of << eg.fasta;
                 ++written;
             }
         });
@@ -409,7 +448,8 @@ static int cmd_extract(const std::string& archive_dir,
                     spdlog::warn("Accession not found or deleted: {}", q.accessions[idx]);
                     continue;
                 }
-                ordered[idx] = std::move(eg.fasta);
+                ordered[idx] = concat ? concat_contigs(eg.fasta, q.accessions[idx], concat_npad)
+                                      : std::move(eg.fasta);
             }
         });
         size_t n = 0;
@@ -420,7 +460,8 @@ static int cmd_extract(const std::string& archive_dir,
         std::vector<ExtractedGenome> results = ar.extract(q);
         spdlog::info("Extracted {} genomes", results.size());
         for (const auto& eg : results)
-            *out_stream << eg.fasta;
+            *out_stream << (concat ? concat_contigs(eg.fasta, eg.accession, concat_npad)
+                                   : eg.fasta);
     }
 
     return 0;
@@ -3004,9 +3045,16 @@ int main(int argc, char** argv) {
     extract->add_option("--max-contamination", ext_max_contam, "Maximum contamination %");
     extract->add_option("-o,--out", ext_out, "Output FASTA (default: stdout)");
     extract->add_option("--output-dir", ext_out_dir, "Write one {accession}.fa per genome to this directory");
+    bool ext_concat = false;
+    int  ext_concat_ns = 300;
+    extract->add_flag("--concat-contigs", ext_concat,
+        "Emit one record per genome: contigs joined by N-runs, header = accession");
+    extract->add_option("--concat-ns", ext_concat_ns,
+        "N-run length between contigs (default 300; must exceed the longest read)");
     extract->callback([&]() {
         std::exit(cmd_extract(ext_archive, ext_accessions, ext_acc_file,
-                              ext_min_comp, ext_max_contam, ext_out, ext_out_dir));
+                              ext_min_comp, ext_max_contam, ext_out, ext_out_dir,
+                              ext_concat, ext_concat_ns));
     });
 
     // genopack slice
