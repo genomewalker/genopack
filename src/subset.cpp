@@ -365,43 +365,73 @@ void subset_archive(const std::filesystem::path& input_gpk,
         write_q_cv.notify_one();
     };
 
-    static constexpr int PREFETCH_AHEAD = 4;
-    auto prefetch_shard = [&]([[maybe_unused]] size_t s) {
-#ifdef MADV_WILLNEED
-        if (s >= src_shards.size()) return;
-        const uint8_t* ptr = src_mmap.data() + src_shards[s]->file_offset;
-        size_t len = static_cast<size_t>(src_shards[s]->compressed_size);
-        static const size_t PAGE = 4096;
-        uintptr_t addr    = reinterpret_cast<uintptr_t>(ptr);
-        uintptr_t aligned = addr & ~(PAGE - 1);
-        ::madvise(reinterpret_cast<void*>(aligned), (addr + len) - aligned, MADV_WILLNEED);
-#endif
+    // Source shards that actually contribute genomes, in file order (src_shards is
+    // already sorted by file_offset).
+    std::vector<size_t> work;
+    work.reserve(src_shards.size());
+    for (size_t s = 0; s < src_shards.size(); ++s)
+        if (!src_shard_records[s].empty()) work.push_back(s);
+
+    // Double-buffered pread: explicit large I/O per shard instead of mmap page faults.
+    // MmapFileReader sets MADV_RANDOM on the whole mapping, and on NFS MADV_WILLNEED is
+    // often silently ignored, so faults arrive one 4 KB page at a time (N RPCs per shard).
+    // One pread() per shard issues a single large RPC and overlaps I/O with decompression.
+    // Same approach as ArchiveReader::visit_shard_batches.
+    const int src_fd = src_mmap.fd();
+    auto do_pread = [src_fd](uint64_t offset, uint64_t size, std::vector<uint8_t>& out) {
+        out.resize(size);
+        uint8_t* p   = out.data();
+        off_t    pos = static_cast<off_t>(offset);
+        size_t   rem = size;
+        while (rem > 0) {
+            ssize_t n = ::pread(src_fd, p, rem, pos);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                throw std::runtime_error("subset pread failed: " + std::string(strerror(errno)));
+            }
+            if (n == 0)
+                throw std::runtime_error("subset pread: unexpected EOF at offset " +
+                                         std::to_string(pos));
+            p   += static_cast<size_t>(n);
+            pos += static_cast<off_t>(n);
+            rem -= static_cast<size_t>(n);
+        }
     };
 
-    for (int k = 0; k < std::min<int>(PREFETCH_AHEAD, static_cast<int>(src_shards.size())); ++k)
-        prefetch_shard(static_cast<size_t>(k));
+    std::array<std::vector<uint8_t>, 2> bufs;
+    int cur = 0;
+    std::future<void> bg;
+    if (!work.empty())
+        do_pread(src_shards[work[0]]->file_offset, src_shards[work[0]]->compressed_size, bufs[0]);
 
     const int n_threads = static_cast<int>(cfg.threads > 0 ? cfg.threads : 1);
     size_t n_shards_done  = 0;
     size_t n_genomes_done = 0;
 
     // ── Phase 3: decompress + write ──────────────────────────────────────────
-    for (size_t s = 0; s < src_shards.size(); ++s) {
-        const auto& rec_idxs = src_shard_records[s];
-        if (rec_idxs.empty()) { ++n_shards_done; continue; }
+    for (size_t w = 0; w < work.size(); ++w) {
+        if (w > 0 && bg.valid()) bg.get();
 
-        prefetch_shard(s + PREFETCH_AHEAD);
+        const int nxt = 1 - cur;
+        if (w + 1 < work.size()) {
+            const uint64_t off = src_shards[work[w + 1]]->file_offset;
+            const uint64_t sz  = src_shards[work[w + 1]]->compressed_size;
+            bg = std::async(std::launch::async,
+                [&bufs, nxt, off, sz, &do_pread]() { do_pread(off, sz, bufs[nxt]); });
+        }
+
+        const size_t s = work[w];
+        const auto& rec_idxs = src_shard_records[s];
+        const uint8_t* base  = bufs[cur].data();
 
         ShardReader shard;
-        shard.open(src_mmap.data(), src_shards[s]->file_offset, src_shards[s]->compressed_size);
+        shard.open(base, 0, src_shards[s]->compressed_size);
 
         // Raw-blob fast path: when no partial output shard is open, every genome
         // in this source shard is kept, and there are no deleted entries, copy the
         // compressed bytes directly without decompress→recompress.
         {
-            const ShardHeader* src_hdr =
-                reinterpret_cast<const ShardHeader*>(
-                    src_mmap.data() + src_shards[s]->file_offset);
+            const ShardHeader* src_hdr = reinterpret_cast<const ShardHeader*>(base);
             if (!cur_writer &&
                 src_hdr->n_deleted == 0 &&
                 rec_idxs.size() == static_cast<size_t>(shard.n_genomes()))
@@ -420,7 +450,7 @@ void subset_archive(const std::filesystem::path& input_gpk,
                     ++n_genomes_done;
                 }
 
-                const uint8_t* blob_ptr = src_mmap.data() + src_shards[s]->file_offset;
+                const uint8_t* blob_ptr = base;
                 size_t blob_len = static_cast<size_t>(src_shards[s]->compressed_size);
                 FrozenShard fs;
                 fs.bytes.assign(blob_ptr, blob_ptr + blob_len);
@@ -438,11 +468,11 @@ void subset_archive(const std::filesystem::path& input_gpk,
                     write_q.push(std::move(wt));
                 }
                 write_q_cv.notify_one();
-                shard.release_pages();
                 ++n_shards_done;
                 if (cfg.verbose || n_shards_done % 2000 == 0)
                     spdlog::info("Phase 3: {}/{} shards (raw), {} genomes",
-                                 n_shards_done, src_shards.size(), n_genomes_done);
+                                 n_shards_done, work.size(), n_genomes_done);
+                cur = nxt;
                 continue;
             }
         }
@@ -482,7 +512,6 @@ void subset_archive(const std::filesystem::path& input_gpk,
             }
         }
 
-        shard.release_pages();
         ++n_shards_done;
 
         // Evict if over cap
@@ -496,9 +525,12 @@ void subset_archive(const std::filesystem::path& input_gpk,
 
         if (cfg.verbose || n_shards_done % 2000 == 0)
             spdlog::info("Phase 3: {}/{} shards, {} genomes, {:.1f} GB buffered",
-                         n_shards_done, src_shards.size(), n_genomes_done,
+                         n_shards_done, work.size(), n_genomes_done,
                          total_buffered_bytes / double(1ULL << 30));
+
+        cur = nxt;
     }
+    if (bg.valid()) bg.get();
 
     // Flush remaining writer
     if (cur_writer) {
