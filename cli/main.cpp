@@ -22,6 +22,7 @@
 #include <genopack/accx.hpp>
 #include <genopack/archive.hpp>
 #include <genopack/archive_set_reader.hpp>
+#include <genopack/derep_view.hpp>
 #ifdef _OPENMP
 #include <omp.h>
 #endif
@@ -550,6 +551,72 @@ static int cmd_slice(const std::string& archive_dir,
 }
 
 // ── genopack stat ──────────────────────────────────────────────────────────────
+// ── genopack neighbors ──────────────────────────────────────────────────────
+// A priori nearest-in-DB member from the derep .gpd cluster structure. For each
+// query accession, its cluster REPRESENTATIVE is its nearest representative-DB
+// member (they clustered within the derep ANI threshold), resolved with NO
+// alignment. This is what ancient-metasim uses to place absent-taxon reads a
+// priori: pick a cluster member as the (leave-one-out) absent source, and its rep
+// -- present in the 1.3M reps DB -- is nearest_db_accession.
+static int cmd_neighbors(const std::string& derep_path,
+                         const std::string& acc_file,
+                         const std::string& out_path) {
+    namespace fs = std::filesystem;
+    std::vector<std::string> gpds;
+    if (fs::is_directory(derep_path)) {
+        for (auto& e : fs::recursive_directory_iterator(derep_path))
+            if (e.is_regular_file() && e.path().extension() == ".gpd")
+                gpds.push_back(e.path().string());
+        std::sort(gpds.begin(), gpds.end());
+    } else {
+        gpds.push_back(derep_path);
+    }
+    if (gpds.empty()) { spdlog::error("No .gpd found under {}", derep_path); return 1; }
+
+    std::vector<std::string> queries;
+    { std::ifstream f(acc_file); std::string l;
+      while (std::getline(f, l)) { if (!l.empty() && l.back()=='\r') l.pop_back();
+                                   if (!l.empty()) queries.push_back(l); } }
+    if (queries.empty()) { spdlog::error("No query accessions in {}", acc_file); return 1; }
+
+    std::ostream* os = &std::cout;
+    std::ofstream ofs;
+    if (!out_path.empty() && out_path != "-") { ofs.open(out_path); os = &ofs; }
+    *os << "accession\tstatus\trep_accession\trep_id\tcluster_size\n";
+
+    std::unordered_set<std::string> remaining(queries.begin(), queries.end());
+    uint64_t resolved = 0;
+    for (const auto& g : gpds) {
+        if (remaining.empty()) break;
+        DerepView dv;
+        try { dv.open(g); } catch (const std::exception& e) {
+            spdlog::warn("skip {}: {}", g, e.what()); continue; }
+        std::unordered_map<uint32_t,uint32_t> csize;
+        dv.scan_representatives([&](uint32_t rid, std::string_view, uint32_t cs){ csize[rid]=cs; });
+        std::vector<std::string> found;
+        for (const auto& acc : remaining) {
+            auto rs = dv.status_for_accession(acc);
+            if (rs.kind == RepStatus::Kind::Absent) continue;
+            const char* k = rs.kind==RepStatus::Kind::Representative ? "representative"
+                          : rs.kind==RepStatus::Kind::Member        ? "member"
+                          : rs.kind==RepStatus::Kind::Unclustered   ? "unclustered"
+                          : "tombstoned";
+            uint32_t cs = (rs.rep_id!=UINT32_MAX && csize.count(rs.rep_id)) ? csize[rs.rep_id] : 0;
+            *os << acc << '\t' << k << '\t' << rs.rep_accession << '\t'
+                << (rs.rep_id==UINT32_MAX ? std::string("-") : std::to_string(rs.rep_id))
+                << '\t' << cs << '\n';
+            found.push_back(acc);
+        }
+        for (auto& a : found) remaining.erase(a);
+        resolved += found.size();
+        dv.close();
+    }
+    for (const auto& a : remaining) *os << a << "\tabsent\t-\t-\t0\n";
+    spdlog::info("neighbors: {} resolved, {} absent (of {} queries, {} .gpd parts)",
+                 resolved, remaining.size(), queries.size(), gpds.size());
+    return 0;
+}
+
 static int cmd_stat(const std::string& archive_dir, bool json) {
     ArchiveSetReader ar = open_archive_auto(archive_dir);
 
@@ -3144,6 +3211,21 @@ int main(int argc, char** argv) {
     stat->add_flag("--json", stat_json, "Output JSON");
     stat->callback([&]() {
         std::exit(cmd_stat(stat_archive, stat_json));
+    });
+
+    // genopack neighbors
+    auto* neighbors = app.add_subcommand("neighbors",
+        "A priori nearest-in-DB member per query accession from the derep .gpd "
+        "cluster structure (cluster rep = nearest representative-DB member, no alignment). "
+        "For ancient-metasim absent-taxon placement.");
+    std::string nb_derep, nb_acc, nb_out;
+    neighbors->add_option("derep", nb_derep,
+        "Derep .gpd file or directory of .gpd parts")->required();
+    neighbors->add_option("--accessions-file", nb_acc,
+        "Query accessions, one per line")->required();
+    neighbors->add_option("-o,--output", nb_out, "Output TSV (default: stdout)");
+    neighbors->callback([&]() {
+        std::exit(cmd_neighbors(nb_derep, nb_acc, nb_out));
     });
 
     // genopack inspect
