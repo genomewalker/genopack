@@ -347,11 +347,23 @@ static int cmd_merge(const std::vector<std::string>& inputs,
 // the contigs joined by runs of `npad` Ns. The N-run must exceed the longest
 // read so no read can align across a contig junction. Header becomes `accession`.
 // Returns "" if the input has no sequence.
+// Per-reference N-mask: non-N segments in the padded (concat) coordinate space,
+// so kaiku computes coverage geometry over real bases and ignores the N spacers.
+// genopack emits this here (it knows every spacer position) instead of kaiku
+// re-scanning the FASTA. Format mirrors kaiku's KNMASK01 loader.
+struct RefMask {
+    std::string accession;
+    std::vector<uint32_t> seg_start, seg_len, n_prefix;
+    uint32_t effective_len = 0;
+};
+
 static std::string concat_contigs(const std::string& fasta,
-                                  const std::string& accession, int npad) {
+                                  const std::string& accession, int npad,
+                                  RefMask* mask = nullptr) {
     std::string seq;
     seq.reserve(fasta.size());
     bool first = true;
+    uint32_t n_before = 0;                 // N bases emitted so far (spacers)
     const size_t n = fasta.size();
     size_t i = 0;
     while (i < n) {
@@ -367,6 +379,24 @@ static std::string concat_contigs(const std::string& fasta,
         }
         i = eol + 1;
     }
+    (void)n_before;
+    if (mask) {
+        // Scan the built sequence for ALL N runs (concat spacers AND intra-contig
+        // assembly gaps) -- both are uncoverable. Contig boundaries alone miss the
+        // source-genome Ns. Same non-N segmentation kaiku's FASTA-scan uses.
+        mask->accession = accession;
+        uint32_t p = 0, nb = 0, len = (uint32_t)seq.size();
+        while (p < len) {
+            while (p < len && (seq[p] == 'N' || seq[p] == 'n')) { p++; nb++; }
+            if (p >= len) break;
+            uint32_t s = p;
+            while (p < len && seq[p] != 'N' && seq[p] != 'n') p++;
+            mask->seg_start.push_back(s);
+            mask->seg_len.push_back(p - s);
+            mask->n_prefix.push_back(nb);
+            mask->effective_len += (p - s);
+        }
+    }
     if (seq.empty()) return {};
     std::string out;
     out.reserve(seq.size() + seq.size() / 60 + accession.size() + 4);
@@ -380,13 +410,38 @@ static std::string concat_contigs(const std::string& fasta,
     return out;
 }
 
+// Write per-reference N-masks in kaiku's KNMASK01 format.
+static bool write_nmask_file(const std::string& path, const std::vector<RefMask>& masks) {
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) return false;
+    const char magic[8] = {'K','N','M','A','S','K','0','1'};
+    fwrite(magic, 1, 8, f);
+    uint32_t n = 0;
+    for (const auto& m : masks) if (!m.accession.empty()) n++;
+    fwrite(&n, 4, 1, f);
+    for (const auto& m : masks) {
+        if (m.accession.empty()) continue;
+        uint16_t nl = (uint16_t)m.accession.size();
+        fwrite(&nl, 2, 1, f); fwrite(m.accession.data(), 1, nl, f);
+        fwrite(&m.effective_len, 4, 1, f);
+        uint32_t ns = (uint32_t)m.seg_start.size(); fwrite(&ns, 4, 1, f);
+        for (uint32_t k = 0; k < ns; k++) {
+            fwrite(&m.seg_start[k], 4, 1, f);
+            fwrite(&m.seg_len[k],   4, 1, f);
+            fwrite(&m.n_prefix[k],  4, 1, f);
+        }
+    }
+    fclose(f);
+    return true;
+}
+
 static int cmd_extract(const std::string& archive_dir,
                        const std::vector<std::string>& accessions,
                        const std::string& accessions_file,
                        float min_completeness, float max_contamination,
                        const std::string& out_fasta,
                        const std::string& out_dir,
-                       bool concat, int concat_npad) {
+                       bool concat, int concat_npad, bool emit_nmask) {
     ArchiveSetReader ar = open_archive_auto(archive_dir);
 
     ExtractQuery q;
@@ -442,13 +497,15 @@ static int cmd_extract(const std::string& archive_dir,
         // visit_shard_batches; results are buffered by request index so the
         // single-stream output stays in accession-list order.
         std::vector<std::string> ordered(q.accessions.size());
+        std::vector<RefMask> masks(concat && emit_nmask ? q.accessions.size() : 0);
         ar.visit_shard_batches(q.accessions, [&](ArchiveSetReader::ShardBatch& batch) {
             for (auto& [idx, eg] : batch) {
                 if (eg.fasta.empty()) {
                     spdlog::warn("Accession not found or deleted: {}", q.accessions[idx]);
                     continue;
                 }
-                ordered[idx] = concat ? concat_contigs(eg.fasta, q.accessions[idx], concat_npad)
+                RefMask* mp = (concat && emit_nmask) ? &masks[idx] : nullptr;
+                ordered[idx] = concat ? concat_contigs(eg.fasta, q.accessions[idx], concat_npad, mp)
                                       : std::move(eg.fasta);
             }
         });
@@ -456,6 +513,11 @@ static int cmd_extract(const std::string& archive_dir,
         for (auto& f : ordered)
             if (!f.empty()) { *out_stream << f; ++n; }
         spdlog::info("Extracted {} genomes", n);
+        if (concat && emit_nmask && !out_fasta.empty() && out_fasta != "-") {
+            std::string np = out_fasta + ".nmask";
+            if (write_nmask_file(np, masks))
+                spdlog::info("Wrote N-mask: {} ({} refs)", np, n);
+        }
     } else {
         std::vector<ExtractedGenome> results = ar.extract(q);
         spdlog::info("Extracted {} genomes", results.size());
@@ -3049,12 +3111,15 @@ int main(int argc, char** argv) {
     int  ext_concat_ns = 300;
     extract->add_flag("--concat-contigs", ext_concat,
         "Emit one record per genome: contigs joined by N-runs, header = accession");
+    bool ext_nmask = false;
+    extract->add_flag("--nmask", ext_nmask,
+        "With --concat-contigs and -o: also write <out>.nmask (per-ref effective len + N-intervals for kaiku)");
     extract->add_option("--concat-ns", ext_concat_ns,
         "N-run length between contigs (default 300; must exceed the longest read)");
     extract->callback([&]() {
         std::exit(cmd_extract(ext_archive, ext_accessions, ext_acc_file,
                               ext_min_comp, ext_max_contam, ext_out, ext_out_dir,
-                              ext_concat, ext_concat_ns));
+                              ext_concat, ext_concat_ns, ext_nmask));
     });
 
     // genopack slice
