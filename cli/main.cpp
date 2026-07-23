@@ -2562,20 +2562,78 @@ static const char* rank_name_gtdb(TaxRank r) {
 static int cmd_taxdump(const std::string& archive_path,
                        const std::string& format,
                        const std::string& output_dir) {
-    ArchiveReader ar;
-    ar.open(archive_path);
+    // Multipart-aware: a reps pack is a DIRECTORY of part_*.gpk. The old code
+    // used a single-file ArchiveReader, which on a directory opened the dir fd and
+    // mmap'd it -> ENODEV. Merge every part's taxonomy tree (dedup nodes by taxid;
+    // GTDB taxids are global across parts, so first occurrence wins). A single .gpk
+    // is just a one-part set. Both format branches below are unchanged: the merged
+    // view exposes the same scan_nodes/scan_accessions/n_nodes/n_accessions API.
+    ArchiveSetReader ar = open_archive_auto(archive_path);
 
-    auto tree_opt = ar.taxonomy_tree();
-    if (!tree_opt) {
+    struct MergedTree {
+        std::map<uint64_t, std::tuple<uint64_t, TaxRank, std::string, bool>> nodes;
+        std::vector<std::pair<std::string, uint64_t>> accs;
+        size_t n_nodes() const { return nodes.size(); }
+        size_t n_accessions() const { return accs.size(); }
+        void scan_nodes(const std::function<void(uint64_t, uint64_t, TaxRank,
+                                                 std::string_view, bool)>& cb) const {
+            for (const auto& [tid, v] : nodes)
+                cb(tid, std::get<0>(v), std::get<1>(v), std::get<2>(v), std::get<3>(v));
+        }
+        void scan_accessions(const std::function<void(std::string_view,
+                                                      uint64_t)>& cb) const {
+            for (const auto& [a, t] : accs) cb(a, t);
+        }
+    } tree;
+
+    bool any_tax = false;
+    for (const auto& pp : ar.part_paths()) {
+        ArchiveReader pr;
+        pr.open(pp);
+        auto t = pr.taxonomy_tree();
+        if (!t) continue;
+        any_tax = true;
+        t->scan_nodes([&](uint64_t taxid, uint64_t parent, TaxRank rank,
+                          std::string_view name, bool synthetic) {
+            tree.nodes.emplace(taxid, std::make_tuple(parent, rank,
+                                                      std::string(name), synthetic));
+        });
+        t->scan_accessions([&](std::string_view acc, uint64_t taxid) {
+            tree.accs.emplace_back(std::string(acc), taxid);
+        });
+    }
+    if (!any_tax) {
         spdlog::error("No taxonomy data in archive");
         return 1;
     }
-    auto& tree = *tree_opt;
+
+    // Remap 64-bit GTDB lineage-hash taxids to a dense 1..N space. Downstream
+    // consumers (kaiku's KtaxNode.taxid is int32) overflow on the raw hashes; the
+    // hashes are synthetic anyway, so relabeling is lossless. std::map iteration is
+    // sorted -> deterministic; the root (taxid 1) sorts first and stays 1.
+    {
+        std::unordered_map<uint64_t, uint64_t> remap;
+        remap.reserve(tree.nodes.size() + 1);
+        uint64_t next_id = 1;
+        for (const auto& [tid, v] : tree.nodes) { (void)v; remap[tid] = next_id++; }
+        std::map<uint64_t, std::tuple<uint64_t, TaxRank, std::string, bool>> renumbered;
+        for (auto& [tid, v] : tree.nodes) {
+            uint64_t par = std::get<0>(v);
+            uint64_t new_par = (par == 0) ? remap[tid]
+                             : (remap.count(par) ? remap[par] : remap[tid]);
+            renumbered.emplace(remap[tid],
+                std::make_tuple(new_par, std::get<1>(v),
+                                std::move(std::get<2>(v)), std::get<3>(v)));
+        }
+        tree.nodes.swap(renumbered);
+        for (auto& [a, t] : tree.accs) { (void)a; if (remap.count(t)) t = remap[t]; }
+    }
 
     std::filesystem::create_directories(output_dir);
     std::filesystem::path out = output_dir;
 
-    spdlog::info("Taxonomy: {} nodes, {} accessions", tree.n_nodes(), tree.n_accessions());
+    spdlog::info("Taxonomy: {} nodes, {} accessions ({} part(s))",
+                 tree.n_nodes(), tree.n_accessions(), ar.part_count());
 
     if (format == "taxdump") {
         // ── NCBI taxdump ─────────────────────────────────────────────────────
