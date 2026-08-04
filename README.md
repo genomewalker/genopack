@@ -303,8 +303,9 @@ and FMHR (per-genus FracMinHash references) simultaneously.
 | `contamination_contig_outlier` | Fraction bp where T² or SPE > 95th percentile (requires GCOV) |
 | `contamination_spe` | SPE-based contig outlier fraction (requires GCOV) |
 | `contamination_rho_outlier` | Genus-outlier AND family-inlier fraction (requires GCOV+FCOV) |
-| `marker_completeness` | Single-copy marker gene completeness (requires `--markers`) |
-| `marker_redundancy` | Single-copy marker gene redundancy (requires `--markers`) |
+| `completeness_marker` | Single-copy marker gene completeness, present/expected (requires `--markers`) |
+| `marker_n_present` | Raw count of present single-copy markers (requires `--markers`) |
+| `marker_n_expected` | Expected single-copy markers for the genus (requires `--markers`) |
 
 ## Library usage
 
