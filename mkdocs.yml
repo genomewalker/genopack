@@ -61,5 +61,6 @@ nav:
   - API Reference: api.md
   - CLI Reference: cli.md
   - Quality Scoring: quality.md
+  - AAMER Subsystem: aamer.md
   - Format: format.md
   - Changelog: changelog.md
