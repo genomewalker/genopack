@@ -9,7 +9,7 @@ is called at runtime. CheckM2 is the calibration yardstick, not a dependency (se
 [CheckM2 alignment](#checkm2-alignment)).
 
 The signals below are the columns of the `check` TSV
-(`src/check/run_check.cpp:644-673`).
+(`src/check/run_check.cpp:693-726`).
 
 ## Terms
 
@@ -45,8 +45,8 @@ $$
 
 | Estimator | Meaning | Notes |
 |-----------|---------|-------|
-| `marker_completeness` (QualRecord field; TSV column `completeness_marker`) | present / expected single-copy genus markers (CheckM2-aligned, genus-calibrated) | primary signal; fraction-tracking, declines with fragmentation. Field: `types.hpp:90`; TSV header: `run_check.cpp:673` |
-| `completeness_aamer_core` | fraction of the genus prevalence-core aamer set (amino-acid 8-mers) recovered | fallback; presence-**saturating** (small dynamic range near 1.0), never NaN when scored (`run_check.cpp:78-80`, `qual.hpp:44`) |
+| `marker_completeness` (QualRecord field; TSV column `completeness_marker`) | present / expected single-copy genus markers (CheckM2-aligned, genus-calibrated) | primary signal; fraction-tracking, declines with fragmentation. Field: `src/check/types.hpp:72`; TSV column emitted at `run_check.cpp:719` |
+| `completeness_aamer_core` | fraction of the genus prevalence-core aamer set (amino-acid 8-mers) recovered | fallback; presence-**saturating** (small dynamic range near 1.0), never NaN when scored (`src/check/types.hpp:57`, `include/genopack/qual.hpp:19`) |
 | `completeness_post_decontam` | bp retained after the contig contamination scan | last resort |
 
 `marker_completeness` is scored on the pass-B FASTA route. When `--markers` is
@@ -65,7 +65,7 @@ in a diverse genus recovers ~100% of its own core but only a small slice of the
 genus accessory pangenome, so a low `cluster_relative` there is genus diversity,
 not missing sequence. It must never drive `completeness_effective` down on its own.
 
-It is admitted only as a soft corroborator (`run_check.cpp:82-90`):
+It is admitted only as a soft corroborator (`src/check/run_check.cpp:66-77`, inside `completeness_effective()`):
 
 $$
 \mathrm{comp\_eff} =

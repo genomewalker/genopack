@@ -4717,7 +4717,7 @@ int main(int argc, char** argv) {
     markers_build_cmd->add_option("--expected-min-frac", mb_expected_min_frac,
         "A marker is counted as expected for a genus only if it is detectable (≥1 IC-passing "
         "syncmer) in at least this fraction of the genus's reference genomes. Mirrors CheckM2's "
-        "~97%% single-copy universality criterion. (default: 0.95)");
+        "~97%% single-copy universality criterion. (default: 0.50)");
     markers_build_cmd->callback([&]() {
         genopack::MarkersBuildConfig cfg;
         cfg.gtdbtk_db          = mb_gtdbtk_db;
