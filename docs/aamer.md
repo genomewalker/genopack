@@ -134,9 +134,19 @@ remains fully live for reading legacy archives, and — more importantly —
 `genopack pcore` currently *sources its own build config* (`k`, `min_seg_aa`,
 `theta`, `frac_max_hash`) from an existing archive's `SEC_CORE` header, and
 **skips any archive that has no CORE params** (`src/run_pcore.cpp:140-144`,
-`"has no CORE params; skipping"`). In other words: a `SEC_CORE` section,
-wherever it came from, is a prerequisite input to building `SEC_PCORE` today,
-even though nothing in this repository writes a fresh one.
+`"has no CORE params; skipping"`). It uses the CoreReader *only* for those four
+config values — never the core aamer content — and exposes **no CLI fallback**
+for them (`pcore`'s only options are `archive`, `--threads`, `--members`).
+`merge` also **drops** `SEC_CORE` (it is in the non-concatenable set,
+`src/merger.cpp:190`), so a merged archive loses the ability to rebuild PCORE.
+
+In other words: a `SEC_CORE` section, wherever it came from, is a prerequisite
+input to building `SEC_PCORE` today, even though nothing in this repository
+writes a fresh one — so an archive cannot currently self-bootstrap the AAMER
+completeness/contamination pipeline (`SEC_CORE → SEC_PCORE → completeness`).
+The four config parameters (`theta`, `min_seg_aa`, `frac_max_hash`, and `k=8`)
+are quality-affecting; a bootstrap path would need them supplied as `pcore` CLI
+options with the canonical values, not defaults invented here.
 
 ### 3.2 SEC_PCORE — dense per-genus aamer reference
 
