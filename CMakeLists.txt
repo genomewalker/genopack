@@ -50,6 +50,11 @@ endif()
 
 # spdlog — always fetch v1.14.1 to match geodesic's fmt version (fmt v10)
 include(FetchContent)
+# Build all fetched static deps position-independent: genopack_lib is whole-archived
+# into libgenopack.so (a shared object), so every archive linked alongside it — spdlog
+# above all — must be PIC. Without this CI fails: spdlog.cpp.o carries a non-PIC TLS
+# relocation (R_X86_64_TPOFF32) that ld refuses inside a shared object.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 FetchContent_Declare(spdlog
   GIT_REPOSITORY https://github.com/gabime/spdlog.git
   GIT_TAG        v1.14.1)
