@@ -1,0 +1,1306 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="High-performance single-file genome archive for large-scale microbial collections">
+      
+      
+      
+        <link rel="canonical" href="https://genomewalker.github.io/genopack/aamer/">
+      
+      
+        <link rel="prev" href="../quality/">
+      
+      
+        <link rel="next" href="../format/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>AAMER Subsystem - genopack</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../stylesheets/extra.css">
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="teal" data-md-color-accent="teal">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#aamer-the-amino-acid-k-mer-subsystem" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+<header class="md-header" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="genopack" class="md-header__button md-logo" aria-label="genopack" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            genopack
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              AAMER Subsystem
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="default" data-md-color-primary="teal" data-md-color-accent="teal"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a4 4 0 0 0-4 4 4 4 0 0 0 4 4 4 4 0 0 0 4-4 4 4 0 0 0-4-4m0 10a6 6 0 0 1-6-6 6 6 0 0 1 6-6 6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="slate" data-md-color-primary="teal" data-md-color-accent="teal"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 18c-.89 0-1.74-.2-2.5-.55C11.56 16.5 13 14.42 13 12s-1.44-4.5-3.5-5.45C10.26 6.2 11.11 6 12 6a6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/genomewalker/genopack" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    genomewalker/genopack
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+            
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href=".." class="md-tabs__link">
+        
+  
+  
+    
+  
+  Home
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../getting-started/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Getting Started
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../api/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  API Reference
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../cli/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  CLI Reference
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../quality/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Quality Scoring
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+    
+  
+  
+    <li class="md-tabs__item md-tabs__item--active">
+      <a href="./" class="md-tabs__link">
+        
+  
+  
+    
+  
+  AAMER Subsystem
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../format/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Format
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../changelog/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Changelog
+
+      </a>
+    </li>
+  
+
+      
+    </ul>
+  </div>
+</nav>
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+  
+
+<nav class="md-nav md-nav--primary md-nav--lifted md-nav--integrated" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="genopack" class="md-nav__button md-logo" aria-label="genopack" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    genopack
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/genomewalker/genopack" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    genomewalker/genopack
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../getting-started/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting Started
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../api/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    API Reference
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../cli/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CLI Reference
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../quality/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Quality Scoring
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    AAMER Subsystem
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    AAMER Subsystem
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#1-overview" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. Overview
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-the-aamer-engine" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. The AAMER engine
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="2. The AAMER engine">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#21-encoding" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.1 Encoding
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#22-hashing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.2 Hashing
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#23-low-complexity-masking" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.3 Low-complexity masking
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#24-6-frame-translation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.4 6-frame translation
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#25-extraction-fracminhash" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.5 Extraction / FracMinHash
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#26-dayhoff-6-variant-marker-panel-only" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2.6 Dayhoff-6 variant (marker panel only)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-the-three-archive-sections" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. The three archive sections
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="3. The three archive sections">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#31-sec_core-genus-prevalence-core" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.1 SEC_CORE — genus prevalence core
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#32-sec_pcore-dense-per-genus-aamer-reference" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.2 SEC_PCORE — dense per-genus aamer reference
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#33-sec_gami-global-aamer-multiplicity-index" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3.3 SEC_GAMI — global aamer multiplicity index
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4-protein-k-mer-primitives" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. Protein k-mer primitives
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#5-how-aamer-feeds-quality" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5. How AAMER feeds quality
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#6-building-it" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        6. Building it
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../format/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Format
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../changelog/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Changelog
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="aamer-the-amino-acid-k-mer-subsystem">AAMER: The Amino-Acid K-mer Subsystem</h1>
+<p>AAMER is genopack's marker-gene-<strong>free</strong> completeness/contamination substrate: a
+single k=8 amino-acid k-mer engine, shared byte-for-byte between the build side
+(protein) and the check side (DNA), that backs three archive sections
+(<code>SEC_CORE</code>, <code>SEC_PCORE</code>, <code>SEC_GAMI</code>), the clade-split contamination tier, the
+SCG marker panel, and the per-contig foreign-containment scan. It is implemented
+across a dozen files with no single entry point — this page is that entry point.</p>
+<h2 id="1-overview">1. Overview</h2>
+<p>An <strong>aamer</strong> is an amino-acid k-mer with <strong>k=8</strong> (<code>AAMER_K</code>,
+<code>include/genopack/aamer.hpp:18</code>). Reference genomes almost never ship as protein;
+query genomes never do. AAMER's build side ingests <strong>protein</strong> (GTDB-Tk MSA
+sequences, <code>extract_aamers_aa</code>, <code>aamer.hpp:687-716</code>), and its check side ingests
+<strong>DNA</strong>, 6-frame translated to protein in software
+(<code>translate_6frame</code>/<code>extract_aamers_dna</code>, <code>aamer.hpp:357-476</code>, <code>620-630</code>). Both
+paths hash the resulting amino-acid octamers with the <strong>identical</strong> function
+(<code>aamer_hash</code>, <code>aamer.hpp:109-124</code>), so a protein aamer built from an MSA column
+and a DNA-translated aamer from a draft assembly land on the same 64-bit key —
+membership lookup works straight across the protein↔DNA boundary without ever
+materializing a shared FASTA format. This is the trick that lets a completeness
+model built once from curated GTDB-Tk protein alignments score arbitrary
+(possibly fragmented, error-prone) nucleotide assemblies at check time, with no
+external gene caller and no HMM search.</p>
+<p>Because it's a raw k-mer signal rather than a curated single-copy-gene set,
+AAMER degrades gracefully on partial ORFs and fragmented contigs — the same
+property that makes GUNC-style protein k-mer methods attractive over
+marker-based ones (<code>cladesplit.hpp:14-22</code>).</p>
+<h2 id="2-the-aamer-engine">2. The AAMER engine</h2>
+<h3 id="21-encoding">2.1 Encoding</h3>
+<p><code>AA_ENC[256]</code> maps ASCII → a 20-letter alphabetical index (A=0 … Y=19, <code>0xFF</code>
+sentinel for gaps/stop/ambiguous; handles upper/lower case, <code>-</code>, <code>*</code>, <code>X</code>)
+(<code>aamer.hpp:22-46</code>). <code>DNA_ENC[256]</code> maps ASCII → <code>{A=0,C=1,G=2,T/U=3}</code>, <code>0xFF</code>
+for anything else (<code>aamer.hpp:49-68</code>). Translation uses genetic code 11
+(bacterial/archaeal), <code>CODON11[64]</code> (<code>aamer.hpp:79-92</code>).</p>
+<h3 id="22-hashing">2.2 Hashing</h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="kt">uint64_t</span><span class="w"> </span><span class="nf">aamer_hash</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="kt">uint8_t</span><span class="o">*</span><span class="w"> </span><span class="n">aa</span><span class="p">)</span><span class="w"> </span><span class="k">noexcept</span><span class="p">;</span><span class="w">   </span><span class="c1">// aamer.hpp:109</span>
+</code></pre></div>
+<p>Packs 8 amino acids at 5 bits each (40 bits) then applies a splitmix64 mix
+(<code>aamer.hpp:109-124</code>). Must be called with identical AA encoding on both sides —
+it is, because both <code>extract_aamers_aa</code> and <code>extract_aamers_dna</code>/<code>translate_6frame</code>
+route through the same <code>AA_ENC</code>/<code>CODON11</code> tables. A Murphy-10 reduced-alphabet
+variant (<code>aamer_hash_murphy10</code>, <code>aamer.hpp:128-143</code>, 10 classes × 4 bits) exists
+for the marker panel's reduced-alphabet mode (§4, §6).</p>
+<h3 id="23-low-complexity-masking">2.3 Low-complexity masking</h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="kt">bool</span><span class="w"> </span><span class="nf">aamer_is_low_complexity</span><span class="p">(</span><span class="k">const</span><span class="w"> </span><span class="kt">uint8_t</span><span class="o">*</span><span class="w"> </span><span class="n">aa</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">k</span><span class="p">)</span><span class="w"> </span><span class="k">noexcept</span><span class="p">;</span><span class="w">  </span><span class="c1">// aamer.hpp:146</span>
+</code></pre></div>
+<p>Rejects a k-mer if it contains a run of <code>&gt;= (k+1)/2</code> identical amino acids — for
+k=8, a run of ≥4 (integer division). Applied uniformly at extraction time on
+both build and check sides (<code>emit_aamers</code>, <code>aamer.hpp:156-162</code>).</p>
+<h3 id="24-6-frame-translation">2.4 6-frame translation</h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="k">template</span><span class="w"> </span><span class="o">&lt;</span><span class="k">typename</span><span class="w"> </span><span class="nc">Cb</span><span class="o">&gt;</span>
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="kt">void</span><span class="w"> </span><span class="n">translate_6frame</span><span class="p">(</span><span class="n">std</span><span class="o">::</span><span class="n">string_view</span><span class="w"> </span><span class="n">seq</span><span class="p">,</span><span class="w"> </span><span class="kt">int</span><span class="w"> </span><span class="n">min_aa_len</span><span class="p">,</span><span class="w"> </span><span class="n">Cb</span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="n">cb</span><span class="p">);</span><span class="w">  </span><span class="c1">// aamer.hpp:357</span>
+</code></pre></div>
+<p>For each inter-stop amino-acid segment <code>&gt;= min_aa_len</code> in all 6 reading frames
+(0-2 forward, 3-5 reverse-complement), invokes
+<code>cb(frame, aa_ptr, aa_len, nt_start, nt_end)</code>. Ambiguous bases (<code>N</code> etc.) break a
+reading frame exactly like a stop codon. An AVX2 path (<code>aamer_detail::xlate8_dual</code>,
+<code>aamer.hpp:307-342</code>) derives the forward and reverse-complement codons from one
+shared base-encode/deinterleave pass, folding what would be 6 independent
+translation passes into 3; a scalar fallback preserves identical output when
+AVX2 is unavailable. <code>translate_3frame_fwd</code> (<code>aamer.hpp:544</code>) is a forward-only
+variant used by marker scoring (§5), which never needs RC frames.</p>
+<h3 id="25-extraction-fracminhash">2.5 Extraction / FracMinHash</h3>
+<table>
+<thead>
+<tr>
+<th>Function</th>
+<th>Side</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>extract_aamers_aa(protein, k=8)</code></td>
+<td>build (protein)</td>
+<td>MSA gaps (<code>-</code>) skipped without breaking the segment; stops break it (<code>aamer.hpp:687-716</code>)</td>
+</tr>
+<tr>
+<td><code>extract_aamers_dna(seq, k, min_seg_aa)</code></td>
+<td>check (DNA)</td>
+<td>full 6-frame translate + hash, sorted-unique (<code>aamer.hpp:620-630</code>)</td>
+</tr>
+<tr>
+<td><code>extract_aamers_dna(seq, k, min_seg_aa, max_hash)</code></td>
+<td>check (DNA), subsampled</td>
+<td>keeps only <code>h &lt;= max_hash</code> — FracMinHash (<code>aamer.hpp:633-643</code>)</td>
+</tr>
+<tr>
+<td><code>extract_aamers_dna_into(...)</code></td>
+<td>check (DNA), in-place</td>
+<td>appends into a caller-owned <code>thread_local</code> buffer, no per-call allocation (<code>aamer.hpp:648-653</code>)</td>
+</tr>
+</tbody>
+</table>
+<p>The FracMinHash rolling variant (<code>emit_aamers_frac</code>, <code>aamer.hpp:169-188</code>)
+maintains the packed 40-bit value across the sliding window with 3 ops instead
+of an 8-byte repack, and hash-gates <em>before</em> the low-complexity scan so the
+expensive check only runs on the ~1/N survivors of the FMH subsample.</p>
+<h3 id="26-dayhoff-6-variant-marker-panel-only">2.6 Dayhoff-6 variant (marker panel only)</h3>
+<p>A second, independent k-mer scheme lives in the same file: Dayhoff-6 reduces the
+20-letter alphabet to 6 classes (<code>AA_DAYHOFF6[20]</code>, <code>aamer.hpp:721-723</code>), with
+<strong>k=12</strong> (<code>AAMER_K_D6</code>) and closed-syncmer selection at inner s-mer length
+<strong>s=4</strong> (<code>AAMER_S_D6</code>, <code>aamer.hpp:725-726</code>) — a syncmer criterion selects a
+k-mer only if its minimum s-mer sits at position 0, giving ~11% density
+(<code>1/(k-s+1)</code>, <code>aamer.hpp:742-757</code>). This is a separate, coarser k-mer used only
+by the <code>--dayhoff6</code> marker-panel build mode (§6); it is not part of the
+CORE/PCORE/GAMI path, which is fixed at k=8 full-alphabet aamers.</p>
+<h2 id="3-the-three-archive-sections">3. The three archive sections</h2>
+<p>All three sections are keyed by a hashed taxon key (genus, or family where
+noted) and store per-key aamer collections built at k=8 from the aamer engine
+above.</p>
+<table>
+<thead>
+<tr>
+<th>Section</th>
+<th>Density</th>
+<th>What it stores</th>
+<th>Feeds</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>SEC_CORE</code> (legacy)</td>
+<td>sparse — aamers with member-prevalence <code>&gt;= ceil(θ·N)</code> only (the "conserved core")</td>
+<td>per-genus sorted-unique aamer set + contributing member ids + <code>core_model_hash</code> (<code>core_section.hpp:21-43</code>)</td>
+<td>historically <code>completeness_aamer_core</code>; superseded by PCORE (see below)</td>
+</tr>
+<tr>
+<td><code>SEC_PCORE</code></td>
+<td>dense — <strong>every</strong> aamer seen in ≥1 member, plus a per-aamer member-prevalence</td>
+<td>3-run stratified encoding (singleton / multi / core) + quantized prevalence, optional per-aamer IDF tier byte (v2) (<code>pcore.hpp:10-16</code>, <code>32-89</code>)</td>
+<td><code>completeness_aamer_core</code> (via the θ-threshold core run) <strong>and</strong> small-foreign-contig detection (dense union)</td>
+</tr>
+<tr>
+<td><code>SEC_GAMI</code></td>
+<td>global — one <code>(hash, count)</code> pair per aamer across <strong>all</strong> genera, count capped at 255</td>
+<td>sorted pairs, zstd-compressed on disk, Elias-Fano + 2-bit packed counts at load (<code>gami.hpp:2-6</code>, <code>18-42</code>)</td>
+<td>the specificity gate for foreign-aamer contamination scoring (rare-vs-universal)</td>
+</tr>
+</tbody>
+</table>
+<h3 id="31-sec_core-genus-prevalence-core">3.1 SEC_CORE — genus prevalence core</h3>
+<p>An entry is the set of aamers present in <code>&gt;= ceil(theta * N)</code> of a genus's <code>N</code>
+reference members (<code>CoreWriter::add_from_members</code>, <code>src/core_section.cpp:17-37</code>);
+default <code>theta = 0.90</code> (<code>core_section.hpp:27</code> comment, matches <code>PcoreWriter</code>'s
+default, <code>pcore.hpp:208</code>). The section is content-hashed
+(<code>core_model_hash</code>, XXH3 over <code>(k, min_seg_aa, theta, sorted per-genus cores)</code>,
+order-independent — <code>core_section.cpp:65-88</code>) so the intrinsic completeness
+column is a pure function of build inputs, not the raw sibling set
+(<code>core_section.hpp:6-10</code>).</p>
+<p><strong>This section has no active builder in the current codebase.</strong> <code>CoreWriter</code>'s
+only call sites are its own defining file and its unit test
+(<code>tests/core_section_test.cpp</code>) — no CLI subcommand constructs one. <code>CoreReader</code>
+remains fully live for reading legacy archives, and — more importantly —
+<code>genopack pcore</code> currently <em>sources its own build config</em> (<code>k</code>, <code>min_seg_aa</code>,
+<code>theta</code>, <code>frac_max_hash</code>) from an existing archive's <code>SEC_CORE</code> header, and
+<strong>skips any archive that has no CORE params</strong> (<code>src/run_pcore.cpp:140-144</code>,
+<code>"has no CORE params; skipping"</code>). It uses the CoreReader <em>only</em> for those four
+config values — never the core aamer content — and exposes <strong>no CLI fallback</strong>
+for them (<code>pcore</code>'s only options are <code>archive</code>, <code>--threads</code>, <code>--members</code>).
+<code>merge</code> also <strong>drops</strong> <code>SEC_CORE</code> (it is in the non-concatenable set,
+<code>src/merger.cpp:190</code>), so a merged archive loses the ability to rebuild PCORE.</p>
+<p><code>pcore</code> therefore reads its build config from a pre-existing <code>SEC_CORE</code> when one
+is present. When it is <strong>absent</strong>, <code>pcore</code> now <strong>bootstraps</strong> from CLI options
+<code>--theta</code> / <code>--min-seg-aa</code> / <code>--frac-max-hash</code> instead of skipping the archive,
+so an archive can build <code>SEC_PCORE → completeness</code> without a legacy <code>SEC_CORE</code>.
+The defaults are the canonical values recovered from the code (<code>k = AAMER_K = 8</code>;
+<code>min_seg_aa = k = 8</code>, <code>aamer.hpp:621</code>; <code>theta = 0.90</code>, the <code>PcoreWriter</code>/unit-test
+default; <code>frac_max_hash = UINT64_MAX</code>, i.e. dense/no-subsampling, required for the
+1–2 kb small-contig detection that is PCORE's whole purpose). These are
+quality-affecting — override them only to match a specific legacy <code>SEC_CORE</code>.</p>
+<h3 id="32-sec_pcore-dense-per-genus-aamer-reference">3.2 SEC_PCORE — dense per-genus aamer reference</h3>
+<p><code>SEC_PCORE</code> is the unified, dense reference that supersedes CORE: it stores
+<strong>every</strong> aamer seen in ≥1 member together with a per-aamer member prevalence,
+from which a consumer derives, at query time (<code>pcore.hpp:6-9</code>):</p>
+<ul>
+<li>prevalence ≥ θ → the conserved completeness core (== old CORE, exact)</li>
+<li>prevalence ≥ 1 → the dense foreign/containment reference (small-contig detection)</li>
+<li>raw prevalence → the per-aamer weight for a log-likelihood-ratio contamination score</li>
+</ul>
+<p>Two codecs exist: legacy (open-addressing hash, u8 member count capped at 255 —
+a known bug on genera with &gt;255 members, kept read-only for back-compat) and v1
+(three contiguous PFOR-delta runs per genus — singleton/multi/core — with
+quantized log-normalized prevalence for multi+core; the core run is decided from
+true u32 counts at build time so completeness stays exact regardless of
+quantization) (<code>pcore.hpp:10-16</code>, <code>32-36</code>). v2 adds a per-aamer 4-bit IDF tier
+byte (<code>tier = floor(log2(genus_count))</code>, capped at 15,
+<code>pcore_tier_from_count</code>, <code>pcore.hpp:110-117</code>), stamped in a separate
+<code>genopack tier stamp</code> pass (§6) and used to compute a soft IDF weight
+<code>w = 1 - tier/log2(G)</code> in place of the binary GAMI rare/common call
+(<code>pcore_idf_weight</code>, <code>pcore.hpp:121-126</code>).</p>
+<p><code>PcoreWriter</code> builds bounded-memory: only ~64 bytes/genus of metadata stays
+resident while per-genus encoded runs spill to a temp file
+(<code>$GENOPACK_SPILL_DIR</code> or system temp) as they're added (<code>pcore.hpp:203-206</code>).</p>
+<p>Coverage against the θ-threshold core is a plain sorted-merge intersection:</p>
+<div class="arithmatex">\[
+\mathrm{completeness\_aamer\_core} = \frac{|\text{query aamers} \cap \text{core}|}{|\text{core}|}
+\]</div>
+<p>(<code>pcore_core_coverage</code>, <code>pcore.hpp:188-200</code>; re-implemented inline in
+<code>src/check/pass_aamer.cpp:60-68</code> for the hot path).</p>
+<h3 id="33-sec_gami-global-aamer-multiplicity-index">3.3 SEC_GAMI — global aamer multiplicity index</h3>
+<p>The dense PCORE union tells a consumer <em>whether</em> an aamer is host- or
+family-specific; it says nothing about how common that aamer is <strong>outside</strong>
+the host's lineage. GAMI answers that: for every aamer seen anywhere in the
+corpus, it stores the number of distinct genera that contain it, saturated at
+255 (<code>GlobalMultiplicityIndex::increment</code>, <code>gami.hpp:305-310</code>). V1 was a
+Bloom filter over rare aamers (removed); V2 (current) is exact sorted
+<code>(hash, count8)</code> pairs, zstd-compressed on disk and loaded into an Elias-Fano
+structure with 2-bit packed counts (4 states: absent/1/2/≥3) at query time
+(<code>gami.hpp:18-42</code>). <code>genopack gami build</code> decodes PCORE (or CORE, as a
+fallback) once and serializes this index, eliminating a 10–30 minute in-memory
+GMI rebuild on every <code>genopack check</code> run (<code>gami.hpp:5-6</code>, <code>src/run_gami.cpp:69-141</code>).
+If no <code>SEC_GAMI</code> section is present, <code>check</code> falls back to building the same
+index in memory from PCORE/CORE at check-start (<code>src/check/pass_b.cpp:318-368</code>).</p>
+<h2 id="4-protein-k-mer-primitives">4. Protein k-mer primitives</h2>
+<p>The clade-split contamination tier (<code>cladesplit.hpp</code>, <code>.csp</code> panels) is a
+second, independent consumer of the aamer engine that supports <strong>three</strong>
+interchangeable protein k-mer primitives, selected by <code>ProteinKmer</code>
+(<code>cladesplit.hpp:36-40</code>) and must match between panel build and score:</p>
+<table>
+<thead>
+<tr>
+<th>Primitive</th>
+<th>CLI name</th>
+<th>Definition</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>PK_AAMER</code> (default)</td>
+<td><code>aamer</code></td>
+<td>Plain k=8 aamer — reuses <code>aamer_hash</code> from the core engine directly (<code>src/cladesplit.cpp:95-96</code>)</td>
+</tr>
+<tr>
+<td><code>PK_METAMER</code></td>
+<td><code>metamer</code></td>
+<td>Joint AA+DNA k-mer: 8 AA (5 bits each, 40 bits) <strong>plus</strong> the 8 third-codon-position bases (2 bits each, 16 bits) packed into 56 bits, then splitmix64 — a true Metabuli-style metamer (<code>cladesplit.cpp:97-101</code>)</td>
+</tr>
+<tr>
+<td><code>PK_STROBE</code></td>
+<td><code>strobemer</code></td>
+<td>Order-2 protein randstrobe: a 4-AA "strobe" hash (<code>aa4_hash</code>) at position <code>i</code>, paired with a second 4-AA strobe chosen by minimizing the XOR link within a window <code>[i+9, i+min(i+24, len-4)]</code> (<code>s=4, wmin=5, wmax=20</code>), combined via splitmix64 — gapped, longer-span, more mutation-robust than a contiguous aamer (<code>cladesplit.cpp:66-90</code>)</td>
+</tr>
+</tbody>
+</table>
+<p>All three are FracMinHash-subsampled at <code>1/frac_c</code> via <code>h % c == 0</code>
+(<code>cladesplit.cpp:88, 103</code>; note this is modulo-based subsampling, distinct from
+the max-hash-threshold FracMinHash used in <code>extract_aamers_dna</code>, §2.5).
+<code>CladeSplitConfig</code> defaults: <code>frac_c = 30</code>, <code>min_aa = 8</code>, <code>mode = PK_AAMER</code>
+(<code>cladesplit.hpp:42-46</code>), matching the CLI defaults (<code>cli/main.cpp:4523-4529</code>).</p>
+<p>A <code>.csp</code> panel maps each <strong>genus-diagnostic</strong> aamer (present in exactly one
+genus among clean reference genomes) to that genus; a query genome's aamers
+vote, and <code>minority_fraction</code> = votes to non-majority genus / total diagnostic
+votes (<code>cladesplit.hpp:14-22</code>). v3 panels additionally carry a per-genus
+<strong>single-copy-core (SCC)</strong> index: an aamer is SCC for a genus if it is
+prevalent (present in <code>&gt;= kSccPrevalence = 0.90</code> of the genus's genomes,
+<code>cladesplit.hpp:33</code>) <em>and</em> single-copy (occurs exactly once in
+<code>&gt;= 1 - kSccMultiFrac = 0.90</code> of the genomes where present,
+<code>cladesplit.hpp:34</code>); genera with fewer than <code>kSccMinRefs = 10</code> reference
+genomes get no SCC set (<code>cladesplit.hpp:32</code>). <code>core_dup</code> = fraction of SCC
+aamers occurring ≥2× in a query, feeding <code>contamination_core_dup_mass</code> /
+<code>duplication_contamination</code> in the quality score (see
+<a href="../quality/#duplication-as-a-graded-term">quality.md, Duplication as a graded term</a>).</p>
+<h2 id="5-how-aamer-feeds-quality">5. How AAMER feeds quality</h2>
+<p>Two independent aamer-derived signals reach <code>genopack check</code>
+(full model: <a href="../quality/">quality.md</a>):</p>
+<p><strong>Completeness</strong> — <code>completeness_aamer_core</code> is the intrinsic-completeness
+<strong>fallback</strong> behind <code>marker_completeness</code> in the priority chain
+(<code>completeness_effective</code>, <a href="../quality/#completeness">quality.md § Completeness</a>).
+<code>src/check/pass_aamer.cpp</code> (<code>run_pass_aamer</code>) computes it only for accessions
+that pass-A left un-scored (<code>std::isnan(completeness_cluster_relative)</code>,
+<code>pass_aamer.cpp:20-24</code>): each candidate's contigs are 6-frame translated and
+FracMinHash-subsampled with the <em>same</em> <code>k</code>/<code>min_seg_aa</code>/<code>frac_max_hash</code> the
+PCORE reader was built with (<code>pass_aamer.cpp:88</code>, must match — PCORE pins these
+in its header), then intersected against that genome's genus completeness-core
+(<code>pcore_for_genus(...).core_into(...)</code>, <code>pass_aamer.cpp:43-44</code>).
+<code>marker_completeness</code> (§ below) itself is also aamer-engine output, just scored
+against a curated single-copy-gene panel instead of a raw genus core.</p>
+<p><strong>Contamination (small-contig channel)</strong> — PCORE's dense union plus GAMI's
+global multiplicity together drive <code>score_contig_foreign_indexed</code>
+(<code>src/check/foreign_contam.hpp:254-336</code>), a composition-independent per-contig
+signal that works down to ~1–2 kb, below where TNF/GCOV composition needs
+5–20 kb of context (<code>foreign_contam.hpp:5-6</code>). Each contig's aamers are
+classified host-specific (in the host genus PCORE union), foreign-specific (in
+some other genus's union, not host-family, and — via GAMI — carried by at most
+<code>K</code> genera, so it's taxon-specific rather than universal), or excluded
+(family-conserved or too common). <code>K</code> defaults to
+<code>max(2, n_genera/500)</code> (capped 255), overridable via <code>GENOPACK_FOREIGN_K</code>
+(<code>src/check/pass_b.cpp:338-344</code>). Below 16 classifiable aamers the scorer
+abstains, or (if a family reference exists) falls back to a family-hit-density
+proxy (<code>foreign_contam.hpp:314-334</code>). Unlike <code>completeness_aamer_core</code>, this
+signal is <strong>per-contig</strong>, not a genome-level D/S/G channel: it's persisted to
+<code>SEC_QCONTIG</code> (<code>prot_foreign_frac</code>, <code>prot_loglr</code>, <code>prot_classifiable</code>,
+<code>prot_flags</code>; <code>include/genopack/qcontig.hpp:44-48</code>) and surfaced by
+<code>genopack qcontig</code> / <code>genopack report</code> to flag <em>which</em> contigs to drop
+(the <code>"foreign"</code> channel, alongside <code>"tnf"</code> and <code>"leakage"</code>,
+<code>src/run_report.cpp:508-546</code>) — a decontamination signal, not one of the
+genome-level D/S/G contamination channels documented in
+<a href="../quality/#contamination">quality.md § Contamination</a>.</p>
+<p><strong>SCG markers</strong> — <code>src/check/marker_score.hpp::score_markers_for_genome</code> also
+runs on the raw aamer engine: each contig is forward-3-frame-translated
+(<code>translate_6frame</code>, <code>MRK_MIN_ORF_AA = 50</code>, <code>marker_score.hpp:49, 62</code>), and every
+ORF's k=8 aamers (<code>aamer_hash</code> or, for reduced-alphabet panels,
+<code>aamer_hash_murphy10</code>, selected by <code>mrk_rd.is_murphy10()</code>) are FracMinHash-gated
+against the marker panel's <code>frac_max</code> and matched to a marker id via a bloom
+prefilter + per-genus flat hit-map, or a binary search fallback
+(<code>marker_score.hpp:65-90</code>). A contig votes for a marker if any ORF clears
+<code>max(min_hits, orf_len*3%)</code> hits (<code>MRK_MIN_FRAC_PC = 3</code>,
+<code>marker_score.hpp:50, 92-93</code>); <code>completeness = present/expected</code>,
+<code>redundancy = markers with ≥2 votes / expected</code> (<code>marker_score.hpp:104-118</code>).</p>
+<h2 id="6-building-it">6. Building it</h2>
+<p>Pipeline order (see <a href="../cli/">cli.md</a> for the exhaustive flag reference — this
+section lists only the AAMER-relevant flags):</p>
+<ol>
+<li>
+<p><strong><code>genopack pcore &lt;archive&gt;</code></strong> — builds <code>SEC_PCORE</code> from an archive that
+   already carries a <code>SEC_CORE</code> header (§3.1). Streams every live genome's
+   6-frame-translated, FracMinHash-subsampled aamers, grouped by genus <strong>and</strong>
+   family, into <code>PcoreWriter</code> (<code>src/run_pcore.cpp:137-193</code>).
+   <code>-t/--threads</code> (default 8, parallel shard readers); <code>--members &lt;file&gt;</code>
+   restricts which accessions contribute (default: all live genomes)
+   (<code>cli/main.cpp:4432-4445</code>).</p>
+</li>
+<li>
+<p><strong><code>genopack gami build &lt;archive&gt;</code></strong> — builds <code>SEC_GAMI</code> v2 from the archive's
+   PCORE (or CORE fallback). <code>-t/--threads</code> (default 8, decode parallelism)
+   (<code>cli/main.cpp:4448-4460</code>).</p>
+</li>
+<li>
+<p><strong><code>genopack tier merge</code> / <code>genopack tier stamp</code></strong> (optional) — merges
+   per-part <code>.ptier</code> side-channel files (emitted during PCORE build via
+   <code>PcoreWriter::set_tier_sidechannel</code>, <code>pcore.hpp:219-222</code>) into a global
+   <code>.gtier</code> IDF table, then stamps per-aamer tier bytes into PCORE, upgrading
+   v1 → v2 in place (<code>cli/main.cpp:4462-4494</code>).</p>
+</li>
+<li>
+<p><strong><code>genopack markers build --gtdbtk-db &lt;root&gt; -o markers.mrk</code></strong> — builds the
+   SCG marker aamer panel from GTDB-Tk MSA files (bac120 + ar53).
+   <code>--threshold</code> (default 0.30, presence-call threshold); <code>--scale</code> (default 1,
+   FracMinHash divisor, ignored with <code>--dayhoff6</code>); <code>--dayhoff6</code> (off by
+   default — switches to the k=12 Dayhoff-6 syncmer profile, §2.6);
+   <code>--ic-threshold</code> (default 0.25, <code>--dayhoff6</code> only); <code>--expected-min-frac</code>
+   (default 0.50 — a marker counts as expected for a genus only if detectable
+   in at least this fraction of the genus's reference genomes, mirroring
+   CheckM2's ~97% single-copy universality criterion) (<code>cli/main.cpp:4694-4732</code>).</p>
+</li>
+<li>
+<p><strong><code>genopack cladesplit build -i genomes.tsv -o panel.csp</code></strong> (independent of
+   1–4) — builds a <code>.csp</code> contamination panel from clean reference genomes.
+   <code>--frac-c</code> (default 30), <code>--min-aa</code> (default 8), <code>--primitive</code>
+   (<code>aamer</code>|<code>metamer</code>|<code>strobemer</code>, default <code>aamer</code>) (§4;
+   <code>cli/main.cpp:4519-4536</code>). <code>genopack cladesplit score</code> and
+   <code>genopack cladesplit aamers</code> consume/dump the same primitive and must be
+   invoked with matching flags.</p>
+</li>
+</ol>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.tabs", "navigation.sections", "navigation.top", "navigation.indexes", "content.code.copy", "toc.integrate", "search.highlight"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+        <script src="../javascripts/mathjax.js"></script>
+      
+        <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
+      
+        <script src="https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js"></script>
+      
+    
+  </body>
+</html>
