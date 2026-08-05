@@ -140,13 +140,15 @@ for them (`pcore`'s only options are `archive`, `--threads`, `--members`).
 `merge` also **drops** `SEC_CORE` (it is in the non-concatenable set,
 `src/merger.cpp:190`), so a merged archive loses the ability to rebuild PCORE.
 
-In other words: a `SEC_CORE` section, wherever it came from, is a prerequisite
-input to building `SEC_PCORE` today, even though nothing in this repository
-writes a fresh one — so an archive cannot currently self-bootstrap the AAMER
-completeness/contamination pipeline (`SEC_CORE → SEC_PCORE → completeness`).
-The four config parameters (`theta`, `min_seg_aa`, `frac_max_hash`, and `k=8`)
-are quality-affecting; a bootstrap path would need them supplied as `pcore` CLI
-options with the canonical values, not defaults invented here.
+`pcore` therefore reads its build config from a pre-existing `SEC_CORE` when one
+is present. When it is **absent**, `pcore` now **bootstraps** from CLI options
+`--theta` / `--min-seg-aa` / `--frac-max-hash` instead of skipping the archive,
+so an archive can build `SEC_PCORE → completeness` without a legacy `SEC_CORE`.
+The defaults are the canonical values recovered from the code (`k = AAMER_K = 8`;
+`min_seg_aa = k = 8`, `aamer.hpp:621`; `theta = 0.90`, the `PcoreWriter`/unit-test
+default; `frac_max_hash = UINT64_MAX`, i.e. dense/no-subsampling, required for the
+1–2 kb small-contig detection that is PCORE's whole purpose). These are
+quality-affecting — override them only to match a specific legacy `SEC_CORE`.
 
 ### 3.2 SEC_PCORE — dense per-genus aamer reference
 

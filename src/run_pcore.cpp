@@ -117,7 +117,9 @@ void append_pcore(const std::filesystem::path& gpk, PcoreWriter& pw, uint64_t fr
 } // namespace
 
 int cmd_pcore(const std::filesystem::path& pack_path, int threads,
-              const std::filesystem::path& members_list) {
+              const std::filesystem::path& members_list,
+              float bootstrap_theta, uint32_t bootstrap_min_seg_aa,
+              uint64_t bootstrap_frac_max_hash) {
     auto gpks = collect_gpk_paths(pack_path);
     if (gpks.empty()) throw std::runtime_error("pcore: no .gpk found at " + pack_path.string());
     if (threads < 1) threads = 1;
@@ -137,11 +139,22 @@ int cmd_pcore(const std::filesystem::path& pack_path, int threads,
     for (const auto& gp : gpks) {
         ArchiveReader ar;
         ar.open(gp);
-        if (!ar.has_core()) { spdlog::warn("pcore: {} has no CORE params; skipping", gp.filename().string()); ar.close(); continue; }
-        const CoreReader* cr = ar.core_reader();
-        const int      k = cr->k(), min_seg = cr->min_seg_aa();
-        const uint64_t frac_max = cr->frac_max_hash();
-        const float    theta = cr->theta();   // capture before ar.close() (cr dangles after)
+        // Build config comes from an existing SEC_CORE header when present. SEC_CORE has
+        // no in-repo builder (see docs/aamer.md), so when absent we bootstrap from the
+        // CLI-supplied canonical params instead of skipping the archive.
+        int k; int min_seg; uint64_t frac_max; float theta;
+        if (ar.has_core()) {
+            const CoreReader* cr = ar.core_reader();
+            k = cr->k(); min_seg = cr->min_seg_aa();
+            frac_max = cr->frac_max_hash();
+            theta = cr->theta();               // capture before ar.close() (cr dangles after)
+        } else {
+            k = AAMER_K; min_seg = static_cast<int>(bootstrap_min_seg_aa);
+            frac_max = bootstrap_frac_max_hash; theta = bootstrap_theta;
+            spdlog::info("pcore: {} has no SEC_CORE; bootstrapping build config "
+                         "(k={} min_seg_aa={} theta={:.2f} frac_max_hash={:#018x})",
+                         gp.filename().string(), k, min_seg, theta, frac_max);
+        }
 
         std::unordered_map<std::string, std::string> acc_genus, acc_family;
         ar.scan_taxonomy([&](std::string_view acc, std::string_view tax) {

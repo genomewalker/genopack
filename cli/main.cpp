@@ -4438,10 +4438,21 @@ int main(int argc, char** argv) {
     pcore_cmd->add_option("-t,--threads", pcore_threads, "Parallel shard readers (default: 8)");
     pcore_cmd->add_option("--members", pcore_members,
         "Reference accession list (one per line); only these genomes build the reference. Default: all live");
+    // Bootstrap config, used only when an input archive has no SEC_CORE to source it from.
+    float    pcore_theta    = 0.90f;
+    uint32_t pcore_min_seg  = 8;
+    uint64_t pcore_frac_max = UINT64_MAX;
+    pcore_cmd->add_option("--theta", pcore_theta,
+        "Prevalence threshold for the conserved core, used only when the archive has no SEC_CORE (default: 0.90)");
+    pcore_cmd->add_option("--min-seg-aa", pcore_min_seg,
+        "Min inter-stop AA segment length at extraction, used only when no SEC_CORE (default: 8 = k)");
+    pcore_cmd->add_option("--frac-max-hash", pcore_frac_max,
+        "FracMinHash max hash at extraction, used only when no SEC_CORE (default: UINT64_MAX = dense, no subsampling)");
     pcore_cmd->callback([&]() {
         std::exit(genopack::cmd_pcore(std::filesystem::path(pcore_pack), pcore_threads,
                                       pcore_members.empty() ? std::filesystem::path{}
-                                                            : std::filesystem::path{pcore_members}));
+                                                            : std::filesystem::path{pcore_members},
+                                      pcore_theta, pcore_min_seg, pcore_frac_max));
     });
 
     // genopack gami — precomputed global multiplicity index (eliminates runtime GMI rebuild)
