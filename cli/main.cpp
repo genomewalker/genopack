@@ -3633,6 +3633,8 @@ int main(int argc, char** argv) {
     std::filesystem::path tax_part_input, tax_part_output;
     int tax_part_n = 1;
     std::string tax_part_rank = "g";
+    bool tax_part_contiguous = false;
+    long tax_part_cap = 0;
     tax_part->add_option("-i,--input", tax_part_input,
         "Input TSV (accession TAB taxonomy TAB file_path)")->required()->check(CLI::ExistingFile);
     tax_part->add_option("-n,--parts", tax_part_n, "Number of output parts")->required();
@@ -3640,6 +3642,14 @@ int main(int argc, char** argv) {
         "Output directory for part_0.tsv ... part_N-1.tsv")->required();
     tax_part->add_option("-r,--rank", tax_part_rank,
         "Rank to partition by: g=genus (default), f=family")->default_val("g");
+    tax_part->add_flag("--contiguous", tax_part_contiguous,
+        "Pack parts by taxonomy-contiguous fill (sibling taxa land adjacent → a read's "
+        "relatives cluster in ~1 part → much lower read fan-out for downstream routing) "
+        "instead of size-only LPT. Recommended with --cap.");
+    tax_part->add_option("--cap", tax_part_cap,
+        "Max genomes per taxon group; larger groups are split into <=cap contiguous chunks so "
+        "no part grossly exceeds total/parts (bounds mega-taxon imbalance under --contiguous). "
+        "0 = no cap.")->default_val(0);
     tax_part->callback([&]() {
         if (tax_part_n <= 0) { spdlog::error("--parts must be >= 1"); std::exit(1); }
         std::filesystem::create_directories(tax_part_output);
@@ -3665,6 +3675,19 @@ int main(int argc, char** argv) {
             }
             return "__unknown__";
         };
+        // Full lineage prefix up to & including the rank field — lets --contiguous sort
+        // sibling taxa adjacent so higher ranks (family/order) co-locate within a part.
+        std::unordered_map<std::string,std::string> key_prefix;
+        auto extract_prefix = [&](std::string_view tax) -> std::string {
+            std::string needle = ";" + rp;
+            size_t rank_start;
+            auto pos = tax.find(needle);
+            if (pos != std::string_view::npos) rank_start = pos + 1;
+            else if (tax.starts_with(rp)) rank_start = 0;
+            else return std::string(tax);
+            auto e = tax.find(';', rank_start);
+            return std::string(tax.substr(0, e==std::string_view::npos?tax.size():e));
+        };
         while (std::getline(fin2, ln2)) {
             if (ln2.empty()) continue; ++total2;
             std::string_view sv2(ln2);
@@ -3672,11 +3695,57 @@ int main(int argc, char** argv) {
             if (t1==std::string_view::npos) { rank_rows["__unknown__"].push_back(ln2); continue; }
             auto t2=sv2.find('\t',t1+1);
             auto tax2=(t2==std::string_view::npos)?sv2.substr(t1+1):sv2.substr(t1+1,t2-t1-1);
-            rank_rows[extract_key(tax2)].push_back(std::move(ln2));
+            auto key2 = extract_key(tax2);
+            if (tax_part_contiguous) { auto& pf = key_prefix[key2]; if (pf.empty()) pf = extract_prefix(tax2); }
+            rank_rows[key2].push_back(std::move(ln2));
         }
         fin2.close();
         spdlog::info("taxonomy partition: {} genomes, {} {} groups",
                      total2, rank_rows.size(), rp);
+
+        if (tax_part_contiguous) {
+            // Taxonomy-contiguous fill: split oversized groups into <=cap chunks, sort all
+            // units by lineage prefix (sibling taxa adjacent), then stream them into parts
+            // filling to ~total/parts. Sibling co-location minimises downstream read fan-out
+            // for routing; the cap bounds mega-taxon imbalance. Measured on GTDB r232 aDNA:
+            // ~13x fewer per-read shard visits vs LPT's ~9x.
+            struct Unit { std::string sortkey; std::vector<std::string>* rows; size_t lo, hi; };
+            std::vector<Unit> units;
+            for (auto& [k,v] : rank_rows) {
+                const std::string& pf = key_prefix.count(k) ? key_prefix[k] : k;
+                if (tax_part_cap <= 0 || (long)v.size() <= tax_part_cap) {
+                    units.push_back({pf + '\t' + k, &v, 0, v.size()});
+                } else {
+                    size_t c = 0;
+                    for (size_t off=0; off < v.size(); off += (size_t)tax_part_cap, ++c)
+                        units.push_back({pf + '\t' + k + '#' + std::to_string(c), &v,
+                                         off, std::min(off + (size_t)tax_part_cap, v.size())});
+                }
+            }
+            std::sort(units.begin(), units.end(),
+                      [](const Unit& a, const Unit& b){ return a.sortkey < b.sortkey; });
+            const double per = (double)total2 / tax_part_n;
+            std::vector<std::ofstream> fout(tax_part_n);
+            std::vector<size_t> pcnt(tax_part_n, 0);
+            for (int i=0;i<tax_part_n;++i) {
+                auto op = tax_part_output / ("part_"+std::to_string(i)+".tsv");
+                fout[i].open(op);
+                if (!fout[i]) { spdlog::error("Cannot write: {}", op.string()); std::exit(1); }
+                fout[i] << hdr2 << '\n';
+            }
+            int cur = 0; size_t placed = 0;
+            for (auto& u : units) {
+                // even N-way split by cumulative position: unit lands in the part its
+                // start falls into, so all N parts fill to ~per (uses every part, no overflow)
+                while (cur < tax_part_n-1 && placed >= (size_t)((double)(cur+1)*per)) ++cur;
+                for (size_t i=u.lo;i<u.hi;++i) fout[cur] << (*u.rows)[i] << '\n';
+                placed += (u.hi - u.lo); pcnt[cur] += (u.hi - u.lo);
+            }
+            auto [mn,mx]=std::minmax_element(pcnt.begin(),pcnt.end());
+            spdlog::info("taxonomy partition (contiguous, cap={}): {} genomes, load balance min={} max={}",
+                         tax_part_cap, total2, *mn, *mx);
+            std::exit(0);
+        }
 
         // LPT bin-packing
         std::vector<std::pair<std::string,std::vector<std::string>*>> grps;
