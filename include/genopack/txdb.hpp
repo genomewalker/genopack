@@ -202,12 +202,18 @@ private:
     std::unordered_map<std::string, uint64_t> ncbi_overrides_;
 };
 
+class NcbiTaxdb;  // fwd
+
 // Build a path→NCBI-taxid override map for a set of accession→lineage strings by
 // resolving each taxon name against an NCBI taxdump (unambiguous names only).
 // Feed the result to TxdbWriter::set_ncbi_overrides so shared taxa keep native
 // NCBI taxids (bit63=0) with NCBI precedence. `taxdump_dir` holds nodes.dmp+names.dmp.
 std::unordered_map<std::string, uint64_t> build_ncbi_taxid_overrides(
     const std::string& taxdump_dir,
+    const std::unordered_map<std::string, std::string>& taxonomy_map);
+// Same, reusing an already-loaded NcbiTaxdb (avoids re-parsing the dump).
+std::unordered_map<std::string, uint64_t> build_ncbi_taxid_overrides(
+    const NcbiTaxdb& ncbi,
     const std::unordered_map<std::string, std::string>& taxonomy_map);
 
 // ── TxdbReader ───────────────────────────────────────────────────────────────

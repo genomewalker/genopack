@@ -781,6 +781,13 @@ std::unordered_map<std::string, uint64_t> build_ncbi_taxid_overrides(
 {
     spdlog::info("Loading NCBI taxdump for taxid reconciliation: {}", taxdump_dir);
     NcbiTaxdb ncbi = NcbiTaxdb::load(taxdump_dir);
+    return build_ncbi_taxid_overrides(ncbi, taxonomy_map);
+}
+
+std::unordered_map<std::string, uint64_t> build_ncbi_taxid_overrides(
+    const NcbiTaxdb& ncbi,
+    const std::unordered_map<std::string, std::string>& taxonomy_map)
+{
     std::unordered_map<std::string, uint64_t> overrides;
     static const std::string kRankChars = "dlkpcofgs";
     for (const auto& [accession, lineage] : taxonomy_map) {

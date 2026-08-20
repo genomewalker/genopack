@@ -56,6 +56,16 @@ public:
     // Look up a taxid by scientific name. Returns -1 if not found or ambiguous.
     int taxid_for_name(const std::string& name) const;
 
+    // Follow merged.dmp so a stale taxid maps to its current one (identity if live).
+    int resolve_merged(int taxid) const;
+
+    // Expand a taxid to its real-NCBI-taxid lineage as (cumulative canonical path,
+    // ncbi_taxid) pairs — one per canonical-rank ancestor (d/k/p/c/o/f/g/s), plus a
+    // leaf for `taxid` itself when it sits below species (strain/subspecies). Feed
+    // the deepest path as a record's lineage and the pairs as overrides to PRESERVE
+    // authoritative NCBI taxids instead of re-deriving them by name. Empty if unknown.
+    std::vector<std::pair<std::string, uint64_t>> canonical_path_taxids(int taxid) const;
+
     bool empty() const { return name_.empty(); }
     std::size_t size() const { return name_.size(); }
 
@@ -68,6 +78,7 @@ private:
     std::unordered_map<int, Node>        nodes_;    // taxid → {parent, rank}
     std::unordered_map<int, std::string> name_;     // taxid → scientific name
     std::unordered_map<std::string, int> name2tid_; // scientific name → taxid (unique only)
+    std::unordered_map<int, int>         merged_;   // old taxid → current taxid (merged.dmp)
 
     std::vector<std::pair<std::string, std::string>>
         lineage(int taxid) const;

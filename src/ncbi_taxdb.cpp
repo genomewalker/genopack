@@ -185,8 +185,74 @@ NcbiTaxdb NcbiTaxdb::load(const fs::path& dir) {
     // Remove ambiguous entries so taxid_for_name() never returns a wrong hit.
     std::erase_if(db.name2tid_, [](const auto& kv){ return kv.second == -1; });
 
-    spdlog::info("NcbiTaxdb loaded: {} nodes, {} unique names", db.nodes_.size(), db.name2tid_.size());
+    // merged.dmp (optional): old_taxid | new_taxid | — lets stale authoritative
+    // taxids remap to their current node instead of falling through to name/concept.
+    {
+        std::ifstream in(dir / "merged.dmp");
+        std::string line;
+        while (std::getline(in, line)) {
+            if (line.empty()) continue;
+            auto f = split_dmp(line);
+            if (f.size() < 2) continue;
+            try { db.merged_[std::stoi(f[0])] = std::stoi(f[1]); } catch (...) {}
+        }
+    }
+
+    spdlog::info("NcbiTaxdb loaded: {} nodes, {} unique names, {} merged", db.nodes_.size(), db.name2tid_.size(), db.merged_.size());
     return db;
+}
+
+int NcbiTaxdb::resolve_merged(int taxid) const {
+    // follow merged chain (bounded) to the current taxid
+    for (int i = 0; i < 16; ++i) {
+        if (nodes_.count(taxid)) return taxid;
+        auto it = merged_.find(taxid);
+        if (it == merged_.end()) return taxid;
+        taxid = it->second;
+    }
+    return taxid;
+}
+
+std::vector<std::pair<std::string, uint64_t>>
+NcbiTaxdb::canonical_path_taxids(int taxid) const {
+    static const std::unordered_map<std::string, std::string> kPfx = {
+        {"domain","d__"},{"superkingdom","d__"},{"realm","d__"},{"kingdom","k__"},
+        {"phylum","p__"},{"class","c__"},{"order","o__"},{"family","f__"},
+        {"genus","g__"},{"species","s__"}};
+    taxid = resolve_merged(taxid);
+    // collect ancestors root->taxon with (rank, name, taxid)
+    std::vector<std::tuple<std::string,std::string,int>> chain;
+    std::unordered_set<int> seen;
+    int cur = taxid;
+    while (cur != 1 && cur != 0 && !seen.count(cur)) {
+        seen.insert(cur);
+        auto nit = nodes_.find(cur);
+        if (nit == nodes_.end()) break;
+        auto nme = name_.find(cur);
+        chain.emplace_back(nit->second.rank, nme != name_.end() ? nme->second : "", cur);
+        cur = nit->second.parent_taxid;
+    }
+    std::reverse(chain.begin(), chain.end());
+    std::vector<std::pair<std::string, uint64_t>> out;
+    std::string path;
+    int deepest = 0;
+    for (auto& [rank, name, tid] : chain) {
+        auto it = kPfx.find(rank);
+        if (it == kPfx.end() || name.empty()) continue;
+        std::string tok = it->second + name;
+        path = path.empty() ? tok : path + ";" + tok;
+        out.emplace_back(path, static_cast<uint64_t>(tid));
+        deepest = tid;
+    }
+    // taxid below the deepest canonical rank (strain/subspecies): keep it as a leaf
+    // under the species so the accession preserves its authoritative id.
+    if (!out.empty() && deepest != taxid) {
+        auto nme = name_.find(taxid);
+        std::string sname = nme != name_.end() ? nme->second : ("taxon " + std::to_string(taxid));
+        path += ";s__" + sname;
+        out.emplace_back(path, static_cast<uint64_t>(taxid));
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------------------

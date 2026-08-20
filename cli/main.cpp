@@ -2830,10 +2830,43 @@ static std::string strip_propagated_ranks(const std::string& lineage) {
     return out;
 }
 
+// Load an accession -> authoritative NCBI taxid map (2-col acc/taxid, or a wider
+// TSV with an 'accession' and a 'taxid'/'host_taxid' header column).
+static std::unordered_map<std::string, int> load_preserve_map(const std::string& path) {
+    std::unordered_map<std::string, int> m;
+    std::ifstream in(path);
+    if (!in) throw std::runtime_error("Cannot open --preserve-taxids file: " + path);
+    std::string line;
+    if (!std::getline(in, line)) return m;
+    auto split = [](const std::string& s) {
+        std::vector<std::string> f; size_t p = 0;
+        while (true) { size_t t = s.find('\t', p); f.push_back(s.substr(p, t == std::string::npos ? t : t - p));
+                       if (t == std::string::npos) break; p = t + 1; } return f;
+    };
+    std::vector<std::string> h = split(line);
+    int ai = -1, ti = -1;
+    for (size_t i = 0; i < h.size(); ++i) {
+        std::string c = h[i]; for (auto& ch : c) ch = (char)std::tolower(ch);
+        if (c == "accession" || c == "acc") ai = (int)i;
+        if (c == "taxid" || c == "host_taxid" || c == "ncbi_taxid") ti = (int)i;
+    }
+    bool has_header = (ai >= 0 && ti >= 0);
+    if (!has_header) { ai = 0; ti = (h.size() >= 2) ? 1 : 0;   // headerless 2-col: acc<TAB>taxid
+        try { m[h[ai]] = std::stoi(h[ti]); } catch (...) {} }
+    while (std::getline(in, line)) {
+        if (line.empty()) continue;
+        auto f = split(line);
+        if ((int)f.size() <= std::max(ai, ti)) continue;
+        try { int tid = std::stoi(f[ti]); if (tid > 0) m[f[ai]] = tid; } catch (...) {}
+    }
+    return m;
+}
+
 static int cmd_taxonomy_unify(const std::vector<std::string>& archives,
                               const std::string& ncbi_taxdump,
                               const std::string& output_dir,
-                              const std::string& format) {
+                              const std::string& format,
+                              const std::string& preserve_file) {
     std::unordered_map<std::string, std::string> taxonomy_map;
     for (const auto& apath : archives) {
         ArchiveSetReader ar = open_archive_auto(apath);
@@ -2856,10 +2889,36 @@ static int cmd_taxonomy_unify(const std::vector<std::string>& archives,
     // paths below consume the cleaned strings, keeping them consistent).
     for (auto& [acc, lin] : taxonomy_map) { (void)acc; lin = strip_propagated_ranks(lin); }
 
+    std::unordered_map<std::string, uint64_t> overrides;
+    if (!ncbi_taxdump.empty()) {
+        NcbiTaxdb ncbi = NcbiTaxdb::load(ncbi_taxdump);
+        // taxid PRESERVATION: for accessions with an authoritative NCBI taxid, replace
+        // their lineage with that taxid's real NCBI lineage (real taxids all the way
+        // down, incl strain leaf) so the id is kept verbatim rather than name-derived.
+        std::unordered_map<std::string, uint64_t> preserved;
+        if (!preserve_file.empty()) {
+            auto pm = load_preserve_map(preserve_file);
+            size_t n_pres = 0;
+            for (const auto& [acc, tid] : pm) {
+                if (!taxonomy_map.count(acc)) continue;           // only accessions we actually have
+                auto pts = ncbi.canonical_path_taxids(tid);
+                if (pts.empty()) continue;
+                taxonomy_map[acc] = pts.back().first;             // authoritative NCBI lineage
+                for (const auto& [path, ptid] : pts) preserved[path] = ptid;
+                ++n_pres;
+            }
+            spdlog::info("taxid preservation: {} accessions pinned to authoritative NCBI taxids ({} paths)",
+                         n_pres, preserved.size());
+        }
+        // name-resolution over the (now partially-preserved) lineages, then let
+        // preserved paths win (authoritative id beats name-derived).
+        overrides = build_ncbi_taxid_overrides(ncbi, taxonomy_map);
+        for (const auto& [path, tid] : preserved) overrides[path] = tid;
+    }
+
     TxdbWriter txw;
     for (const auto& [acc, tax] : taxonomy_map) txw.add(acc, tax);
-    if (!ncbi_taxdump.empty())
-        txw.set_ncbi_overrides(build_ncbi_taxid_overrides(ncbi_taxdump, taxonomy_map));
+    if (!overrides.empty()) txw.set_ncbi_overrides(std::move(overrides));
     TaxonomyTree unified = txw.build_tree();
 
     TaxdumpTree tree;
@@ -4535,8 +4594,14 @@ int main(int argc, char** argv) {
     tax_unify->add_option("-o,--output", unify_output, "Output directory")->required();
     tax_unify->add_option("-f,--format", unify_format,
         "Output format: 'taxdump' (NCBI names/nodes/acc2taxid.dmp, default) or 'columnar' (binary + TSV)");
+    std::string unify_preserve;
+    tax_unify->add_option("--preserve-taxids", unify_preserve,
+        "TSV of accession -> authoritative NCBI taxid (2-col, or headered accession/taxid|host_taxid). "
+        "Those accessions PRESERVE the given taxid (importing its real NCBI lineage, incl strain leaf) "
+        "instead of re-deriving by name — e.g. organelle host taxids. Requires --ncbi-taxdump; "
+        "stale ids are remapped via merged.dmp.");
     tax_unify->callback([&]() {
-        std::exit(cmd_taxonomy_unify(unify_inputs, unify_ncbi, unify_output, unify_format));
+        std::exit(cmd_taxonomy_unify(unify_inputs, unify_ncbi, unify_output, unify_format, unify_preserve));
     });
 
     // genopack reindex
