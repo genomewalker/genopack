@@ -83,6 +83,10 @@ private:
     std::vector<std::pair<std::string, std::string>>
         lineage(int taxid) const;
 
+    // Binary cache of the parsed maps (skips the dmp parse on repeat loads).
+    bool load_cache(const fs::path& cache);
+    void save_cache(const fs::path& cache) const;
+
     std::string lineage_to_10rank(
         const std::vector<std::pair<std::string, std::string>>& lineage,
         const std::string& accession) const;

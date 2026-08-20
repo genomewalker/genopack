@@ -2867,15 +2867,42 @@ static int cmd_taxonomy_unify(const std::vector<std::string>& archives,
                               const std::string& output_dir,
                               const std::string& format,
                               const std::string& preserve_file) {
-    std::unordered_map<std::string, std::string> taxonomy_map;
+    // Gather every part path, then read their TAXN sections in parallel — unify is
+    // I/O-bound decompressing TAXN out of large packs (metavr.gpk is ~100GB), so
+    // overlapping the per-part reads is the dominant win.
+    std::vector<std::filesystem::path> parts;
     for (const auto& apath : archives) {
         ArchiveSetReader ar = open_archive_auto(apath);
-        for (const auto& pp : ar.part_paths()) {
-            ArchiveReader pr;
-            pr.open(pp);
-            pr.scan_taxonomy([&](std::string_view acc, std::string_view tax) {
-                taxonomy_map.emplace(std::string(acc), std::string(tax));
-            });
+        for (const auto& pp : ar.part_paths()) parts.emplace_back(pp);
+    }
+    std::vector<std::vector<std::pair<std::string, std::string>>> per_part(parts.size());
+    {
+        unsigned nthreads = std::max(1u, std::min<unsigned>(
+            static_cast<unsigned>(parts.size()),
+            std::thread::hardware_concurrency() ? std::thread::hardware_concurrency() : 8u));
+        std::atomic<size_t> next{0};
+        auto worker = [&] {
+            size_t i;
+            while ((i = next.fetch_add(1)) < parts.size()) {
+                ArchiveReader pr;
+                pr.open(parts[i]);
+                auto& out = per_part[i];
+                pr.scan_taxonomy([&](std::string_view acc, std::string_view tax) {
+                    out.emplace_back(std::string(acc), std::string(tax));
+                });
+            }
+        };
+        std::vector<std::thread> pool;
+        for (unsigned t = 0; t < nthreads; ++t) pool.emplace_back(worker);
+        for (auto& th : pool) th.join();
+    }
+    std::unordered_map<std::string, std::string> taxonomy_map;
+    {
+        size_t total = 0; for (auto& v : per_part) total += v.size();
+        taxonomy_map.reserve(total);
+        for (auto& v : per_part) {
+            for (auto& kv : v) taxonomy_map.emplace(std::move(kv.first), std::move(kv.second));
+            std::vector<std::pair<std::string, std::string>>().swap(v);  // free as we go
         }
     }
     if (taxonomy_map.empty()) {
@@ -2916,8 +2943,19 @@ static int cmd_taxonomy_unify(const std::vector<std::string>& archives,
         for (const auto& [path, tid] : preserved) overrides[path] = tid;
     }
 
+    // Add entries in a stable (accession-sorted) order so the tree is DETERMINISTIC
+    // regardless of read/hash-map order — otherwise concept_id collision-resolution
+    // and homonym override races (two paths competing for one NCBI taxid) would make
+    // the output depend on thread scheduling.
     TxdbWriter txw;
-    for (const auto& [acc, tax] : taxonomy_map) txw.add(acc, tax);
+    {
+        std::vector<const std::pair<const std::string, std::string>*> ordered;
+        ordered.reserve(taxonomy_map.size());
+        for (const auto& kv : taxonomy_map) ordered.push_back(&kv);
+        std::sort(ordered.begin(), ordered.end(),
+                  [](auto* a, auto* b){ return a->first < b->first; });
+        for (auto* kv : ordered) txw.add(kv->first, kv->second);
+    }
     if (!overrides.empty()) txw.set_ncbi_overrides(std::move(overrides));
     TaxonomyTree unified = txw.build_tree();
 

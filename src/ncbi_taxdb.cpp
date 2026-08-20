@@ -9,6 +9,8 @@
 #include <stdexcept>
 #include <string_view>
 #include <unordered_set>
+#include <thread>
+#include <cstdint>
 
 #include <spdlog/spdlog.h>
 
@@ -149,10 +151,75 @@ void NcbiTaxdb::ensure_fresh(const fs::path& dir, int max_age_days) {
 // Load
 // ---------------------------------------------------------------------------
 
+namespace {
+constexpr uint32_t kCacheMagic = 0x4E434258u;  // "NCBX"
+constexpr uint32_t kCacheVer   = 1u;
+
+template<class T> void wr(std::ostream& o, const T& v) { o.write(reinterpret_cast<const char*>(&v), sizeof(T)); }
+template<class T> bool rd(std::istream& i, T& v) { return static_cast<bool>(i.read(reinterpret_cast<char*>(&v), sizeof(T))); }
+void wrs(std::ostream& o, const std::string& s) { uint16_t n = (uint16_t)std::min<size_t>(s.size(), 65535); wr(o, n); o.write(s.data(), n); }
+bool rds(std::istream& i, std::string& s) { uint16_t n; if (!rd(i, n)) return false; s.resize(n); return n == 0 || static_cast<bool>(i.read(&s[0], n)); }
+
+// Cache is valid only if it exists and is newer than both source dumps.
+bool cache_fresh(const fs::path& cache, const fs::path& dir) {
+    std::error_code ec;
+    if (!fs::exists(cache, ec)) return false;
+    auto ct = fs::last_write_time(cache, ec); if (ec) return false;
+    for (const char* f : {"nodes.dmp", "names.dmp"}) {
+        auto st = fs::last_write_time(dir / f, ec); if (ec) return false;
+        if (st > ct) return false;
+    }
+    return true;
+}
+}  // namespace
+
+bool NcbiTaxdb::load_cache(const fs::path& cache) {
+    std::ifstream in(cache, std::ios::binary);
+    if (!in) return false;
+    uint32_t magic, ver; if (!rd(in, magic) || !rd(in, ver) || magic != kCacheMagic || ver != kCacheVer) return false;
+    uint64_t n;
+    if (!rd(in, n)) return false;
+    nodes_.reserve(n);
+    for (uint64_t k = 0; k < n; ++k) { int32_t t, p; std::string r; if (!rd(in, t) || !rd(in, p) || !rds(in, r)) return false; nodes_[t] = {p, std::move(r)}; }
+    if (!rd(in, n)) return false;
+    name_.reserve(n);
+    for (uint64_t k = 0; k < n; ++k) { int32_t t; std::string s; if (!rd(in, t) || !rds(in, s)) return false; name_[t] = std::move(s); }
+    if (!rd(in, n)) return false;
+    name2tid_.reserve(n);
+    for (uint64_t k = 0; k < n; ++k) { std::string s; int32_t t; if (!rds(in, s) || !rd(in, t)) return false; name2tid_[std::move(s)] = t; }
+    if (!rd(in, n)) return false;
+    merged_.reserve(n);
+    for (uint64_t k = 0; k < n; ++k) { int32_t a, b; if (!rd(in, a) || !rd(in, b)) return false; merged_[a] = b; }
+    return static_cast<bool>(in);
+}
+
+void NcbiTaxdb::save_cache(const fs::path& cache) const {
+    fs::path tmp = cache; tmp += ".tmp";
+    { std::ofstream o(tmp, std::ios::binary); if (!o) return;
+      wr(o, kCacheMagic); wr(o, kCacheVer);
+      wr(o, (uint64_t)nodes_.size());     for (auto& [t, nd] : nodes_)   { wr(o, (int32_t)t); wr(o, (int32_t)nd.parent_taxid); wrs(o, nd.rank); }
+      wr(o, (uint64_t)name_.size());      for (auto& [t, s]  : name_)    { wr(o, (int32_t)t); wrs(o, s); }
+      wr(o, (uint64_t)name2tid_.size());  for (auto& [s, t]  : name2tid_){ wrs(o, s); wr(o, (int32_t)t); }
+      wr(o, (uint64_t)merged_.size());    for (auto& [a, b]  : merged_)  { wr(o, (int32_t)a); wr(o, (int32_t)b); }
+      if (!o) { std::error_code ec; fs::remove(tmp, ec); return; } }
+    std::error_code ec; fs::rename(tmp, cache, ec);  // atomic publish; best-effort
+}
+
 NcbiTaxdb NcbiTaxdb::load(const fs::path& dir) {
     NcbiTaxdb db;
 
-    {
+    // Fast path: a fresh binary cache skips the ~15-20s dmp parse. Any read error
+    // falls through to a full parse, so a stale/corrupt cache never breaks a run.
+    fs::path cache = dir / ".ncbi_taxdb.cache";
+    if (cache_fresh(cache, dir) && db.load_cache(cache)) {
+        spdlog::info("NcbiTaxdb loaded (cache): {} nodes, {} unique names, {} merged",
+                     db.nodes_.size(), db.name2tid_.size(), db.merged_.size());
+        return db;
+    }
+    db = NcbiTaxdb{};  // discard any partial cache read
+
+    // Parse nodes.dmp and names.dmp concurrently (disjoint maps) + merged.dmp.
+    auto parse_nodes = [&] {
         std::ifstream in(dir / "nodes.dmp");
         if (!in) throw std::runtime_error("Cannot open nodes.dmp in " + dir.string());
         std::string line;
@@ -160,14 +227,10 @@ NcbiTaxdb NcbiTaxdb::load(const fs::path& dir) {
             if (line.empty()) continue;
             auto f = split_dmp(line);
             if (f.size() < 3) continue;
-            int taxid  = std::stoi(f[0]);
-            int parent = std::stoi(f[1]);
-            db.nodes_[taxid] = {parent, f[2]};
+            db.nodes_[std::stoi(f[0])] = {std::stoi(f[1]), f[2]};
         }
-    }
-
-    // Build both taxid→name and name→taxid (mark ambiguous names with -1).
-    {
+    };
+    auto parse_names = [&] {
         std::ifstream in(dir / "names.dmp");
         if (!in) throw std::runtime_error("Cannot open names.dmp in " + dir.string());
         std::string line;
@@ -179,14 +242,16 @@ NcbiTaxdb NcbiTaxdb::load(const fs::path& dir) {
             const std::string& sci = f[1];
             db.name_[taxid] = sci;
             auto [it, inserted] = db.name2tid_.emplace(sci, taxid);
-            if (!inserted) it->second = -1; // ambiguous — mark unusable
+            if (!inserted) it->second = -1;  // ambiguous — mark unusable
         }
-    }
-    // Remove ambiguous entries so taxid_for_name() never returns a wrong hit.
-    std::erase_if(db.name2tid_, [](const auto& kv){ return kv.second == -1; });
+        std::erase_if(db.name2tid_, [](const auto& kv){ return kv.second == -1; });
+    };
+    std::exception_ptr err;
+    std::thread tn([&]{ try { parse_names(); } catch (...) { err = std::current_exception(); } });
+    parse_nodes();
+    tn.join();
+    if (err) std::rethrow_exception(err);
 
-    // merged.dmp (optional): old_taxid | new_taxid | — lets stale authoritative
-    // taxids remap to their current node instead of falling through to name/concept.
     {
         std::ifstream in(dir / "merged.dmp");
         std::string line;
@@ -198,6 +263,7 @@ NcbiTaxdb NcbiTaxdb::load(const fs::path& dir) {
         }
     }
 
+    db.save_cache(cache);  // best-effort; next load is fast
     spdlog::info("NcbiTaxdb loaded: {} nodes, {} unique names, {} merged", db.nodes_.size(), db.name2tid_.size(), db.merged_.size());
     return db;
 }
