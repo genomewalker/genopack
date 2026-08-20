@@ -1,4 +1,6 @@
 #include <genopack/txdb.hpp>
+#include <genopack/ncbi_taxdb.hpp>
+#include <spdlog/spdlog.h>
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -140,7 +142,8 @@ static std::string cluster_group_name(const std::string& anchor,
 static BuiltTree build_internal(
     const std::vector<std::pair<std::string, std::string>>& entries,
     const std::unordered_map<std::string, std::array<float, 136>>* kmer_profiles = nullptr,
-    float similarity_threshold = 0.97f)
+    float similarity_threshold = 0.97f,
+    const std::unordered_map<std::string, uint64_t>* ncbi_overrides = nullptr)
 {
     std::unordered_map<std::string, std::string> acc_to_cluster_rep;
 
@@ -232,16 +235,30 @@ static BuiltTree build_internal(
         auto it = path_to_tid.find(path);
         if (it != path_to_tid.end()) return it->second;
 
-        uint64_t tid = path_to_concept_id(path);
-        // Resolve collisions: increment within GTDB namespace
-        while (true) {
-            auto existing = tid_to_path.find(tid);
-            if (existing == tid_to_path.end()) break;
-            if (existing->second == path) break;
-            ++tid;
-            // Keep bit 63 set and avoid wrapping to 0 in low bits
-            tid |= TAXID_GTDB_BIT;
-            if ((tid & ~TAXID_GTDB_BIT) == 0) tid |= 1;
+        uint64_t tid;
+        // NCBI-taxid override: a path whose taxon is known to NCBI keeps its
+        // native NCBI taxid (bit 63 = 0). This gives NCBI precedence over the
+        // synthetic concept_id — the same taxon shares one id across NCBI/GTDB.
+        const uint64_t* ov = nullptr;
+        if (ncbi_overrides) {
+            auto oit = ncbi_overrides->find(path);
+            if (oit != ncbi_overrides->end() && tid_to_path.find(oit->second) == tid_to_path.end())
+                ov = &oit->second;   // skip if this taxid was already claimed by another path
+        }
+        if (ov) {
+            tid = *ov;
+        } else {
+            tid = path_to_concept_id(path);
+            // Resolve collisions: increment within GTDB namespace
+            while (true) {
+                auto existing = tid_to_path.find(tid);
+                if (existing == tid_to_path.end()) break;
+                if (existing->second == path) break;
+                ++tid;
+                // Keep bit 63 set and avoid wrapping to 0 in low bits
+                tid |= TAXID_GTDB_BIT;
+                if ((tid & ~TAXID_GTDB_BIT) == 0) tid |= 1;
+            }
         }
         path_to_tid[path] = tid;
         tid_to_path[tid]  = path;
@@ -351,8 +368,13 @@ void TxdbWriter::set_kmer_profiles(
     similarity_threshold_ = similarity_threshold;
 }
 
+void TxdbWriter::set_ncbi_overrides(std::unordered_map<std::string, uint64_t> overrides) {
+    ncbi_overrides_ = std::move(overrides);
+}
+
 TaxonomyTree TxdbWriter::build_tree() const {
-    BuiltTree bt = build_internal(entries_, kmer_profiles_, similarity_threshold_);
+    BuiltTree bt = build_internal(entries_, kmer_profiles_, similarity_threshold_,
+                                  ncbi_overrides_.empty() ? nullptr : &ncbi_overrides_);
 
     std::sort(bt.nodes_ordered.begin(), bt.nodes_ordered.end(),
               [](const NodeInfo& a, const NodeInfo& b) { return a.taxid < b.taxid; });
@@ -746,6 +768,43 @@ void TaxonomyTree::scan_accessions(
             cb(s, v.acc_taxids[i]);
         }
     }
+}
+
+// ── NCBI taxid reconciliation ─────────────────────────────────────────────────
+// Replay the same cumulative-path tokenization build_internal uses and resolve
+// each taxon name against NCBI's unambiguous scientific-name index. A hit pins
+// that node to its native NCBI taxid (bit63=0); a miss leaves it a concept_id
+// (bit63=1). This is what makes e.g. d__Bacteria == NCBI taxid 2 across sources.
+std::unordered_map<std::string, uint64_t> build_ncbi_taxid_overrides(
+    const std::string& taxdump_dir,
+    const std::unordered_map<std::string, std::string>& taxonomy_map)
+{
+    spdlog::info("Loading NCBI taxdump for taxid reconciliation: {}", taxdump_dir);
+    NcbiTaxdb ncbi = NcbiTaxdb::load(taxdump_dir);
+    std::unordered_map<std::string, uint64_t> overrides;
+    static const std::string kRankChars = "dlkpcofgs";
+    for (const auto& [accession, lineage] : taxonomy_map) {
+        (void)accession;
+        std::string path;
+        size_t pos = 0;
+        while (pos < lineage.size()) {
+            size_t sep = lineage.find(';', pos);
+            std::string tok = lineage.substr(pos, sep == std::string::npos ? std::string::npos : sep - pos);
+            pos = (sep == std::string::npos) ? lineage.size() : sep + 1;
+            size_t du = tok.find("__");
+            if (du == std::string::npos) continue;
+            std::string prefix = tok.substr(0, du);
+            std::string name   = tok.substr(du + 2);
+            if (prefix.size() != 1 || kRankChars.find(prefix[0]) == std::string::npos) continue;
+            if (name.empty()) continue;
+            path = path.empty() ? tok : path + ";" + tok;
+            if (overrides.count(path)) continue;
+            int tid = ncbi.taxid_for_name(name);
+            if (tid > 0) overrides[path] = static_cast<uint64_t>(tid);
+        }
+    }
+    spdlog::info("NCBI taxid overrides: {} lineage paths pinned to native NCBI taxids", overrides.size());
+    return overrides;
 }
 
 } // namespace genopack

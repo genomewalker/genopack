@@ -40,7 +40,8 @@ void merge_archives(const std::vector<std::filesystem::path>& inputs,
                     const std::filesystem::path& output,
                     bool remap_genome_ids,
                     bool merge_cidx,
-                    const std::string& spill_dir)
+                    const std::string& spill_dir,
+                    const std::string& ncbi_taxdump_dir)
 {
     if (inputs.empty())
         throw std::runtime_error("merge_archives: no inputs");
@@ -492,6 +493,12 @@ void merge_archives(const std::vector<std::filesystem::path>& inputs,
         TxdbWriter txw;
         for (const auto& [acc, tax] : all_taxonomies)
             txw.add(acc, tax);
+        if (!ncbi_taxdump_dir.empty()) {
+            std::unordered_map<std::string, std::string> tmap;
+            tmap.reserve(all_taxonomies.size());
+            for (const auto& [acc, tax] : all_taxonomies) tmap.emplace(acc, tax);
+            txw.set_ncbi_overrides(build_ncbi_taxid_overrides(ncbi_taxdump_dir, tmap));
+        }
         SectionDesc txdb_sd = txw.finalize(mw, next_section_id++);
         toc_out.add_section(txdb_sd);
     }

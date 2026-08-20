@@ -186,6 +186,11 @@ public:
         const std::unordered_map<std::string, std::array<float, 136>>& profiles,
         float similarity_threshold = 0.97f);
 
+    // Register a path→NCBI-taxid override map. Any lineage path found here keeps
+    // its native NCBI taxid (bit 63 = 0) instead of a synthetic concept_id,
+    // giving NCBI precedence for taxa shared with GTDB/other sources.
+    void set_ncbi_overrides(std::unordered_map<std::string, uint64_t> overrides);
+
     TaxonomyTree build_tree() const;
 
     SectionDesc finalize(AppendWriter& writer, uint64_t section_id);
@@ -194,7 +199,16 @@ private:
     std::vector<std::pair<std::string, std::string>> entries_;
     const std::unordered_map<std::string, std::array<float, 136>>* kmer_profiles_ = nullptr;
     float similarity_threshold_ = 0.97f;
+    std::unordered_map<std::string, uint64_t> ncbi_overrides_;
 };
+
+// Build a path→NCBI-taxid override map for a set of accession→lineage strings by
+// resolving each taxon name against an NCBI taxdump (unambiguous names only).
+// Feed the result to TxdbWriter::set_ncbi_overrides so shared taxa keep native
+// NCBI taxids (bit63=0) with NCBI precedence. `taxdump_dir` holds nodes.dmp+names.dmp.
+std::unordered_map<std::string, uint64_t> build_ncbi_taxid_overrides(
+    const std::string& taxdump_dir,
+    const std::unordered_map<std::string, std::string>& taxonomy_map);
 
 // ── TxdbReader ───────────────────────────────────────────────────────────────
 class TxdbReader {

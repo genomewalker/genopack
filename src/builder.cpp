@@ -17,6 +17,7 @@
 #include <genopack/kmrx.hpp>
 #include <genopack/taxn.hpp>
 #include <genopack/txdb.hpp>
+#include <genopack/ncbi_taxdb.hpp>
 #include <genopack/catalog.hpp>
 #include <genopack/format.hpp>
 #include <genopack/bprm.hpp>
@@ -2119,6 +2120,8 @@ struct ArchiveBuilder::Impl {
                 txw.add(accession, taxonomy);
             if (!acc_kmer_profiles.empty())
                 txw.set_kmer_profiles(acc_kmer_profiles);
+            if (!cfg.ncbi_taxdump_dir.empty())
+                txw.set_ncbi_overrides(build_ncbi_taxid_overrides(cfg.ncbi_taxdump_dir, taxonomy_map));
             SectionDesc txdb_sd = txw.finalize(mw, next_section_id++);
             toc.add_section(txdb_sd);
         }

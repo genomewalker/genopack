@@ -64,7 +64,13 @@ std::string trim(const std::string& s) {
     return s.substr(b, e - b + 1);
 }
 
-std::vector<std::string> split_dmp(const std::string& line) {
+std::vector<std::string> split_dmp(const std::string& line_in) {
+    // NCBI .dmp records are "\t|\t"-separated and terminate with a "\t|" (or "|")
+    // sentinel. Drop that terminator so the final field isn't left as "value\t|".
+    std::string_view lv(line_in);
+    if (lv.size() >= 2 && lv.substr(lv.size() - 2) == "\t|") lv.remove_suffix(2);
+    else if (!lv.empty() && lv.back() == '|')                lv.remove_suffix(1);
+    std::string line(lv);
     std::vector<std::string> fields;
     std::size_t pos = 0;
     while (true) {

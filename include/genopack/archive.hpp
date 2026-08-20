@@ -342,6 +342,9 @@ struct ArchiveBuilderConfig {
     std::string markers_path;           // path to .mrk file; empty = skip build-time marker scoring
     int         marker_min_hits  = 5;  // min pool hits to call a marker present (matches check default)
     std::string contam_panel_path;      // path to .csp contamination panel; empty = skip duplication scoring
+    std::string ncbi_taxdump_dir;       // path to NCBI taxdump (nodes.dmp+names.dmp); empty = pure concept_id TXDB.
+                                        // When set, lineage taxa known to NCBI keep native NCBI taxids (bit63=0),
+                                        // giving NCBI precedence; unknown taxa stay synthetic concept_ids (bit63=1).
     std::filesystem::path from_gpk_source;  // non-empty: rebuild by streaming decoded sequence from this .gpk
 };
 

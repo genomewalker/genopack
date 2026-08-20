@@ -27,6 +27,7 @@
 #include <omp.h>
 #endif
 #include <genopack/repack.hpp>
+#include <genopack/router_minimizer.hpp>
 #include <genopack/subset.hpp>
 #include <genopack/catalog.hpp>
 #include <genopack/cidx.hpp>
@@ -119,7 +120,8 @@ static int cmd_build(const std::string& input_tsv, const std::string& output_dir
                      bool thin        = false,
                      std::string tmpdir = {},
                      bool build_tier  = false,
-                     uint32_t pcore_frac = 100) {
+                     uint32_t pcore_frac = 100,
+                     std::string ncbi_taxdump = {}) {
     ArchiveBuilder::Config cfg;
     const bool explicit_codec = no_dict || ref_dict || delta || mem_delta;
     cfg.io_threads                        = static_cast<size_t>(std::max(1, threads));
@@ -169,6 +171,9 @@ static int cmd_build(const std::string& input_tsv, const std::string& output_dir
         spdlog::info("build: auto-resolved markers panel → {}", cfg.markers_path);
     if (!cfg.contam_panel_path.empty())
         spdlog::info("build: contamination panel → {}", cfg.contam_panel_path);
+    cfg.ncbi_taxdump_dir = ncbi_taxdump;
+    if (!cfg.ncbi_taxdump_dir.empty())
+        spdlog::info("build: NCBI taxdump (taxid reconciliation) → {}", cfg.ncbi_taxdump_dir);
 
     if (!from_gpk.empty()) {
         // Rebuild from an existing .gpk: stream decoded sequence from its shards
@@ -326,7 +331,8 @@ static int cmd_build(const std::string& input_tsv, const std::string& output_dir
 static int cmd_merge(const std::vector<std::string>& inputs,
                      const std::string& list_file,
                      const std::string& output,
-                     const std::string& tmpdir) {
+                     const std::string& tmpdir,
+                     const std::string& ncbi_taxdump = {}) {
     std::vector<std::filesystem::path> paths;
     for (const auto& s : inputs) paths.emplace_back(s);
     if (!list_file.empty()) {
@@ -339,7 +345,7 @@ static int cmd_merge(const std::vector<std::string>& inputs,
     }
     if (paths.size() < 2)
         throw std::runtime_error("merge: need at least 2 input archives");
-    merge_archives(paths, output, /*remap_genome_ids=*/true, /*merge_cidx=*/true, tmpdir);
+    merge_archives(paths, output, /*remap_genome_ids=*/true, /*merge_cidx=*/true, tmpdir, ncbi_taxdump);
     return 0;
 }
 
@@ -360,7 +366,10 @@ struct RefMask {
 
 static std::string concat_contigs(const std::string& fasta,
                                   const std::string& accession, int npad,
-                                  RefMask* mask = nullptr) {
+                                  RefMask* mask = nullptr,
+                                  std::vector<uint64_t>* mins = nullptr,
+                                  int mk = genopack::router::DEFAULT_K,
+                                  int mw = genopack::router::DEFAULT_W) {
     std::string seq;
     seq.reserve(fasta.size());
     bool first = true;
@@ -399,6 +408,11 @@ static std::string concat_contigs(const std::string& fasta,
         }
     }
     if (seq.empty()) return {};
+    // Router minimizers from the CLEAN unwrapped seq (matches the query side, which sees the
+    // sequence with newlines stripped and N-runs resetting the rolling k-mer).
+    if (mins)
+        genopack::router::for_each_minimizer(seq.data(), seq.size(), mk, mw,
+                                             [&](uint64_t m){ mins->push_back(m); });
     std::string out;
     out.reserve(seq.size() + seq.size() / 60 + accession.size() + 4);
     out.push_back('>');
@@ -442,7 +456,11 @@ static int cmd_extract(const std::string& archive_dir,
                        float min_completeness, float max_contamination,
                        const std::string& out_fasta,
                        const std::string& out_dir,
-                       bool concat, int concat_npad, bool emit_nmask) {
+                       bool concat, int concat_npad, bool emit_nmask,
+                       const std::string& index_path = "",
+                       int index_k = genopack::router::DEFAULT_K,
+                       int index_w = genopack::router::DEFAULT_W,
+                       const std::string& manifest_path = "") {
     ArchiveSetReader ar = open_archive_auto(archive_dir);
 
     ExtractQuery q;
@@ -456,6 +474,40 @@ static int cmd_extract(const std::string& archive_dir,
         std::string line;
         while (std::getline(af, line))
             if (!line.empty()) q.accessions.push_back(line);
+    }
+
+    // --manifest: per-genome property TSV from METADATA ONLY (ACCX+CATL+TAXN, no sequence
+    // decompression). Everything needed to plan a partition (bp for bp-balance, oph_fingerprint
+    // for similarity ordering, taxonomy for taxonomic contiguity, completeness/contamination for
+    // QC) is in GenomeMeta, so this is O(n) over the index — seconds, not a decompression pass.
+    if (!manifest_path.empty()) {
+        std::ofstream mf(manifest_path);
+        if (!mf) { spdlog::error("Cannot open manifest: {}", manifest_path); return 1; }
+        mf << "accession\tbp\tn_contigs\tgc_pct\tcompleteness\tcontamination\toph_fingerprint\tshard_id\tdeleted\ttaxonomy\n";
+        size_t nm = 0, nmiss = 0;
+        auto emit_manifest_row = [&](std::string_view acc, const GenomeMeta& meta,
+                                     std::string_view taxonomy) {
+            mf << acc << '\t' << meta.genome_length << '\t' << meta.n_contigs << '\t'
+               << (meta.gc_pct_x100 / 100.0) << '\t' << (meta.completeness_x10 / 10.0) << '\t'
+               << (meta.contamination_x10 / 10.0) << '\t' << meta.oph_fingerprint << '\t'
+               << meta.shard_id << '\t' << ((meta.flags & 1u) ? 1 : 0) << '\t'
+               << taxonomy << '\n';
+            ++nm;
+        };
+        if (q.accessions.empty()) {
+            ar.scan_genome_catalog(emit_manifest_row);
+        } else {
+            for (const auto& acc : q.accessions) {
+                auto meta = ar.genome_meta_by_accession(acc);
+                if (!meta) { ++nmiss; continue; }
+                auto taxonomy = ar.taxonomy_for_accession(acc);
+                emit_manifest_row(acc, *meta,
+                                  taxonomy ? std::string_view(*taxonomy) : std::string_view{});
+            }
+        }
+        spdlog::info("Wrote manifest: {} ({} genomes, {} not found)", manifest_path, nm, nmiss);
+        // manifest-only run (no FASTA requested) — done.
+        if (out_fasta.empty() && out_dir.empty()) return 0;
     }
 
     // --output-dir: write one {accession}.fa per genome, open archive once
@@ -499,6 +551,21 @@ static int cmd_extract(const std::string& archive_dir,
         // single-stream output stays in accession-list order.
         std::vector<std::string> ordered(q.accessions.size());
         std::vector<RefMask> masks(concat && emit_nmask ? q.accessions.size() : 0);
+        // --index: stream this partition's router minimizers to a sidecar (u64 LE), memory-flat
+        // (per-genome buffer, mutex-guarded append). One extract call = one partition, so the file
+        // IS the partition's minimizer set (dedup deferred to the assembler). Requires --concat-contigs.
+        const bool do_index = !index_path.empty() && concat;
+        FILE* idxf = nullptr; std::mutex idxmu; uint64_t idx_count = 0;
+        if (do_index) {
+            idxf = fopen(index_path.c_str(), "wb");
+            if (!idxf) { spdlog::error("Cannot open index output: {}", index_path); return 1; }
+        }
+        // --index STREAMS: each genome's FASTA is written immediately (mutex-guarded) and its
+        // minimizers appended, WITHOUT buffering all genomes in `ordered`. A shard is ~23k genomes
+        // (~100+ GB of sequence) — buffering it OOMs. Streaming keeps RAM flat (one genome at a time).
+        // Order becomes fetch-order, not accession-order (irrelevant for bowtie2-build / router).
+        std::mutex outmu; std::atomic<size_t> n_stream{0};
+        size_t n = 0;
         ar.visit_shard_batches(q.accessions, [&](ArchiveSetReader::ShardBatch& batch) {
             for (auto& [idx, eg] : batch) {
                 if (eg.fasta.empty()) {
@@ -506,13 +573,22 @@ static int cmd_extract(const std::string& archive_dir,
                     continue;
                 }
                 RefMask* mp = (concat && emit_nmask) ? &masks[idx] : nullptr;
-                ordered[idx] = concat ? concat_contigs(eg.fasta, q.accessions[idx], concat_npad, mp)
-                                      : std::move(eg.fasta);
+                std::vector<uint64_t> lm;
+                std::string rec = concat ? concat_contigs(eg.fasta, q.accessions[idx], concat_npad, mp,
+                                                          do_index ? &lm : nullptr, index_k, index_w)
+                                         : std::move(eg.fasta);
+                if (do_index) {
+                    if (!rec.empty()) { std::lock_guard<std::mutex> lk(outmu); *out_stream << rec; n_stream.fetch_add(1); }
+                    if (!lm.empty())  { std::lock_guard<std::mutex> lk(idxmu); fwrite(lm.data(), sizeof(uint64_t), lm.size(), idxf); idx_count += lm.size(); }
+                } else {
+                    ordered[idx] = std::move(rec);
+                }
             }
         });
-        size_t n = 0;
-        for (auto& f : ordered)
-            if (!f.empty()) { *out_stream << f; ++n; }
+        if (idxf) { fclose(idxf); spdlog::info("Wrote router index: {} ({} minimizers, k={} w={})",
+                                               index_path, idx_count, index_k, index_w); }
+        if (do_index) { n = n_stream.load(); }
+        else for (auto& f : ordered) if (!f.empty()) { *out_stream << f; ++n; }
         spdlog::info("Extracted {} genomes", n);
         if (concat && emit_nmask && !out_fasta.empty() && out_fasta != "-") {
             std::string np = out_fasta + ".nmask";
@@ -2559,6 +2635,244 @@ static const char* rank_name_gtdb(TaxRank r) {
     }
 }
 
+// A taxonomy view assembled from one or more sources (parts of a pack, or several
+// independent packs), exposing the same scan API the exporter consumes.
+struct TaxdumpTree {
+    std::map<uint64_t, std::tuple<uint64_t, TaxRank, std::string, bool>> nodes;
+    std::vector<std::pair<std::string, uint64_t>> accs;
+    size_t n_nodes() const { return nodes.size(); }
+    size_t n_accessions() const { return accs.size(); }
+    void scan_nodes(const std::function<void(uint64_t, uint64_t, TaxRank,
+                                             std::string_view, bool)>& cb) const {
+        for (const auto& [tid, v] : nodes)
+            cb(tid, std::get<0>(v), std::get<1>(v), std::get<2>(v), std::get<3>(v));
+    }
+    void scan_accessions(const std::function<void(std::string_view, uint64_t)>& cb) const {
+        for (const auto& [a, t] : accs) cb(a, t);
+    }
+};
+
+// Renumber synthetic concept_ids to a dense block above max NCBI taxid (native
+// NCBI ids are preserved) and write the taxonomy in the requested format.
+static int write_taxdump_from_tree(TaxdumpTree& tree,
+                                   const std::string& format,
+                                   const std::string& output_dir) {
+    // Remap 64-bit synthetic concept_ids (bit63=1) to a dense space so downstream
+    // consumers (kaiku's KtaxNode.taxid is int32) don't overflow on the raw hashes.
+    // NATIVE NCBI taxids (bit63=0, e.g. Homo sapiens 9606) fit uint32 and are
+    // meaningful — they are PRESERVED so exported ids stay recognizable. Synthetic
+    // ids are renumbered into a block above the max NCBI taxid so nothing collides.
+    {
+        uint64_t max_ncbi = 1;  // root (taxid 1) is native; keep dense block above all NCBI ids
+        for (const auto& [tid, v] : tree.nodes) { (void)v; if (!taxid_is_gtdb(tid)) max_ncbi = std::max(max_ncbi, tid); }
+        std::unordered_map<uint64_t, uint64_t> remap;
+        remap.reserve(tree.nodes.size() + 1);
+        uint64_t next_id = max_ncbi + 1;
+        for (const auto& [tid, v] : tree.nodes) { (void)v; remap[tid] = taxid_is_gtdb(tid) ? next_id++ : tid; }
+        std::map<uint64_t, std::tuple<uint64_t, TaxRank, std::string, bool>> renumbered;
+        for (auto& [tid, v] : tree.nodes) {
+            uint64_t par = std::get<0>(v);
+            uint64_t new_par = (par == 0) ? remap[tid]
+                             : (remap.count(par) ? remap[par] : remap[tid]);
+            renumbered.emplace(remap[tid],
+                std::make_tuple(new_par, std::get<1>(v),
+                                std::move(std::get<2>(v)), std::get<3>(v)));
+        }
+        tree.nodes.swap(renumbered);
+        for (auto& [a, t] : tree.accs) { (void)a; if (remap.count(t)) t = remap[t]; }
+    }
+
+    std::filesystem::create_directories(output_dir);
+    std::filesystem::path out = output_dir;
+
+    spdlog::info("Taxonomy: {} nodes, {} accessions", tree.n_nodes(), tree.n_accessions());
+
+    if (format == "taxdump") {
+        {
+            std::ofstream f(out / "names.dmp");
+            if (!f) throw std::runtime_error("Cannot open names.dmp");
+            tree.scan_nodes([&](uint64_t taxid, uint64_t, TaxRank,
+                                std::string_view name, bool) {
+                f << taxid << "\t|\t" << name << "\t|\t\t|\tscientific name\t|\n";
+            });
+        }
+        {
+            std::ofstream f(out / "nodes.dmp");
+            if (!f) throw std::runtime_error("Cannot open nodes.dmp");
+            tree.scan_nodes([&](uint64_t taxid, uint64_t parent, TaxRank rank,
+                                std::string_view, bool) {
+                uint64_t p = (parent == 0) ? taxid : parent;
+                f << taxid << "\t|\t" << p << "\t|\t" << rank_name_ncbi(rank)
+                  << "\t|\t\t|\t0\t|\t0\t|\t1\t|\t0\t|\t0\t|\t0\t|\t0\t|\t0\t|\t\t|\n";
+            });
+        }
+        {
+            std::ofstream f(out / "acc2taxid.dmp");
+            if (!f) throw std::runtime_error("Cannot open acc2taxid.dmp");
+            f << "accession\taccession.version\ttaxid\tgi\n";
+            tree.scan_accessions([&](std::string_view acc, uint64_t taxid) {
+                f << acc << "\t" << acc << "\t" << taxid << "\t0\n";
+            });
+        }
+        { std::ofstream(out / "merged.dmp");   }
+        { std::ofstream(out / "delnodes.dmp"); }
+        spdlog::info("taxdump written to {}", output_dir);
+    } else if (format == "columnar") {
+        {
+            std::vector<Acc2TaxidEntry> entries;
+            entries.reserve(tree.n_accessions());
+            tree.scan_accessions([&](std::string_view acc, uint64_t taxid) {
+                entries.push_back({cidx_hash(acc), taxid});
+            });
+            std::sort(entries.begin(), entries.end(),
+                      [](const Acc2TaxidEntry& a, const Acc2TaxidEntry& b) {
+                          return a.acc_hash < b.acc_hash;
+                      });
+            std::ofstream f(out / "acc2taxid.bin", std::ios::binary);
+            if (!f) throw std::runtime_error("Cannot open acc2taxid.bin");
+            Acc2TaxidHeader hdr{};
+            hdr.magic     = TAXDUMP_ACC2TAXID_MAGIC;
+            hdr.version   = 1;
+            hdr.n_entries = entries.size();
+            f.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
+            f.write(reinterpret_cast<const char*>(entries.data()),
+                    static_cast<std::streamsize>(entries.size() * sizeof(Acc2TaxidEntry)));
+        }
+        {
+            std::vector<TaxnodeEntry> nodes;
+            std::string name_pool;
+            nodes.reserve(tree.n_nodes());
+            tree.scan_nodes([&](uint64_t taxid, uint64_t parent, TaxRank rank,
+                                std::string_view name, bool synthetic) {
+                TaxnodeEntry e{};
+                e.taxid        = taxid;
+                e.parent_taxid = (parent == 0) ? taxid : parent;
+                e.name_offset  = static_cast<uint32_t>(name_pool.size());
+                e.rank         = static_cast<uint8_t>(rank);
+                e.flags        = synthetic ? 1u : 0u;
+                e.name_len     = static_cast<uint16_t>(name.size());
+                name_pool.append(name);
+                name_pool.push_back('\0');
+                nodes.push_back(e);
+            });
+            std::sort(nodes.begin(), nodes.end(),
+                      [](const TaxnodeEntry& a, const TaxnodeEntry& b) {
+                          return a.taxid < b.taxid;
+                      });
+            std::ofstream f(out / "taxnodes.bin", std::ios::binary);
+            if (!f) throw std::runtime_error("Cannot open taxnodes.bin");
+            TaxnodesHeader hdr{};
+            hdr.magic          = TAXDUMP_TAXNODES_MAGIC;
+            hdr.version        = 1;
+            hdr.n_nodes        = static_cast<uint32_t>(nodes.size());
+            hdr.name_pool_size = static_cast<uint32_t>(name_pool.size());
+            f.write(reinterpret_cast<const char*>(&hdr), sizeof(hdr));
+            f.write(reinterpret_cast<const char*>(nodes.data()),
+                    static_cast<std::streamsize>(nodes.size() * sizeof(TaxnodeEntry)));
+            f.write(name_pool.data(), static_cast<std::streamsize>(name_pool.size()));
+            spdlog::info("taxnodes.bin: {} nodes, {} bytes name pool", nodes.size(), name_pool.size());
+        }
+        {
+            std::ofstream f(out / "acc2taxid.tsv");
+            if (!f) throw std::runtime_error("Cannot open acc2taxid.tsv");
+            f << "accession\ttaxid\n";
+            tree.scan_accessions([&](std::string_view acc, uint64_t taxid) {
+                f << acc << "\t" << taxid << "\n";
+            });
+        }
+        {
+            std::ofstream f(out / "taxonomy.tsv");
+            if (!f) throw std::runtime_error("Cannot open taxonomy.tsv");
+            f << "taxid\tparent_taxid\trank\tname\tis_synthetic\n";
+            tree.scan_nodes([&](uint64_t taxid, uint64_t parent, TaxRank rank,
+                                std::string_view name, bool synthetic) {
+                uint64_t p = (parent == 0) ? taxid : parent;
+                f << taxid << "\t" << p << "\t" << rank_name_gtdb(rank)
+                  << "\t" << name << "\t" << (synthetic ? 1 : 0) << "\n";
+            });
+        }
+        spdlog::info("columnar written to {}", output_dir);
+    } else {
+        spdlog::error("Unknown format '{}'. Use 'taxdump' or 'columnar'.", format);
+        return 1;
+    }
+    return 0;
+}
+
+// Unify the taxonomies of N INDEPENDENT packs into one common taxdump WITHOUT
+// merging sequence data. Reads only TAXN lineage strings, rebuilds one tree with
+// NCBI reconciliation, and writes a single nodes/names/acc2taxid covering every
+// accession — so per-pack bowtie2 references share one taxid space for kaiku.
+// Strip GTDB's propagated l__/k__ placeholder ranks whose name duplicates the
+// domain (e.g. "d__Bacteria;l__Bacteria;k__Bacteria;p__..." -> "d__Bacteria;p__...").
+// Real eukaryotic l__/k__ clades (l__Opisthokonta, k__Metazoa) differ from the
+// domain name and are kept — only the redundant prokaryote placeholders are dropped.
+static std::string strip_propagated_ranks(const std::string& lineage) {
+    std::string dom;
+    for (size_t p = 0; p < lineage.size(); ) {
+        size_t s = lineage.find(';', p);
+        std::string tok = lineage.substr(p, s == std::string::npos ? std::string::npos : s - p);
+        if (tok.size() > 3 && tok[0] == 'd' && tok[1] == '_' && tok[2] == '_') { dom = tok.substr(3); break; }
+        p = (s == std::string::npos) ? lineage.size() : s + 1;
+    }
+    if (dom.empty()) return lineage;
+    std::string out;
+    for (size_t p = 0; p < lineage.size(); ) {
+        size_t s = lineage.find(';', p);
+        std::string tok = lineage.substr(p, s == std::string::npos ? std::string::npos : s - p);
+        p = (s == std::string::npos) ? lineage.size() : s + 1;
+        if (tok.size() > 3 && (tok[0] == 'l' || tok[0] == 'k') && tok[1] == '_' && tok[2] == '_'
+            && tok.compare(3, std::string::npos, dom) == 0)
+            continue;  // drop domain-propagated placeholder rank
+        if (!out.empty()) out += ';';
+        out += tok;
+    }
+    return out;
+}
+
+static int cmd_taxonomy_unify(const std::vector<std::string>& archives,
+                              const std::string& ncbi_taxdump,
+                              const std::string& output_dir,
+                              const std::string& format) {
+    std::unordered_map<std::string, std::string> taxonomy_map;
+    for (const auto& apath : archives) {
+        ArchiveSetReader ar = open_archive_auto(apath);
+        for (const auto& pp : ar.part_paths()) {
+            ArchiveReader pr;
+            pr.open(pp);
+            pr.scan_taxonomy([&](std::string_view acc, std::string_view tax) {
+                taxonomy_map.emplace(std::string(acc), std::string(tax));
+            });
+        }
+    }
+    if (taxonomy_map.empty()) {
+        spdlog::error("No taxonomy (TAXN) found in any input archive");
+        return 1;
+    }
+    spdlog::info("taxonomy unify: {} accessions across {} archives", taxonomy_map.size(), archives.size());
+
+    // Normalize away GTDB's domain-propagated l__/k__ placeholder ranks so the
+    // unified tree has one clean backbone (both the tree and the NCBI-override
+    // paths below consume the cleaned strings, keeping them consistent).
+    for (auto& [acc, lin] : taxonomy_map) { (void)acc; lin = strip_propagated_ranks(lin); }
+
+    TxdbWriter txw;
+    for (const auto& [acc, tax] : taxonomy_map) txw.add(acc, tax);
+    if (!ncbi_taxdump.empty())
+        txw.set_ncbi_overrides(build_ncbi_taxid_overrides(ncbi_taxdump, taxonomy_map));
+    TaxonomyTree unified = txw.build_tree();
+
+    TaxdumpTree tree;
+    unified.scan_nodes([&](uint64_t taxid, uint64_t parent, TaxRank rank,
+                           std::string_view name, bool synthetic) {
+        tree.nodes.emplace(taxid, std::make_tuple(parent, rank, std::string(name), synthetic));
+    });
+    unified.scan_accessions([&](std::string_view acc, uint64_t taxid) {
+        tree.accs.emplace_back(std::string(acc), taxid);
+    });
+    return write_taxdump_from_tree(tree, format, output_dir);
+}
+
 static int cmd_taxdump(const std::string& archive_path,
                        const std::string& format,
                        const std::string& output_dir) {
@@ -2570,22 +2884,7 @@ static int cmd_taxdump(const std::string& archive_path,
     // view exposes the same scan_nodes/scan_accessions/n_nodes/n_accessions API.
     ArchiveSetReader ar = open_archive_auto(archive_path);
 
-    struct MergedTree {
-        std::map<uint64_t, std::tuple<uint64_t, TaxRank, std::string, bool>> nodes;
-        std::vector<std::pair<std::string, uint64_t>> accs;
-        size_t n_nodes() const { return nodes.size(); }
-        size_t n_accessions() const { return accs.size(); }
-        void scan_nodes(const std::function<void(uint64_t, uint64_t, TaxRank,
-                                                 std::string_view, bool)>& cb) const {
-            for (const auto& [tid, v] : nodes)
-                cb(tid, std::get<0>(v), std::get<1>(v), std::get<2>(v), std::get<3>(v));
-        }
-        void scan_accessions(const std::function<void(std::string_view,
-                                                      uint64_t)>& cb) const {
-            for (const auto& [a, t] : accs) cb(a, t);
-        }
-    } tree;
-
+    TaxdumpTree tree;
     bool any_tax = false;
     for (const auto& pp : ar.part_paths()) {
         ArchiveReader pr;
@@ -2607,15 +2906,18 @@ static int cmd_taxdump(const std::string& archive_path,
         return 1;
     }
 
-    // Remap 64-bit GTDB lineage-hash taxids to a dense 1..N space. Downstream
-    // consumers (kaiku's KtaxNode.taxid is int32) overflow on the raw hashes; the
-    // hashes are synthetic anyway, so relabeling is lossless. std::map iteration is
-    // sorted -> deterministic; the root (taxid 1) sorts first and stays 1.
+    // Remap 64-bit synthetic concept_ids (bit63=1) to a dense space so downstream
+    // consumers (kaiku's KtaxNode.taxid is int32) don't overflow on the raw hashes.
+    // NATIVE NCBI taxids (bit63=0, e.g. Homo sapiens 9606) fit uint32 and are
+    // meaningful — they are PRESERVED so exported ids stay recognizable. Synthetic
+    // ids are renumbered into a block above the max NCBI taxid so nothing collides.
     {
+        uint64_t max_ncbi = 1;  // root (taxid 1) is native; keep dense block above all NCBI ids
+        for (const auto& [tid, v] : tree.nodes) { (void)v; if (!taxid_is_gtdb(tid)) max_ncbi = std::max(max_ncbi, tid); }
         std::unordered_map<uint64_t, uint64_t> remap;
         remap.reserve(tree.nodes.size() + 1);
-        uint64_t next_id = 1;
-        for (const auto& [tid, v] : tree.nodes) { (void)v; remap[tid] = next_id++; }
+        uint64_t next_id = max_ncbi + 1;
+        for (const auto& [tid, v] : tree.nodes) { (void)v; remap[tid] = taxid_is_gtdb(tid) ? next_id++ : tid; }
         std::map<uint64_t, std::tuple<uint64_t, TaxRank, std::string, bool>> renumbered;
         for (auto& [tid, v] : tree.nodes) {
             uint64_t par = std::get<0>(v);
@@ -3054,6 +3356,12 @@ int main(int argc, char** argv) {
     build->add_option("--markers", build_markers,
         "Path to markers.mrk; build-time marker completeness scoring. If omitted, "
         "auto-resolved from $GENOPACK_DATA/markers.mrk or the install share dir.");
+    std::string build_ncbi_taxdump;
+    build->add_option("--ncbi-taxdump", build_ncbi_taxdump,
+        "Path to an NCBI taxdump dir (nodes.dmp + names.dmp). When set, lineage taxa whose "
+        "scientific name is unambiguous in NCBI keep their native NCBI taxid (bit63=0, "
+        "recognizable across tools); GTDB/other-only taxa stay synthetic concept_ids (bit63=1). "
+        "Gives NCBI precedence — Bacteria/Archaea/Viruses share NCBI taxids 2/2157/10239 across sources.");
     std::string build_contam_panel;
     build->add_option("--contam-panel", build_contam_panel,
         "Path to contamination .csp panel; build-time intra-genome duplication scoring. "
@@ -3114,7 +3422,7 @@ int main(int argc, char** argv) {
                                 build_no_gstx, build_markers, build_from_gpk,
                                 build_micro_genus_threshold,
                                 build_contam_panel, build_pcore, build_thin, build_tmpdir,
-                                build_tier, build_pcore_frac);
+                                build_tier, build_pcore_frac, build_ncbi_taxdump);
             if (rc != 0) std::exit(rc);
             std::string hostname = "worker";
             {
@@ -3146,7 +3454,7 @@ int main(int argc, char** argv) {
                              build_no_gstx, build_markers, build_from_gpk,
                              build_micro_genus_threshold,
                              build_contam_panel, build_pcore, build_thin, build_tmpdir,
-                             build_tier, build_pcore_frac));
+                             build_tier, build_pcore_frac, build_ncbi_taxdump));
     });
 
     // genopack enrich — compute GSTX/GCOV/CORE/PCORE/GAMI from a thin archive
@@ -3241,10 +3549,25 @@ int main(int argc, char** argv) {
         "With --concat-contigs and -o: also write <out>.nmask (per-ref effective len + N-intervals for kaiku)");
     extract->add_option("--concat-ns", ext_concat_ns,
         "N-run length between contigs (default 300; must exceed the longest read)");
+    std::string ext_index;
+    int ext_index_k = genopack::router::DEFAULT_K, ext_index_w = genopack::router::DEFAULT_W;
+    extract->add_option("--index", ext_index,
+        "With --concat-contigs: also write this partition's router minimizers (u64 LE) to <path> "
+        "for the read->partition router. One extract call = one partition.");
+    extract->add_option("--index-k", ext_index_k, "Router minimizer k (default 19)");
+    extract->add_option("--index-w", ext_index_w, "Router minimizer window w (default 11)");
+    std::string ext_manifest;
+    extract->add_option("--manifest", ext_manifest,
+        "Write per-genome property TSV (bp, n_contigs, gc, completeness, contamination, "
+        "oph_fingerprint, taxonomy) for the accession set, or the full catalog when no "
+        "accessions are given. Metadata-only (no sequence "
+        "decompression): use WITHOUT -o for a fast catalog scan to drive bp-balanced / "
+        "similarity-aware partitioning; use WITH -o to emit it in the same pass as the FASTA.");
     extract->callback([&]() {
         std::exit(cmd_extract(ext_archive, ext_accessions, ext_acc_file,
                               ext_min_comp, ext_max_contam, ext_out, ext_out_dir,
-                              ext_concat, ext_concat_ns, ext_nmask));
+                              ext_concat, ext_concat_ns, ext_nmask,
+                              ext_index, ext_index_k, ext_index_w, ext_manifest));
     });
 
     // genopack slice
@@ -3310,8 +3633,14 @@ int main(int argc, char** argv) {
     merge_cmd->add_option("--tmpdir", merge_tmpdir,
         "Directory for SKCH spill files during merge "
         "(default: $GENOPACK_SKETCH_SPILL_DIR / $GENOPACK_SPILL_DIR / /scratch / /tmp).");
+    std::string merge_ncbi_taxdump;
+    merge_cmd->add_option("--ncbi-taxdump", merge_ncbi_taxdump,
+        "Unify the merged taxonomy against an NCBI taxdump dir (nodes.dmp+names.dmp): "
+        "taxa whose scientific name is unambiguous in NCBI keep native NCBI taxids "
+        "(NCBI precedence — Bacteria/Archaea/Viruses = 2/2157/10239 across GTDB & NCBI packs); "
+        "source-only taxa stay synthetic concept_ids. Detects NCBI vs other automatically.");
     merge_cmd->callback([&]() {
-        std::exit(cmd_merge(merge_inputs, merge_list, merge_output, merge_tmpdir));
+        std::exit(cmd_merge(merge_inputs, merge_list, merge_output, merge_tmpdir, merge_ncbi_taxdump));
     });
 
     // genopack add
@@ -4189,6 +4518,25 @@ int main(int argc, char** argv) {
     taxdump_cmd->add_option("-o,--output", taxdump_output, "Output directory")->required();
     taxdump_cmd->callback([&]() {
         std::exit(cmd_taxdump(taxdump_archive, taxdump_format, taxdump_output));
+    });
+
+    // genopack taxonomy unify
+    auto* tax_unify = tax_cmd->add_subcommand("unify",
+        "Unify the taxonomies of several INDEPENDENT .gpk packs into one common taxdump "
+        "WITHOUT merging sequence data. Reads only TAXN lineage strings, rebuilds one tree "
+        "(NCBI-reconciled with --ncbi-taxdump), and writes a single nodes/names/acc2taxid "
+        "covering every accession — so per-pack bowtie2 references share one taxid space for kaiku.");
+    std::vector<std::string> unify_inputs;
+    std::string unify_ncbi, unify_output, unify_format = "taxdump";
+    tax_unify->add_option("inputs", unify_inputs, "Input .gpk packs (any number)")->required()->expected(1, -1);
+    tax_unify->add_option("--ncbi-taxdump", unify_ncbi,
+        "NCBI taxdump dir (nodes.dmp+names.dmp): shared taxa keep native NCBI taxids (NCBI precedence); "
+        "source-only taxa stay synthetic concept_ids. Auto-detects NCBI vs GTDB/other.");
+    tax_unify->add_option("-o,--output", unify_output, "Output directory")->required();
+    tax_unify->add_option("-f,--format", unify_format,
+        "Output format: 'taxdump' (NCBI names/nodes/acc2taxid.dmp, default) or 'columnar' (binary + TSV)");
+    tax_unify->callback([&]() {
+        std::exit(cmd_taxonomy_unify(unify_inputs, unify_ncbi, unify_output, unify_format));
     });
 
     // genopack reindex
