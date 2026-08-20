@@ -2862,11 +2862,25 @@ static std::unordered_map<std::string, int> load_preserve_map(const std::string&
     return m;
 }
 
+static TaxRank ncbi_rank_to_taxrank(const std::string& r) {
+    if (r == "domain" || r == "superkingdom" || r == "realm") return TaxRank::DOMAIN;
+    if (r == "kingdom") return TaxRank::KINGDOM;
+    if (r == "phylum")  return TaxRank::PHYLUM;
+    if (r == "class")   return TaxRank::CLASS;
+    if (r == "order")   return TaxRank::ORDER;
+    if (r == "family")  return TaxRank::FAMILY;
+    if (r == "genus")   return TaxRank::GENUS;
+    if (r == "species") return TaxRank::SPECIES;
+    return TaxRank::NO_RANK;  // clade / no rank / subspecies / strain / etc.
+}
+
 static int cmd_taxonomy_unify(const std::vector<std::string>& archives,
                               const std::string& ncbi_taxdump,
                               const std::string& output_dir,
                               const std::string& format,
-                              const std::string& preserve_file) {
+                              const std::string& preserve_file,
+                              bool ncbi_backbone,
+                              bool gtdb_replaces_prok) {
     // Gather every part path, then read their TAXN sections in parallel — unify is
     // I/O-bound decompressing TAXN out of large packs (metavr.gpk is ~100GB), so
     // overlapping the per-part reads is the dominant win.
@@ -2916,9 +2930,10 @@ static int cmd_taxonomy_unify(const std::vector<std::string>& archives,
     // paths below consume the cleaned strings, keeping them consistent).
     for (auto& [acc, lin] : taxonomy_map) { (void)acc; lin = strip_propagated_ranks(lin); }
 
+    std::unique_ptr<NcbiTaxdb> ncbi;
     std::unordered_map<std::string, uint64_t> overrides;
     if (!ncbi_taxdump.empty()) {
-        NcbiTaxdb ncbi = NcbiTaxdb::load(ncbi_taxdump);
+        ncbi = std::make_unique<NcbiTaxdb>(NcbiTaxdb::load(ncbi_taxdump));
         // taxid PRESERVATION: for accessions with an authoritative NCBI taxid, replace
         // their lineage with that taxid's real NCBI lineage (real taxids all the way
         // down, incl strain leaf) so the id is kept verbatim rather than name-derived.
@@ -2928,7 +2943,7 @@ static int cmd_taxonomy_unify(const std::vector<std::string>& archives,
             size_t n_pres = 0;
             for (const auto& [acc, tid] : pm) {
                 if (!taxonomy_map.count(acc)) continue;           // only accessions we actually have
-                auto pts = ncbi.canonical_path_taxids(tid);
+                auto pts = ncbi->canonical_path_taxids(tid);
                 if (pts.empty()) continue;
                 taxonomy_map[acc] = pts.back().first;             // authoritative NCBI lineage
                 for (const auto& [path, ptid] : pts) preserved[path] = ptid;
@@ -2939,7 +2954,7 @@ static int cmd_taxonomy_unify(const std::vector<std::string>& archives,
         }
         // name-resolution over the (now partially-preserved) lineages, then let
         // preserved paths win (authoritative id beats name-derived).
-        overrides = build_ncbi_taxid_overrides(ncbi, taxonomy_map);
+        overrides = build_ncbi_taxid_overrides(*ncbi, taxonomy_map);
         for (const auto& [path, tid] : preserved) overrides[path] = tid;
     }
 
@@ -2967,6 +2982,32 @@ static int cmd_taxonomy_unify(const std::vector<std::string>& archives,
     unified.scan_accessions([&](std::string_view acc, uint64_t taxid) {
         tree.accs.emplace_back(std::string(acc), taxid);
     });
+
+    // Optional full-NCBI backbone: fold the entire NCBI tree in as nodes (real
+    // taxids), so taxa with no reference genome still exist in the scaffold. With
+    // --gtdb-replaces-prok, NCBI's own Bacteria/Archaea descendants are EXCISED
+    // (anchors 2/2157 kept) so GTDB — already grafted under those anchors — stays
+    // authoritative for prokaryotes and nothing is double-counted. The backbone is
+    // authoritative for the structure of native NCBI nodes; pack concept_ids (GTDB
+    // divergences, viral vOTUs) keep their graft under the anchors.
+    if (ncbi_backbone && ncbi) {
+        std::unordered_set<uint64_t> excised;
+        if (gtdb_replaces_prok) {
+            auto d = ncbi->descendants_including({2, 2157});
+            d.erase(2); d.erase(2157);                 // keep the anchors themselves
+            for (int t : d) excised.insert(static_cast<uint64_t>(t));
+        }
+        size_t added = 0, skipped = 0;
+        ncbi->for_each_node([&](int taxid, int parent, const std::string& rank, const std::string& name) {
+            if (excised.count(static_cast<uint64_t>(taxid))) { ++skipped; return; }
+            tree.nodes[static_cast<uint64_t>(taxid)] =
+                std::make_tuple(static_cast<uint64_t>(parent), ncbi_rank_to_taxrank(rank),
+                                name.empty() ? std::to_string(taxid) : name, false);
+            ++added;
+        });
+        spdlog::info("ncbi-backbone: imported {} NCBI nodes ({} prokaryote nodes excised for GTDB)",
+                     added, skipped);
+    }
     return write_taxdump_from_tree(tree, format, output_dir);
 }
 
@@ -4638,8 +4679,16 @@ int main(int argc, char** argv) {
         "Those accessions PRESERVE the given taxid (importing its real NCBI lineage, incl strain leaf) "
         "instead of re-deriving by name — e.g. organelle host taxids. Requires --ncbi-taxdump; "
         "stale ids are remapped via merged.dmp.");
+    bool unify_backbone = false, unify_replace_prok = false;
+    tax_unify->add_flag("--ncbi-backbone", unify_backbone,
+        "Fold the ENTIRE NCBI tree in as backbone nodes (real taxids), so NCBI taxa without a "
+        "reference genome still exist in the scaffold. Requires --ncbi-taxdump.");
+    tax_unify->add_flag("--gtdb-replaces-prok", unify_replace_prok,
+        "With --ncbi-backbone: EXCISE NCBI's own Bacteria(2)/Archaea(2157) descendants (anchors kept) "
+        "so GTDB stays authoritative for prokaryotes and NCBI+GTDB bacteria aren't double-counted.");
     tax_unify->callback([&]() {
-        std::exit(cmd_taxonomy_unify(unify_inputs, unify_ncbi, unify_output, unify_format, unify_preserve));
+        std::exit(cmd_taxonomy_unify(unify_inputs, unify_ncbi, unify_output, unify_format,
+                                     unify_preserve, unify_backbone, unify_replace_prok));
     });
 
     // genopack reindex

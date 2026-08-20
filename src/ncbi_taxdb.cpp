@@ -449,4 +449,30 @@ std::string NcbiTaxdb::taxonomy_for_taxid(int taxid,
     return lineage_to_10rank(lin, accession);
 }
 
+void NcbiTaxdb::for_each_node(
+    const std::function<void(int, int, const std::string&, const std::string&)>& cb) const {
+    static const std::string kEmpty;
+    for (const auto& [taxid, nd] : nodes_) {
+        auto nm = name_.find(taxid);
+        cb(taxid, nd.parent_taxid, nd.rank, nm != name_.end() ? nm->second : kEmpty);
+    }
+}
+
+std::unordered_set<int> NcbiTaxdb::descendants_including(const std::vector<int>& roots) const {
+    std::unordered_map<int, std::vector<int>> children;
+    children.reserve(nodes_.size());
+    for (const auto& [taxid, nd] : nodes_)
+        if (nd.parent_taxid != taxid) children[nd.parent_taxid].push_back(taxid);
+    std::unordered_set<int> out;
+    std::vector<int> stack;
+    for (int r : roots) { if (out.insert(r).second) stack.push_back(r); }
+    while (!stack.empty()) {
+        int t = stack.back(); stack.pop_back();
+        auto it = children.find(t);
+        if (it == children.end()) continue;
+        for (int c : it->second) if (out.insert(c).second) stack.push_back(c);
+    }
+    return out;
+}
+
 } // namespace genopack

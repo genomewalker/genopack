@@ -2,9 +2,11 @@
 
 #include <chrono>
 #include <filesystem>
+#include <functional>
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace genopack {
@@ -65,6 +67,13 @@ public:
     // the deepest path as a record's lineage and the pairs as overrides to PRESERVE
     // authoritative NCBI taxids instead of re-deriving them by name. Empty if unknown.
     std::vector<std::pair<std::string, uint64_t>> canonical_path_taxids(int taxid) const;
+
+    // Iterate every NCBI node: cb(taxid, parent_taxid, ncbi_rank, scientific_name).
+    // Used to import the full NCBI tree as a backbone (`taxonomy unify --ncbi-backbone`).
+    void for_each_node(const std::function<void(int, int, const std::string&, const std::string&)>& cb) const;
+    // All taxids whose ancestry reaches any of `roots` (roots themselves included).
+    // Used to excise NCBI's own Bacteria/Archaea subtrees when GTDB replaces prok.
+    std::unordered_set<int> descendants_including(const std::vector<int>& roots) const;
 
     bool empty() const { return name_.empty(); }
     std::size_t size() const { return name_.size(); }
