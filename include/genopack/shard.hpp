@@ -171,8 +171,8 @@ private:
 };
 
 // ── ShardReader ─────────────────────────────────────────────────────────────
-// Reads a shard section from a memory-mapped .gpk file or a standalone .gpks
-// file. All accesses are zero-copy into the mapped region.
+// Reads a shard section from a memory-mapped .gpk file, an archive fd, or a
+// standalone .gpks file. Archive-fd reads are backed by owned heap memory.
 
 class ShardReader {
 public:
@@ -187,7 +187,11 @@ public:
     // base: start of the entire file mapping.
     // section_offset: byte offset of this shard section in the file.
     // section_size: byte length of this shard section.
-    void open(const uint8_t* base, uint64_t section_offset, uint64_t section_size);
+    // fd >= 0 reads the complete compressed shard with bulk pread() into an
+    // owned heap buffer, avoiding MADV_RANDOM mmap faults over NFS. fd < 0
+    // retains the zero-copy mmap path.
+    void open(const uint8_t* base, uint64_t section_offset, uint64_t section_size,
+              int fd = -1);
 
     // Open a standalone .gpks file (loads into owned memory).
     void open_file(const std::filesystem::path& path);

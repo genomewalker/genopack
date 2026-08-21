@@ -732,7 +732,8 @@ struct ArchiveReader::Impl {
             // Open into a local first: if open() throws (corrupt shard), nothing is
             // published, so the cache is never left holding a non-functional entry.
             auto reader = std::make_unique<ShardReader>();
-            reader->open(mmap_.data(), desc_it->second->file_offset, desc_it->second->compressed_size);
+            reader->open(mmap_.data(), desc_it->second->file_offset,
+                         desc_it->second->compressed_size, mmap_.fd());
             it = shards_.emplace(shard_id, std::move(reader)).first;
         }
         return *it->second;

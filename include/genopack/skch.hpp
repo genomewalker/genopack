@@ -178,7 +178,10 @@ private:
 class SkchReader {
 public:
     // Opens a SKC4 section. Rejects V1/V2/V3 archives with a clear error.
-    void open(const uint8_t* base, uint64_t offset, uint64_t compressed_size);
+    // fd >= 0 makes frame reads use pread() into a heap buffer instead of faulting
+    // the (MADV_RANDOM) mmap page-by-page — ~200x faster for sparse reads over NFS.
+    // offset is the section's absolute file offset (frame file pos = offset + data_offset).
+    void open(const uint8_t* base, uint64_t offset, uint64_t compressed_size, int fd = -1);
 
     // Check if a genome_id exists in this section (uses lightweight id index, no decompress).
     bool contains(GenomeId genome_id) const;
@@ -254,6 +257,8 @@ private:
     uint32_t                    frame_sz_ = 0;
     std::vector<SkchFrameDesc>  frames_;
     const uint8_t*              section_base_ = nullptr;
+    int                         src_fd_       = -1;   // >=0 -> pread frames instead of mmap
+    uint64_t                    sec_file_off_ = 0;    // section's absolute file offset
 
     uint32_t n_kmer_sizes_ = 0;
     uint32_t kmer_sizes_[8] = {};

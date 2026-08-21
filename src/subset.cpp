@@ -247,7 +247,8 @@ void subset_archive(const std::filesystem::path& input_gpk,
     std::filesystem::path out_path = output_gpk;
     if (out_path.extension() != ".gpk")
         out_path = std::filesystem::path(out_path.string() + ".gpk");
-    std::filesystem::create_directories(out_path.parent_path());
+    if (!out_path.parent_path().empty())
+        std::filesystem::create_directories(out_path.parent_path());
 
     AppendWriter app_writer;
     app_writer.create(out_path);
@@ -604,6 +605,14 @@ void subset_archive(const std::filesystem::path& input_gpk,
         TaxonomyIndexWriter tiw;
         for (const auto& [acc, tax] : acc_to_tax) tiw.add(acc, tax);
         new_toc.add_section(tiw.finalize(mw, next_section_id++));
+
+        // TXDB — rebuild the taxonomy tree/registry scoped to the KEPT genomes.
+        // The source TXDB carries the full source-catalog accession registry
+        // (~9.5M), so a raw byte-copy would bloat every subset with taxa the
+        // subset does not contain. Rebuilding from acc_to_tax prunes it exactly.
+        TxdbWriter txw;
+        for (const auto& [acc, tax] : acc_to_tax) txw.add(acc, tax);
+        new_toc.add_section(txw.finalize(mw, next_section_id++));
     }
 
     // KMRX — only kept genomes
@@ -636,13 +645,18 @@ void subset_archive(const std::filesystem::path& input_gpk,
     // SKCH — re-frame kept genomes' sketches WITHOUT re-sketching. The stored OPH signatures
     // (sig1/sig2/mask) are copied verbatim out of the source frames and re-emitted into new
     // 16384-row V4 frames, so a reader of the output gets bit-identical signatures — no FASTA
-    // needed. sketch_for_ids_multi_k decompresses each touched frame once; num_threads=1 keeps
-    // add() sequential (SkchWriterMultiK spills to a tmpfile and is not concurrent-safe).
+    // needed. sketch_for_ids_multi_k decompresses each touched source frame once; the frame
+    // reads/decompresses (NFS + zstd, the cost) run in parallel across threads while the cheap
+    // spill-write add() is serialised under sw_mutex — SkchWriterMultiK spills to a tmpfile and
+    // is not concurrent-safe. Per-row buffers are disjoint across frames (a row's nk callbacks
+    // arrive in sequence from one thread), and finalize re-sorts by id, so output is
+    // deterministic regardless of add order.
     {
         auto skch_secs = src_toc.find_by_type(SEC_SKCH);
         if (!skch_secs.empty()) {
             SkchReader sr;
-            sr.open(src_mmap.data(), skch_secs[0]->file_offset, skch_secs[0]->compressed_size);
+            sr.open(src_mmap.data(), skch_secs[0]->file_offset, skch_secs[0]->compressed_size,
+                    src_mmap.fd());   // pread frames (NFS: ~200x vs MADV_RANDOM mmap faults)
             const uint32_t sz = sr.sketch_size();
             std::vector<uint32_t> ks;
             for (uint32_t i = 0; i < sr.n_kmer_sizes(); ++i) ks.push_back(sr.kmer_size_at(i));
@@ -666,7 +680,9 @@ void subset_archive(const std::filesystem::path& input_gpk,
                 s1[r].resize(nk); s2[r].resize(nk); mk[r].resize(nk); nr[r].assign(nk, 0);
             }
 
-            size_t n_written = 0;
+            std::atomic<size_t> n_written{0};
+            std::mutex sw_mutex;
+            const int skch_threads = static_cast<int>(cfg.threads > 0 ? cfg.threads : 1);
             sr.sketch_for_ids_multi_k(sorted, sz,
                 [&](size_t row, uint32_t ki, const SketchResult& res) {
                     glen[row] = res.genome_length;
@@ -674,15 +690,18 @@ void subset_archive(const std::filesystem::path& input_gpk,
                     s2[row][ki].assign(res.sig2, res.sig2 + sz);
                     mk[row][ki].assign(res.mask, res.mask + res.mask_words);
                     nr[row][ki] = res.n_real_bins;
-                    if (++kcnt[row] == nk) {
-                        sw.add(sorted[row], glen[row], s1[row], s2[row], nr[row], mk[row]);
-                        ++n_written;
+                    if (++kcnt[row] == nk) {                   // row owned by one thread
+                        {
+                            std::lock_guard<std::mutex> lk(sw_mutex);
+                            sw.add(sorted[row], glen[row], s1[row], s2[row], nr[row], mk[row]);
+                        }
+                        n_written.fetch_add(1, std::memory_order_relaxed);
                         s1[row].clear(); s2[row].clear(); mk[row].clear(); nr[row].clear();
                     }
-                }, 1);
+                }, skch_threads);
 
             spdlog::info("Subset: SKCH re-framed {} of {} kept genomes ({} k-values, sz={})",
-                         n_written, nrows, nk, sz);
+                         n_written.load(), nrows, nk, sz);
             new_toc.add_section(sw.finalize(mw, next_section_id++));
         }
     }
@@ -708,8 +727,9 @@ void subset_archive(const std::filesystem::path& input_gpk,
             new_toc.add_section(qcol_write(mw, next_section_id++, std::move(kept)));
     }
 
-    // TXDB / CIDX — copy raw bytes (genome_id indexed, unaffected by reshard)
-    for (uint32_t type : {SEC_TXDB, SEC_CIDX}) {
+    // CIDX — copy raw bytes (genome_id indexed, unaffected by reshard).
+    // TXDB is NOT copied here; it is rebuilt rep-scoped from acc_to_tax above.
+    for (uint32_t type : {SEC_CIDX}) {
         for (auto* sd : src_toc.find_by_type(type)) {
             uint64_t new_offset = mw.current_offset();
             mw.append(src_mmap.data() + sd->file_offset, sd->compressed_size);

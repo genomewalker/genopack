@@ -65,6 +65,16 @@ public:
     // Probes parts in order. First hit wins.
     std::optional<ExtractedGenome> fetch_by_accession(std::string_view accession) const;
 
+    // Metadata-only per-accession lookup (no sequence decompression). Probes parts in order.
+    std::optional<GenomeMeta> genome_meta_by_accession(std::string_view accession) const;
+
+    // Visits the full catalog one part at a time. Each part is scanned linearly and metadata and
+    // taxonomy are resolved within that same part, avoiding cross-part probes per accession.
+    void scan_genome_catalog(
+        const std::function<void(std::string_view accession,
+                                 const GenomeMeta& meta,
+                                 std::string_view taxonomy)>& cb) const;
+
     // Groups accessions by owning part, calls each part's batch fetch once,
     // reassembles in original order. Misses → nullopt at that index.
     std::vector<std::optional<ExtractedGenome>>

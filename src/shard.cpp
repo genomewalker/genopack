@@ -1309,12 +1309,13 @@ size_t ShardWriter::n_bytes_raw() const { return impl_->total_raw_bytes; }
 struct ShardReader::Impl {
     const uint8_t*          base_         = nullptr;  // start of shard section
     uint64_t                section_size_ = 0;
+    bool                    mmap_backed_  = false;
     const ShardHeader*    header_       = nullptr;
     const GenomeDirEntry* dir_          = nullptr;
     const CheckpointEntry* checkpoints_ = nullptr;
     uint64_t               checkpoint_count_ = 0;
 
-    std::vector<uint8_t>    owned_data_;  // non-empty when file-based open
+    std::vector<uint8_t>    owned_data_;  // non-empty when pread/file-based open
 
     ZSTD_DDict*  ddict_    = nullptr;   // immutable after setup, safe to share across threads
     mutable std::string  ref_prefix_;   // cached reference prefix for legacy delta shards
@@ -1425,6 +1426,7 @@ struct ShardReader::Impl {
         mem_anchor_seq_.clear();
         base_         = nullptr;
         section_size_ = 0;
+        mmap_backed_  = false;
         header_       = nullptr;
         dir_          = nullptr;
         checkpoints_  = nullptr;
@@ -1930,9 +1932,38 @@ ShardReader::~ShardReader() {
 ShardReader::ShardReader(ShardReader&&) noexcept = default;
 ShardReader& ShardReader::operator=(ShardReader&&) noexcept = default;
 
-void ShardReader::open(const uint8_t* base, uint64_t section_offset, uint64_t section_size) {
+void ShardReader::open(const uint8_t* base, uint64_t section_offset,
+                       uint64_t section_size, int fd) {
     if (!impl_) impl_ = std::make_unique<Impl>();
     else        impl_->reset();
+
+    if (fd >= 0) {
+        // The archive mmap is MADV_RANDOM. Over NFS, consuming a large shard
+        // directly from it faults page-by-page; one bulk pread streams the
+        // compressed section into memory at the filesystem's sequential rate.
+        impl_->owned_data_.resize(static_cast<size_t>(section_size));
+        uint8_t* dst = impl_->owned_data_.data();
+        size_t remaining = impl_->owned_data_.size();
+        off_t offset = static_cast<off_t>(section_offset);
+        while (remaining > 0) {
+            ssize_t n = ::pread(fd, dst, remaining, offset);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                throw std::runtime_error("ShardReader pread: " +
+                                         std::string(strerror(errno)));
+            }
+            if (n == 0)
+                throw std::runtime_error("ShardReader pread: unexpected EOF at offset " +
+                                         std::to_string(offset));
+            dst       += static_cast<size_t>(n);
+            offset    += static_cast<off_t>(n);
+            remaining -= static_cast<size_t>(n);
+        }
+        impl_->setup(impl_->owned_data_.data(), section_size);
+        return;
+    }
+
+    impl_->mmap_backed_ = true;
     impl_->setup(base + section_offset, section_size);
 }
 
@@ -1957,7 +1988,7 @@ uint32_t ShardReader::n_genomes() const { return impl_->header_->n_genomes; }
 
 void ShardReader::release_pages() const noexcept {
 #ifdef MADV_DONTNEED
-    if (!impl_ || !impl_->base_) return;
+    if (!impl_ || !impl_->base_ || !impl_->mmap_backed_) return;
     // Release the entire shard section (header + dir + blobs).
     // base_ points to section start; section_size_ covers everything.
     // We advise DONTNEED on the whole region so subsequent accesses to

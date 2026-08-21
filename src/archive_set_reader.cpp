@@ -204,6 +204,29 @@ ArchiveSetReader::fetch_by_accession(std::string_view accession) const {
     return std::nullopt;
 }
 
+std::optional<GenomeMeta>
+ArchiveSetReader::genome_meta_by_accession(std::string_view accession) const {
+    for (const auto& p : impl_->parts) {
+        auto m = p->genome_meta_by_accession(accession);
+        if (m) return m;
+    }
+    return std::nullopt;
+}
+
+void ArchiveSetReader::scan_genome_catalog(
+    const std::function<void(std::string_view, const GenomeMeta&, std::string_view)>& cb) const
+{
+    for (const auto& p : impl_->parts) {
+        p->scan_genome_accessions([&](std::string_view accession, GenomeId genome_id) {
+            auto meta = p->genome_meta(genome_id);
+            if (!meta) return;
+            auto taxonomy = p->taxonomy_for_accession(accession);
+            cb(accession, *meta,
+               taxonomy ? std::string_view(*taxonomy) : std::string_view{});
+        });
+    }
+}
+
 std::vector<std::optional<ExtractedGenome>>
 ArchiveSetReader::batch_fetch_by_accessions(const std::vector<std::string>& accessions) const {
     std::vector<std::optional<ExtractedGenome>> out(accessions.size());
@@ -337,4 +360,3 @@ void ArchiveSetReader::visit_shard_batches(
     }
 }
 } // namespace genopack
-

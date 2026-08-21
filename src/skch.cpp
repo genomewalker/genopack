@@ -453,9 +453,11 @@ SectionDesc SkchWriterMultiK::finalize(AppendWriter& writer, uint64_t section_id
                              "rebuild archive with genopack build)" + hint);
 }
 
-void SkchReader::open(const uint8_t* base, uint64_t offset, uint64_t compressed_size) {
+void SkchReader::open(const uint8_t* base, uint64_t offset, uint64_t compressed_size, int fd) {
     cdata_    = base + offset;
     cdata_sz_ = compressed_size;
+    src_fd_       = fd;
+    sec_file_off_ = offset;
 
     if (compressed_size < sizeof(SkchSeekHdr))
         throw std::runtime_error("SkchReader: section too small for V4 header");
@@ -685,7 +687,26 @@ void SkchReader::sketch_for_ids(const std::vector<GenomeId>& sorted_ids,
 
         const SkchFrameDesc& fd = frames_[fi];
         const uint32_t frame_n  = fd.n_genomes;
-        const uint8_t* csrc     = section_base_ + fd.data_offset;
+        // Read the compressed frame. The archive mmap is MADV_RANDOM, so faulting a
+        // ~GB frame page-by-page over NFS is ~5 MB/s (MADV_WILLNEED is ignored there);
+        // pread() into a heap buffer streams it sequentially (~900 MB/s). Same idiom as
+        // the GSTX/QUAL sections. Falls back to the mmap when no fd was supplied.
+        std::vector<uint8_t> cbuf;
+        const uint8_t* csrc;
+        if (src_fd_ >= 0) {
+            cbuf.resize(fd.compressed_size);
+            size_t got = 0; bool ok = true;
+            const off_t foff = static_cast<off_t>(sec_file_off_ + fd.data_offset);
+            while (got < fd.compressed_size) {
+                ssize_t n = pread(src_fd_, cbuf.data() + got, fd.compressed_size - got, foff + got);
+                if (n <= 0) { ok = false; break; }
+                got += static_cast<size_t>(n);
+            }
+            if (!ok) continue;
+            csrc = cbuf.data();
+        } else {
+            csrc = section_base_ + fd.data_offset;
+        }
 
         unsigned long long raw_sz = ZSTD_getFrameContentSize(csrc, fd.compressed_size);
         if (raw_sz == ZSTD_CONTENTSIZE_ERROR || raw_sz == ZSTD_CONTENTSIZE_UNKNOWN)
@@ -770,7 +791,26 @@ void SkchReader::sketch_for_ids_multi_k(const std::vector<GenomeId>& sorted_ids,
 
         const SkchFrameDesc& fd = frames_[fi];
         const uint32_t frame_n  = fd.n_genomes;
-        const uint8_t* csrc     = section_base_ + fd.data_offset;
+        // Read the compressed frame. The archive mmap is MADV_RANDOM, so faulting a
+        // ~GB frame page-by-page over NFS is ~5 MB/s (MADV_WILLNEED is ignored there);
+        // pread() into a heap buffer streams it sequentially (~900 MB/s). Same idiom as
+        // the GSTX/QUAL sections. Falls back to the mmap when no fd was supplied.
+        std::vector<uint8_t> cbuf;
+        const uint8_t* csrc;
+        if (src_fd_ >= 0) {
+            cbuf.resize(fd.compressed_size);
+            size_t got = 0; bool ok = true;
+            const off_t foff = static_cast<off_t>(sec_file_off_ + fd.data_offset);
+            while (got < fd.compressed_size) {
+                ssize_t n = pread(src_fd_, cbuf.data() + got, fd.compressed_size - got, foff + got);
+                if (n <= 0) { ok = false; break; }
+                got += static_cast<size_t>(n);
+            }
+            if (!ok) continue;
+            csrc = cbuf.data();
+        } else {
+            csrc = section_base_ + fd.data_offset;
+        }
 
         unsigned long long raw_sz = ZSTD_getFrameContentSize(csrc, fd.compressed_size);
         if (raw_sz == ZSTD_CONTENTSIZE_ERROR || raw_sz == ZSTD_CONTENTSIZE_UNKNOWN)

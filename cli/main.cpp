@@ -27,7 +27,6 @@
 #include <omp.h>
 #endif
 #include <genopack/repack.hpp>
-#include <genopack/router_minimizer.hpp>
 #include <genopack/subset.hpp>
 #include <genopack/catalog.hpp>
 #include <genopack/cidx.hpp>
@@ -366,10 +365,7 @@ struct RefMask {
 
 static std::string concat_contigs(const std::string& fasta,
                                   const std::string& accession, int npad,
-                                  RefMask* mask = nullptr,
-                                  std::vector<uint64_t>* mins = nullptr,
-                                  int mk = genopack::router::DEFAULT_K,
-                                  int mw = genopack::router::DEFAULT_W) {
+                                  RefMask* mask = nullptr) {
     std::string seq;
     seq.reserve(fasta.size());
     bool first = true;
@@ -408,11 +404,6 @@ static std::string concat_contigs(const std::string& fasta,
         }
     }
     if (seq.empty()) return {};
-    // Router minimizers from the CLEAN unwrapped seq (matches the query side, which sees the
-    // sequence with newlines stripped and N-runs resetting the rolling k-mer).
-    if (mins)
-        genopack::router::for_each_minimizer(seq.data(), seq.size(), mk, mw,
-                                             [&](uint64_t m){ mins->push_back(m); });
     std::string out;
     out.reserve(seq.size() + seq.size() / 60 + accession.size() + 4);
     out.push_back('>');
@@ -457,9 +448,6 @@ static int cmd_extract(const std::string& archive_dir,
                        const std::string& out_fasta,
                        const std::string& out_dir,
                        bool concat, int concat_npad, bool emit_nmask,
-                       const std::string& index_path = "",
-                       int index_k = genopack::router::DEFAULT_K,
-                       int index_w = genopack::router::DEFAULT_W,
                        const std::string& manifest_path = "") {
     ArchiveSetReader ar = open_archive_auto(archive_dir);
 
@@ -551,20 +539,6 @@ static int cmd_extract(const std::string& archive_dir,
         // single-stream output stays in accession-list order.
         std::vector<std::string> ordered(q.accessions.size());
         std::vector<RefMask> masks(concat && emit_nmask ? q.accessions.size() : 0);
-        // --index: stream this partition's router minimizers to a sidecar (u64 LE), memory-flat
-        // (per-genome buffer, mutex-guarded append). One extract call = one partition, so the file
-        // IS the partition's minimizer set (dedup deferred to the assembler). Requires --concat-contigs.
-        const bool do_index = !index_path.empty() && concat;
-        FILE* idxf = nullptr; std::mutex idxmu; uint64_t idx_count = 0;
-        if (do_index) {
-            idxf = fopen(index_path.c_str(), "wb");
-            if (!idxf) { spdlog::error("Cannot open index output: {}", index_path); return 1; }
-        }
-        // --index STREAMS: each genome's FASTA is written immediately (mutex-guarded) and its
-        // minimizers appended, WITHOUT buffering all genomes in `ordered`. A shard is ~23k genomes
-        // (~100+ GB of sequence) — buffering it OOMs. Streaming keeps RAM flat (one genome at a time).
-        // Order becomes fetch-order, not accession-order (irrelevant for bowtie2-build / router).
-        std::mutex outmu; std::atomic<size_t> n_stream{0};
         size_t n = 0;
         ar.visit_shard_batches(q.accessions, [&](ArchiveSetReader::ShardBatch& batch) {
             for (auto& [idx, eg] : batch) {
@@ -573,22 +547,11 @@ static int cmd_extract(const std::string& archive_dir,
                     continue;
                 }
                 RefMask* mp = (concat && emit_nmask) ? &masks[idx] : nullptr;
-                std::vector<uint64_t> lm;
-                std::string rec = concat ? concat_contigs(eg.fasta, q.accessions[idx], concat_npad, mp,
-                                                          do_index ? &lm : nullptr, index_k, index_w)
-                                         : std::move(eg.fasta);
-                if (do_index) {
-                    if (!rec.empty()) { std::lock_guard<std::mutex> lk(outmu); *out_stream << rec; n_stream.fetch_add(1); }
-                    if (!lm.empty())  { std::lock_guard<std::mutex> lk(idxmu); fwrite(lm.data(), sizeof(uint64_t), lm.size(), idxf); idx_count += lm.size(); }
-                } else {
-                    ordered[idx] = std::move(rec);
-                }
+                ordered[idx] = concat ? concat_contigs(eg.fasta, q.accessions[idx], concat_npad, mp)
+                                      : std::move(eg.fasta);
             }
         });
-        if (idxf) { fclose(idxf); spdlog::info("Wrote router index: {} ({} minimizers, k={} w={})",
-                                               index_path, idx_count, index_k, index_w); }
-        if (do_index) { n = n_stream.load(); }
-        else for (auto& f : ordered) if (!f.empty()) { *out_stream << f; ++n; }
+        for (auto& f : ordered) if (!f.empty()) { *out_stream << f; ++n; }
         spdlog::info("Extracted {} genomes", n);
         if (concat && emit_nmask && !out_fasta.empty() && out_fasta != "-") {
             std::string np = out_fasta + ".nmask";
@@ -3687,13 +3650,6 @@ int main(int argc, char** argv) {
         "With --concat-contigs and -o: also write <out>.nmask (per-ref effective len + N-intervals for kaiku)");
     extract->add_option("--concat-ns", ext_concat_ns,
         "N-run length between contigs (default 300; must exceed the longest read)");
-    std::string ext_index;
-    int ext_index_k = genopack::router::DEFAULT_K, ext_index_w = genopack::router::DEFAULT_W;
-    extract->add_option("--index", ext_index,
-        "With --concat-contigs: also write this partition's router minimizers (u64 LE) to <path> "
-        "for the read->partition router. One extract call = one partition.");
-    extract->add_option("--index-k", ext_index_k, "Router minimizer k (default 19)");
-    extract->add_option("--index-w", ext_index_w, "Router minimizer window w (default 11)");
     std::string ext_manifest;
     extract->add_option("--manifest", ext_manifest,
         "Write per-genome property TSV (bp, n_contigs, gc, completeness, contamination, "
@@ -3704,8 +3660,7 @@ int main(int argc, char** argv) {
     extract->callback([&]() {
         std::exit(cmd_extract(ext_archive, ext_accessions, ext_acc_file,
                               ext_min_comp, ext_max_contam, ext_out, ext_out_dir,
-                              ext_concat, ext_concat_ns, ext_nmask,
-                              ext_index, ext_index_k, ext_index_w, ext_manifest));
+                              ext_concat, ext_concat_ns, ext_nmask, ext_manifest));
     });
 
     // genopack slice
