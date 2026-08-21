@@ -25,13 +25,13 @@ The output `mydb.gpk` is a directory containing `toc.bin` plus section files. De
 | `-i / --input` | required | Input TSV (`accession\tfile_path\t[completeness\tcontamination\ttaxonomy\t…]`) |
 | `-o / --output` | required | Output archive directory (`.gpk`) |
 | `-t / --threads` | 16 | I/O threads (decompression + compression) |
-| `-z / --zstd-level` | 6 | zstd compression level (1–22) |
+| `-z / --zstd-level` | 6 | zstd compression level (1-22) |
 | `-p / --parallel` | 1 | Parallel build workers (auto-merge) |
 | `--no-dict` | off | Disable shared dictionary training |
 | `--ref-dict` | off | Use first genome in each shard as reference content dictionary |
 | `--delta` | off | Compress non-reference blobs against first genome via zstd prefix |
 | `--mem-delta` / `--no-mem-delta` | on | k=31 k-mer seeded exact-match encoding for highly similar shard groups |
-| `--2bit` / `--no-2bit` | on | Pack nucleotides to 2 bits/base before zstd (~1.5–2× extra compression) |
+| `--2bit` / `--no-2bit` | on | Pack nucleotides to 2 bits/base before zstd (~1.5-2× extra compression) |
 | `--cidx` / `--no-cidx` | off (skip) | Build CIDX contig index (off by default; pass `--cidx` to build it) |
 | `--kmer-sort` / `--no-kmer-sort` | on | Sort genomes within each shard by kmer4 NN chain |
 | `--taxon-group` / `--no-taxon-group` | on | Group genomes into per-taxon shards (requires taxonomy column) |
@@ -48,6 +48,7 @@ The output `mydb.gpk` is a directory containing `toc.bin` plus section files. De
 | `--micro-genus-threshold` | 0 (auto) | Min genomes for a genus to get its own shard + GSTX/GCOV/FMHR consensus model; smaller genera are bin-packed and unmodeled. Auto: 4 (≤50k genomes), 8 (≤500k), 16 (≤2M), else 32 |
 | `--markers` | auto | Path to `markers.mrk` for build-time marker completeness scoring. Auto-resolved from `$GENOPACK_DATA/markers.mrk` or the install share dir |
 | `--contam-panel` | auto | Path to contamination `.csp` panel for build-time intra-genome duplication scoring. Auto-resolved from `$GENOPACK_DATA/contamination.csp` or the install share dir; absent → axis skipped |
+| `--ncbi-taxdump` | unset | Path to an NCBI taxdump dir (`nodes.dmp`+`names.dmp`). Lineage taxa whose scientific name is unambiguous in NCBI keep their native NCBI taxid; taxa NCBI doesn't have get a synthetic concept_id. See [Unified Taxonomy](Taxonomy-Graft.md) |
 | `--from-gpk` | unset | Rebuild from an existing `.gpk`: stream decoded sequence from its shards instead of opening per-genome FASTA files. Mutually exclusive with `-i` |
 | `--tmpdir` | `/scratch` or `/tmp` | Directory for PCORE/SKCH spill files; use a fast local NVMe path |
 | `--thin` | off | Ingest-only preset: write sequences, sketches, TAXN/GIDX/CIDX only; skip compute sections (GSTX/GCOV/CORE/PCORE/GAMI). Do not combine with `--taxon-group` |
@@ -83,7 +84,7 @@ genopack enrich -i thin.gpk -o enriched.gpk [options]
 
 ## `merge`
 
-Merge multiple `.gpk` archives into one. Uses parallel `pwrite` (one thread per part) for NFS efficiency.
+Merge multiple `.gpk` archives into one. Uses parallel `pwrite`, with one thread per part.
 
 ```bash
 genopack merge -l parts.txt -o merged.gpk
@@ -95,7 +96,8 @@ genopack merge part1.gpk part2.gpk part3.gpk -o merged.gpk
 |------|---------|-------------|
 | `-l / --list` | | Text file with one `.gpk` path per line |
 | `-o / --output` | required | Output path |
-| *(no thread option)* | — | No thread flag: merge copies each input part concurrently via `std::async` + `pwrite` (one task per part), so parallelism scales with the number of input archives |
+| `--ncbi-taxdump` | unset | Reconcile the merged taxonomy against an NCBI taxdump dir: shared taxa keep native NCBI taxids |
+| *(no thread option)* | - | No thread flag: merge copies each input part concurrently via `std::async` + `pwrite` (one task per part), so parallelism scales with the number of input archives |
 
 ---
 
@@ -151,7 +153,7 @@ genopack extract mydb.gpk [filters] -o out.fasta
 |------|-------------|
 | `--accession ACC` | Extract genome(s) by accession (repeatable: `--accession A --accession B`) |
 | `--accessions-file FILE` | Extract list of accessions (one per line) |
-| `--min-completeness FLOAT` | Completeness filter (0–100) |
+| `--min-completeness FLOAT` | Completeness filter (0-100) |
 | `--max-contamination FLOAT` | Contamination filter |
 | `-o / --out` | Output FASTA (default: stdout) |
 
@@ -207,7 +209,7 @@ Walks every shard, hashes each genome's canonical FASTA content, groups duplicat
 
 ## `subset`
 
-Subset an archive to a set of accessions by **copying** the kept genomes' sections (sequences, sketches, QUAL, taxonomy, KMRX) directly — no source FASTA, no re-sketching, original QUAL preserved. For a multipart directory, subsets each `part_*.gpk`. Genome IDs are preserved (sparse); corpus-derived sections (GSTX/CIDX/HNSW) are dropped.
+Subset an archive to a set of accessions by **copying** the kept genomes' sections (sequences, sketches, QUAL, taxonomy, KMRX) directly. This requires no source FASTA or re-sketching and preserves the original QUAL. For a multipart directory, subsets each `part_*.gpk`. Genome IDs are preserved (sparse); corpus-derived sections (GSTX/CIDX/HNSW) are dropped.
 
 ```bash
 genopack subset input output --accessions-file accs.txt [options]
@@ -240,7 +242,7 @@ genopack repack input.gpk output.gpk [options]
 
 **Algorithm:** Three-phase two-pass design.
 
-1. **Phase 1 (fast):** Reads only `GenomeDirEntry` arrays from each shard (~300 MB total for a 3.1 TB archive). Builds a full genome→taxonomy routing table in memory.
+1. **Phase 1:** Reads only `GenomeDirEntry` arrays from each shard (~300 MB total for a 3.1 TB archive). Builds a full genome→taxonomy routing table in memory.
 2. **Phase 2:** Sorts all genome records by `(taxonomy, oph_fingerprint)`.
 3. **Phase 3:** Single sequential pass through the source archive; decompresses FASTAs with OMP parallelism; routes each genome to its pre-determined taxon writer; flushes the *largest* writer when memory cap is hit (minimises partial-shard fragmentation).
 
@@ -309,6 +311,29 @@ Default patch format is `accession\tnew_taxonomy`. `--gtdbtk` accepts GTDB-Tk's 
 
 ---
 
+### `taxonomy unify`
+
+Reconcile the taxonomies of several independent `.gpk` packs into one common taxdump without merging their sequence data. The command reads each pack's lineage strings (TAXN), builds one tree, and writes `nodes.dmp`/`names.dmp`/`acc2taxid.dmp` (or columnar binary + TSV) covering every accession. The result provides one taxid space for per-pack mapping references and downstream classification. See [Unified Taxonomy](Taxonomy-Graft.md).
+
+```bash
+genopack taxonomy unify prok.gpk organelle.gpk viral.gpk \
+    --ncbi-taxdump ./taxdump -o ./common_taxonomy [-f taxdump|columnar]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `inputs` | required | Input `.gpk` packs (any number) |
+| `-o / --output` | required | Output directory |
+| `-f / --format` | `taxdump` | `taxdump` (NCBI `nodes`/`names`/`acc2taxid.dmp`) or `columnar` (binary + TSV) |
+| `--ncbi-taxdump` | unset | NCBI taxdump dir: taxa with an unambiguous NCBI name keep their native taxid; GTDB/other-only taxa get a synthetic concept_id |
+| `--preserve-taxids` | unset | TSV of `accession → NCBI taxid` (e.g. organelle host taxids). Those accessions keep the given taxid instead of resolving by name. Its NCBI lineage is imported down to a strain leaf. Stale ids remap via `merged.dmp` |
+| `--ncbi-backbone` | off | Fold the entire NCBI tree in as backbone nodes, so NCBI taxa without a reference genome still exist in the scaffold |
+| `--gtdb-replaces-prok` | off | With `--ncbi-backbone`: excise NCBI's `Bacteria`/`Archaea` descendants (anchors kept) so GTDB stays authoritative for prokaryotes |
+
+Output is deterministic (identical inputs → identical output). The NCBI taxdump parse is cached to `<taxdump-dir>/.ncbi_taxdb.cache`.
+
+---
+
 ## `taxdump`
 
 Export taxonomy in NCBI or columnar binary format.
@@ -342,7 +367,7 @@ genopack check mydb.gpk -o quality.tsv [options]
 | `--min-genus-size` | 3 | Min genus members for saturated tier |
 | `--leakage-threshold` | 0.05 | Containment leakage threshold |
 | `--recompute` | off | Ignore existing QUAL section and force full rescan |
-| `--scan-all` | off | Force every genome through FASTA-level analysis (intrinsic completeness for all, not just flagged); implied when `--markers` is given |
+| `--scan-all` | off | Force every genome through FASTA-level analysis (intrinsic completeness for all, rather than only flagged genomes); implied when `--markers` is given |
 | `--markers` | unset | Path to markers `.mrk` DB; enables marker-based completeness/redundancy scoring |
 | `--cross-genus-margin` | 0.0 | log-LR margin a foreign genus must beat the host by for `cross_genus` to flag a contig; 0 flags on any foreign LL > host LL |
 | `--dup-restore` | unset | Re-inject the build-time `core_dup` axis from a quality TSV or `cladesplit score` TSV, when a prior run overwrote QUAL without it |
@@ -367,7 +392,7 @@ genopack ingest mydb.gpk --checkm2 quality_report.tsv
 
 ## `report`
 
-Emit a unified per-genome quality table resolved through a named profile. Each axis is sourced from exactly one column (built-in rule or stored policy) and the report carries that column's provenance (tool/method) — fusion is explicit, never silent.
+Emit a per-genome quality table resolved through a named profile. Each axis is sourced from one column (built-in rule or stored policy), and the report includes that column's provenance (tool/method). The selected fusion is recorded.
 
 ```bash
 genopack report mydb.gpk -p best -o report.tsv
@@ -450,7 +475,7 @@ genopack qcontig mydb.gpk --min-foreign 0.30 -o flagged_contigs.tsv
 
 ## `decontaminate`
 
-Iteratively remove contaminated genomes (per-contig CCO above a threshold), rebuilding genus/family models from the survivors each round so the DB and its consensus stay clean.
+Iteratively remove contaminated genomes (per-contig CCO above a threshold), rebuilding genus/family models from the survivors after each round.
 
 ```bash
 genopack decontaminate mydb.gpk [--dry-run]
@@ -459,9 +484,9 @@ genopack decontaminate mydb.gpk [--dry-run]
 | Flag | Default | Description |
 |------|---------|-------------|
 | `archive` | required | Path to `.gpk` archive |
-| `--max-fmh-z` | 5.0 | Remove genomes whose per-genus FMH-minority z (robust median+MAD delta from genus baseline) exceeds this — the genus-band signal |
+| `--max-fmh-z` | 5.0 | Remove genomes whose per-genus FMH-minority z (median+MAD delta from genus baseline) exceeds this; the genus-band signal |
 | `--min-delta` | 0.02 | Also require `fmh_minority` to exceed the genus baseline by this absolute amount (guards tight-baseline genera from z blow-up) |
-| `--max-cco` | 1.5 | Remove genomes whose CCO contamination % (per-contig T²∪SPE TNF-outlier bp vs the genus GCOV covariance) exceeds this — the distant-band signal (family/order/phylum); needs contigs ≥20kb |
+| `--max-cco` | 1.5 | Remove genomes whose CCO contamination % (per-contig T²∪SPE TNF-outlier bp vs the genus GCOV covariance) exceeds this; the distant-band signal (family/order/phylum). Needs contigs ≥20kb |
 | `--max-iters` | 5 | Max decontamination rounds |
 | `-t / --threads` | 8 | Threads |
 | `--dry-run` | off | Report what would be removed (with fmh_z/cco per axis) without modifying the archive |
@@ -485,7 +510,7 @@ genopack gcov mydb.gpk
 
 ## `pcore`
 
-Build SEC_PCORE: the unified dense per-genus aamer reference (every aamer + prevalence). Dense enough to detect SMALL foreign contigs (the conserved-only CORE is too sparse for 1-2kb).
+Build SEC_PCORE, the dense per-genus aamer reference containing every aamer and its prevalence. It detects foreign contigs of 1-2kb; the conserved-only CORE is too sparse at that length.
 
 ```bash
 genopack pcore mydb.gpk
@@ -553,7 +578,7 @@ Stamp per-aamer tier bytes from a global `.gtier` into a PCORE section, rewritin
 
 ## `cladesplit`
 
-Protein-aamer clade-split contamination tier (GUNC-style, fast). Build a panel of genus-diagnostic aamers from clean genomes, then score genomes by lineage-split.
+Protein-aamer clade-split contamination tier (GUNC-style). Build a panel of genus-diagnostic aamers from reference genomes, then score genomes by lineage split.
 
 ### `cladesplit build`
 
@@ -582,7 +607,7 @@ Score genomes against a `.csp` panel (per-genome `minority_fraction`).
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-i / --input` | | TSV (accession, file_path) — or use `--gpk` |
+| `-i / --input` | | TSV (accession, file_path), or use `--gpk` |
 | `--gpk` | | Score live genomes inside a `.gpk` archive directly (flag contamination in a genopack file) |
 | `--panel` | required | Panel `.csp` |
 | `-o / --output` | required | Output per-genome TSV (incl. `redundancy_fraction`) |
@@ -629,7 +654,7 @@ Build `markers.mrk` from GTDB-Tk MSA files (bac120 + ar53).
 | `--threshold` | 0.30 | Default presence threshold |
 | `-t / --threads` | 1 | Thread count |
 | `--scale` | 1 | FracMinHash scale factor: keep 1/N of hashes (ignored with `--dayhoff6`) |
-| `--dayhoff6` | off | Build Dayhoff-6 k=12 syncmer profile pool (recommended; compact, robust to divergence) |
+| `--dayhoff6` | off | Build Dayhoff-6 k=12 syncmer profile pool (compact and less sensitive to divergence) |
 | `--ic-threshold` | 0.25 | Min per-column IC fraction to include k-mer positions (`--dayhoff6` only) |
 | `--expected-min-frac` | 0.50 | A marker is counted as expected for a genus only if detectable (≥1 IC-passing syncmer) in at least this fraction of the genus's reference genomes; mirrors CheckM2's single-copy universality criterion |
 
@@ -639,7 +664,7 @@ Build `markers.mrk` from GTDB-Tk MSA files (bac120 + ar53).
 genopack markers remerge markers.mrk
 ```
 
-Append the pre-merged pool to an existing `.mrk` panel (in place) so `MarkerReader` uses its zero-copy mmap fast-path instead of copying ~450MB per worker. No source genomes needed.
+Append the pre-merged pool to an existing `.mrk` panel (in place) so `MarkerReader` uses its zero-copy mmap path instead of copying ~450MB per worker. This does not require source genomes.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -717,8 +742,8 @@ genopack sim --ref genome.fna --output-dir sim_out/
 
 There is no `genopack similar` or `genopack cidx` CLI. KMRX similarity search and CIDX contig→genome lookup are exposed through the C++ API only:
 
-- `ArchiveReader::find_similar(...)` / `find_similar_by_accession(...)` — linear KMRX cosine similarity scan.
-- `ArchiveReader::find_contig_genome_id(accession)` — CIDX binary search, ~150M queries/s/core.
+- `ArchiveReader::find_similar(...)` / `find_similar_by_accession(...)`: linear KMRX cosine similarity scan.
+- `ArchiveReader::find_contig_genome_id(accession)`: CIDX binary search, ~150M queries/s/core.
 
 See [API → Similarity & contig lookup](api.md#similarity--contig-lookup).
 
@@ -756,7 +781,7 @@ Typical uses: an archive built with `--no-cidx` later wants contig lookup (`--ci
 genopack verify mydb.gpk [--strict] [--coverage-only] [--verbose]
 ```
 
-Runs two checks. First, **semantic coverage**: cross-checks per-genome/per-genus section row counts against the catalog from the TOC only (no data scan) — SKCH (per k, every k must cover the whole catalog), QUAL, GIDX, ACCX, CATL rows must equal the genome count; GSTX and other compute sections are reported as presence + coverage, not gated. Second, **byte-level checksums**: TailLocator, TocHeader, and per-section XXH128 content checksums. Exits 0 if all checks pass, non-zero on any failure.
+Runs two checks. **Semantic coverage** cross-checks per-genome and per-genus section row counts against the catalog from the TOC only, without a data scan. SKCH (per k, every k must cover the whole catalog), QUAL, GIDX, ACCX, and CATL rows must equal the genome count. GSTX and other compute sections are reported as presence + coverage, not gated. **Byte-level checksums** cover TailLocator, TocHeader, and per-section XXH128 content. The command exits 0 if all checks pass and non-zero on any failure.
 
 | Flag | Default | Description |
 |------|---------|-------------|

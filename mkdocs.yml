@@ -60,6 +60,8 @@ nav:
   - Getting Started: getting-started.md
   - API Reference: api.md
   - CLI Reference: cli.md
+  - Unified Taxonomy: Taxonomy-Graft.md
+  - Taxonomy Export: Taxonomy-Export.md
   - Quality Scoring: quality.md
   - AAMER Subsystem: aamer.md
   - Format: format.md

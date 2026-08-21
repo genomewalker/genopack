@@ -25,7 +25,7 @@ struct CidxEntry {
 };
 ```
 
-**Hash function:** FNV-1a-64 — same as ACCX and the columnar taxonomy binary, so lookup code is shared across all index types.
+**Hash function:** FNV-1a-64, the same function used by ACCX and the columnar taxonomy binary. Lookup code is shared across all index types.
 
 **Multiple sections:** incremental `add` operations append a new CIDX section per batch. `MergedCidxReader` searches newest→oldest and returns the first match. `genopack merge` consolidates all CIDX sections into one.
 
@@ -47,14 +47,14 @@ CIDX is built when `--cidx` is passed to `genopack build` (off by default). For 
 genopack::ArchiveReader ar;
 ar.open("mydb.gpk");
 
-// Single lookup — O(log n) binary search across all CIDX sections
+// Single lookup, O(log n) binary search across all CIDX sections
 uint32_t gid = ar.find_contig_genome_id("NZ_JAVJIU010000001.1");
 if (gid != UINT32_MAX) {
     std::string acc = ar.accession_for_genome_id(gid);
     auto tax = ar.taxonomy_for_accession(acc);
 }
 
-// Batch lookup — parallel hash + sort + merge-join
+// Batch lookup, parallel hash + sort + merge-join
 std::vector<std::string_view> contigs = { "NZ_ABC.1", "NZ_DEF.1", /* ... */ };
 std::vector<uint32_t> genome_ids(contigs.size());
 ar.batch_find_contig_genome_ids(contigs.data(), genome_ids.data(),
@@ -66,13 +66,13 @@ ar.batch_find_contig_genome_ids(contigs.data(), genome_ids.data(),
 
 `batch_find_contig_genome_ids` runs in three phases:
 
-1. **Hash** — compute FNV-1a-64 for all N accessions in parallel across T threads — O(N/T)
-2. **Sort** — sort queries by hash (pdqsort) — O(N log N)
-3. **Merge-join** — for each CIDX section (newest→oldest), merge-join sorted queries against the sorted section entries — O(N + M) per section
+1. **Hash:** compute FNV-1a-64 for all N accessions in parallel across T threads, O(N/T)
+2. **Sort:** sort queries by hash (pdqsort), O(N log N)
+3. **Merge-join:** for each CIDX section (newest→oldest), merge-join sorted queries against the sorted section entries, O(N + M) per section
 
 Within the merge-join, two optimisations avoid scanning the full entry array:
 
-- **Range clip:** binary-search the entry array to `[ei_start, ei_end)` covering only the hash range of the current query batch — free for clustered queries (e.g. one organism)
+- **Range clip:** binary-search the entry array to `[ei_start, ei_end)`, covering only the hash range of the current query batch. This reduces scans for clustered queries (e.g. one organism)
 - **Hardware prefetch:** `__builtin_prefetch` 32 entries (8 cache lines) ahead on both the query and entry arrays
 
 After each section pass, only unresolved queries enter the next pass.
@@ -84,6 +84,6 @@ After each section pass, only unresolved queries enter the next pass.
 | 1,000 | 1 | 68 ns |
 | 10,000 | 1 | 6.8 ns |
 | 10,000 | 4 | 6.9 ns |
-| single lookup | — | ~250 µs (cold mmap) |
+| single lookup | - | ~250 µs (cold mmap) |
 
 Thread scaling is flat at this archive size because the bottleneck is the merge-join sequential pass, not hashing. Parallelism helps at N > 100k with multi-section archives.

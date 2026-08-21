@@ -8,7 +8,7 @@
 |--------|----------|-------------|
 | `accession` | ✓ | Unique genome identifier (e.g. `GCA_000008085.1`) |
 | `file_path` | ✓ | Path to `.fa`, `.fna`, `.fa.gz`, or `.fna.gz` |
-| `completeness` | | CheckM completeness % (0–100) |
+| `completeness` | | CheckM completeness % (0-100) |
 | `contamination` | | CheckM contamination % |
 | `taxonomy` | | Full lineage string (`d__;p__;c__;o__;f__;g__;s__`) |
 | extra columns | | Stored verbatim in `meta.tsv` sidecar |
@@ -36,13 +36,13 @@ The output `mydb.gpk` is a directory containing `toc.bin` and section files. Def
 | `-i / --input` | required | Input TSV |
 | `-o / --output` | required | Output archive directory (`.gpk`) |
 | `-t / --threads` | 16 | I/O threads (decompression + compression) |
-| `-z / --zstd-level` | 6 | zstd compression level (1–22) |
+| `-z / --zstd-level` | 6 | zstd compression level (1-22) |
 | `-p / --parallel` | 1 | Parallel build workers (auto-merge) |
 | `--no-dict` | off | Disable shared dictionary training |
 | `--ref-dict` | off | Use first genome in each shard as reference content dictionary |
 | `--delta` | off | Compress non-reference blobs against first genome via zstd prefix |
 | `--mem-delta` / `--no-mem-delta` | **on** | k=31 k-mer seeded exact-match encoding for highly similar shard groups |
-| `--2bit` / `--no-2bit` | **on** | Pack nucleotides to 2 bits/base before zstd (~1.5–2× extra compression) |
+| `--2bit` / `--no-2bit` | **on** | Pack nucleotides to 2 bits/base before zstd (~1.5-2× extra compression) |
 | `--cidx` / `--no-cidx` | off (skip) | Build CIDX contig index; opt in with `--cidx` (recommended for >1M genomes needing contig lookup) |
 | `--kmer-sort` / `--no-kmer-sort` | on | Sort genomes within each shard by kmer4 NN chain |
 | `--taxon-group` / `--no-taxon-group` | on | Group genomes into per-taxon shards (requires taxonomy column) |
@@ -84,7 +84,7 @@ genopack inspect parts_dir/        # iterate all part_*.gpk
 genopack inspect mydb.gpk --json
 ```
 
-Reports per-archive sketch size, mask words, available k-mer sizes, bytes per genome, and total preload-cost estimate. Useful when planning memory budgets for downstream consumers (e.g. geodesic).
+Reports per-archive sketch size, mask words, available k-mer sizes, bytes per genome, and total preload-cost estimate for planning downstream memory budgets (e.g. geodesic).
 
 ---
 
@@ -139,9 +139,9 @@ The columnar binary export produces four files:
 
 | File | Description |
 |------|-------------|
-| `acc2taxid.bin` | Sorted `(FNV-1a-64(acc), taxid)` pairs — O(log n) binary search |
-| `taxnodes.bin` | Sorted node records + name pool — O(log n) taxid lookup |
-| `acc2taxid.tsv` | `accession\ttaxid` — pandas/polars/R compatible |
+| `acc2taxid.bin` | Sorted `(FNV-1a-64(acc), taxid)` pairs; O(log n) binary search |
+| `taxnodes.bin` | Sorted node records + name pool; O(log n) taxid lookup |
+| `acc2taxid.tsv` | `accession\ttaxid` for pandas/polars/R |
 | `taxonomy.tsv` | `taxid\tparent_taxid\trank\tname\tis_synthetic` |
 
 ---
@@ -215,7 +215,7 @@ Soft-deletes (tombstones) genomes. Physical space is not reclaimed; use `genopac
 
 ## Distributed build
 
-For large collections on a **shared NFS filesystem**, partition by genus (LPT bin-packing keeps each genus whole in one part), build on separate nodes in parallel, and query the parts directory directly — no merge or coordinator needed:
+For large collections on a **shared NFS filesystem**, partition by genus (LPT bin-packing keeps each genus whole in one part), build on separate nodes in parallel, and query the parts directory directly. No merge or coordinator is needed:
 
 ```bash
 # 1. Partition by genus into N balanced parts
@@ -226,12 +226,12 @@ genopack build -i parts/part_0.tsv -o parts/part_0.gpk -p 16 -t 8
 genopack build -i parts/part_1.tsv -o parts/part_1.gpk -p 8  -t 8
 # ...
 
-# 3. Query the parts directory directly — no merge step
+# 3. Query the parts directory directly: no merge step
 genopack check parts/ --genomes query.txt -o quality.tsv -t 16
 genopack stat  parts/
 ```
 
-Every CLI command that takes an archive path also accepts a directory containing `part_*.gpk`. Genus-partitioning ensures each part's GSTX is built from the complete membership of every genus it contains — no cross-part fragmentation.
+Every CLI command that takes an archive path also accepts a directory containing `part_*.gpk`. Genus partitioning builds each part's GSTX from the complete membership of every genus it contains, without cross-part fragmentation.
 
 **For disconnected nodes with local scratch** (workers cannot write to a shared NFS output), use the coordinator instead:
 

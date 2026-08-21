@@ -1,24 +1,25 @@
 # genopack
 
-A single-file genome archive format for large-scale microbial genome collections. Stores millions of FASTA genomes with compressed shards, fast accession lookup, taxonomy, multi-k OPH sketches, and a full taxonomy tree — all in one seekable `.gpk` archive (a directory containing `toc.bin` plus section files) or a multipart set of `part_*.gpk` archives read transparently as one.
+A single-file genome archive format for large-scale microbial genome collections. Stores millions of FASTA genomes with compressed shards, fast accession lookup, taxonomy, multi-k OPH sketches, and a full taxonomy tree in one seekable `.gpk` archive (a directory containing `toc.bin` plus section files) or a multipart set of `part_*.gpk` archives read as one.
 
 ## Features
 
-- **Single-file archive** — one `.gpk` directory replaces millions of per-genome files on NFS
-- **Multipart sets** — directories containing `part_0.gpk`, `part_1.gpk`, … are read transparently via `ArchiveSetReader`
-- **Fast genome access** — O(1) accession and genome-id lookup via ACCX and GIDX, plus per-genome shard-local blob fetch
-- **zstd-compressed shards** — auto, shared-dict, reference-delta, MEM-delta, and 2-bit-pack codecs with mmap-backed reads
-- **OPH sketches (SKCH v4)** — dual-seed (42, 43) one-permutation-hash signatures over one or more k-mer sizes, stored as seekable zstd frames (16 384 genomes per frame), so a `sketch_for_ids` query decompresses only the frames it touches
-- **Contig index (CIDX)** — FNV-1a sorted array mapping every contig accession → genome_id; batch lookup at ~150M queries/s
-- **Taxonomy storage** — full NCBI/GTDB taxonomy tree (TXDB) + per-accession lineage strings (TAXN)
-- **Taxonomy export** — NCBI taxdump (`names.dmp`/`nodes.dmp`/`acc2taxid.dmp`) and columnar binary (`acc2taxid.bin`/`taxnodes.bin`) plus TSV sidecars
-- **k=4 tetranucleotide profiles (KMRX)** — 136-dim L2-normalised float vectors for cosine similarity (library API; no CLI)
-- **Taxonomy repack** — re-shard by genus/family for 10–13× faster per-taxon NFS access
-- **Distributed build** — split TSV across N nodes, build parts in parallel, merge or coordinate via NFS manifest
-- **Append and tombstone** — add genomes or mark deleted without full rebuild
-- **Quality scoring (`genopack check`)** — per-genome completeness and contamination signals (QUAL section): cluster-relative completeness, leakage, TNF excess, chromosome skew closure, contig-level Mahalanobis outlier (CCO), SPE, sibling outlier (family-vs-genus), marker-gene completeness/redundancy, FracMinHash minority fraction
-- **Covariance sections (GCOV/FCOV)** — per-genus and per-family TNF covariance matrices built in one pass at build time or via `genopack gcov`; used by `check` for contamination detection
-- **`.gpd` derep archives** — read derep state produced by [geodesic](https://github.com/genomewalker/geodesic) via `DerepView`: O(1) `accession → rep_id`, O(1) `rep_id → embedding`, with staleness detection against the source pack
+- **Single-file archive:** one `.gpk` directory replaces millions of per-genome files on NFS
+- **Multipart sets:** directories containing `part_0.gpk`, `part_1.gpk`, … are read via `ArchiveSetReader`
+- **Fast genome access:** O(1) accession and genome-id lookup via ACCX and GIDX, plus per-genome shard-local blob fetch
+- **zstd-compressed shards:** auto, shared-dict, reference-delta, MEM-delta, and 2-bit-pack codecs with mmap-backed reads
+- **OPH sketches (SKCH v4):** dual-seed (42, 43) one-permutation-hash signatures over one or more k-mer sizes, stored as seekable zstd frames (16 384 genomes per frame). A `sketch_for_ids` query decompresses only the frames it touches
+- **Contig index (CIDX):** FNV-1a sorted array mapping every contig accession → genome_id; batch lookup at ~150M queries/s
+- **Taxonomy storage:** full NCBI/GTDB taxonomy tree (TXDB) + per-accession lineage strings (TAXN)
+- **Unified taxonomy:** reconcile several independent packs into one taxdump with native NCBI taxids where names resolve, authoritative-taxid preservation, and an optional full-NCBI backbone (`taxonomy unify`)
+- **Taxonomy export:** NCBI taxdump (`names.dmp`/`nodes.dmp`/`acc2taxid.dmp`) and columnar binary (`acc2taxid.bin`/`taxnodes.bin`) plus TSV sidecars
+- **k=4 tetranucleotide profiles (KMRX):** 136-dim L2-normalised float vectors for cosine similarity (library API; no CLI)
+- **Taxonomy repack:** re-shard by genus/family for 10-13× faster per-taxon NFS access
+- **Distributed build:** split TSV across N nodes, build parts in parallel, merge or coordinate via NFS manifest
+- **Append and tombstone:** add genomes or mark deleted without full rebuild
+- **Quality scoring (`genopack check`):** per-genome completeness and contamination signals (QUAL section): cluster-relative completeness, leakage, TNF excess, chromosome skew closure, contig-level Mahalanobis outlier (CCO), SPE, sibling outlier (family-vs-genus), marker-gene completeness/redundancy, FracMinHash minority fraction
+- **Covariance sections (GCOV/FCOV):** per-genus and per-family TNF covariance matrices built in one pass at build time or via `genopack gcov`; used by `check` for contamination detection
+- **`.gpd` derep archives:** read derep state produced by [geodesic](https://github.com/genomewalker/geodesic) via `DerepView`: O(1) `accession → rep_id`, O(1) `rep_id → embedding`, with staleness detection against the source pack
 
 ## Format overview
 
@@ -132,7 +133,7 @@ genopack taxonomy patch --patch patch.tsv --archive mydb.gpk
 ### Export taxonomy packages
 
 ```bash
-# NCBI taxdump (names.dmp, nodes.dmp, acc2taxid.dmp — Kraken/Kaiju compatible)
+# NCBI taxdump (names.dmp, nodes.dmp, acc2taxid.dmp: Kraken/Kaiju compatible)
 genopack taxdump mydb.gpk -f taxdump -o ./taxdump/
 
 # Columnar binary (acc2taxid.bin + taxnodes.bin) + TSV sidecars
@@ -143,9 +144,9 @@ The columnar binary export is for applications that need taxonomy without linkin
 
 | File | Size (GTDB r226 reps) | Description |
 |------|----------------------|-------------|
-| `acc2taxid.bin` | 2.2 MB | Sorted `(FNV-1a-64(acc), taxid)` pairs — O(log n) binary search |
-| `taxnodes.bin` | 6.3 MB | Sorted node records + name pool — O(log n) taxid lookup |
-| `acc2taxid.tsv` | 3.7 MB | `accession\ttaxid` — pandas/polars/R |
+| `acc2taxid.bin` | 2.2 MB | Sorted `(FNV-1a-64(acc), taxid)` pairs; O(log n) binary search |
+| `taxnodes.bin` | 6.3 MB | Sorted node records + name pool; O(log n) taxid lookup |
+| `acc2taxid.tsv` | 3.7 MB | `accession\ttaxid` for pandas/polars/R |
 | `taxonomy.tsv` | 9.0 MB | `taxid\tparent_taxid\trank\tname\tis_synthetic` |
 
 ### Re-shard by taxonomy
@@ -154,7 +155,7 @@ The columnar binary export is for applications that need taxonomy without linkin
 genopack repack mydb.gpk mydb_taxon.gpk -t 24 -z 6 -m 32
 ```
 
-Reads only shard directory headers in a fast first pass (~minutes), then a single sequential decompression pass routes each genome to its taxonomy group. Tools like `geodesic` then read only the shards for a target taxon, not the whole archive.
+The first pass reads only shard directory headers (~minutes). A sequential decompression pass then routes each genome to its taxonomy group. Tools such as `geodesic` read only the shards for a target taxon, not the whole archive.
 
 ### Merge archives
 
@@ -189,7 +190,7 @@ genopack reindex mydb.gpk --skch --force
 
 ## Distributed build
 
-For large collections on a **shared NFS filesystem**, partition by genus, build parts in parallel, and query the directory directly — no merge or coordinator needed:
+For large collections on a **shared NFS filesystem**, partition by genus, build parts in parallel, and query the directory directly. No merge or coordinator is needed:
 
 ```bash
 # 1. Partition by genus into N balanced parts (LPT bin-packing, genus stays whole)
@@ -227,7 +228,7 @@ genopack merge -l <(ls parts/*.gpk) -o merged.gpk
 |--------|----------|-------------|
 | `accession` | ✓ | Unique genome identifier |
 | `file_path` | ✓ | Path to `.fa`, `.fna`, `.fa.gz`, or `.fna.gz` |
-| `completeness` | | CheckM completeness % (0–100) |
+| `completeness` | | CheckM completeness % (0-100) |
 | `contamination` | | CheckM contamination % |
 | `taxonomy` | | Full lineage string (`d__;p__;c__;o__;f__;g__;s__`) |
 | any extras | | Stored verbatim in `meta.tsv` sidecar |
@@ -295,9 +296,9 @@ and FMHR (per-genus FracMinHash references) simultaneously.
 
 | Column | Description |
 |--------|-------------|
-| `quality_tier` | `HQ` / `MQ` / `LQ` — **completeness-only** (`comp_eff`); contamination is decoupled and never demotes to LQ. Only the calibrated duplication channel `D` caps HQ→MQ (`run_check.cpp:181-197`) |
+| `quality_tier` | `HQ` / `MQ` / `LQ`; **completeness-only** (`comp_eff`). Contamination is decoupled and never demotes to LQ. Only the calibrated duplication channel `D` caps HQ→MQ (`run_check.cpp:181-197`) |
 | `completeness_effective` | Intrinsic completeness: `marker_completeness`, else `completeness_aamer_core`, else `completeness_post_decontam`. `completeness_cluster_relative` corroborates (geomean) only when intrinsic < 0.50 and sits > 0.30 above it |
-| `completeness_cluster_relative` | Fraction of the genus pangenome covered (accessory breadth) — not intrinsic completeness |
+| `completeness_cluster_relative` | Fraction of the genus pangenome covered (accessory breadth), not intrinsic completeness |
 | `contamination_leakage` | Minimizer mass leakage outside expected genus range |
 | `contamination_tnf_excess` | TNF Mahalanobis distance from genus centroid |
 | `contamination_contig_outlier` | Fraction bp where T² or SPE > 95th percentile (requires GCOV) |
@@ -313,7 +314,7 @@ and FMHR (per-genus FracMinHash references) simultaneously.
 #include <genopack/archive.hpp>
 #include <genopack/archive_set_reader.hpp>
 
-// Single archive or multipart set — same API
+// Single archive or multipart set, same API
 genopack::ArchiveSetReader reader;
 reader.open("mydb.gpk");           // archive directory
 // or

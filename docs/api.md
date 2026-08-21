@@ -22,7 +22,7 @@ Per-genome metadata record. 72 bytes, 8-byte aligned.
 | `genome_length` | `uint64_t` | Total assembly length in bp |
 | `n_contigs` | `uint32_t` | Number of contigs |
 | `gc_pct_x100` | `uint16_t` | GC% × 100 (e.g. 5234 = 52.34%) |
-| `completeness_x10` | `uint16_t` | CheckM completeness × 10 (0–1000) |
+| `completeness_x10` | `uint16_t` | CheckM completeness × 10 (0-1000) |
 | `contamination_x10` | `uint16_t` | CheckM contamination × 10 |
 | `oph_fingerprint` | `uint64_t` | MinHash minimum (k=21); similarity sort key |
 | `blob_offset` | `uint64_t` | Byte offset of compressed blob within shard blob area |
@@ -255,7 +255,7 @@ bool ok = reader.is_open();
 reader.close();
 ```
 
-`open_archive_auto(path)` is a free function that detects layout and returns an opened reader; throws `std::runtime_error` on failure. Multipart layout is discovered from `part_*.gpk` entries only — `part_N.meta.tsv` sidecars are ignored.
+`open_archive_auto(path)` is a free function that detects layout and returns an opened reader. It throws `std::runtime_error` on failure. Multipart layout is discovered from `part_*.gpk` entries only; `part_N.meta.tsv` sidecars are ignored.
 
 ### Layout introspection
 
@@ -392,7 +392,7 @@ app.commit();
 
 ## ScanEngine
 
-High-throughput streaming scan optimised for NFS and NVMe. Decouples I/O threads (sequential reads) from worker threads (decompression + processing).
+Streaming scan for NFS and NVMe. It separates I/O threads (sequential reads) from worker threads (decompression + processing).
 
 ```cpp
 #include <genopack/scan_engine.hpp>
@@ -458,7 +458,7 @@ The three-phase algorithm:
 |-------|-----|-------------|
 | 1 - Directory scan | ~300 MB | Reads only `GenomeDirEntry` headers; builds genome→taxonomy index |
 | 2 - Sort | 0 | Sorts all records by `(taxonomy, oph_fingerprint)` in memory |
-| 3 - Decompress + route | Full archive | Single sequential pass; smart eviction of largest writer at memory cap |
+| 3 - Decompress + route | Full archive | Single sequential pass; eviction of largest writer at memory cap |
 
 ---
 

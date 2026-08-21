@@ -1,11 +1,11 @@
 # AAMER: The Amino-Acid K-mer Subsystem
 
-AAMER is genopack's marker-gene-**free** completeness/contamination substrate: a
-single k=8 amino-acid k-mer engine, shared byte-for-byte between the build side
-(protein) and the check side (DNA), that backs three archive sections
+AAMER is genopack's marker-gene-**free** completeness/contamination substrate. Its
+k=8 amino-acid k-mer engine is shared byte-for-byte between the build side
+(protein) and the check side (DNA). It backs three archive sections
 (`SEC_CORE`, `SEC_PCORE`, `SEC_GAMI`), the clade-split contamination tier, the
-SCG marker panel, and the per-contig foreign-containment scan. It is implemented
-across a dozen files with no single entry point — this page is that entry point.
+SCG marker panel, and the per-contig foreign-containment scan. This page describes
+the implementation across its source files.
 
 ## 1. Overview
 
@@ -15,19 +15,18 @@ query genomes never do. AAMER's build side ingests **protein** (GTDB-Tk MSA
 sequences, `extract_aamers_aa`, `aamer.hpp:687-716`), and its check side ingests
 **DNA**, 6-frame translated to protein in software
 (`translate_6frame`/`extract_aamers_dna`, `aamer.hpp:357-476`, `620-630`). Both
-paths hash the resulting amino-acid octamers with the **identical** function
+paths hash the resulting amino-acid octamers with the **same** function
 (`aamer_hash`, `aamer.hpp:109-124`), so a protein aamer built from an MSA column
-and a DNA-translated aamer from a draft assembly land on the same 64-bit key —
-membership lookup works straight across the protein↔DNA boundary without ever
-materializing a shared FASTA format. This is the trick that lets a completeness
-model built once from curated GTDB-Tk protein alignments score arbitrary
+and a DNA-translated aamer from a draft assembly produce the same 64-bit key.
+Membership lookup therefore works across the protein↔DNA boundary without
+materializing a shared FASTA format. A completeness model built from curated
+GTDB-Tk protein alignments can score
 (possibly fragmented, error-prone) nucleotide assemblies at check time, with no
 external gene caller and no HMM search.
 
-Because it's a raw k-mer signal rather than a curated single-copy-gene set,
-AAMER degrades gracefully on partial ORFs and fragmented contigs — the same
-property that makes GUNC-style protein k-mer methods attractive over
-marker-based ones (`cladesplit.hpp:14-22`).
+Because it is a raw k-mer signal rather than a curated single-copy-gene set,
+AAMER continues to produce signal from partial ORFs and fragmented contigs
+(`cladesplit.hpp:14-22`).
 
 ## 2. The AAMER engine
 
@@ -45,9 +44,9 @@ for anything else (`aamer.hpp:49-68`). Translation uses genetic code 11
 uint64_t aamer_hash(const uint8_t* aa) noexcept;   // aamer.hpp:109
 ```
 
-Packs 8 amino acids at 5 bits each (40 bits) then applies a splitmix64 mix
-(`aamer.hpp:109-124`). Must be called with identical AA encoding on both sides —
-it is, because both `extract_aamers_aa` and `extract_aamers_dna`/`translate_6frame`
+Packs 8 amino acids at 5 bits each (40 bits), then applies a splitmix64 mix
+(`aamer.hpp:109-124`). Both sides must use the same AA encoding. They do because
+`extract_aamers_aa` and `extract_aamers_dna`/`translate_6frame`
 route through the same `AA_ENC`/`CODON11` tables. A Murphy-10 reduced-alphabet
 variant (`aamer_hash_murphy10`, `aamer.hpp:128-143`, 10 classes × 4 bits) exists
 for the marker panel's reduced-alphabet mode (§4, §6).
@@ -58,8 +57,8 @@ for the marker panel's reduced-alphabet mode (§4, §6).
 bool aamer_is_low_complexity(const uint8_t* aa, int k) noexcept;  // aamer.hpp:146
 ```
 
-Rejects a k-mer if it contains a run of `>= (k+1)/2` identical amino acids — for
-k=8, a run of ≥4 (integer division). Applied uniformly at extraction time on
+Rejects a k-mer if it contains a run of `>= (k+1)/2` identical amino acids. For
+k=8, this is a run of ≥4 (integer division). The rule is applied at extraction time on
 both build and check sides (`emit_aamers`, `aamer.hpp:156-162`).
 
 ### 2.4 6-frame translation
@@ -85,7 +84,7 @@ variant used by marker scoring (§5), which never needs RC frames.
 |---|---|---|
 | `extract_aamers_aa(protein, k=8)` | build (protein) | MSA gaps (`-`) skipped without breaking the segment; stops break it (`aamer.hpp:687-716`) |
 | `extract_aamers_dna(seq, k, min_seg_aa)` | check (DNA) | full 6-frame translate + hash, sorted-unique (`aamer.hpp:620-630`) |
-| `extract_aamers_dna(seq, k, min_seg_aa, max_hash)` | check (DNA), subsampled | keeps only `h <= max_hash` — FracMinHash (`aamer.hpp:633-643`) |
+| `extract_aamers_dna(seq, k, min_seg_aa, max_hash)` | check (DNA), subsampled | keeps only `h <= max_hash` using FracMinHash (`aamer.hpp:633-643`) |
 | `extract_aamers_dna_into(...)` | check (DNA), in-place | appends into a caller-owned `thread_local` buffer, no per-call allocation (`aamer.hpp:648-653`) |
 
 The FracMinHash rolling variant (`emit_aamers_frac`, `aamer.hpp:169-188`)
@@ -98,7 +97,7 @@ expensive check only runs on the ~1/N survivors of the FMH subsample.
 A second, independent k-mer scheme lives in the same file: Dayhoff-6 reduces the
 20-letter alphabet to 6 classes (`AA_DAYHOFF6[20]`, `aamer.hpp:721-723`), with
 **k=12** (`AAMER_K_D6`) and closed-syncmer selection at inner s-mer length
-**s=4** (`AAMER_S_D6`, `aamer.hpp:725-726`) — a syncmer criterion selects a
+**s=4** (`AAMER_S_D6`, `aamer.hpp:725-726`). A syncmer criterion selects a
 k-mer only if its minimum s-mer sits at position 0, giving ~11% density
 (`1/(k-s+1)`, `aamer.hpp:742-757`). This is a separate, coarser k-mer used only
 by the `--dayhoff6` marker-panel build mode (§6); it is not part of the
@@ -112,30 +111,30 @@ above.
 
 | Section | Density | What it stores | Feeds |
 |---|---|---|---|
-| `SEC_CORE` (legacy) | sparse — aamers with member-prevalence `>= ceil(θ·N)` only (the "conserved core") | per-genus sorted-unique aamer set + contributing member ids + `core_model_hash` (`core_section.hpp:21-43`) | historically `completeness_aamer_core`; superseded by PCORE (see below) |
-| `SEC_PCORE` | dense — **every** aamer seen in ≥1 member, plus a per-aamer member-prevalence | 3-run stratified encoding (singleton / multi / core) + quantized prevalence, optional per-aamer IDF tier byte (v2) (`pcore.hpp:10-16`, `32-89`) | `completeness_aamer_core` (via the θ-threshold core run) **and** small-foreign-contig detection (dense union) |
-| `SEC_GAMI` | global — one `(hash, count)` pair per aamer across **all** genera, count capped at 255 | sorted pairs, zstd-compressed on disk, Elias-Fano + 2-bit packed counts at load (`gami.hpp:2-6`, `18-42`) | the specificity gate for foreign-aamer contamination scoring (rare-vs-universal) |
+| `SEC_CORE` (legacy) | sparse; aamers with member-prevalence `>= ceil(θ·N)` only (the "conserved core") | per-genus sorted-unique aamer set + contributing member ids + `core_model_hash` (`core_section.hpp:21-43`) | historically `completeness_aamer_core`; superseded by PCORE (see below) |
+| `SEC_PCORE` | dense; **every** aamer seen in ≥1 member, plus a per-aamer member-prevalence | 3-run stratified encoding (singleton / multi / core) + quantized prevalence, optional per-aamer IDF tier byte (v2) (`pcore.hpp:10-16`, `32-89`) | `completeness_aamer_core` (via the θ-threshold core run) **and** small-foreign-contig detection (dense union) |
+| `SEC_GAMI` | global; one `(hash, count)` pair per aamer across **all** genera, count capped at 255 | sorted pairs, zstd-compressed on disk, Elias-Fano + 2-bit packed counts at load (`gami.hpp:2-6`, `18-42`) | the specificity gate for foreign-aamer contamination scoring (rare-vs-universal) |
 
-### 3.1 SEC_CORE — genus prevalence core
+### 3.1 SEC_CORE: genus prevalence core
 
 An entry is the set of aamers present in `>= ceil(theta * N)` of a genus's `N`
 reference members (`CoreWriter::add_from_members`, `src/core_section.cpp:17-37`);
 default `theta = 0.90` (`core_section.hpp:27` comment, matches `PcoreWriter`'s
 default, `pcore.hpp:208`). The section is content-hashed
 (`core_model_hash`, XXH3 over `(k, min_seg_aa, theta, sorted per-genus cores)`,
-order-independent — `core_section.cpp:65-88`) so the intrinsic completeness
+order-independent; `core_section.cpp:65-88`) so the intrinsic completeness
 column is a pure function of build inputs, not the raw sibling set
 (`core_section.hpp:6-10`).
 
 **This section has no active builder in the current codebase.** `CoreWriter`'s
 only call sites are its own defining file and its unit test
-(`tests/core_section_test.cpp`) — no CLI subcommand constructs one. `CoreReader`
-remains fully live for reading legacy archives, and — more importantly —
+(`tests/core_section_test.cpp`); no CLI subcommand constructs one. `CoreReader`
+remains available for reading legacy archives. In addition,
 `genopack pcore` currently *sources its own build config* (`k`, `min_seg_aa`,
 `theta`, `frac_max_hash`) from an existing archive's `SEC_CORE` header, and
 **skips any archive that has no CORE params** (`src/run_pcore.cpp:140-144`,
 `"has no CORE params; skipping"`). It uses the CoreReader *only* for those four
-config values — never the core aamer content — and exposes **no CLI fallback**
+config values, not the core aamer content, and exposes **no CLI fallback**
 for them (`pcore`'s only options are `archive`, `--threads`, `--members`).
 `merge` also **drops** `SEC_CORE` (it is in the non-concatenable set,
 `src/merger.cpp:190`), so a merged archive loses the ability to rebuild PCORE.
@@ -144,15 +143,15 @@ for them (`pcore`'s only options are `archive`, `--threads`, `--members`).
 is present. When it is **absent**, `pcore` now **bootstraps** from CLI options
 `--theta` / `--min-seg-aa` / `--frac-max-hash` instead of skipping the archive,
 so an archive can build `SEC_PCORE → completeness` without a legacy `SEC_CORE`.
-The defaults are the canonical values recovered from the code (`k = AAMER_K = 8`;
+The defaults are taken from the code (`k = AAMER_K = 8`;
 `min_seg_aa = k = 8`, `aamer.hpp:621`; `theta = 0.90`, the `PcoreWriter`/unit-test
 default; `frac_max_hash = UINT64_MAX`, i.e. dense/no-subsampling, required for the
-1–2 kb small-contig detection that is PCORE's whole purpose). These are
-quality-affecting — override them only to match a specific legacy `SEC_CORE`.
+1-2 kb small-contig detection provided by PCORE). These values affect quality;
+override them only to match a specific legacy `SEC_CORE`.
 
-### 3.2 SEC_PCORE — dense per-genus aamer reference
+### 3.2 SEC_PCORE: dense per-genus aamer reference
 
-`SEC_PCORE` is the unified, dense reference that supersedes CORE: it stores
+`SEC_PCORE` is the dense reference that supersedes CORE. It stores
 **every** aamer seen in ≥1 member together with a per-aamer member prevalence,
 from which a consumer derives, at query time (`pcore.hpp:6-9`):
 
@@ -160,12 +159,13 @@ from which a consumer derives, at query time (`pcore.hpp:6-9`):
 - prevalence ≥ 1 → the dense foreign/containment reference (small-contig detection)
 - raw prevalence → the per-aamer weight for a log-likelihood-ratio contamination score
 
-Two codecs exist: legacy (open-addressing hash, u8 member count capped at 255 —
-a known bug on genera with >255 members, kept read-only for back-compat) and v1
-(three contiguous PFOR-delta runs per genus — singleton/multi/core — with
+Two codecs exist. The legacy codec uses an open-addressing hash and a u8 member
+count capped at 255. This known bug affects genera with >255 members, so the codec
+is kept read-only for backward compatibility. V1 uses three contiguous PFOR-delta
+runs per genus (singleton/multi/core), with
 quantized log-normalized prevalence for multi+core; the core run is decided from
 true u32 counts at build time so completeness stays exact regardless of
-quantization) (`pcore.hpp:10-16`, `32-36`). v2 adds a per-aamer 4-bit IDF tier
+quantization (`pcore.hpp:10-16`, `32-36`). v2 adds a per-aamer 4-bit IDF tier
 byte (`tier = floor(log2(genus_count))`, capped at 15,
 `pcore_tier_from_count`, `pcore.hpp:110-117`), stamped in a separate
 `genopack tier stamp` pass (§6) and used to compute a soft IDF weight
@@ -185,7 +185,7 @@ $$
 (`pcore_core_coverage`, `pcore.hpp:188-200`; re-implemented inline in
 `src/check/pass_aamer.cpp:60-68` for the hot path).
 
-### 3.3 SEC_GAMI — global aamer multiplicity index
+### 3.3 SEC_GAMI: global aamer multiplicity index
 
 The dense PCORE union tells a consumer *whether* an aamer is host- or
 family-specific; it says nothing about how common that aamer is **outside**
@@ -196,7 +196,7 @@ Bloom filter over rare aamers (removed); V2 (current) is exact sorted
 `(hash, count8)` pairs, zstd-compressed on disk and loaded into an Elias-Fano
 structure with 2-bit packed counts (4 states: absent/1/2/≥3) at query time
 (`gami.hpp:18-42`). `genopack gami build` decodes PCORE (or CORE, as a
-fallback) once and serializes this index, eliminating a 10–30 minute in-memory
+fallback) once and serializes this index, eliminating a 10-30 minute in-memory
 GMI rebuild on every `genopack check` run (`gami.hpp:5-6`, `src/run_gami.cpp:69-141`).
 If no `SEC_GAMI` section is present, `check` falls back to building the same
 index in memory from PCORE/CORE at check-start (`src/check/pass_b.cpp:318-368`).
@@ -210,13 +210,13 @@ interchangeable protein k-mer primitives, selected by `ProteinKmer`
 
 | Primitive | CLI name | Definition |
 |---|---|---|
-| `PK_AAMER` (default) | `aamer` | Plain k=8 aamer — reuses `aamer_hash` from the core engine directly (`src/cladesplit.cpp:95-96`) |
-| `PK_METAMER` | `metamer` | Joint AA+DNA k-mer: 8 AA (5 bits each, 40 bits) **plus** the 8 third-codon-position bases (2 bits each, 16 bits) packed into 56 bits, then splitmix64 — a true Metabuli-style metamer (`cladesplit.cpp:97-101`) |
-| `PK_STROBE` | `strobemer` | Order-2 protein randstrobe: a 4-AA "strobe" hash (`aa4_hash`) at position `i`, paired with a second 4-AA strobe chosen by minimizing the XOR link within a window `[i+9, i+min(i+24, len-4)]` (`s=4, wmin=5, wmax=20`), combined via splitmix64 — gapped, longer-span, more mutation-robust than a contiguous aamer (`cladesplit.cpp:66-90`) |
+| `PK_AAMER` (default) | `aamer` | Plain k=8 aamer; reuses `aamer_hash` from the core engine directly (`src/cladesplit.cpp:95-96`) |
+| `PK_METAMER` | `metamer` | Joint AA+DNA k-mer: 8 AA (5 bits each, 40 bits) **plus** the 8 third-codon-position bases (2 bits each, 16 bits) packed into 56 bits, then splitmix64; a Metabuli-style metamer (`cladesplit.cpp:97-101`) |
+| `PK_STROBE` | `strobemer` | Order-2 protein randstrobe: a 4-AA "strobe" hash (`aa4_hash`) at position `i`, paired with a second 4-AA strobe chosen by minimizing the XOR link within a window `[i+9, i+min(i+24, len-4)]` (`s=4, wmin=5, wmax=20`), combined via splitmix64. Its gapped, longer span tolerates more mutations than a contiguous aamer (`cladesplit.cpp:66-90`) |
 
 All three are FracMinHash-subsampled at `1/frac_c` via `h % c == 0`
-(`cladesplit.cpp:88, 103`; note this is modulo-based subsampling, distinct from
-the max-hash-threshold FracMinHash used in `extract_aamers_dna`, §2.5).
+(`cladesplit.cpp:88, 103`). This modulo-based subsampling differs from the
+max-hash-threshold FracMinHash used in `extract_aamers_dna` (§2.5).
 `CladeSplitConfig` defaults: `frac_c = 30`, `min_aa = 8`, `mode = PK_AAMER`
 (`cladesplit.hpp:42-46`), matching the CLI defaults (`cli/main.cpp:4523-4529`).
 
@@ -239,27 +239,27 @@ aamers occurring ≥2× in a query, feeding `contamination_core_dup_mass` /
 Two independent aamer-derived signals reach `genopack check`
 (full model: [quality.md](quality.md)):
 
-**Completeness** — `completeness_aamer_core` is the intrinsic-completeness
+**Completeness:** `completeness_aamer_core` is the intrinsic-completeness
 **fallback** behind `marker_completeness` in the priority chain
 (`completeness_effective`, [quality.md § Completeness](quality.md#completeness)).
 `src/check/pass_aamer.cpp` (`run_pass_aamer`) computes it only for accessions
 that pass-A left un-scored (`std::isnan(completeness_cluster_relative)`,
 `pass_aamer.cpp:20-24`): each candidate's contigs are 6-frame translated and
-FracMinHash-subsampled with the *same* `k`/`min_seg_aa`/`frac_max_hash` the
-PCORE reader was built with (`pass_aamer.cpp:88`, must match — PCORE pins these
-in its header), then intersected against that genome's genus completeness-core
+FracMinHash-subsampled with the *same* `k`/`min_seg_aa`/`frac_max_hash` used to
+build the PCORE reader. These values must match because PCORE stores them in its
+header (`pass_aamer.cpp:88`). The result is intersected against that genome's genus completeness-core
 (`pcore_for_genus(...).core_into(...)`, `pass_aamer.cpp:43-44`).
-`marker_completeness` (§ below) itself is also aamer-engine output, just scored
+`marker_completeness` (§ below) is also aamer-engine output, but is scored
 against a curated single-copy-gene panel instead of a raw genus core.
 
-**Contamination (small-contig channel)** — PCORE's dense union plus GAMI's
+**Contamination (small-contig channel):** PCORE's dense union plus GAMI's
 global multiplicity together drive `score_contig_foreign_indexed`
 (`src/check/foreign_contam.hpp:254-336`), a composition-independent per-contig
-signal that works down to ~1–2 kb, below where TNF/GCOV composition needs
-5–20 kb of context (`foreign_contam.hpp:5-6`). Each contig's aamers are
+signal for contigs down to ~1-2 kb. TNF/GCOV composition needs
+5-20 kb of context (`foreign_contam.hpp:5-6`). Each contig's aamers are
 classified host-specific (in the host genus PCORE union), foreign-specific (in
-some other genus's union, not host-family, and — via GAMI — carried by at most
-`K` genera, so it's taxon-specific rather than universal), or excluded
+some other genus's union, not host-family, and carried by at most
+`K` genera according to GAMI, so it is taxon-specific rather than universal), or excluded
 (family-conserved or too common). `K` defaults to
 `max(2, n_genera/500)` (capped 255), overridable via `GENOPACK_FOREIGN_K`
 (`src/check/pass_b.cpp:338-344`). Below 16 classifiable aamers the scorer
@@ -270,11 +270,11 @@ signal is **per-contig**, not a genome-level D/S/G channel: it's persisted to
 `prot_flags`; `include/genopack/qcontig.hpp:44-48`) and surfaced by
 `genopack qcontig` / `genopack report` to flag *which* contigs to drop
 (the `"foreign"` channel, alongside `"tnf"` and `"leakage"`,
-`src/run_report.cpp:508-546`) — a decontamination signal, not one of the
+`src/run_report.cpp:508-546`). It is a decontamination signal, not one of the
 genome-level D/S/G contamination channels documented in
 [quality.md § Contamination](quality.md#contamination).
 
-**SCG markers** — `src/check/marker_score.hpp::score_markers_for_genome` also
+**SCG markers:** `src/check/marker_score.hpp::score_markers_for_genome` also
 runs on the raw aamer engine: each contig is forward-3-frame-translated
 (`translate_6frame`, `MRK_MIN_ORF_AA = 50`, `marker_score.hpp:49, 62`), and every
 ORF's k=8 aamers (`aamer_hash` or, for reduced-alphabet panels,
@@ -288,10 +288,10 @@ prefilter + per-genus flat hit-map, or a binary search fallback
 
 ## 6. Building it
 
-Pipeline order (see [cli.md](cli.md) for the exhaustive flag reference — this
-section lists only the AAMER-relevant flags):
+Pipeline order (see [cli.md](cli.md) for the full flag reference; this section
+lists only the AAMER-relevant flags):
 
-1. **`genopack pcore <archive>`** — builds `SEC_PCORE` from an archive that
+1. **`genopack pcore <archive>`:** builds `SEC_PCORE` from an archive that
    already carries a `SEC_CORE` header (§3.1). Streams every live genome's
    6-frame-translated, FracMinHash-subsampled aamers, grouped by genus **and**
    family, into `PcoreWriter` (`src/run_pcore.cpp:137-193`).
@@ -299,28 +299,28 @@ section lists only the AAMER-relevant flags):
    restricts which accessions contribute (default: all live genomes)
    (`cli/main.cpp:4432-4445`).
 
-2. **`genopack gami build <archive>`** — builds `SEC_GAMI` v2 from the archive's
+2. **`genopack gami build <archive>`:** builds `SEC_GAMI` v2 from the archive's
    PCORE (or CORE fallback). `-t/--threads` (default 8, decode parallelism)
    (`cli/main.cpp:4448-4460`).
 
-3. **`genopack tier merge` / `genopack tier stamp`** (optional) — merges
+3. **`genopack tier merge` / `genopack tier stamp`** (optional): merges
    per-part `.ptier` side-channel files (emitted during PCORE build via
    `PcoreWriter::set_tier_sidechannel`, `pcore.hpp:219-222`) into a global
    `.gtier` IDF table, then stamps per-aamer tier bytes into PCORE, upgrading
    v1 → v2 in place (`cli/main.cpp:4462-4494`).
 
-4. **`genopack markers build --gtdbtk-db <root> -o markers.mrk`** — builds the
+4. **`genopack markers build --gtdbtk-db <root> -o markers.mrk`**: builds the
    SCG marker aamer panel from GTDB-Tk MSA files (bac120 + ar53).
    `--threshold` (default 0.30, presence-call threshold); `--scale` (default 1,
    FracMinHash divisor, ignored with `--dayhoff6`); `--dayhoff6` (off by
-   default — switches to the k=12 Dayhoff-6 syncmer profile, §2.6);
+   default; switches to the k=12 Dayhoff-6 syncmer profile, §2.6);
    `--ic-threshold` (default 0.25, `--dayhoff6` only); `--expected-min-frac`
-   (default 0.50 — a marker counts as expected for a genus only if detectable
+   (default 0.50; a marker counts as expected for a genus only if detectable
    in at least this fraction of the genus's reference genomes, mirroring
    CheckM2's ~97% single-copy universality criterion) (`cli/main.cpp:4694-4732`).
 
 5. **`genopack cladesplit build -i genomes.tsv -o panel.csp`** (independent of
-   1–4) — builds a `.csp` contamination panel from clean reference genomes.
+   1-4): builds a `.csp` contamination panel from clean reference genomes.
    `--frac-c` (default 30), `--min-aa` (default 8), `--primitive`
    (`aamer`\|`metamer`\|`strobemer`, default `aamer`) (§4;
    `cli/main.cpp:4519-4536`). `genopack cladesplit score` and

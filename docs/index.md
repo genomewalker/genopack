@@ -2,7 +2,7 @@
 
 **Single-file genome archive for large-scale microbial collections.**
 
-genopack stores millions of FASTA genomes with compressed shards, O(1) accession and genome-id lookup, full taxonomy, multi-k OPH sketches, and tetranucleotide profiles. Everything lives in one seekable `.gpk` archive (a directory containing `toc.bin` + section files) or a multipart set of `part_*.gpk` archives read transparently via `ArchiveSetReader`.
+genopack stores millions of FASTA genomes with compressed shards, O(1) accession and genome-id lookup, full taxonomy, multi-k OPH sketches, and tetranucleotide profiles. The data is stored in one seekable `.gpk` archive (a directory containing `toc.bin` + section files) or a multipart set of `part_*.gpk` archives read via `ArchiveSetReader`.
 
 ---
 
@@ -43,7 +43,7 @@ if (g) std::cout << g->fasta;
 | Feature | Description |
 |---------|-------------|
 | **Single archive** | One `.gpk` directory (`toc.bin` + section files) replaces millions of per-genome files on NFS |
-| **Multipart sets** | Directories containing `part_*.gpk` are read transparently as one logical archive |
+| **Multipart sets** | Directories containing `part_*.gpk` are read as one logical archive |
 | **zstd shards** | Auto, shared-dict, reference-delta, MEM-delta, and 2-bit-pack codecs |
 | **O(1) lookup** | FNV-1a hash table (ACCX) + direct index (GIDX) for genome fetch |
 | **Contig index** | CIDX maps every contig accession → genome_id at ~150M queries/s |
@@ -53,7 +53,7 @@ if (g) std::cout << g->fasta;
 | **Taxonomy repack** | Re-shard by genus/family for fast per-taxon NFS access |
 | **Distributed build** | Split TSV across N nodes; merge with parallel `pwrite` or coordinate via NFS manifest |
 | **Append / tombstone** | Add genomes or soft-delete without full rebuild |
-| **`.gpd` derep view** | Read derep state produced by [geodesic](https://github.com/genomewalker/geodesic) — `accession → rep_id`, `rep_id → embedding`, with staleness detection |
+| **`.gpd` derep view** | Read derep state produced by [geodesic](https://github.com/genomewalker/geodesic): `accession → rep_id`, `rep_id → embedding`, with staleness detection |
 
 ---
 

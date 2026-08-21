@@ -1,6 +1,6 @@
 # Binary Format
 
-A `.gpk` archive is a **directory of seekable section files** plus a `toc.bin` entry, inspired by Parquet. Sections can be appended without rewriting existing data, and the TOC is updated with each generation; a 64-byte `TailLocator` at the end of `toc.bin` points to the current TOC. Multipart sets (used for very large or distributed builds) are directories containing one or more `part_*.gpk` archives — readers like `ArchiveSetReader` open them transparently.
+A `.gpk` archive is a **directory of seekable section files** plus a `toc.bin` entry, inspired by Parquet. Sections can be appended without rewriting existing data. The TOC is updated with each generation, and a 64-byte `TailLocator` at the end of `toc.bin` points to the current TOC. Multipart sets (used for very large or distributed builds) are directories containing one or more `part_*.gpk` archives. Readers such as `ArchiveSetReader` open them as one archive.
 
 > **Single-file layout.** Earlier versions stored everything in one `.gpk` file with `FileHeader · sections · TOC · TailLocator`. The directory layout below is the current on-disk form; the section-level binary structures (CATL, GIDX, ACCX, …) are unchanged.
 
@@ -14,7 +14,7 @@ A `.gpk` archive is a **directory of seekable section files** plus a `toc.bin` e
     <span class="fmt-size">256 B</span>
   </div>
   <div class="fmt-row">
-    <span class="fmt-name">SHRD × N<span class="fmt-sub">compressed genome shards — each generation appended, old shards untouched</span></span>
+    <span class="fmt-name">SHRD × N<span class="fmt-sub">compressed genome shards; each generation appended, old shards untouched</span></span>
     <span class="fmt-size">variable</span>
   </div>
   <div class="fmt-row divider">
@@ -37,16 +37,16 @@ A `.gpk` archive is a **directory of seekable section files** plus a `toc.bin` e
     <span class="fmt-name">TXDB<span class="fmt-sub">full taxonomy tree (taxid/parent/rank/name + acc→taxid)</span></span>
   </div>
   <div class="fmt-row">
-    <span class="fmt-name">SKCH<span class="fmt-sub">OPH (one-permutation hash) sketches — V4 seekable, dual-seed, multi-k</span></span>
+    <span class="fmt-name">SKCH<span class="fmt-sub">OPH (one-permutation hash) sketches: V4 seekable, dual-seed, multi-k</span></span>
   </div>
   <div class="fmt-row">
-    <span class="fmt-name" style="font-style:italic;font-weight:400">KMRX<span class="fmt-sub">optional — float[n × 136] L2-normalised k=4 tetranucleotide profiles (library-only)</span></span>
+    <span class="fmt-name" style="font-style:italic;font-weight:400">KMRX<span class="fmt-sub">optional float[n × 136] L2-normalised k=4 tetranucleotide profiles (library-only)</span></span>
   </div>
   <div class="fmt-row">
     <span class="fmt-name">TOMB<span class="fmt-sub">tombstone records for soft-deleted genomes</span></span>
   </div>
   <div class="fmt-row divider">
-    <span class="fmt-name">TOC<span class="fmt-sub">SectionDesc[] (raw, uncompressed) — one record per section</span></span>
+    <span class="fmt-name">TOC<span class="fmt-sub">SectionDesc[] (raw, uncompressed), one record per section</span></span>
   </div>
   <div class="fmt-row">
     <span class="fmt-name">TailLocator<span class="fmt-sub">fixed footer at EOF, points to TOC offset</span></span>
@@ -73,7 +73,7 @@ A `.gpk` archive is a **directory of seekable section files** plus a `toc.bin` e
 
 ---
 
-## `FileHeader` — 256 bytes
+## `FileHeader`: 256 bytes
 
 Offsets 0..39 are byte-identical to the older GPK2 header (magic/version/uuid/created_at/flags). The former GPK2 `reserved[88]` region now holds named GPK3 fields followed by a smaller reserved tail. A `static_assert(sizeof(FileHeader) == 256)` enforces the size.
 
@@ -117,19 +117,19 @@ Offsets 0..39 are byte-identical to the older GPK2 header (magic/version/uuid/cr
         <span class="fmt-size">128 B</span>
       </div>
       <div class="fmt-row">
-        <span class="fmt-name">GenomeDirEntry[n_genomes]<span class="fmt-sub">genome_id · oph_fingerprint · blob_offset · blob_len_cmp · blob_len_raw<br>checkpoint_idx · n_checkpoints — sorted by oph_fingerprint</span></span>
+        <span class="fmt-name">GenomeDirEntry[n_genomes]<span class="fmt-sub">genome_id · oph_fingerprint · blob_offset · blob_len_cmp · blob_len_raw<br>checkpoint_idx · n_checkpoints; sorted by oph_fingerprint</span></span>
         <span class="fmt-size">64 B × n</span>
       </div>
       <div class="fmt-row">
-        <span class="fmt-name" style="font-style:italic;font-weight:400">zstd dictionary<span class="fmt-sub">optional — ZSTD_DICT and REF_DICT codecs only</span></span>
+        <span class="fmt-name" style="font-style:italic;font-weight:400">zstd dictionary<span class="fmt-sub">optional; ZSTD_DICT and REF_DICT codecs only</span></span>
         <span class="fmt-size">dict_size B</span>
       </div>
       <div class="fmt-row">
-        <span class="fmt-name">Blob area<span class="fmt-sub">blob[0] · blob[1] · ... — each independently decompressible</span></span>
+        <span class="fmt-name">Blob area<span class="fmt-sub">blob[0] · blob[1] · ...; each independently decompressible</span></span>
         <span class="fmt-size">variable</span>
       </div>
       <div class="fmt-row">
-        <span class="fmt-name" style="font-style:italic;font-weight:400">CheckpointEntry[]<span class="fmt-sub">optional — symbol_offset · block_offset · enables sub-genome slice</span></span>
+        <span class="fmt-name" style="font-style:italic;font-weight:400">CheckpointEntry[]<span class="fmt-sub">optional; symbol_offset · block_offset · enables sub-genome slice</span></span>
         <span class="fmt-size">16 B × n</span>
       </div>
     </div>
@@ -138,7 +138,7 @@ Offsets 0..39 are byte-identical to the older GPK2 header (magic/version/uuid/cr
 
 Genomes are sorted by `oph_fingerprint` within each shard. Nearby OPH values indicate similar k-mer content, maximising zstd LDM reuse and shared dictionary effectiveness.
 
-### `ShardHeader` — 128 bytes
+### `ShardHeader`: 128 bytes
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
@@ -161,7 +161,7 @@ Genomes are sorted by `oph_fingerprint` within each shard. Nearby OPH values ind
 | 88 | 16 B | `checksum` | |
 | 104 | 24 B | _reserved_ | Zero-padded |
 
-### `GenomeDirEntry` — 64 bytes each
+### `GenomeDirEntry`: 64 bytes each
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
@@ -176,7 +176,7 @@ Genomes are sorted by `oph_fingerprint` within each shard. Nearby OPH values ind
 | 44 | 4 B | `meta_row_id` | Row index in logical catalog |
 | 48 | 16 B | _reserved_ | |
 
-### `CheckpointEntry` — 16 bytes each (optional)
+### `CheckpointEntry`: 16 bytes each (optional)
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
@@ -210,7 +210,7 @@ Genomes are sorted by `oph_fingerprint` within each shard. Nearby OPH values ind
         <span class="fmt-size">32 B</span>
       </div>
       <div class="fmt-row">
-        <span class="fmt-name">RowGroupStatsV2[n_groups]<span class="fmt-sub">min/max oph · min/max completeness · min/max genome_length<br>enables predicate pushdown — skip entire groups without row scan</span></span>
+        <span class="fmt-name">RowGroupStatsV2[n_groups]<span class="fmt-sub">min/max oph · min/max completeness · min/max genome_length<br>enables predicate pushdown to skip entire groups without row scan</span></span>
         <span class="fmt-size">72 B × n</span>
       </div>
       <div class="fmt-row">
@@ -223,7 +223,7 @@ Genomes are sorted by `oph_fingerprint` within each shard. Nearby OPH values ind
 
 Multiple CATL fragments (one per generation) are merged by `MergedCatalogReader` at read time; newer fragments take precedence on duplicate `genome_id`.
 
-### `CatlHeader` — 32 bytes
+### `CatlHeader`: 32 bytes
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
@@ -234,7 +234,7 @@ Multiple CATL fragments (one per generation) are merged by `MergedCatalogReader`
 | 16 | 8 B | `stats_offset` | Byte offset of `RowGroupStatsV2[]` from section start |
 | 24 | 8 B | `rows_offset` | Byte offset of `GenomeMeta[]` from section start |
 
-### `RowGroupStatsV2` — 72 bytes each
+### `RowGroupStatsV2`: 72 bytes each
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
@@ -253,7 +253,7 @@ Multiple CATL fragments (one per generation) are merged by `MergedCatalogReader`
 | 56 | 4 B | `flags_any` | OR of all `GenomeMeta.flags` in group |
 | 60 | 12 B | _reserved_ | |
 
-### `GenomeMeta` — 72 bytes each
+### `GenomeMeta`: 72 bytes each
 
 | Offset | Size | Field | Description |
 |--------|------|-------|-------------|
@@ -291,7 +291,7 @@ genome_id  ->  (section_id, dir_index, catl_row_index)
 
 The TOC is an uncompressed array of `SectionDesc` records written directly after a `TocHeader`.
 
-### `SectionDesc` — 112 bytes
+### `SectionDesc`: 112 bytes
 
 Offsets 0..79 are byte-identical to the older GPK2 descriptor; the three GPK3 fields (`derivation_hash`, `semantic_schema_hash`, `header_size`) are appended. A `static_assert(sizeof(SectionDesc) == 112)` enforces the size.
 
@@ -318,9 +318,9 @@ struct SectionDesc {
 
 ### Open sequence
 
-1. `lseek(-64, SEEK_END)` — read the 64-byte `TailLocator`
-2. `lseek(toc_offset, SEEK_SET)` — read and decompress the TOC
-3. Parse `SectionDesc[]` — mmap the entire file
+1. `lseek(-64, SEEK_END)`: read the 64-byte `TailLocator`
+2. `lseek(toc_offset, SEEK_SET)`: read and decompress the TOC
+3. Parse `SectionDesc[]`, then mmap the entire file
 
 ---
 
@@ -349,7 +349,7 @@ Stores L2-normalised k=4 canonical tetranucleotide frequency vectors (136 dimens
 
 ## SKCH section (V4 seekable)
 
-Stores one-permutation-hash (OPH) MinHash signatures used for fast Jaccard estimation. V4 is dual-seed (two parallel sketches per genome at independent seeds), supports multiple k-mer sizes in a single section, and is laid out as zstd-compressed seekable frames so a reader can stream a single frame without decompressing the whole section.
+Stores one-permutation-hash (OPH) MinHash signatures used for Jaccard estimation. V4 is dual-seed (two parallel sketches per genome at independent seeds) and supports multiple k-mer sizes in a single section. Its zstd-compressed seekable frames let a reader stream one frame without decompressing the whole section.
 
 > Backward compatibility: V1/V2/V3 archives are **rejected** by current readers. Use `genopack reindex --skch --force` to rebuild SKCH on legacy archives.
 
@@ -362,7 +362,7 @@ Stores one-permutation-hash (OPH) MinHash signatures used for fast Jaccard estim
 | `seed1` (default) | `42` | Primary OPH seed |
 | `seed2` (default) | `43` | Dual seed (independent second sketch, **not** a densification seed) |
 
-### `SkchSeekHdr` — 96 bytes
+### `SkchSeekHdr`: 96 bytes
 
 | Offset | Size | Field | Description |
 |---|---|---|---|
@@ -379,7 +379,7 @@ Stores one-permutation-hash (OPH) MinHash signatures used for fast Jaccard estim
 | 72  | 8 B  | `seed2`         | Dual seed |
 | 80  | 16 B | _reserved_      | Zero-padded |
 
-### `SkchFrameDesc` — 16 bytes (× `n_frames`)
+### `SkchFrameDesc`: 16 bytes (× `n_frames`)
 
 | Offset | Size | Field | Description |
 |---|---|---|---|
@@ -394,7 +394,7 @@ Stores one-permutation-hash (OPH) MinHash signatures used for fast Jaccard estim
 [SkchFrameDesc       × n_frames                  (16 B each)]
 [uint64_t genome_ids[n_genomes]                          ] ← binary search w/o decompression
 [uint64_t genome_lengths[n_genomes]                      ] ← parallel to genome_ids
-[Frame 0 .. Frame n_frames-1   — independent zstd frames ]
+[Frame 0 .. Frame n_frames-1, independent zstd frames ]
 ```
 
 Each decompressed frame is **planar by k-mer size**:
@@ -410,9 +410,9 @@ Each decompressed frame is **planar by k-mer size**:
 
 ---
 
-# `.gpd` — Geodesic Derep Archive Format v1
+# `.gpd`: Geodesic Derep Archive Format v1
 
-A `.gpd` file is the on-disk artefact produced by [geodesic](https://github.com/genomewalker/geodesic) when it dereplicates a genopack archive set. It is a **single file** (not a directory) and is consumed read-only by genopack via the `DerepView` API. The format is cheap to mmap, reuses genopack's accession universe verbatim, and detects staleness against the source pack without re-running derep.
+A `.gpd` file is the on-disk artefact produced by [geodesic](https://github.com/genomewalker/geodesic) when it dereplicates a genopack archive set. It is a **single file** (not a directory) and is consumed read-only by genopack via the `DerepView` API. The format can be mmaped, reuses genopack's accession universe verbatim, and detects staleness against the source pack without re-running derep.
 
 ## File layout
 
@@ -425,7 +425,7 @@ A `.gpd` file is the on-disk artefact produced by [geodesic](https://github.com/
 
 All multi-byte integers are little-endian; section payloads are 8-byte aligned (zero padding).
 
-### `GpdFileHeader` — 64 bytes (offset 0)
+### `GpdFileHeader`: 64 bytes (offset 0)
 
 | Offset | Size | Field | Description |
 |---|---|---|---|
@@ -436,7 +436,7 @@ All multi-byte integers are little-endian; section payloads are 8-byte aligned (
 | 16 | 8 B  | `toc_size`     | TOC byte size |
 | 24 | 40 B | _reserved_     | Zero-padded |
 
-### `GpdTailLocator` — 16 bytes (last bytes of file)
+### `GpdTailLocator`: 16 bytes (last bytes of file)
 
 | Offset | Size | Field | Description |
 |---|---|---|---|
@@ -458,7 +458,7 @@ All multi-byte integers are little-endian; section payloads are 8-byte aligned (
 | `GCST` | CSTAT| **Reserved / not implemented.** Magic and `has_cstats`/`cstat_offset` slots exist, but the geodesic writer hardcodes `has_cstats = 0` (and `cstat_offset = 0xFFFFFFFF`) and no reader parses it. |
 | `GTOC` | TOC  | Section descriptor table |
 
-Sections may be zstd-compressed (`flags & 1`); the reader decompresses transparently and the TOC carries both compressed and uncompressed sizes.
+Sections may be zstd-compressed (`flags & 1`). The reader decompresses them, and the TOC carries both compressed and uncompressed sizes.
 
 ### `GpdHeader` (HDR section)
 
@@ -468,7 +468,7 @@ struct GpdHeader {
     uint16_t format_major;     // 1
     uint16_t format_minor;     // 0
     uint64_t created_at_unix;
-    uint8_t  run_id[16];       // UUID v4 — unique per derep run
+    uint8_t  run_id[16];       // UUID v4, unique per derep run
     uint16_t n_parts;          // source pack parts at derep time
     uint16_t embedding_dim;    // typically 256
     uint8_t  embedding_dtype;  // 0=f32, 1=f16

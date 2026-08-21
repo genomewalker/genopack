@@ -19,14 +19,14 @@ Produces files compatible with tools that consume the NCBI taxonomy dump (Kraken
 
 ```
 output_dir/
-  names.dmp       — taxid | name | unique_name | name_class |
-  nodes.dmp       — taxid | parent_taxid | rank | ... (NCBI pipe format)
-  acc2taxid.dmp   — accession | accession.version | taxid | gi=0
-  merged.dmp      — empty stub (required by some tools)
-  delnodes.dmp    — empty stub (required by some tools)
+  names.dmp, taxid | name | unique_name | name_class |
+  nodes.dmp, taxid | parent_taxid | rank | ... (NCBI pipe format)
+  acc2taxid.dmp, accession | accession.version | taxid | gi=0
+  merged.dmp, empty stub (required by some tools)
+  delnodes.dmp, empty stub (required by some tools)
 ```
 
-**Rank mapping** — GTDB ranks are mapped to NCBI rank names:
+**Rank mapping:** GTDB ranks are mapped to NCBI rank names:
 
 | GTDB rank | NCBI name |
 |-----------|-----------|
@@ -39,9 +39,9 @@ output_dir/
 | species | species |
 | (intermediate) | no rank |
 
-**Root node** — `taxid=1` is self-referential (`parent=1`) per NCBI convention.
+**Root node:** `taxid=1` is self-referential (`parent=1`) per NCBI convention.
 
-**Taxids** — synthetic integer identifiers assigned by the TXDB builder. They are stable within an archive but are not NCBI taxids.
+**Taxids:** synthetic integer identifiers assigned by the TXDB builder. They are stable within an archive but are not NCBI taxids.
 
 ### Example: building a Kraken2 database from genopack taxonomy
 
@@ -52,14 +52,14 @@ kraken2-build --download-taxonomy --taxonomy-dir ./kraken_taxonomy/
 
 ## Columnar binary format (`-f columnar`)
 
-Designed for applications that need taxonomy without linking the genopack library — a single `mmap` of two small binary files is sufficient.
+Applications can use the taxonomy without linking the genopack library by mmaping two binary files.
 
 ```
 output_dir/
-  acc2taxid.bin   — sorted (hash, taxid) binary array
-  taxnodes.bin    — sorted node records + name pool
-  acc2taxid.tsv   — accession → taxid (tab-separated, human-readable)
-  taxonomy.tsv    — taxid, parent_taxid, rank, name, is_synthetic
+  acc2taxid.bin, sorted (hash, taxid) binary array
+  taxnodes.bin, sorted node records + name pool
+  acc2taxid.tsv, accession → taxid (tab-separated, human-readable)
+  taxonomy.tsv, taxid, parent_taxid, rank, name, is_synthetic
 ```
 
 ### acc2taxid.bin
@@ -69,8 +69,8 @@ Maps accession strings → taxid via FNV-1a-64 hash, sorted ascending. Binary-se
 **Layout:**
 
 ```
-[Acc2TaxidHeader — 32 bytes]
-[Acc2TaxidEntry × n_entries — sorted by acc_hash]
+[Acc2TaxidHeader, 32 bytes]
+[Acc2TaxidEntry × n_entries, sorted by acc_hash]
 ```
 
 ```c
@@ -87,7 +87,7 @@ struct Acc2TaxidEntry {
 };  // 16 bytes, sorted ascending by acc_hash
 ```
 
-**Hash function** — same FNV-1a-64 used by CIDX, so lookup code is shared:
+**Hash function:** the same FNV-1a-64 used by CIDX, so lookup code is shared:
 
 ```c
 uint64_t fnv1a64(const char* s, size_t len) {
@@ -140,9 +140,9 @@ Stores all taxonomy nodes sorted by taxid. Each node has parent, rank, and a poi
 **Layout:**
 
 ```
-[TaxnodesHeader — 32 bytes]
-[TaxnodeEntry × n_nodes — sorted by taxid]
-[name_pool — null-terminated name strings]
+[TaxnodesHeader, 32 bytes]
+[TaxnodeEntry × n_nodes, sorted by taxid]
+[name_pool, null-terminated name strings]
 ```
 
 ```c
@@ -170,8 +170,8 @@ struct TaxnodeEntry {
 |-------|------|
 | 0 | no_rank |
 | 1 | domain |
-| 2 | life (l__ — mOTUs extended format) |
-| 3 | kingdom (k__ — mOTUs extended format) |
+| 2 | life (l__, mOTUs extended format) |
+| 3 | kingdom (k__, mOTUs extended format) |
 | 4 | phylum |
 | 5 | class |
 | 6 | order |
@@ -210,14 +210,14 @@ def get_node(mm, n_nodes, pool_base, taxid: int):
 
 ### TSV sidecars
 
-`acc2taxid.tsv` — tab-separated, one genome per line:
+`acc2taxid.tsv` is tab-separated, with one genome per line:
 ```
 accession	taxid
 GCA_000008085.1	450743105
 GCA_000008885.1	1938317629
 ```
 
-`taxonomy.tsv` — full node table:
+`taxonomy.tsv` contains the full node table:
 ```
 taxid	parent_taxid	rank	name	is_synthetic
 1	1	no_rank	root	0
