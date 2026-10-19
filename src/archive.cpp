@@ -157,10 +157,11 @@ struct ArchiveReader::Impl {
     uint32_t n_shards_    = 0;
 
     // O(1) accession → GenomeId lookup across all ACCX readers (mmap'd hash tables).
+    // Tombstoned genomes are skipped, so a multipart set falls through to the part holding the live copy.
     std::optional<GenomeId> find_accession(std::string_view acc) const {
         for (const auto& r : accx_readers_) {
             auto gid = r.find(acc);
-            if (gid) return gid;
+            if (gid && !is_deleted(*gid)) return gid;
         }
         return std::nullopt;
     }
@@ -1373,7 +1374,9 @@ void ArchiveReader::scan_taxonomy(
     const std::function<void(std::string_view, std::string_view)>& cb) const
 {
     for (const auto& tir : impl_->taxn_readers_)
-        tir.scan(cb);
+        tir.scan([&](std::string_view acc, std::string_view tax) {
+            if (impl_->tombstones_idx_.empty() || impl_->find_accession(acc)) cb(acc, tax);
+        });
 }
 
 std::string ArchiveReader::accession_for_genome_id(GenomeId id) const {
