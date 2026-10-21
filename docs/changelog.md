@@ -9,6 +9,7 @@
 - **`--preserve-taxids`:** accessions with an authoritative NCBI taxid (e.g. organelle host taxids) keep it verbatim, importing the taxid's real NCBI lineage down to a strain leaf. Stale ids remap via `merged.dmp`. On the RefSeq organelle set, accessions matching their authoritative host taxid rose from 98.3% to 99.997%.
 - **`--ncbi-backbone` / `--gtdb-replaces-prok`:** optionally folds the entire NCBI tree in as backbone nodes, excising NCBI's own `Bacteria`/`Archaea` descendants so GTDB stays authoritative for prokaryotes.
 - **Performance:** caches the NCBI taxdump parse in `<dir>/.ncbi_taxdb.cache` (parallel dmp parse, staleness-checked). A 2.1M-accession, 1.6M-node unify runs in ~40 s with the cache.
+- **Fixes:** accession lookup (`find_accession`) and `scan_taxonomy` skip tombstoned genomes, so in a multipart set `extract` reads the live copy in a later part instead of the deleted (empty) one, and taxonomy scans no longer list deleted accessions (`src/archive.cpp`).
 - **Fixes:** `NcbiTaxdb` name parsing dropped every name because a `.dmp` record terminator was left on the last field. Taxdump export flattened all taxids to `1..N`; it now keeps native NCBI ids and renumbers only concept_ids above the maximum NCBI taxid.
 
 ## 1.1.0: 2026-07-18
