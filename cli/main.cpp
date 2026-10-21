@@ -2615,23 +2615,56 @@ struct TaxdumpTree {
     }
 };
 
+// Match the existing dense export assignment, reserving removed concepts when
+// lineage overrides rebuild a tree. Native NCBI IDs always remain native.
+static std::unordered_map<uint64_t, uint64_t> export_taxid_map(const TaxdumpTree& tree) {
+    uint64_t max_ncbi = 1;
+    for (const auto& [tid, v] : tree.nodes) {
+        (void)v;
+        if (!taxid_is_gtdb(tid)) max_ncbi = std::max(max_ncbi, tid);
+    }
+    std::unordered_map<uint64_t, uint64_t> remap;
+    remap.reserve(tree.nodes.size() + 1);
+    uint64_t next_id = max_ncbi + 1;
+    for (const auto& [tid, v] : tree.nodes) {
+        (void)v;
+        remap[tid] = taxid_is_gtdb(tid) ? next_id++ : tid;
+    }
+    return remap;
+}
+
 // Renumber synthetic concept_ids to a dense block above max NCBI taxid (native
 // NCBI ids are preserved) and write the taxonomy in the requested format.
 static int write_taxdump_from_tree(TaxdumpTree& tree,
                                    const std::string& format,
-                                   const std::string& output_dir) {
+                                   const std::string& output_dir,
+                                   const std::unordered_map<uint64_t, uint64_t>* stable_ids = nullptr) {
     // Remap 64-bit synthetic concept_ids (bit63=1) to a dense space so downstream
     // consumers (kaiku's KtaxNode.taxid is int32) don't overflow on the raw hashes.
     // NATIVE NCBI taxids (bit63=0, e.g. Homo sapiens 9606) fit uint32 and are
     // meaningful — they are PRESERVED so exported ids stay recognizable. Synthetic
     // ids are renumbered into a block above the max NCBI taxid so nothing collides.
     {
-        uint64_t max_ncbi = 1;  // root (taxid 1) is native; keep dense block above all NCBI ids
-        for (const auto& [tid, v] : tree.nodes) { (void)v; if (!taxid_is_gtdb(tid)) max_ncbi = std::max(max_ncbi, tid); }
-        std::unordered_map<uint64_t, uint64_t> remap;
-        remap.reserve(tree.nodes.size() + 1);
-        uint64_t next_id = max_ncbi + 1;
-        for (const auto& [tid, v] : tree.nodes) { (void)v; remap[tid] = taxid_is_gtdb(tid) ? next_id++ : tid; }
+        auto remap = export_taxid_map(tree);
+        if (stable_ids && !stable_ids->empty()) {
+            uint64_t next_id = 2;
+            for (const auto& [tid, exported] : *stable_ids) {
+                (void)tid;
+                next_id = std::max(next_id, exported + 1);
+            }
+            for (const auto& [tid, v] : tree.nodes) {
+                (void)v;
+                if (!taxid_is_gtdb(tid)) next_id = std::max(next_id, tid + 1);
+            }
+            for (const auto& [tid, v] : tree.nodes) {
+                (void)v;
+                if (!taxid_is_gtdb(tid)) continue;
+                auto it = stable_ids->find(tid);
+                remap[tid] = it == stable_ids->end() ? next_id++ : it->second;
+                if (tree.nodes.count(remap[tid]))
+                    throw std::runtime_error("Lineage override introduces a native taxid that conflicts with a reserved export taxid");
+            }
+        }
         std::map<uint64_t, std::tuple<uint64_t, TaxRank, std::string, bool>> renumbered;
         for (auto& [tid, v] : tree.nodes) {
             uint64_t par = std::get<0>(v);
@@ -2842,6 +2875,7 @@ static int cmd_taxonomy_unify(const std::vector<std::string>& archives,
                               const std::string& output_dir,
                               const std::string& format,
                               const std::string& preserve_file,
+                              const std::string& lineage_overrides_file,
                               bool ncbi_backbone,
                               bool gtdb_replaces_prok) {
     // Gather every part path, then read their TAXN sections in parallel — unify is
@@ -2888,90 +2922,131 @@ static int cmd_taxonomy_unify(const std::vector<std::string>& archives,
     }
     spdlog::info("taxonomy unify: {} accessions across {} archives", taxonomy_map.size(), archives.size());
 
-    // Normalize away GTDB's domain-propagated l__/k__ placeholder ranks so the
-    // unified tree has one clean backbone (both the tree and the NCBI-override
-    // paths below consume the cleaned strings, keeping them consistent).
-    for (auto& [acc, lin] : taxonomy_map) { (void)acc; lin = strip_propagated_ranks(lin); }
+    // Replace only the in-memory TAXN strings, before either output/backbone path.
+    // Share patch normalization so seven- and ten-rank inputs have identical semantics.
+    std::unordered_map<std::string, std::string> lineage_overrides;
+    if (!lineage_overrides_file.empty()) {
+        std::ifstream in(lineage_overrides_file);
+        if (!in) throw std::runtime_error("Cannot open --lineage-overrides file: " + lineage_overrides_file);
+        std::unordered_set<std::string> seen;
+        std::string line;
+        size_t row = 0;
+        while (std::getline(in, line)) {
+            ++row;
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            const auto tab = line.find('\t');
+            if (tab == std::string::npos || tab == 0 || tab + 1 == line.size() ||
+                line.find('\t', tab + 1) != std::string::npos)
+                throw std::runtime_error("--lineage-overrides: expected accession TAB lineage at row " + std::to_string(row));
+            const auto acc = line.substr(0, tab);
+            if (!seen.insert(acc).second)
+                throw std::runtime_error("--lineage-overrides: duplicate accession: " + acc);
+            auto it = taxonomy_map.find(acc);
+            if (it == taxonomy_map.end())
+                throw std::runtime_error("--lineage-overrides: accession absent from input packs: " + acc);
+            lineage_overrides.emplace(acc, normalize_gtdb_10rank(line.substr(tab + 1), acc));
+        }
+        if (in.bad()) throw std::runtime_error("Error reading --lineage-overrides file: " + lineage_overrides_file);
+        spdlog::info("taxonomy unify: applied {} lineage overrides", seen.size());
+    }
 
     std::unique_ptr<NcbiTaxdb> ncbi;
-    std::unordered_map<std::string, uint64_t> overrides;
-    if (!ncbi_taxdump.empty()) {
-        ncbi = std::make_unique<NcbiTaxdb>(NcbiTaxdb::load(ncbi_taxdump));
-        // taxid PRESERVATION: for accessions with an authoritative NCBI taxid, replace
-        // their lineage with that taxid's real NCBI lineage (real taxids all the way
-        // down, incl strain leaf) so the id is kept verbatim rather than name-derived.
-        std::unordered_map<std::string, uint64_t> preserved;
-        if (!preserve_file.empty()) {
-            auto pm = load_preserve_map(preserve_file);
-            size_t n_pres = 0;
-            for (const auto& [acc, tid] : pm) {
-                if (!taxonomy_map.count(acc)) continue;           // only accessions we actually have
-                auto pts = ncbi->canonical_path_taxids(tid);
-                if (pts.empty()) continue;
-                taxonomy_map[acc] = pts.back().first;             // authoritative NCBI lineage
-                for (const auto& [path, ptid] : pts) preserved[path] = ptid;
-                ++n_pres;
+    if (!ncbi_taxdump.empty()) ncbi = std::make_unique<NcbiTaxdb>(NcbiTaxdb::load(ncbi_taxdump));
+    auto build_tree = [&]() {
+        // Normalize away GTDB's domain-propagated l__/k__ placeholder ranks so the
+        // unified tree has one clean backbone (both the tree and the NCBI-override
+        // paths below consume the cleaned strings, keeping them consistent).
+        for (auto& [acc, lin] : taxonomy_map) { (void)acc; lin = strip_propagated_ranks(lin); }
+
+        std::unordered_map<std::string, uint64_t> overrides;
+        if (!ncbi_taxdump.empty()) {
+            // taxid PRESERVATION: for accessions with an authoritative NCBI taxid, replace
+            // their lineage with that taxid's real NCBI lineage (real taxids all the way
+            // down, incl strain leaf) so the id is kept verbatim rather than name-derived.
+            std::unordered_map<std::string, uint64_t> preserved;
+            if (!preserve_file.empty()) {
+                auto pm = load_preserve_map(preserve_file);
+                size_t n_pres = 0;
+                for (const auto& [acc, tid] : pm) {
+                    if (!taxonomy_map.count(acc)) continue;           // only accessions we actually have
+                    auto pts = ncbi->canonical_path_taxids(tid);
+                    if (pts.empty()) continue;
+                    taxonomy_map[acc] = pts.back().first;             // authoritative NCBI lineage
+                    for (const auto& [path, ptid] : pts) preserved[path] = ptid;
+                    ++n_pres;
+                }
+                spdlog::info("taxid preservation: {} accessions pinned to authoritative NCBI taxids ({} paths)",
+                             n_pres, preserved.size());
             }
-            spdlog::info("taxid preservation: {} accessions pinned to authoritative NCBI taxids ({} paths)",
-                         n_pres, preserved.size());
+            // name-resolution over the (now partially-preserved) lineages, then let
+            // preserved paths win (authoritative id beats name-derived).
+            overrides = build_ncbi_taxid_overrides(*ncbi, taxonomy_map);
+            for (const auto& [path, tid] : preserved) overrides[path] = tid;
         }
-        // name-resolution over the (now partially-preserved) lineages, then let
-        // preserved paths win (authoritative id beats name-derived).
-        overrides = build_ncbi_taxid_overrides(*ncbi, taxonomy_map);
-        for (const auto& [path, tid] : preserved) overrides[path] = tid;
-    }
 
-    // Add entries in a stable (accession-sorted) order so the tree is DETERMINISTIC
-    // regardless of read/hash-map order — otherwise concept_id collision-resolution
-    // and homonym override races (two paths competing for one NCBI taxid) would make
-    // the output depend on thread scheduling.
-    TxdbWriter txw;
-    {
-        std::vector<const std::pair<const std::string, std::string>*> ordered;
-        ordered.reserve(taxonomy_map.size());
-        for (const auto& kv : taxonomy_map) ordered.push_back(&kv);
-        std::sort(ordered.begin(), ordered.end(),
-                  [](auto* a, auto* b){ return a->first < b->first; });
-        for (auto* kv : ordered) txw.add(kv->first, kv->second);
-    }
-    if (!overrides.empty()) txw.set_ncbi_overrides(std::move(overrides));
-    TaxonomyTree unified = txw.build_tree();
-
-    TaxdumpTree tree;
-    unified.scan_nodes([&](uint64_t taxid, uint64_t parent, TaxRank rank,
-                           std::string_view name, bool synthetic) {
-        tree.nodes.emplace(taxid, std::make_tuple(parent, rank, std::string(name), synthetic));
-    });
-    unified.scan_accessions([&](std::string_view acc, uint64_t taxid) {
-        tree.accs.emplace_back(std::string(acc), taxid);
-    });
-
-    // Optional full-NCBI backbone: fold the entire NCBI tree in as nodes (real
-    // taxids), so taxa with no reference genome still exist in the scaffold. With
-    // --gtdb-replaces-prok, NCBI's own Bacteria/Archaea descendants are EXCISED
-    // (anchors 2/2157 kept) so GTDB — already grafted under those anchors — stays
-    // authoritative for prokaryotes and nothing is double-counted. The backbone is
-    // authoritative for the structure of native NCBI nodes; pack concept_ids (GTDB
-    // divergences, viral vOTUs) keep their graft under the anchors.
-    if (ncbi_backbone && ncbi) {
-        std::unordered_set<uint64_t> excised;
-        if (gtdb_replaces_prok) {
-            auto d = ncbi->descendants_including({2, 2157});
-            d.erase(2); d.erase(2157);                 // keep the anchors themselves
-            for (int t : d) excised.insert(static_cast<uint64_t>(t));
+        // Add entries in a stable (accession-sorted) order so the tree is DETERMINISTIC
+        // regardless of read/hash-map order — otherwise concept_id collision-resolution
+        // and homonym override races (two paths competing for one NCBI taxid) would make
+        // the output depend on thread scheduling.
+        TxdbWriter txw;
+        {
+            std::vector<const std::pair<const std::string, std::string>*> ordered;
+            ordered.reserve(taxonomy_map.size());
+            for (const auto& kv : taxonomy_map) ordered.push_back(&kv);
+            std::sort(ordered.begin(), ordered.end(),
+                      [](auto* a, auto* b){ return a->first < b->first; });
+            for (auto* kv : ordered) txw.add(kv->first, kv->second);
         }
-        size_t added = 0, skipped = 0;
-        ncbi->for_each_node([&](int taxid, int parent, const std::string& rank, const std::string& name) {
-            if (excised.count(static_cast<uint64_t>(taxid))) { ++skipped; return; }
-            tree.nodes[static_cast<uint64_t>(taxid)] =
-                std::make_tuple(static_cast<uint64_t>(parent), ncbi_rank_to_taxrank(rank),
-                                name.empty() ? std::to_string(taxid) : name, false);
-            ++added;
+        if (!overrides.empty()) txw.set_ncbi_overrides(std::move(overrides));
+        TaxonomyTree unified = txw.build_tree();
+
+        TaxdumpTree tree;
+        unified.scan_nodes([&](uint64_t taxid, uint64_t parent, TaxRank rank,
+                               std::string_view name, bool synthetic) {
+            tree.nodes.emplace(taxid, std::make_tuple(parent, rank, std::string(name), synthetic));
         });
-        spdlog::info("ncbi-backbone: imported {} NCBI nodes ({} prokaryote nodes excised for GTDB)",
-                     added, skipped);
+        unified.scan_accessions([&](std::string_view acc, uint64_t taxid) {
+            tree.accs.emplace_back(std::string(acc), taxid);
+        });
+
+        // Optional full-NCBI backbone: fold the entire NCBI tree in as nodes (real
+        // taxids), so taxa with no reference genome still exist in the scaffold. With
+        // --gtdb-replaces-prok, NCBI's own Bacteria/Archaea descendants are EXCISED
+        // (anchors 2/2157 kept) so GTDB — already grafted under those anchors — stays
+        // authoritative for prokaryotes and nothing is double-counted. The backbone is
+        // authoritative for the structure of native NCBI nodes; pack concept_ids (GTDB
+        // divergences, viral vOTUs) keep their graft under the anchors.
+        if (ncbi_backbone && ncbi) {
+            std::unordered_set<uint64_t> excised;
+            if (gtdb_replaces_prok) {
+                auto d = ncbi->descendants_including({2, 2157});
+                d.erase(2); d.erase(2157);                 // keep the anchors themselves
+                for (int t : d) excised.insert(static_cast<uint64_t>(t));
+            }
+            size_t added = 0, skipped = 0;
+            ncbi->for_each_node([&](int taxid, int parent, const std::string& rank, const std::string& name) {
+                if (excised.count(static_cast<uint64_t>(taxid))) { ++skipped; return; }
+                tree.nodes[static_cast<uint64_t>(taxid)] =
+                    std::make_tuple(static_cast<uint64_t>(parent), ncbi_rank_to_taxrank(rank),
+                                    name.empty() ? std::to_string(taxid) : name, false);
+                ++added;
+            });
+            spdlog::info("ncbi-backbone: imported {} NCBI nodes ({} prokaryote nodes excised for GTDB)",
+                         added, skipped);
+        }
+        return tree;
+    };
+
+    // Reserve the original export IDs, including IDs of nodes that disappear.
+    // New concepts append after that block; surviving concepts keep their IDs.
+    std::unordered_map<uint64_t, uint64_t> stable_ids;
+    if (!lineage_overrides.empty()) {
+        auto original_tree = build_tree();
+        stable_ids = export_taxid_map(original_tree);
+        for (const auto& [acc, lineage] : lineage_overrides) taxonomy_map.at(acc) = lineage;
     }
-    return write_taxdump_from_tree(tree, format, output_dir);
+    auto tree = build_tree();
+    return write_taxdump_from_tree(tree, format, output_dir, &stable_ids);
 }
 
 static int cmd_taxdump(const std::string& archive_path,
@@ -4628,6 +4703,11 @@ int main(int argc, char** argv) {
     tax_unify->add_option("-o,--output", unify_output, "Output directory")->required();
     tax_unify->add_option("-f,--format", unify_format,
         "Output format: 'taxdump' (NCBI names/nodes/acc2taxid.dmp, default) or 'columnar' (binary + TSV)");
+    std::string unify_lineage_overrides;
+    tax_unify->add_option("--lineage-overrides", unify_lineage_overrides,
+        "Two-column accession TAB lineage TSV: replace pack TAXN lineages at read time. "
+        "GTDB 7-rank lineages are normalized as in taxonomy patch; 10-rank lineages are retained. "
+        "Duplicate or absent accessions are errors.");
     std::string unify_preserve;
     tax_unify->add_option("--preserve-taxids", unify_preserve,
         "TSV of accession -> authoritative NCBI taxid (2-col, or headered accession/taxid|host_taxid). "
@@ -4643,7 +4723,7 @@ int main(int argc, char** argv) {
         "so GTDB stays authoritative for prokaryotes and NCBI+GTDB bacteria aren't double-counted.");
     tax_unify->callback([&]() {
         std::exit(cmd_taxonomy_unify(unify_inputs, unify_ncbi, unify_output, unify_format,
-                                     unify_preserve, unify_backbone, unify_replace_prok));
+                                     unify_preserve, unify_lineage_overrides, unify_backbone, unify_replace_prok));
     });
 
     // genopack reindex

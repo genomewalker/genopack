@@ -342,3 +342,8 @@ endif()
 install(TARGETS genopack DESTINATION bin)
 install(TARGETS genopack_lib genopack_shared DESTINATION lib)
 install(DIRECTORY include/genopack DESTINATION include)
+
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_test(NAME genopack-unify-lineage-override
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/unify_lineage_override.py
+          $<TARGET_FILE:genopack> ${CMAKE_CURRENT_BINARY_DIR})
