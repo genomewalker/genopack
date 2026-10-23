@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <thread>
@@ -30,6 +31,12 @@ PcoreSpillWriter::PcoreSpillWriter(std::filesystem::path spill_dir, int buf_tupl
       parts_(new Part[N_PARTS])
 {
     std::filesystem::create_directories(spill_dir_);
+    // A private subdirectory per writer: builds sharing a spill dir (the /tmp default,
+    // or one NFS dir across nodes) would otherwise truncate each other's pspill files.
+    std::string own = (spill_dir_ / "pspill_XXXXXX").string();
+    if (!::mkdtemp(own.data()))
+        throw std::runtime_error("pcore_spiller: cannot create a spill dir in " + spill_dir_.string());
+    spill_dir_ = own;
     // Pin the Part headers (229 KB) so they survive the high-memory shard-write
     // phase without being paged out.  finalize() would otherwise take 1-2 s on
     // page-faults when first touching each Part struct.  Ignore failure gracefully.
@@ -216,6 +223,8 @@ void PcoreSpillWriter::cleanup() {
         if (p.fp) { std::fclose(p.fp); p.fp = nullptr; }
         if (p.file_exists) std::remove(p.path.c_str());
     }
+    std::error_code ec;
+    std::filesystem::remove(spill_dir_, ec);
 }
 
 } // namespace genopack

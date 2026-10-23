@@ -245,6 +245,10 @@ add_executable(genopack_skani_af_test tests/skani_af.cpp)
 target_link_libraries(genopack_skani_af_test PRIVATE genopack_lib)
 add_test(NAME genopack-skani-af COMMAND genopack_skani_af_test)
 
+add_executable(genopack_pcore_spill_shared_dir_test tests/pcore_spill_shared_dir.cpp)
+target_link_libraries(genopack_pcore_spill_shared_dir_test PRIVATE genopack_lib)
+add_test(NAME genopack-pcore-spill-shared-dir COMMAND genopack_pcore_spill_shared_dir_test)
+
 add_executable(genopack_mem_delta_test tests/mem_delta.cpp)
 target_link_libraries(genopack_mem_delta_test PRIVATE genopack_lib)
 target_compile_definitions(genopack_mem_delta_test PRIVATE GENOPACK_BIN="$<TARGET_FILE:genopack>")
@@ -371,6 +375,9 @@ add_test(NAME genopack-reindex-syncmer-inherit
 add_test(NAME genopack-sketch-kmers-single
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/sketch_kmers_single.py
           $<TARGET_FILE:genopack> ${CMAKE_CURRENT_BINARY_DIR})
+add_test(NAME genopack-concurrent-builds
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/concurrent_builds.py
+          $<TARGET_FILE:genopack> ${CMAKE_CURRENT_BINARY_DIR})
 set_tests_properties(genopack-dedup-sequence-confirm genopack-reindex-singleton-species
-  genopack-reindex-syncmer-inherit genopack-sketch-kmers-single
+  genopack-reindex-syncmer-inherit genopack-sketch-kmers-single genopack-concurrent-builds
   PROPERTIES ENVIRONMENT PYTHONDONTWRITEBYTECODE=1)
