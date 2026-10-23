@@ -347,3 +347,6 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 add_test(NAME genopack-unify-lineage-override
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/unify_lineage_override.py
           $<TARGET_FILE:genopack> ${CMAKE_CURRENT_BINARY_DIR})
+add_test(NAME genopack-unify-stable-taxids
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/unify_stable_taxids.py
+          $<TARGET_FILE:genopack> ${CMAKE_CURRENT_BINARY_DIR})

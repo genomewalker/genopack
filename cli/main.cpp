@@ -2638,7 +2638,8 @@ static std::unordered_map<uint64_t, uint64_t> export_taxid_map(const TaxdumpTree
 static int write_taxdump_from_tree(TaxdumpTree& tree,
                                    const std::string& format,
                                    const std::string& output_dir,
-                                   const std::unordered_map<uint64_t, uint64_t>* stable_ids = nullptr) {
+                                   const std::unordered_map<uint64_t, uint64_t>* stable_ids = nullptr,
+                                   uint64_t id_floor = 0) {
     // Remap 64-bit synthetic concept_ids (bit63=1) to a dense space so downstream
     // consumers (kaiku's KtaxNode.taxid is int32) don't overflow on the raw hashes.
     // NATIVE NCBI taxids (bit63=0, e.g. Homo sapiens 9606) fit uint32 and are
@@ -2647,7 +2648,7 @@ static int write_taxdump_from_tree(TaxdumpTree& tree,
     {
         auto remap = export_taxid_map(tree);
         if (stable_ids && !stable_ids->empty()) {
-            uint64_t next_id = 2;
+            uint64_t next_id = std::max<uint64_t>(2, id_floor);
             for (const auto& [tid, exported] : *stable_ids) {
                 (void)tid;
                 next_id = std::max(next_id, exported + 1);
@@ -2877,7 +2878,8 @@ static int cmd_taxonomy_unify(const std::vector<std::string>& archives,
                               const std::string& preserve_file,
                               const std::string& lineage_overrides_file,
                               bool ncbi_backbone,
-                              bool gtdb_replaces_prok) {
+                              bool gtdb_replaces_prok,
+                              const std::string& stable_from) {
     // Gather every part path, then read their TAXN sections in parallel — unify is
     // I/O-bound decompressing TAXN out of large packs (metavr.gpk is ~100GB), so
     // overlapping the per-part reads is the dominant win.
@@ -3037,9 +3039,59 @@ static int cmd_taxonomy_unify(const std::vector<std::string>& archives,
         return tree;
     };
 
+    // Pin to a prior export: every synthetic node whose full (rank, name) path from
+    // the root exists in the prior taxonomy.tsv keeps that taxid; new nodes get ids
+    // above the prior maximum, so a retired id is never reissued.
+    std::unordered_map<uint64_t, uint64_t> stable_ids;
+    if (!stable_from.empty()) {
+        for (const auto& [acc, lineage] : lineage_overrides) taxonomy_map.at(acc) = lineage;
+        auto tree = build_tree();
+        std::ifstream in(stable_from);
+        if (!in) throw std::runtime_error("Cannot open --stable-taxids-from file: " + stable_from);
+        std::unordered_map<uint64_t, std::tuple<uint64_t, std::string, std::string>> prior;
+        std::string line;
+        std::getline(in, line);
+        while (std::getline(in, line)) {
+            std::array<std::string, 4> f; size_t p = 0;
+            for (auto& x : f) { size_t t = line.find('\t', p); x = line.substr(p, t - p); p = t + 1; }
+            prior.emplace(std::stoull(f[0]), std::make_tuple(std::stoull(f[1]), f[2], f[3]));
+        }
+        uint64_t id_floor = 0;
+        for (const auto& [tid, v] : prior) { (void)v; id_floor = std::max(id_floor, tid + 1); }
+        auto path_keys = [](const auto& nodes, auto parent_of, auto label_of) {
+            std::unordered_map<uint64_t, std::string> key;
+            std::function<const std::string&(uint64_t)> k = [&](uint64_t t) -> const std::string& {
+                auto it = key.find(t);
+                if (it != key.end()) return it->second;
+                uint64_t par = parent_of(nodes.at(t));
+                std::string s = (par == 0 || par == t || !nodes.count(par)) ? std::string() : k(par) + '\x1f';
+                return key[t] = s + label_of(nodes.at(t));
+            };
+            for (const auto& [t, v] : nodes) { (void)v; k(t); }
+            return key;
+        };
+        auto old_keys = path_keys(prior, [](const auto& v) { return std::get<0>(v); },
+                                  [](const auto& v) { return std::get<1>(v) + '\x1e' + std::get<2>(v); });
+        std::unordered_map<std::string, uint64_t> by_path;
+        size_t ambiguous = 0;
+        for (const auto& [t, key] : old_keys)
+            if (!by_path.emplace(key, t).second) { by_path[key] = 0; ++ambiguous; }
+        auto new_keys = path_keys(tree.nodes, [](const auto& v) { return std::get<0>(v); },
+                                  [](const auto& v) { return std::string(rank_name_gtdb(std::get<1>(v))) + '\x1e' + std::get<2>(v); });
+        size_t synthetic = 0;
+        for (const auto& [t, key] : new_keys) {
+            if (!taxid_is_gtdb(t)) continue;
+            ++synthetic;
+            auto it = by_path.find(key);
+            if (it != by_path.end() && it->second) stable_ids[t] = it->second;
+        }
+        spdlog::info("stable taxids: {} of {} synthetic nodes keep their prior taxid; {} new from {}; "
+                     "{} ambiguous prior paths", stable_ids.size(), synthetic, synthetic - stable_ids.size(),
+                     id_floor, ambiguous);
+        return write_taxdump_from_tree(tree, format, output_dir, &stable_ids, id_floor);
+    }
     // Reserve the original export IDs, including IDs of nodes that disappear.
     // New concepts append after that block; surviving concepts keep their IDs.
-    std::unordered_map<uint64_t, uint64_t> stable_ids;
     if (!lineage_overrides.empty()) {
         auto original_tree = build_tree();
         stable_ids = export_taxid_map(original_tree);
@@ -4721,9 +4773,14 @@ int main(int argc, char** argv) {
     tax_unify->add_flag("--gtdb-replaces-prok", unify_replace_prok,
         "With --ncbi-backbone: EXCISE NCBI's own Bacteria(2)/Archaea(2157) descendants (anchors kept) "
         "so GTDB stays authoritative for prokaryotes and NCBI+GTDB bacteria aren't double-counted.");
+    std::string unify_stable_from;
+    tax_unify->add_option("--stable-taxids-from", unify_stable_from,
+        "A prior unify output's columnar taxonomy.tsv. Synthetic nodes whose full (rank, name) path "
+        "exists there keep that taxid; new nodes are numbered above its maximum taxid.");
     tax_unify->callback([&]() {
         std::exit(cmd_taxonomy_unify(unify_inputs, unify_ncbi, unify_output, unify_format,
-                                     unify_preserve, unify_lineage_overrides, unify_backbone, unify_replace_prok));
+                                     unify_preserve, unify_lineage_overrides, unify_backbone, unify_replace_prok,
+                                     unify_stable_from));
     });
 
     // genopack reindex
