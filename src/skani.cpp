@@ -264,12 +264,17 @@ SkaniResult compute_ani(const SkaniSketch& a, const SkaniSketch& b, int k) {
 
     res.c_ab = double(isect) / double(a.hashes.size());
     res.c_ba = double(isect) / double(b.hashes.size());
-    res.af   = std::max(res.c_ab, res.c_ba);
 
-    double max_c = res.af;
+    const double max_c = std::max(res.c_ab, res.c_ba);
     if (max_c <= 0.0) { res.ani = 0.0; return res; }
 
     res.ani = std::pow(max_c, 1.0 / k) * 100.0;
+    // Containment folds identity into coverage (c ~ AF x identity^k), so read raw it
+    // understates skani's aligned fraction. Scaled so skani's GTDB cut AF >= 0.5 falls
+    // at c = 0.405: fitted on r232 family 49546, held on 4881357 and 216572
+    // (precision >= 0.993, recall >= 0.970 vs skani). ceiling: fitted for k=21, c=125;
+    // other sketch settings need a refit; upgrade: estimate AF from positional anchors.
+    res.af = std::min(1.0, max_c / (0.405 / 0.5));
     return res;
 }
 

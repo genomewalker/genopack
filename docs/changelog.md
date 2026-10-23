@@ -4,6 +4,10 @@
 
 ## Unreleased
 
+### ANI
+
+- `compute_ani` reports `af` as containment scaled so skani's GTDB cut (AF >= 0.5) falls at containment 0.405, capped at 1. Before, `af` was the raw containment, which also carries identity (c ~ AF x identity^k), so ANI >= 95 and AF >= 0.5 behaved like ANI >= 96.75 and missed 6-12% of skani's GTDB pairs. Against skani on r232 families 49546, 4881357 and 216572, recall went from 0.918, 0.942 and 0.877 to 0.980, 0.984 and 0.970; precision went from 1.000 to 0.990, 0.997 and 0.993. ANI, `c_ab` and `c_ba` are unchanged. Fitted for k=21, c=125. Check: `tests/skani_af.cpp`.
+
 ### Open
 
 - `ArchiveReader::open` reads every CATL, ACCX, GIDX, QCOL and TAXN section with large preads before walking them. Before, they were faulted in a page at a time through the `MADV_RANDOM` mmap. On the r232 reps pack (12 parts) at dandycomp01fl, geodesic's pack open went from 20.5 s to 3.0 s cold. A single-genome `genopack extract` went from 12.9-27.4 s to 1.7-2.4 s (3 interleaved rounds each, identical FASTA). Check: `tests/open_prefetch.cpp`.

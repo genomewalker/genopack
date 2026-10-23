@@ -241,6 +241,10 @@ target_link_libraries(genopack_open_prefetch_test PRIVATE genopack_lib)
 target_compile_definitions(genopack_open_prefetch_test PRIVATE GENOPACK_BIN="$<TARGET_FILE:genopack>")
 add_test(NAME genopack-open-prefetch COMMAND genopack_open_prefetch_test)
 
+add_executable(genopack_skani_af_test tests/skani_af.cpp)
+target_link_libraries(genopack_skani_af_test PRIVATE genopack_lib)
+add_test(NAME genopack-skani-af COMMAND genopack_skani_af_test)
+
 add_executable(genopack_mem_delta_test tests/mem_delta.cpp)
 target_link_libraries(genopack_mem_delta_test PRIVATE genopack_lib)
 target_compile_definitions(genopack_mem_delta_test PRIVATE GENOPACK_BIN="$<TARGET_FILE:genopack>")
