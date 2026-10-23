@@ -1,6 +1,26 @@
 # Changelog
 
+> Status as of 2026-10-23: Unreleased covers main up to 43238fc. Entries for features merged after 1.1.0 that were missing (2026-07-19 to 2026-08-13) were added under "Commands and flags".
+
 ## Unreleased
+
+### Unified taxonomy: stable taxids
+
+- **`taxonomy unify --stable-taxids-from <prior>/taxonomy.tsv`** (7887ad4): synthetic nodes whose full (rank, name) path exists in a prior unify's columnar `taxonomy.tsv` keep that taxid; new nodes are numbered above its maximum. Without it, export ids follow concept-hash order and a reunify after renaming 464,051 species reused 1,215,247 prior taxids for other taxa. Pass it on every reunify of a released taxonomy.
+- **`taxonomy unify --lineage-overrides <tsv>`** (834573a): replaces listed accessions' pack TAXN lineages at read time. Duplicate or absent accessions are errors.
+- **Unify fails on shared taxids** (365e976): export throws if two nodes would receive one stable or export taxid, instead of silently dropping the second.
+
+### Quality
+
+- **`quality_score` QCOL column** (f88d727, merged ad3be6f): the continuous completeness-only score is stored in QCOL (axis `support`, unit `Fraction01`, U16, 0 = not scored), readable via `ArchiveReader::qcol_reader()`.
+
+### Commands and flags
+
+- **`subset`** (490b34d): copy-only accession subset of an archive or multipart directory; no source FASTA or re-sketching.
+- **`extract --concat-contigs`** (a9e61cd) and **`--nmask`** (d1e0bd4): one N-joined record per genome, with a kaiku `KNMASK01` side file.
+- **`neighbors`** (eb4228c): a priori nearest-in-DB member per query from derep `.gpd` clusters.
+- **`pcore` bootstrap** (7e6b310): archives without `SEC_CORE` build PCORE from `--theta` / `--min-seg-aa` / `--frac-max-hash` instead of being skipped.
+- **`taxonomy partition --contiguous` / `--cap`** (3bd0840): taxonomy-contiguous part filling with a per-group size cap.
 
 ### Unified taxonomy
 
@@ -38,17 +58,17 @@
 
 ## 1.0.0: 2026-05-10
 
-- **Directory archive layout**: `.gpk` is now a directory of section files plus `toc.bin`. Single-file `.gpk` archives are no longer produced; section binary structures (CATL, GIDX, ACCX, …) are unchanged.
+- **Directory archive layout**: `.gpk` is now a directory of section files plus `toc.bin`. Single-file `.gpk` archives are no longer produced; section binary structures (CATL, GIDX, ACCX, …) are unchanged. *(Corrected 2026-10-23: current builders write a single `.gpk` file and `ArchiveReader` maps one file; see [Format](format.md).)*
 - **Multipart sets via `ArchiveSetReader`**: open a directory of `part_*.gpk` archives as one set. Per-accession routing across parts, aggregated stats, multipart-aware `extract` / `fetch_by_accession` / `batch_fetch` / `fetch_sequence_slice` / `taxonomy_for_accession`. `LocatedGenomeMeta` carries `(part_index, part_path)` so callers can disambiguate part-local `genome_id` values that may collide across parts.
 - **SKCH V4 (seekable, dual-seed, multi-k)**: replaces V1/V2/V3 (now hard-rejected). 96-byte `SkchSeekHdr`, 16-byte `SkchFrameDesc`, 16 384 genomes per zstd-compressed frame, planar (n_real_bins / sigs1 / sigs2 / masks) with seeds default 42/43, up to 8 k-mer sizes (`--sketch-kmers 16,21,31`).
 - **`.gpd` Geodesic Derep Archive Format v1** + `DerepView` reader: representatives, rep-only embedding matrix (default f16), `accession_set_hash` (xxh3-64 of sorted live accessions joined with `\n`), staleness levels (`Valid` / `LayoutChangedSameLiveSet` / `StaleNewGenomes` / `StaleTombstones` / `Mismatch`).
-- **NTDB section**: optional embedded NCBI `nodes.dmp` + `names.dmp` (zstd) for offline taxid resolution; built by `coordinator --ntdb DIR`.
+- **NTDB section**: optional embedded NCBI `nodes.dmp` + `names.dmp` (zstd) for offline taxid resolution; built by `coordinator --ntdb DIR`. *(Removed 2026-07-09 in be1b440; current archives have no NTDB section and `coordinator` has no `--ntdb`.)*
 - **`inspect` subcommand**: reports SKCH layout (V3 vs V4 seekable, `n_kmers`, `sketch_size`, frame size, dual-seed presence) and preload memory cost. Accepts a single archive or a multipart directory.
 - **`taxonomy` subcommand group**: replaces the single `genopack taxonomy` invocation with `show` / `normalize` / `partition` / `assign-taxids` / `diff` / `patch` (the last accepts GTDB-Tk classify_summary directly via `--gtdbtk`).
-- **`coordinator --ntdb`**: NFS-coordinated distributed build can now embed an NTDB section in the merged archive.
+- **`coordinator --ntdb`**: NFS-coordinated distributed build can now embed an NTDB section in the merged archive. *(Removed in be1b440.)*
 - **`reindex` extended**: `--force`, `--no-gidx`, `--txdb`, `--cidx FILE` (+ `--cidx-threads`), `--skch` with full `--sketch-kmer(s)` / `--sketch-size` / `--sketch-syncmer` (+ `--skch-threads`). Use `--skch --force` to upgrade legacy SKCH layouts to V4 in place.
 - **`dedup` is now in-place**: tombstones duplicate genomes by content hash directly in the archive (`--dry-run` to preview); physical bytes reclaimed only by `repack`.
-- **CLI surface trimmed**: `genopack similar` and `genopack cidx` removed. The functionality remains in the C++ API (`ArchiveReader::find_similar` / `find_similar_by_accession` / `find_contig_genome_id`); HNSW is no longer built by default and is library-only.
+- **CLI surface trimmed**: `genopack similar` and `genopack cidx` removed. The functionality remains in the C++ API (`ArchiveReader::find_similar` / `find_similar_by_accession` / `find_contig_genome_id`); HNSW is no longer built by default and is library-only. *(Corrected 2026-10-23: `ArchiveReader` has no `find_similar`; only the HNSW section reader had one, and HNSW was removed in be1b440. Rank KMRX profiles with `cosine_similarity`.)*
 - **Default build flags**: `--taxon-group` and `--taxon-rank` (genus) are on by default. `build` uses `taxon-rank`, while `repack` uses the separate `--taxonomy-rank` option.
 - **`stat --json` and multipart support**: `stat` accepts either a single archive directory or a multipart set; `--json` emits machine-readable output.
 - **`repack` command**: two-pass taxonomy-grouped reshard for fast per-taxon NFS access

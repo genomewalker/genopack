@@ -1,5 +1,9 @@
 # `.gpd` — Geodesic Derep Archive Format v1
 
+> Status as of 2026-10-23: checked against `src/derep_view.cpp` and `include/genopack/derep_view.hpp`. The optional CSTAT
+> (cluster stats) section is specified below but **not implemented**: the reader defines no `GPD_SEC_CST`, the HDR byte
+> once named `has_cstats` is padding, and `GpdRepEntry.cstat_offset` is an unused `reserved` field.
+
 A `.gpd` file is the canonical artifact of a geodesic dereplication run.
 It is a self-contained binary archive that answers, for every genome in
 the input pack: "is this a representative? if not, who is? what is the
@@ -25,7 +29,7 @@ A `.gpd` is a **single file**, not a directory:
 
 ```
 [FileHeader  64B]
-[Section blobs  ...] (HDR, ASTR, ASOF, ARMP, RTBL, G2RM, EMBD, [CSTAT])
+[Section blobs  ...] (HDR, ASTR, ASOF, ARMP, RTBL, G2RM, EMBD)
 [TOC               ]
 [TailLocator 16B   ]
 ```
@@ -67,7 +71,7 @@ constexpr uint32_t GPD_SEC_ARM  = 0x4D524147u; // 'GARM'  accession hash map (op
 constexpr uint32_t GPD_SEC_RTB  = 0x42545247u; // 'GRTB'  rep table
 constexpr uint32_t GPD_SEC_G2R  = 0x4D523247u; // 'G2RM'  genome→rep map
 constexpr uint32_t GPD_SEC_EMB  = 0x424D4547u; // 'GEMB'  embeddings
-constexpr uint32_t GPD_SEC_CST  = 0x54534347u; // 'GCST'  cluster stats (optional)
+// GPD_SEC_CST = 0x54534347u ('GCST', cluster stats) is reserved; not implemented
 constexpr uint32_t GPD_SEC_TOC  = 0x434F5447u; // 'GTOC'
 ```
 
@@ -110,8 +114,7 @@ struct GpdHeader {
     uint16_t n_parts;          // source pack parts at derep time
     uint16_t embedding_dim;    // typically 256
     uint8_t  embedding_dtype;  // 0=float32, 1=float16
-    uint8_t  has_cstats;       // 1 if CSTAT section is present
-    uint8_t  pad0[2];
+    uint8_t  pad0[3];          // reserved, always 0
     uint64_t n_genomes;        // total genomes covered (= sum of part live_counts)
     uint64_t n_reps;
     uint64_t n_unclustered;
@@ -194,7 +197,7 @@ Verify by comparing accession string at the candidate ordinal.
 For 5M genomes × 7M buckets × 16 bytes = ~110 MB. Compressed to ~40 MB
 with zstd.
 
-If absent (older writers, or `--no-armp` flag), reader falls back to
+If absent (older writers, or a writer configured with `emit_armp = false`), reader falls back to
 ASOF binary search.
 
 ## RTBL section — rep table
@@ -210,7 +213,7 @@ struct GpdRepEntry {           // 24 bytes
     uint16_t sketch_kmer;      // which k-mer size produced the winning sketch
     uint8_t  flags;            // bit0=has_embedding(must be 1 in v1)
     uint8_t  pad;
-    uint32_t cstat_offset;     // index into CSTAT, or 0xFFFFFFFF if absent
+    uint32_t reserved;         // unused (was cstat_offset; CSTAT not implemented)
 } entries[n_reps];
 ```
 
@@ -247,10 +250,10 @@ uint32_t pad1;
 ```
 
 Default dtype is **f16** (270 MB for 546k×256). Loss is acceptable for
-cosine search; mapping pipelines that need f32 can request via
-`derep --embedding-dtype f32` at write time.
+cosine search. geodesic always writes f16 (`src/pipeline.cpp`, geodesic bb95d09); f32 is
+readable but there is no CLI option to request it.
 
-## CSTAT section — cluster stats (optional)
+## CSTAT section — cluster stats (reserved, not implemented)
 
 ```c
 uint32_t magic = 'GCST';
@@ -265,7 +268,7 @@ struct GpdClusterStat {        // 12 bytes
 } stats[n_entries];
 ```
 
-Optional. Used for QC reports; mapping pipelines ignore.
+Not implemented: no writer or reader exists in genopack (2026-10-23). The layout is kept as a reservation for a future QC-report section.
 
 ## Public API (genopack)
 
@@ -363,7 +366,6 @@ struct DerepArchiveBuilderConfig {
     uint16_t              embedding_dim;
     uint8_t               embedding_dtype; // 0=f32, 1=f16
     bool                  emit_armp = true;
-    bool                  emit_cstat = false;
     int                   zstd_level = 19;
     std::string           geodesic_version;
 };

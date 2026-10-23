@@ -1,8 +1,10 @@
 # genopack
 
+> Status as of 2026-10-23: a `.gpk` is a single file (multipart sets are directories of `part_*.gpk`); see the [changelog](changelog.md) for unreleased changes.
+
 **Single-file genome archive for large-scale microbial collections.**
 
-genopack stores millions of FASTA genomes with compressed shards, O(1) accession and genome-id lookup, full taxonomy, multi-k OPH sketches, and tetranucleotide profiles. The data is stored in one seekable `.gpk` archive (a directory containing `toc.bin` + section files) or a multipart set of `part_*.gpk` archives read via `ArchiveSetReader`.
+genopack stores millions of FASTA genomes with compressed shards, O(1) accession and genome-id lookup, full taxonomy, multi-k OPH sketches, and tetranucleotide profiles. The data is stored in one seekable `.gpk` file or a multipart set of `part_*.gpk` archives read via `ArchiveSetReader`.
 
 ---
 
@@ -30,7 +32,7 @@ genopack inspect mydb.gpk
 #include <genopack/archive_set_reader.hpp>
 
 genopack::ArchiveSetReader reader;
-reader.open("mydb.gpk");        // archive directory; or directory of part_*.gpk
+reader.open("mydb.gpk");        // single .gpk file; ArchiveSetReader also opens a directory of part_*.gpk
 
 auto g = reader.fetch_by_accession("GCA_000008085.1");
 if (g) std::cout << g->fasta;
@@ -42,7 +44,7 @@ if (g) std::cout << g->fasta;
 
 | Feature | Description |
 |---------|-------------|
-| **Single archive** | One `.gpk` directory (`toc.bin` + section files) replaces millions of per-genome files on NFS |
+| **Single archive** | One `.gpk` file replaces millions of per-genome files on NFS |
 | **Multipart sets** | Directories containing `part_*.gpk` are read as one logical archive |
 | **zstd shards** | Auto, shared-dict, reference-delta, MEM-delta, and 2-bit-pack codecs |
 | **O(1) lookup** | FNV-1a hash table (ACCX) + direct index (GIDX) for genome fetch |

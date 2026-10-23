@@ -1,5 +1,7 @@
 # Taxonomy Export
 
+> Status as of 2026-10-23: taxid export rule corrected against `cli/main.cpp` (`export_taxid_map`): native NCBI ids are kept, only synthetic ids are renumbered.
+
 `genopack taxdump` exports the taxonomy stored in a `.gpk` archive to two formats: NCBI-compatible taxdump and a columnar binary.
 
 ## Usage
@@ -41,7 +43,7 @@ output_dir/
 
 **Root node:** `taxid=1` is self-referential (`parent=1`) per NCBI convention.
 
-**Taxids:** synthetic integer identifiers assigned by the TXDB builder. They are stable within an archive but are not NCBI taxids.
+**Taxids:** native NCBI taxids (present when the pack was built with `--ncbi-taxdump`) are exported verbatim. Synthetic concept_ids (bit 63 set) are renumbered into a dense block above the largest NCBI taxid, in concept-hash order. That numbering is stable for identical input only; see [Unified Taxonomy](Taxonomy-Graft.md#reunifying-a-released-taxonomy) for keeping ids stable across releases.
 
 ### Example: building a Kraken2 database from genopack taxonomy
 

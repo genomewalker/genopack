@@ -1,5 +1,7 @@
 # Getting Started
 
+> Status as of 2026-10-23: examples checked against `genopack --help`; KMRX similarity uses `cosine_similarity` (there is no `find_similar`); `add`/`dedup` descriptions match the code.
+
 ## Input TSV format
 
 `genopack build` and `genopack add` accept a tab-separated file:
@@ -29,12 +31,12 @@ GCA_000006945.2	/data/GCA_000006945.2.fna.gz	99.1	0.1	d__Bacteria;p__Proteobacte
 genopack build -i genomes.tsv -o mydb.gpk -t 24 -z 6
 ```
 
-The output `mydb.gpk` is a directory containing `toc.bin` and section files. Defaults: per-taxon shard grouping (genus rank), kmer-NN sort within each shard, OPH sketches (k=16, sketch size 10 000), auto codec. The CIDX contig index is opt-in (`--cidx`).
+The output `mydb.gpk` is a single file. Defaults: per-taxon shard grouping (genus rank), kmer-NN sort within each shard, OPH sketches (k=16, sketch size 10 000), auto codec. The CIDX contig index is opt-in (`--cidx`).
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-i / --input` | required | Input TSV |
-| `-o / --output` | required | Output archive directory (`.gpk`) |
+| `-o / --output` | required | Output archive file (`.gpk`; appended if missing) |
 | `-t / --threads` | 16 | I/O threads (decompression + compression) |
 | `-z / --zstd-level` | 6 | zstd compression level (1-22) |
 | `-p / --parallel` | 1 | Parallel build workers (auto-merge) |
@@ -74,7 +76,7 @@ genopack stat mydb.gpk             # text
 genopack stat mydb.gpk --json      # JSON
 ```
 
-`stat` works on a single archive directory or on a directory containing `part_*.gpk` (multipart set). Output: generation, shard count, genome count (total + live), total bp, compression ratio.
+`stat` works on a single `.gpk` file or on a directory containing `part_*.gpk` (multipart set). Output: generation, shard count, genome count (total + live), total bp, compression ratio.
 
 ## Inspect SKCH layout
 
@@ -148,15 +150,16 @@ The columnar binary export produces four files:
 
 ## Similarity (library only)
 
-There is no `genopack similar` CLI. KMRX k=4 cosine similarity is exposed through the C++ API:
+There is no `genopack similar` CLI and no built-in top-k search. KMRX k=4 profiles are exposed through the C++ API; rank candidates with `cosine_similarity`:
 
 ```cpp
 genopack::ArchiveReader reader; reader.open("mydb.gpk");
-const float* p = reader.kmer_profile_by_accession("GCA_000008085.1");
-auto hits = reader.find_similar_by_accession("GCA_000008085.1", 20);
+const float* q = reader.kmer_profile_by_accession("GCA_000008085.1");
+const float* c = reader.kmer_profile_by_accession("GCA_000005845.2");
+float sim = genopack::cosine_similarity(q, c);   // <genopack/kmrx.hpp>
 ```
 
-`find_similar` performs a linear KMRX cosine scan.
+KMRX is optional and not built by default; `kmer_profile*` returns `nullptr` when it is absent.
 
 ---
 
@@ -199,7 +202,7 @@ The algorithm runs in three phases:
 genopack add mydb.gpk -i new_genomes.tsv
 ```
 
-Appends a new shard generation. Existing shards are untouched; the catalog is updated with a new CATL fragment. Use `genopack repack` afterwards if taxonomy grouping is important.
+Appends a new shard generation. Existing shards are untouched; CATL, ACCX, GIDX, TAXN, TXDB, CIDX and KMRX each receive a new fragment. Use `genopack repack` afterwards if taxonomy grouping is important.
 
 ---
 
@@ -259,7 +262,7 @@ genopack dedup mydb.gpk              # tombstone duplicates in place
 genopack dedup mydb.gpk --dry-run    # report duplicates without modifying the archive
 ```
 
-Detects exact-sequence duplicates (same content under different accessions). The genome with the highest completeness wins; the rest are tombstoned in a new catalog fragment. Reclaim space afterwards with `genopack repack`.
+Groups genomes with equal OPH fingerprint and genome length from metadata alone (no FASTA is read), so duplicates are sketch-equal, not proven byte-identical. The genome with the highest completeness wins (ties: lowest genome_id); the rest are tombstoned in a new TOMB section. Reclaim space afterwards with `genopack repack`.
 
 ---
 

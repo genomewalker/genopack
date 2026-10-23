@@ -1,8 +1,10 @@
 # Binary Format
 
-A `.gpk` archive is a **directory of seekable section files** plus a `toc.bin` entry, inspired by Parquet. Sections can be appended without rewriting existing data. The TOC is updated with each generation, and a 64-byte `TailLocator` at the end of `toc.bin` points to the current TOC. Multipart sets (used for very large or distributed builds) are directories containing one or more `part_*.gpk` archives. Readers such as `ArchiveSetReader` open them as one archive.
+> Status as of 2026-10-23: checked against `include/genopack/format.hpp` (GPK3, `FORMAT_MAJOR` 3, `FORMAT_MINOR` 0). TailLocator is 128 bytes; the section table lists every `SEC_*` constant; the MetaBundle fast-open directory is documented below.
 
-> **Single-file layout.** Earlier versions stored everything in one `.gpk` file with `FileHeader · sections · TOC · TailLocator`. The directory layout below is the current on-disk form; the section-level binary structures (CATL, GIDX, ACCX, …) are unchanged.
+A `.gpk` archive is a **single file**: `FileHeader`, then appended sections, a MetaBundle directory, the TOC and a 128-byte `TailLocator` at end of file. Sections can be appended without rewriting existing data; the TOC is rewritten with each generation and the TailLocator points to the current one. Multipart sets (used for very large or distributed builds) are directories containing one or more `part_*.gpk` files. `ArchiveSetReader` opens them as one archive. `build -o mydb` writes `mydb.gpk`.
+
+> **On-disk form.** Builders write one `.gpk` file (`src/builder.cpp`, since 440fea5) and `ArchiveReader` memory-maps that file. The 1.0.0 changelog described a directory of section files plus `toc.bin`; current code does not produce that layout.
 
 ---
 
@@ -49,8 +51,8 @@ A `.gpk` archive is a **directory of seekable section files** plus a `toc.bin` e
     <span class="fmt-name">TOC<span class="fmt-sub">SectionDesc[] (raw, uncompressed), one record per section</span></span>
   </div>
   <div class="fmt-row">
-    <span class="fmt-name">TailLocator<span class="fmt-sub">fixed footer at EOF, points to TOC offset</span></span>
-    <span class="fmt-size">64 B</span>
+    <span class="fmt-name">TailLocator<span class="fmt-sub">fixed footer at EOF, points to TOC offset and MetaBundle</span></span>
+    <span class="fmt-size">128 B</span>
   </div>
 </div>
 
@@ -70,6 +72,21 @@ A `.gpk` archive is a **directory of seekable section files** plus a `toc.bin` e
 | `SKCH` | OPH sketches | One-permutation hash signatures (V4 seekable; dual-seed; multi-k) |
 | `KMRX` | K-mer profiles | *Library-only.* float[n × 136] L2-normalised k=4 tetranucleotide frequencies |
 | `TOMB` | Tombstone | Soft-deleted genome_id records |
+| `TOCB` | TOC block | `TocHeader` + `SectionDesc[]` directory |
+| `BPRM` | Build parameters | Self-describing build parameters, one per archive; its `params_hash` is mirrored in `FileHeader.build_params_hash` |
+| `GSTX` | Genus sketch stats | Per-genus consensus sketch, p90 distance and TNF centroid |
+| `GCOV` | Genus covariance | Per-genus biological covariance (whitening basis + calibrated quantiles) |
+| `FCOV` | Family covariance | Same layout as GCOV, keyed by family hash |
+| `FMHR` | FracMinHash reference | Per-genus FracMinHash reference sketches (k=21, c=125) |
+| `CORE` | Prevalence cores | Per-genus conserved aamer cores (content-hashed models) |
+| `PCOR` | Dense aamer reference | `SEC_PCORE`: every aamer per genus with u8 prevalence; supersedes CORE for small-contig detection |
+| `GAMI` | Aamer multiplicity | Global aamer multiplicity index (blocked Bloom of rare aamers), precomputed at build time |
+| `QCOL` | Intrinsic quality | Columnar genopack-computed quality |
+| `XQAL` | External quality | Columnar external quality (CheckM2, anvi'o, …) ingested with `genopack ingest` |
+| `CQAL` | Calibrated quality | Columnar calibrated quality (excluded from derivation) |
+| `PROF` | Profiles | Named, content-hashed reporting/fusion profiles (`genopack profile`) |
+| `QCTG` | Per-contig quality | `SEC_QCONTIG`: which contigs drive a genome's score (`genopack qcontig`) |
+| `QUAL` | Legacy quality | Flat per-genome quality records; superseded by the QCOL/XQAL/CQAL columnar store |
 
 ---
 
@@ -316,11 +333,38 @@ struct SectionDesc {
 };
 ```
 
+### `TailLocator`: 128 bytes
+
+Offsets 0..63 are byte-identical to GPK2; GPK3 appends the file UUID and a directory hash. A `static_assert(sizeof(TailLocator) == 128)` enforces the size.
+
+| Offset | Size | Field | Description |
+|--------|------|-------|-------------|
+| 0 | 4 B | `magic` | `GPKT` (`0x544B5047`) |
+| 4 | 2 B | `version` | |
+| 6 | 2 B | `flags` | |
+| 8 | 8 B | `toc_offset` | Byte offset of the TOC |
+| 16 | 8 B | `toc_size` | TOC byte size |
+| 24 | 8 B | `generation` | |
+| 32 | 16 B | `toc_checksum` | |
+| 48 | 8 B | `meta_bundle_offset` | Stored in `reserved[0..7]`; 0 = no MetaBundle |
+| 56 | 8 B | `meta_bundle_size` | Stored in `reserved[8..15]`; 0 = no MetaBundle |
+| 64 | 16 B | `file_uuid_lo/hi` | Cross-check against `FileHeader` UUID |
+| 80 | 16 B | `directory_xxh128` | Aggregate hash of the directory |
+| 96 | 32 B | _reserved_ | Zero-padded to 128 |
+
+### MetaBundle: embedded section directory
+
+Written just before the TOC and pointed to by the TailLocator. One read of `[meta_bundle_offset, +meta_bundle_size)` returns the full section directory, so readers never page-fault near the end of a multi-TB mmap to find sections.
+
+- **`MetaHeader` (128 B):** magic `GMET` (`0x54454D47`), version 1, `n_sections`, `generation`, archive UUID, live/total genome counts, catalog/accession/tombstone root section ids, XXH128 of the bundle.
+- **`MetaTrailer` (32 B):** magic `0x6C617274` (`"tral"`), `n_sections`, `generation`; a mirror anchor.
+
 ### Open sequence
 
-1. `lseek(-64, SEEK_END)`: read the 64-byte `TailLocator`
-2. `lseek(toc_offset, SEEK_SET)`: read and decompress the TOC
-3. Parse `SectionDesc[]`, then mmap the entire file
+1. `pread` the final 128 bytes: the `TailLocator`; reject if magic is not `GPKT`.
+2. If `meta_bundle_offset` and `meta_bundle_size` are non-zero, `pread` the MetaBundle and take the directory from it (fast path).
+3. Otherwise (legacy archive), `pread` the raw TOC at `toc_offset`; `genopack reindex` adds a MetaBundle.
+4. Bounds-check every `SectionDesc` against the file size, then open sections lazily from the mmap.
 
 ---
 

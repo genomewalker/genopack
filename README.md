@@ -1,6 +1,6 @@
 # genopack
 
-Status as of 2026-10-23: `taxonomy unify` gains `--lineage-overrides` (replace listed accessions' lineages at read time,
+Status as of 2026-10-23: README, docs/ and the wiki were re-checked against the code (dependency list corrected; full CLI and format reference in docs/). `taxonomy unify` gains `--lineage-overrides` (replace listed accessions' lineages at read time,
 normalized as in `taxonomy patch`) and `--stable-taxids-from PRIOR/taxonomy.tsv` (every node whose full rank/name path
 exists in a prior unify output keeps that taxid; new nodes are numbered above the prior maximum, so retired ids are never
 reissued). Exported taxids otherwise follow concept-hash order and shift when any node is added or removed, so pass
@@ -12,7 +12,7 @@ A single-file genome archive format for large-scale microbial genome collections
 
 ## Features
 
-- **Single-file archive:** one `.gpk` directory replaces millions of per-genome files on NFS
+- **Single-file archive:** one `.gpk` file replaces millions of per-genome files on NFS
 - **Multipart sets:** directories containing `part_0.gpk`, `part_1.gpk`, … are read via `ArchiveSetReader`
 - **Fast genome access:** O(1) accession and genome-id lookup via ACCX and GIDX, plus per-genome shard-local blob fetch
 - **zstd-compressed shards:** auto, shared-dict, reference-delta, MEM-delta, and 2-bit-pack codecs with mmap-backed reads
@@ -32,7 +32,7 @@ A single-file genome archive format for large-scale microbial genome collections
 ## Format overview
 
 ```
-toc.bin             - sections + tail locator
+FileHeader (256 B)  - magic GPK3, version, UUIDs, generation, build-params hash
 SHRD × N            - zstd-compressed genome shards (sorted by OPH fingerprint)
 CATL                - columnar genome metadata (genome_id, shard_id, GC%, length, OPH, quality)
 GIDX                - genome_id → (section_id, dir_index, catl_row) for O(1) fetch
@@ -46,18 +46,19 @@ GSTX (optional)     - per-genus sketch stats: TNF centroid, p90 completeness, OP
 GCOV (optional)     - per-genus biological covariance (Ledoit-Wolf TNF, eigenvectors, SPE thresholds)
 FCOV (optional)     - per-family biological covariance (same layout as GCOV, keyed by family hash)
 FMHR (optional)     - per-genus FracMinHash reference sketches (k=21, c=125)
-QUAL (optional)     - per-genome quality records (56 B each): completeness, contamination, flags
+QCOL (optional)     - columnar per-genome quality (supersedes the legacy 56 B QUAL records)
 TOMB                - tombstones for soft-deleted genomes
-TailLocator (64 B)  - fixed footer at end of toc.bin pointing to the TOC offset
+TOC + MetaBundle    - section directory (one pread opens the archive)
+TailLocator (128 B) - fixed footer at end of file pointing to the TOC and MetaBundle
 ```
 
 See the [documentation site](https://genomewalker.github.io/genopack/) for the full binary format specification, API reference, and CLI reference. The `.gpd` derep archive format is documented in [`DEREP_FORMAT.md`](DEREP_FORMAT.md) and in the binary format docs.
 
 ## Build
 
-**Dependencies** (resolved automatically via CMake FetchContent): CLI11, spdlog, BS::thread_pool, hnswlib, Catch2, rapidgzip, Eigen3, xxHash.
+**Dependencies** (fetched by CMake FetchContent): spdlog, unordered_dense, mimalloc; CLI11 and Eigen3 are fetched only when no system copy is found.
 
-**System dependencies:** `cmake ≥ 3.20`, `zstd`, `zlib`, `libdeflate` (optional, faster gzip), C++20 compiler.
+**System dependencies:** `cmake ≥ 3.20`, `zstd` (pkg-config), `zlib`, `xxhash` headers (required; set `Xxhash_INCLUDE_DIR` if not found), `libdeflate` (optional, faster gzip), OpenMP (optional), Python 3 (tests), C++20 compiler.
 
 ```bash
 git clone https://github.com/genomewalker/genopack
@@ -77,7 +78,7 @@ cmake --build build --parallel
 genopack build -i genomes.tsv -o mydb.gpk -t 24 -z 6
 ```
 
-The output `mydb.gpk` is a directory containing `toc.bin` and section files. Defaults: per-taxon shard grouping (`--taxon-group`, genus rank), kmer-NN sort within shards, OPH sketches (k=16, sketch size 10 000). The CIDX contig index is opt-in (`--cidx`). Disable default stages with `--no-taxon-group`, `--no-kmer-sort`, `--no-sketch`. Use `--sketch-kmers 16,21,31` to build a multi-k SKCH section in one pass.
+The output `mydb.gpk` is a single file. Defaults: per-taxon shard grouping (`--taxon-group`, genus rank), kmer-NN sort within shards, OPH sketches (k=16, sketch size 10 000). The CIDX contig index is opt-in (`--cidx`). Disable default stages with `--no-taxon-group`, `--no-kmer-sort`, `--no-sketch`. Use `--sketch-kmers 16,21,31` to build a multi-k SKCH section in one pass.
 
 ### Archive statistics
 
@@ -86,7 +87,7 @@ genopack stat mydb.gpk            # text
 genopack stat mydb.gpk --json     # JSON
 ```
 
-Works on a single archive directory or on a directory of `part_*.gpk` (multipart set).
+Works on a single `.gpk` file or on a directory of `part_*.gpk` (multipart set).
 
 ### Inspect SKCH layout and preload cost
 
@@ -324,7 +325,7 @@ and FMHR (per-genus FracMinHash references) simultaneously.
 
 // Single archive or multipart set, same API
 genopack::ArchiveSetReader reader;
-reader.open("mydb.gpk");           // archive directory
+reader.open("mydb.gpk");           // single .gpk file
 // or
 reader.open("path/to/parts_dir/"); // dir with part_*.gpk
 

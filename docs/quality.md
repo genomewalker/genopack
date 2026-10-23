@@ -1,5 +1,7 @@
 # Quality Scoring
 
+> Status as of 2026-10-23: `quality_score` is also a QCOL column (f88d727); field sources checked against `src/check/` and `include/genopack/qual*.hpp`.
+
 `genopack check` computes per-genome completeness and contamination signals from
 sketch geometry, aggregates them into a continuous quality score and an HQ/MQ/LQ
 tier, and writes both a TSV and a 56-byte-per-genome `QUAL` section
@@ -45,7 +47,7 @@ $$
 
 | Estimator | Meaning | Notes |
 |-----------|---------|-------|
-| `marker_completeness` (QualRecord field; TSV column `completeness_marker`) | present / expected single-copy genus markers (CheckM2-aligned, genus-calibrated) | primary signal; fraction-tracking, declines with fragmentation. Field: `src/check/types.hpp:72`; TSV column emitted at `run_check.cpp:719` |
+| `marker_completeness` (`GenomeQuality` field, `src/check/types.hpp:72`; stored quantized as `QualRecord::marker_completeness_u8`; TSV column `completeness_marker`) | present / expected single-copy genus markers (CheckM2-aligned, genus-calibrated) | primary signal; fraction-tracking, declines with fragmentation. Field: `src/check/types.hpp:72`; TSV column emitted at `run_check.cpp:719` |
 | `completeness_aamer_core` | fraction of the genus prevalence-core aamer set (amino-acid 8-mers) recovered | fallback; presence-**saturating** (small dynamic range near 1.0), never NaN when scored (`src/check/types.hpp:57`, `include/genopack/qual.hpp:19`) |
 | `completeness_post_decontam` | bp retained after the contig contamination scan | last resort |
 
@@ -201,6 +203,13 @@ a signal whose PPV vs CheckM2 never exceeds ~15%, reordering the catalog based o
 that signal. Contamination is reported separately as the D/S/G channels above.
 Dereplication consumes them as an explicit D → S → G tiebreak, so the noisy
 channels cannot override the calibrated one.
+
+The score is stored in the `check` TSV (column `quality_score`, second after
+`quality_tier`) and, since f88d727, as a QCOL column: axis `support`, method
+`quality_score`, unit `Fraction01`, packed as a U16 where 0 means not scored and
+reads back as NaN (`include/genopack/qual_columns.hpp:53-55`). Library readers get it
+through `ArchiveReader::qcol_reader()`. `genopack report`, `extract --manifest` and
+the meta TSV do not include it.
 
 ### Tier chain
 

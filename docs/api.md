@@ -1,5 +1,7 @@
 # API Reference
 
+> Status as of 2026-10-23: checked against `include/genopack/*.hpp`. KMRX has no built-in top-k search (`find_similar` does not exist); `ArchiveBuilderConfig` and `BuildRecord` match `archive.hpp` / `types.hpp`; quality, profile, per-contig and taxonomy-tree readers are listed under [Section readers](#section-readers).
+
 All public symbols live in the `genopack` namespace. Include `<genopack/archive.hpp>` for the high-level reader/builder/appender. Low-level types are in `<genopack/types.hpp>`.
 
 ---
@@ -17,7 +19,7 @@ Per-genome metadata record. 72 bytes, 8-byte aligned.
 | Field | Type | Description |
 |-------|------|-------------|
 | `genome_id` | `uint64_t` | Stable integer identifier (1-based) |
-| `genome_type` | `uint32_t` | Genome type flags |
+| `genome_type` | `uint32_t` | `GenomeType` enum value: nuclear, mitochondrion, plastid, plasmid, virus or phage (0 = nuclear in old archives) |
 | `shard_id` | `uint32_t` | Shard section this genome lives in |
 | `genome_length` | `uint64_t` | Total assembly length in bp |
 | `n_contigs` | `uint32_t` | Number of contigs |
@@ -86,7 +88,8 @@ struct BuildRecord {
     float    contamination = 0.0f;
     uint64_t genome_length = 0;
     uint32_t n_contigs     = 0;
-    std::vector<std::pair<std::string, std::string>> extra_fields;
+    GenomeType genome_type = GenomeType::NUCLEAR;
+    std::vector<std::pair<std::string, std::string>> extra_fields;  // written verbatim to meta.tsv
 };
 ```
 
@@ -187,20 +190,15 @@ void batch_find_contig_genome_ids(const std::string_view* accs,
 
 ### Similarity & contig lookup
 
-> Library-only. There is no `genopack similar` or `genopack cidx` CLI; these are exposed through `ArchiveReader` and use the optional KMRX section (not built by default).
+> Library-only. There is no `genopack similar` or `genopack cidx` CLI. Profiles come from the optional KMRX section (not built by default). There is no built-in top-k search: rank candidates yourself with `cosine_similarity` from `<genopack/kmrx.hpp>`.
 
 ```cpp
 // Pointer to float[136] L2-normalised k=4 profile, nullptr if not stored
 const float* kmer_profile(GenomeId id) const;
 const float* kmer_profile_by_accession(std::string_view accession) const;
 
-// Up to k most similar genomes by cosine similarity.
-// Linear KMRX cosine scan.
-std::vector<std::pair<GenomeId, float>>
-find_similar(GenomeId id, size_t k = 10) const;
-
-std::vector<std::pair<GenomeId, float>>
-find_similar_by_accession(std::string_view accession, size_t k = 10) const;
+// Free function in <genopack/kmrx.hpp>
+float cosine_similarity(const float* a, const float* b);
 ```
 
 ### Genome iteration
@@ -239,7 +237,7 @@ ArchiveStats archive_stats() const;
 
 ## ArchiveSetReader
 
-Read facade over **either** a single archive directory **or** a multipart set (a directory of `part_*.gpk` archives). Same query surface as `ArchiveReader`, with per-accession routing across parts and aggregated stats.
+Read facade over **either** a single `.gpk` file **or** a multipart set (a directory of `part_*.gpk` archives). Same query surface as `ArchiveReader`, with per-accession routing across parts and aggregated stats.
 
 ```cpp
 #include <genopack/archive_set_reader.hpp>
@@ -249,7 +247,7 @@ Read facade over **either** a single archive directory **or** a multipart set (a
 
 ```cpp
 genopack::ArchiveSetReader reader;
-reader.open("mydb.gpk");        // single archive directory
+reader.open("mydb.gpk");        // single .gpk file
 reader.open("multipart_dir");   // directory of part_*.gpk
 bool ok = reader.is_open();
 reader.close();
@@ -340,14 +338,38 @@ Builds a new archive from scratch. Not thread-safe.
 ```cpp
 struct ArchiveBuilderConfig {
     ShardWriterConfig shard_cfg;
-    size_t io_threads           = 16;    // parallel FASTA decompression
-    bool   verbose              = false;
-    size_t batch_size           = 1000;  // genomes buffered before shard flush
-    GenomeId starting_genome_id = 1;
-    bool   build_cidx           = true;  // disable with --no-cidx for large archives
-    bool   kmer_nn_sort         = true;  // sort within shards by kmer NN chain
-    bool   taxonomy_group       = true;  // bucket by taxonomy before shard formation
-    std::string taxonomy_rank   = "g";   // "g" = genus, "f" = family
+    size_t   io_threads            = 16;     // parallel FASTA decompression
+    bool     verbose               = false;
+    size_t   batch_size            = 1000;   // genomes buffered before shard flush
+    GenomeId starting_genome_id    = 1;      // set per part in parallel builds
+    bool     build_cidx            = true;   // CIDX contig index (--no-cidx)
+    bool     thin_archive          = false;  // --thin: ingest-only, no compute sections
+    std::string tmpdir;                      // PCORE/SKCH spill dir (--tmpdir)
+    bool     kmer_nn_sort          = true;   // sort within shards by k=4 profile NN chain
+    bool     taxonomy_group        = true;   // bucket by taxonomy before shard formation
+    std::string taxonomy_rank      = "g";    // "g" = genus, "f" = family
+    bool     build_sketch          = false;  // OPH sketches -> SKCH (the CLI turns this on)
+    bool     build_gstx            = true;   // GSTX (needs taxonomy_group + build_sketch)
+    bool     build_gcov            = true;   // GCOV (needs build_gstx)
+    bool     build_pcore           = true;   // dense SEC_PCORE (--no-pcore)
+    bool     build_tier            = false;  // emit .ptier for `tier merge` (--tier)
+    uint32_t pcore_frac            = 100;    // FMH 1/N subsampling (--pcore-frac, GENOPACK_AAMER_FRAC)
+    uint32_t foreign_K             = 3;      // max genus count for a taxon-specific foreign aamer
+    float    core_theta            = 0.90f;  // genus-core prevalence threshold
+    uint32_t genus_member_cap      = 2000;   // max members per genus in the CORE/PCORE union; 0 = unlimited
+    uint32_t micro_genus_threshold = 0;      // 0 = auto (4/8/16/32 by corpus size)
+    int      sketch_kmer_size      = 16;     // single-k OPH
+    std::vector<int> sketch_kmer_sizes;      // >1 value: multi-k SKCH v2
+    int      sketch_size           = 10000;  // OPH bins
+    int      sketch_syncmer_s      = 0;      // 0 = off; the CLI resolves its -1 "auto" to k/3
+    uint64_t sketch_seed           = 42;
+    int      fmh_k                 = 21;     // FMHR FracMinHash k
+    int      fmh_c                 = 125;    // FMHR density 1/c
+    std::string markers_path;                // .mrk panel; empty = no build-time marker scoring
+    int      marker_min_hits       = 5;
+    std::string contam_panel_path;           // .csp panel; empty = no duplication scoring
+    std::string ncbi_taxdump_dir;            // NCBI taxdump; empty = pure concept_id TXDB
+    std::filesystem::path from_gpk_source;   // non-empty: rebuild by streaming from this .gpk
 };
 ```
 
@@ -522,6 +544,25 @@ float sim = genopack::cosine_similarity(p1, p2);
 ```
 
 Profiles are stored uncompressed as `float[n_genomes × 136]` with sorted `genome_ids[]` for O(log n) binary search.
+
+---
+
+## Section readers
+
+`ArchiveReader` exposes the derived and quality sections through `has_*()` checks and reader accessors. Each reader pointer is `nullptr` when the section is absent.
+
+| Accessor (`archive.hpp`) | Reader type (header) | Content |
+|---|---|---|
+| `taxonomy_tree()` | `TaxonomyTree` (`txdb.hpp`) | TXDB tree: `taxid_for_accession`, `parent`, `rank`, `name`, `ancestor_at_rank`, `lca`, `lca_rank`, `is_synthetic` |
+| `has_qual()`, `scan_qual(cb)` | `QualRecord` (`qual.hpp`) | Per-genome quality records |
+| `qcol_reader()` | `ColStoreReader` (`colstore.hpp`) | QCOL intrinsic quality columns, including `quality_score` |
+| `has_xqual()`, `xqual_reader()` | `ColStoreReader` | XQAL external quality (CheckM2, anvi'o) from `genopack ingest` |
+| `has_cqal()`, `cqal_reader()` | `ColStoreReader` | CQAL calibrated quality from `genopack calibrate` |
+| `has_prof()`, `prof_reader()` | `ProfReader` (`prof.hpp`) | Named reporting profiles from `genopack profile` |
+| `has_qcontig()`, `qcontig_reader()` | `QcontigReader` (`qcontig.hpp`) | Per-contig quality overlay written by `check` |
+| GSTX / GCOV / FCOV / FMHR / PCORE accessors | `GstxReader`, `GcovReader`, `FmhrReader`, `PcoreReader` | Per-genus (GCOV: also per-family FCOV) reference models |
+
+Other public entry points not shown above: `ArchiveReader::visit_shard_batches_parallel`, `fetch_sequence_slice_by_accession`, `genome_meta_by_accession`; `ArchiveSetReader::genome_meta_by_accession` and `scan_genome_catalog`; and `ShardWriter` (`shard.hpp`), the write-side counterpart of `ShardReader`.
 
 ---
 

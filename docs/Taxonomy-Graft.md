@@ -1,6 +1,8 @@
 # Unified Taxonomy
 
-> **Status as of 2026-08-21.** Implemented and tested.
+> **Status as of 2026-10-23.** Implemented and tested. Adds `taxonomy unify --lineage-overrides` (834573a),
+> `--stable-taxids-from` (7887ad4) and the hard failure on duplicate export taxids (365e976). Every reunify of a
+> released taxonomy must pass `--stable-taxids-from`; see [Reunifying a released taxonomy](#reunifying-a-released-taxonomy).
 
 Combine independent reference packs (GTDB prokaryotes, organelles, viruses, and
 optionally full NCBI) into **one taxonomy with NCBI taxids where they apply**, so
@@ -60,8 +62,34 @@ one tree, and writes the taxonomy. GTDB's propagated `l__`/`k__` placeholder ran
 (the domain name repeated at life/kingdom) are dropped so the prokaryote backbone
 attaches phyla directly under the domain.
 
-Outputs: `taxdump` format writes `nodes.dmp`, `names.dmp`, `acc2taxid.dmp`;
-`columnar` writes `taxnodes.bin`, `acc2taxid.bin`, and `taxonomy.tsv`/`acc2taxid.tsv`.
+Outputs: `taxdump` format writes `nodes.dmp`, `names.dmp`, `acc2taxid.dmp`, plus
+empty `merged.dmp` and `delnodes.dmp` stubs; `columnar` writes `taxnodes.bin`,
+`acc2taxid.bin`, and `taxonomy.tsv`/`acc2taxid.tsv`.
+
+### Lineage overrides
+
+`--lineage-overrides` takes a two-column `accession<TAB>lineage` TSV and replaces
+those accessions' pack TAXN lineages at read time, without patching the packs.
+GTDB 7-rank lineages are normalized as in `taxonomy patch`; 10-rank lineages are
+kept. A malformed row, a duplicate accession, or an accession absent from the input
+packs is an error (`cli/main.cpp:2946-2970`).
+
+### Reunifying a released taxonomy
+
+Export numbering is not stable by itself. Native NCBI taxids are kept, but synthetic
+concept_ids are renumbered into a dense block in concept-hash order. Adding,
+removing or renaming one node therefore shifts the exported id of every later node,
+and an old taxid can come to name a different taxon. A reunify after renaming
+464,051 species reused 1,215,247 prior taxids for other taxa this way (7887ad4).
+
+Pass `--stable-taxids-from <prior>/taxonomy.tsv`, the prior release's columnar
+`taxonomy.tsv`. Every synthetic node whose full (rank, name) path exists there keeps
+that taxid; new nodes are numbered above the prior maximum. Pin common trees to the
+prior common tree and backbone trees to the prior backbone tree.
+
+`unify` fails rather than silently dropping a node when two taxa would share one
+stable or exported taxid (`Stable taxid … assigned to two nodes`, `Export taxid …
+assigned to two nodes`; `cli/main.cpp:2660-2690`).
 
 ### Preserving authoritative taxids
 
@@ -98,7 +126,10 @@ retained via the GTDB pack; NCBI-only prokaryotes are dropped.
   lineage path, so parent pointers strictly decrease depth. Verified on the
   produced trees (root 1, no cycles, every node reaches the root).
 - **Deterministic.** Accession-sorted processing makes concept_id assignment and
-  name-resolution order-independent.
+  name-resolution order-independent: identical inputs give byte-identical output.
+  Exported dense taxids are stable across *different* inputs only with
+  `--stable-taxids-from`.
+- **No shared taxids.** Export throws if two nodes would receive one taxid.
 
 ## Implementation
 

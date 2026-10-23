@@ -1,12 +1,14 @@
 # CLI Reference
 
+> Status as of 2026-10-23: every subcommand and flag in `genopack --help` is documented here (checked by a per-command flag diff against the installed binary). Known `--help` text bugs, where the code wins: `enrich --sketch-kmers` claims a 16,21,31 default (it has none); `build --thin` says not to pass `--taxon-group`, which is already on by default; `dedup` says "same sequence" (it matches OPH fingerprint + length); `repack` says "one sequential pass" (it is two-pass); `reindex --sketch-syncmer` says "inherit or 0" (it resolves -1 to k/3).
+
 ## Synopsis
 
 ```
 genopack <command> [options]
 ```
 
-All commands accept `--help` / `-h` for option details. Wherever a flag below takes an *archive*, the path may be either a single archive directory (containing `toc.bin`) or a directory containing one or more `part_*.gpk` (multipart set).
+All commands accept `--help` / `-h` for option details. Wherever a flag below takes an *archive*, the path may be either a single `.gpk` file or a directory containing one or more `part_*.gpk` (multipart set).
 
 ---
 
@@ -18,12 +20,12 @@ Build a new archive from a TSV.
 genopack build -i genomes.tsv -o mydb.gpk [options]
 ```
 
-The output `mydb.gpk` is a directory containing `toc.bin` plus section files. Defaults: per-taxon shard grouping (`--taxon-group`, genus rank), kmer-NN sort within shards, OPH sketches (`--sketch`, k=16, sketch size 10 000), auto codec. The CIDX contig index is opt-in (`--cidx`).
+The output `mydb.gpk` is a single file (`-o mydb` also writes `mydb.gpk`). Defaults: per-taxon shard grouping (`--taxon-group`, genus rank), kmer-NN sort within shards, OPH sketches (`--sketch`, k=16, sketch size 10 000), auto codec. The CIDX contig index is opt-in (`--cidx`).
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-i / --input` | required | Input TSV (`accession\tfile_path\t[completeness\tcontamination\ttaxonomy\t…]`) |
-| `-o / --output` | required | Output archive directory (`.gpk`) |
+| `-i / --input` | required unless `--from-gpk` | Input TSV (`accession\tfile_path\t[completeness\tcontamination\ttaxonomy\t…]`); exactly one of `-i` and `--from-gpk` must be given |
+| `-o / --output` | required | Output archive file (`.gpk`; appended if missing) |
 | `-t / --threads` | 16 | I/O threads (decompression + compression) |
 | `-z / --zstd-level` | 6 | zstd compression level (1-22) |
 | `-p / --parallel` | 1 | Parallel build workers (auto-merge) |
@@ -51,7 +53,7 @@ The output `mydb.gpk` is a directory containing `toc.bin` plus section files. De
 | `--ncbi-taxdump` | unset | Path to an NCBI taxdump dir (`nodes.dmp`+`names.dmp`). Lineage taxa whose scientific name is unambiguous in NCBI keep their native NCBI taxid; taxa NCBI doesn't have get a synthetic concept_id. See [Unified Taxonomy](Taxonomy-Graft.md) |
 | `--from-gpk` | unset | Rebuild from an existing `.gpk`: stream decoded sequence from its shards instead of opening per-genome FASTA files. Mutually exclusive with `-i` |
 | `--tmpdir` | `/scratch` or `/tmp` | Directory for PCORE/SKCH spill files; use a fast local NVMe path |
-| `--thin` | off | Ingest-only preset: write sequences, sketches, TAXN/GIDX/CIDX only; skip compute sections (GSTX/GCOV/CORE/PCORE/GAMI). Do not combine with `--taxon-group` |
+| `--thin` | off | Ingest-only preset: write sequences, sketches, TAXN/GIDX/CIDX only; skip compute sections (GSTX/GCOV/CORE/PCORE/GAMI). `--taxon-group` is on by default and `--thin` does not turn it off; the `--help` text says not to group in thin mode, so pass `--no-taxon-group` explicitly |
 | `--coordinator` | unset | NFS manifest coordinator: `manifest_dir:/output.gpk` |
 | `-v / --verbose` | off | Verbose progress |
 
@@ -74,7 +76,7 @@ genopack enrich -i thin.gpk -o enriched.gpk [options]
 | `--taxon-rank` | `g` | Taxonomy rank for grouping (`g` = genus, `f` = family) |
 | `--markers` | unset | Marker panel (`.mrk`) for CORE/PCORE/GAMI sections |
 | `--contam-panel` | unset | Contamination panel (`.csp`) for duplication scoring |
-| `--sketch-kmers` | `16,21,31` | Comma-separated k-mer sizes for multi-k SKCH (default: 16,21,31) |
+| `--sketch-kmers` | unset (single-k, k=16) | Comma-separated k-mer sizes for multi-k SKCH; pass `16,21,31` explicitly for multi-k. The single-k size is fixed at 16; enrich exposes no option for it. The `--help` text claims a 16,21,31 default, but enrich has none |
 | `--sketch-size` | 10000 | OPH bins |
 | `--sketch-syncmer` | auto | Syncmer `s` (default: auto) |
 | `--pcore` | off | Also build PCORE/GAMI (use for thin archives built without `--markers`) |
@@ -97,6 +99,7 @@ genopack merge part1.gpk part2.gpk part3.gpk -o merged.gpk
 | `-l / --list` | | Text file with one `.gpk` path per line |
 | `-o / --output` | required | Output path |
 | `--ncbi-taxdump` | unset | Reconcile the merged taxonomy against an NCBI taxdump dir: shared taxa keep native NCBI taxids |
+| `--tmpdir` | `$GENOPACK_SKETCH_SPILL_DIR`, `$GENOPACK_SPILL_DIR`, `/scratch`, `/tmp` | Directory for SKCH spill files during merge |
 | *(no thread option)* | - | No thread flag: merge copies each input part concurrently via `std::async` + `pwrite` (one task per part), so parallelism scales with the number of input archives |
 
 ---
@@ -109,7 +112,7 @@ Print archive statistics.
 genopack stat mydb.gpk [--json]
 ```
 
-Output: generation, shard count, live/total genome count, total bp, compression ratio, per-section inventory. Accepts a single archive directory or a multipart set; multipart sets show an aggregated total plus per-part breakdown.
+Output: generation, shard count, live/total genome count, total bp, compression ratio, per-section inventory. Accepts a single `.gpk` file or a multipart set; multipart sets show an aggregated total plus per-part breakdown.
 
 ---
 
@@ -156,6 +159,11 @@ genopack extract mydb.gpk [filters] -o out.fasta
 | `--min-completeness FLOAT` | Completeness filter (0-100) |
 | `--max-contamination FLOAT` | Contamination filter |
 | `-o / --out` | Output FASTA (default: stdout) |
+| `--output-dir DIR` | Write one `{accession}.fa` per genome to this directory |
+| `--concat-contigs` | One record per genome: contigs joined by N-runs, header = accession |
+| `--concat-ns INT` | N-run length between contigs (default 300; must exceed the longest read) |
+| `--nmask` | With `--concat-contigs` and `-o`: also write `<out>.nmask` (per-reference effective length + N-intervals, for kaiku) |
+| `--manifest FILE` | Per-genome property TSV (bp, n_contigs, gc, completeness, contamination, oph_fingerprint, taxonomy) for the selected accessions, or the whole catalog when none are given. Metadata-only without `-o`; with `-o` it is written in the same pass as the FASTA |
 
 ---
 
@@ -164,10 +172,12 @@ genopack extract mydb.gpk [filters] -o out.fasta
 Extract a subsequence by accession and coordinates.
 
 ```bash
-genopack slice mydb.gpk --accession GCA_000008085.1 --start 100000 --length 5000 --fasta
+genopack slice mydb.gpk GCA_000008085.1 --start 100000 --length 5000 --fasta
 ```
 
-Decompresses only the checkpoint blocks covering the requested region (sub-genome granularity).
+The accession is a positional argument. `--start` (0-based) and `--length` are required; `--fasta` adds a FASTA header.
+
+For archives without 2-bit packing, only the checkpoint blocks covering the region are decompressed. Archives built with the default `build --2bit` packing decompress the whole genome and then slice (`src/shard.cpp`, 2-bit branch of `decompress_sequence_slice`).
 
 ---
 
@@ -179,7 +189,11 @@ Append genomes to an existing archive (new shard generation).
 genopack add mydb.gpk -i new_genomes.tsv
 ```
 
-Existing shards are untouched. The catalog receives a new CATL fragment. Use `repack` afterwards if taxonomy grouping is required.
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-i / --input` | required | Input TSV of genomes to append |
+
+Existing shards are untouched. CATL, ACCX, GIDX, TAXN, TXDB, CIDX and KMRX each receive a new fragment. Use `repack` afterwards if taxonomy grouping is required.
 
 ---
 
@@ -191,19 +205,19 @@ Soft-delete (tombstone) genomes.
 genopack rm mydb.gpk GCA_000001405 GCA_000002655
 ```
 
-Marks genomes as deleted in a new catalog fragment. Physical space is not reclaimed; use `repack` to compact.
+Records the genome ids in a new tombstone (TOMB) section. Physical space is not reclaimed; use `repack` to compact.
 
 ---
 
 ## `dedup`
 
-Tombstone duplicate genomes (same sequence, different accession) in place.
+Tombstone duplicate genomes (equal OPH fingerprint and length, different accession) in place.
 
 ```bash
 genopack dedup mydb.gpk [--dry-run]
 ```
 
-Walks every shard, hashes each genome's canonical FASTA content, groups duplicates and tombstones all but one representative per group. Modifies the archive in place by appending a new CATL fragment with the tombstones; physical bytes are reclaimed only by `repack`. With `--dry-run`, prints the duplicate groups without writing.
+Scans genome metadata only (no FASTA is read) and groups genomes with equal OPH fingerprint and genome length. In each group it keeps the genome with the highest completeness (ties: lowest genome_id) and tombstones the rest in a new TOMB section; physical bytes are reclaimed only by `repack`. With `--dry-run`, prints the duplicate groups without writing. Matching is sketch-based, so "duplicate" means equal fingerprint and length, not byte-identical sequence.
 
 ---
 
@@ -238,7 +252,7 @@ genopack repack input.gpk output.gpk [options]
 | `--taxonomy-rank` | `g` | `g` = genus, `f` = family |
 | `-v / --verbose` | off | Log every source shard processed |
 
-**When to use:** After building a large archive without `--taxonomy-group`, or after many `add` operations that scattered genomes across shards. A repacked archive allows geodesic-style tools to read only the ~1,900 shards belonging to Salmonella instead of all 24,000+ shards.
+**When to use:** After building a large archive with `build --no-taxon-group`, or after many `add` operations that scattered genomes across shards. A repacked archive allows geodesic-style tools to read only the ~1,900 shards belonging to Salmonella instead of all 24,000+ shards.
 
 **Algorithm:** Three-phase two-pass design.
 
@@ -266,7 +280,16 @@ Print the lineage for one accession (or every accession when `--accession` is om
 genopack taxonomy normalize -i raw.tsv -o normalized.tsv [--ncbi-taxdump DIR]
 ```
 
-Take an `accession\ttaxonomy\tfile_path` TSV and produce a normalized 10-rank lineage TSV. With `--ncbi-taxdump`, fills missing ranks from NCBI `nodes.dmp` + `names.dmp`.
+Take an `accession\ttaxonomy\tfile_path` TSV and produce a normalized 10-rank lineage TSV (`d,l,k,p,c,o,f,g,s,S`). GTDB lineages are normalized by rank propagation. With `--ncbi-taxdump`, eukaryote and virus lineages are resolved against NCBI `nodes.dmp` + `names.dmp`; the dump is downloaded if absent or older than 30 days.
+
+Accessions reused by different source files are resolved by decompressed-sequence content hash: exact repeats are dropped and distinct genomes get a `~dupN` suffix.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-i / --input` | required | Input TSV (`accession\ttaxonomy\tfile_path`) |
+| `-o / --output` | required | Output normalized TSV |
+| `--ncbi-taxdump` | unset | NCBI taxdump dir for eukaryote/virus resolution |
+| `--dup-manifest` | unset | Write a TSV of resolved accession collisions (`accession, file_path, resolved_accession, action, content_hash`) |
 
 ### `taxonomy partition`
 
@@ -274,7 +297,16 @@ Take an `accession\ttaxonomy\tfile_path` TSV and produce a normalized 10-rank li
 genopack taxonomy partition -i normalized.tsv -n 8 -o parts/ [-r g]
 ```
 
-Partition a normalized TSV into `N` balanced parts at a given rank (`g` = genus, `f` = family) for parallel/distributed builds. Writes `part_0.tsv` … `part_{N-1}.tsv` under the output directory.
+Partition a normalized TSV into `N` balanced parts at a given rank (`g` = genus, `f` = family) for parallel/distributed builds, using LPT bin-packing. Every genome of one taxon lands in the same part, sorted by taxonomy. Writes `part_0.tsv` … `part_{N-1}.tsv` under the output directory.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-i / --input` | required | Normalized TSV (`accession\ttaxonomy\tfile_path`) |
+| `-n / --parts` | required | Number of output parts |
+| `-o / --output-dir` | required | Output directory |
+| `-r / --rank` | `g` | Partition rank: `g` = genus, `f` = family |
+| `--contiguous` | off | Fill parts in taxonomy order so sibling taxa land in the same part (lower read fan-out downstream) instead of size-only LPT. Use with `--cap` |
+| `--cap` | `0` | Max genomes per taxon group; larger groups are split into contiguous chunks of at most `cap`. `0` = no cap |
 
 ### `taxonomy assign-taxids`
 
@@ -282,7 +314,13 @@ Partition a normalized TSV into `N` balanced parts at a given rank (`g` = genus,
 genopack taxonomy assign-taxids -i normalized.tsv -o registry.tsv [--acc-map acc2cid.tsv]
 ```
 
-Assign canonical concept IDs to lineage paths and emit `canonical_path\tconcept_id` (sorted by path). Optionally writes a per-accession `accession\tconcept_id\ttaxonomy` map.
+Assign canonical concept IDs (`FNV-64(canonical_path) | (1<<63)`, deterministic, no central counter) to lineage paths and emit `canonical_path\tconcept_id` (sorted by path). Optionally writes a per-accession `accession\tconcept_id\ttaxonomy` map.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-i / --input` | required | Normalized TSV |
+| `-o / --registry` | required | Output registry TSV |
+| `--acc-map` | unset | Output per-accession TSV |
 
 ### `taxonomy diff`
 
@@ -290,7 +328,7 @@ Assign canonical concept IDs to lineage paths and emit `canonical_path\tconcept_
 genopack taxonomy diff --current current.tsv --gtdb bac120_taxonomy.tsv --gtdb ar53_taxonomy.tsv -o out/
 ```
 
-Diff a current taxonomy TSV against a new GTDB release and write per-category TSVs (added, removed, reassigned) plus a `summary.txt` to `out/`. With `--write-unchanged`, also writes the (often huge) `unchanged.tsv`.
+Diff a current genome set against a new GTDB release. Each genome is classified as `unchanged`, `taxonomy_changed`, `needs_gtdbtk`, `dropped_from_gtdb` or `new_in_release`; one TSV per category plus `summary.txt` go to `-o / --output-dir`. `--current` accepts the original input TSV or the genopack meta TSV. `--gtdb` is repeatable (pass `bac120_taxonomy.tsv` and `ar53_taxonomy.tsv`, or a merged file). With `--write-unchanged`, also writes the (often huge) `unchanged.tsv`.
 
 ### `taxonomy patch`
 
@@ -329,6 +367,10 @@ genopack taxonomy unify prok.gpk organelle.gpk viral.gpk \
 | `--preserve-taxids` | unset | TSV of `accession → NCBI taxid` (e.g. organelle host taxids). Those accessions keep the given taxid instead of resolving by name. Its NCBI lineage is imported down to a strain leaf. Stale ids remap via `merged.dmp` |
 | `--ncbi-backbone` | off | Fold the entire NCBI tree in as backbone nodes, so NCBI taxa without a reference genome still exist in the scaffold |
 | `--gtdb-replaces-prok` | off | With `--ncbi-backbone`: excise NCBI's `Bacteria`/`Archaea` descendants (anchors kept) so GTDB stays authoritative for prokaryotes |
+| `--lineage-overrides` | unset | `accession\tlineage` TSV replacing those accessions' TAXN lineages at read time (GTDB 7-rank lineages normalized as in `taxonomy patch`). Duplicate or absent accessions are errors |
+| `--stable-taxids-from` | unset | A prior unify's columnar `taxonomy.tsv`. Synthetic nodes whose full (rank, name) path exists there keep that taxid; new nodes are numbered above its maximum |
+
+**Always pass `--stable-taxids-from` when reunifying a released taxonomy.** Without it, synthetic ids are numbered in concept-hash order, so any added, removed or renamed node shifts later ids and old taxids can name other taxa. Unify fails if two nodes would share one taxid. See [Unified Taxonomy](Taxonomy-Graft.md#reunifying-a-released-taxonomy).
 
 Output is deterministic (identical inputs → identical output). The NCBI taxdump parse is cached to `<taxdump-dir>/.ncbi_taxdb.cache`.
 
@@ -343,9 +385,14 @@ genopack taxdump mydb.gpk -f taxdump -o ./taxdump/
 genopack taxdump mydb.gpk -f columnar -o ./taxonomy/
 ```
 
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-f / --format` | `columnar` | `taxdump` or `columnar` |
+| `-o / --output` | required | Output directory |
+
 | Format | Output files | Description |
 |--------|-------------|-------------|
-| `taxdump` | `names.dmp`, `nodes.dmp`, `acc2taxid.dmp` | NCBI taxdump - Kraken/Kaiju compatible |
+| `taxdump` | `names.dmp`, `nodes.dmp`, `acc2taxid.dmp`, empty `merged.dmp` and `delnodes.dmp` | NCBI taxdump - Kraken/Kaiju compatible |
 | `columnar` | `acc2taxid.bin`, `taxnodes.bin`, `acc2taxid.tsv`, `taxonomy.tsv` | Fast offline lookup |
 
 ---
@@ -495,7 +542,7 @@ genopack decontaminate mydb.gpk [--dry-run]
 
 ## `gcov`
 
-Build (or rebuild) the GCOV per-genus covariance section in an existing `.gpk` archive.
+Build (or rebuild) the GCOV (per-genus), FCOV (per-family) and FMHR (per-genus FracMinHash) sections in an existing `.gpk` archive; all three are rewritten together.
 
 ```bash
 genopack gcov mydb.gpk
@@ -521,6 +568,9 @@ genopack pcore mydb.gpk
 | `archive` | required | Path to `.gpk` archive or directory of parts |
 | `-t / --threads` | 8 | Parallel shard readers |
 | `--members` | all live | Reference accession list (one per line); only these genomes build the reference |
+| `--theta` | `0.90` | Conserved-core prevalence threshold; used only when the archive has no SEC_CORE |
+| `--min-seg-aa` | `8` (= k) | Min inter-stop AA segment length; used only when no SEC_CORE |
+| `--frac-max-hash` | `UINT64_MAX` (dense) | FracMinHash max hash; used only when no SEC_CORE |
 
 ---
 
@@ -683,7 +733,7 @@ Score a FASTA file for SCG marker completeness.
 | `--fasta` | required | Input FASTA file |
 | `--markers` | required | Markers `.mrk` file |
 | `--genus` | required | Target genus key (e.g. `g__Escherichia`) |
-| `--min-hits` | 1 | Min hits per marker to call present |
+| `--min-hits` | 1 | Floor on hits per marker; the effective call threshold is `max(--min-hits, query_kmers / 20)` |
 
 ---
 
@@ -740,12 +790,12 @@ genopack sim --ref genome.fna --output-dir sim_out/
 
 ## Similarity search and contig lookup (library-only)
 
-There is no `genopack similar` or `genopack cidx` CLI. KMRX similarity search and CIDX contig→genome lookup are exposed through the C++ API only:
+There is no `genopack similar` or `genopack cidx` CLI. KMRX profiles and CIDX contig→genome lookup are exposed through the C++ API only:
 
-- `ArchiveReader::find_similar(...)` / `find_similar_by_accession(...)`: linear KMRX cosine similarity scan.
+- `ArchiveReader::kmer_profile(...)` / `kmer_profile_by_accession(...)` plus `cosine_similarity(a, b)`: there is no built-in top-k search.
 - `ArchiveReader::find_contig_genome_id(accession)`: CIDX binary search, ~150M queries/s/core.
 
-See [API → Similarity & contig lookup](api.md#similarity--contig-lookup).
+See [API → Similarity & contig lookup](api.md#similarity-contig-lookup).
 
 ---
 
@@ -761,17 +811,20 @@ genopack reindex mydb.gpk [options]
 |------|---------|-------------|
 | `--force` | off | Rebuild indexes even if already present |
 | `--no-gidx` | off | Skip GIDX (useful when only `--skch` is needed and GIDX is absent/unwanted) |
+| `--no-gstx` | off | Skip the GSTX genus-stats index |
+| `--no-qual` | off | Skip the QUAL per-genome quality build |
+| `--gcov` | off | Rebuild GCOV/FCOV/FMHR (full shard rescan). When GSTX and GCOV both exist afterwards, reindex clears the stale-stats header flag that `merge` sets |
 | `--txdb` | off | Build the taxonomy tree (TXDB) from existing TAXN lineage strings |
 | `--cidx FILE` | unset | Build the contig accession index (CIDX) from a build TSV (`accession\ttaxonomy\tfile_path`) |
 | `--cidx-threads` | 8 | Threads for parallel FASTA decompression while indexing contigs |
-| `--skch` | off | Compute OPH sketches for genomes missing from existing SKCH sections |
+| `--skch` | off | Re-sketch **every** genome into one coalesced SKCH section; pre-existing SKCH sections are dropped |
 | `--skch-threads` | 8 | Threads for parallel sketch computation |
 | `--sketch-kmer` | inherit / 16 | OPH k-mer size for a single-k SKCH section |
-| `--sketch-kmers` | `16,21,31` | Comma list (e.g. `16,21,31`) → multi-k SKCH in one pass |
+| `--sketch-kmers` | unset (single-k) | Comma list (e.g. `16,21,31`) → multi-k SKCH v2; takes precedence over `--sketch-kmer` when it has more than one value |
 | `--sketch-size` | inherit / 10000 | OPH sketch size |
-| `--sketch-syncmer` | `-1` (auto: `s=k/3`) | Open-syncmer prefilter `s` (0 disables) |
+| `--sketch-syncmer` | `-1` (auto) | Open-syncmer prefilter `s` (0 disables). Auto is `max(2, k/3)` with k from `--sketch-kmer` (or 16), or the smallest `--sketch-kmers` value; it is never inherited from existing SKCH sections (only k and size are). The `--help` text says "inherit or 0" |
 
-Typical uses: an archive built with `--no-cidx` later wants contig lookup (`--cidx genomes.tsv`); a TAXN-only archive needs the tree (`--txdb`); SKCH layout needs to be upgraded to V4 seekable (`--skch --force`); or a multi-k variant is needed (`--skch --sketch-kmers 16,21,31 --force`).
+Typical uses: an archive built with `build --no-cidx` later wants contig lookup (`--cidx genomes.tsv`); a TAXN-only archive needs the tree (`--txdb`); SKCH layout needs to be upgraded to V4 seekable (`--skch --force`); or a multi-k variant is needed (`--skch --sketch-kmers 16,21,31 --force`).
 
 ---
 
@@ -794,7 +847,7 @@ Runs two checks. **Semantic coverage** cross-checks per-genome and per-genus sec
 
 ## `coordinator`
 
-NFS-coordinated assembly mode for distributed builds. Workers run `genopack build` with `--coordinator <manifest_dir>:<output.gpk>`; the coordinator process waits for the expected number of worker manifests, then merges parts into a single archive.
+NFS-coordinated assembly mode for distributed builds. Workers run `build --coordinator <manifest_dir>:<output.gpk>`; the coordinator process waits for the expected number of worker manifests, then merges parts into a single archive.
 
 ```bash
 genopack coordinator -o mydb.gpk --workers 64 --nfs-dir /shared/manifests/

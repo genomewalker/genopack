@@ -1,5 +1,7 @@
 # AAMER: The Amino-Acid K-mer Subsystem
 
+> Status as of 2026-10-23: CLI citations point at current `cli/main.cpp` lines. `pcore` bootstraps from `--theta` / `--min-seg-aa` / `--frac-max-hash` when an archive has no `SEC_CORE`; it no longer skips such archives.
+
 AAMER is genopack's marker-gene-**free** completeness/contamination substrate. Its
 k=8 amino-acid k-mer engine is shared byte-for-byte between the build side
 (protein) and the check side (DNA). It backs three archive sections
@@ -130,18 +132,16 @@ column is a pure function of build inputs, not the raw sibling set
 only call sites are its own defining file and its unit test
 (`tests/core_section_test.cpp`); no CLI subcommand constructs one. `CoreReader`
 remains available for reading legacy archives. In addition,
-`genopack pcore` currently *sources its own build config* (`k`, `min_seg_aa`,
-`theta`, `frac_max_hash`) from an existing archive's `SEC_CORE` header, and
-**skips any archive that has no CORE params** (`src/run_pcore.cpp:140-144`,
-`"has no CORE params; skipping"`). It uses the CoreReader *only* for those four
-config values, not the core aamer content, and exposes **no CLI fallback**
-for them (`pcore`'s only options are `archive`, `--threads`, `--members`).
-`merge` also **drops** `SEC_CORE` (it is in the non-concatenable set,
+`genopack pcore` *sources its own build config* (`k`, `min_seg_aa`,
+`theta`, `frac_max_hash`) from an existing archive's `SEC_CORE` header when one
+is present. It uses the CoreReader *only* for those four config values, not the
+core aamer content. `merge` also **drops** `SEC_CORE` (it is in the non-concatenable set,
 `src/merger.cpp:190`), so a merged archive loses the ability to rebuild PCORE.
 
 `pcore` therefore reads its build config from a pre-existing `SEC_CORE` when one
-is present. When it is **absent**, `pcore` now **bootstraps** from CLI options
-`--theta` / `--min-seg-aa` / `--frac-max-hash` instead of skipping the archive,
+is present. When it is **absent**, `pcore` **bootstraps** from CLI options
+`--theta` / `--min-seg-aa` / `--frac-max-hash` (`src/run_pcore.cpp:154-155` logs
+`"has no SEC_CORE; bootstrapping build config"`) instead of skipping the archive,
 so an archive can build `SEC_PCORE → completeness` without a legacy `SEC_CORE`.
 The defaults are taken from the code (`k = AAMER_K = 8`;
 `min_seg_aa = k = 8`, `aamer.hpp:621`; `theta = 0.90`, the `PcoreWriter`/unit-test
@@ -218,7 +218,7 @@ All three are FracMinHash-subsampled at `1/frac_c` via `h % c == 0`
 (`cladesplit.cpp:88, 103`). This modulo-based subsampling differs from the
 max-hash-threshold FracMinHash used in `extract_aamers_dna` (§2.5).
 `CladeSplitConfig` defaults: `frac_c = 30`, `min_aa = 8`, `mode = PK_AAMER`
-(`cladesplit.hpp:42-46`), matching the CLI defaults (`cli/main.cpp:4523-4529`).
+(`cladesplit.hpp:42-46`), matching the CLI defaults (`cli/main.cpp:5212-5218`).
 
 A `.csp` panel maps each **genus-diagnostic** aamer (present in exactly one
 genus among clean reference genomes) to that genus; a query genome's aamers
@@ -297,17 +297,17 @@ lists only the AAMER-relevant flags):
    family, into `PcoreWriter` (`src/run_pcore.cpp:137-193`).
    `-t/--threads` (default 8, parallel shard readers); `--members <file>`
    restricts which accessions contribute (default: all live genomes)
-   (`cli/main.cpp:4432-4445`).
+   (`cli/main.cpp:5110-5134`).
 
 2. **`genopack gami build <archive>`:** builds `SEC_GAMI` v2 from the archive's
    PCORE (or CORE fallback). `-t/--threads` (default 8, decode parallelism)
-   (`cli/main.cpp:4448-4460`).
+   (`cli/main.cpp:5137-5151`).
 
 3. **`genopack tier merge` / `genopack tier stamp`** (optional): merges
    per-part `.ptier` side-channel files (emitted during PCORE build via
    `PcoreWriter::set_tier_sidechannel`, `pcore.hpp:219-222`) into a global
    `.gtier` IDF table, then stamps per-aamer tier bytes into PCORE, upgrading
-   v1 → v2 in place (`cli/main.cpp:4462-4494`).
+   v1 → v2 in place (`cli/main.cpp:5152-5184`).
 
 4. **`genopack markers build --gtdbtk-db <root> -o markers.mrk`**: builds the
    SCG marker aamer panel from GTDB-Tk MSA files (bac120 + ar53).
@@ -317,12 +317,12 @@ lists only the AAMER-relevant flags):
    `--ic-threshold` (default 0.25, `--dayhoff6` only); `--expected-min-frac`
    (default 0.50; a marker counts as expected for a genus only if detectable
    in at least this fraction of the genus's reference genomes, mirroring
-   CheckM2's ~97% single-copy universality criterion) (`cli/main.cpp:4694-4732`).
+   CheckM2's ~97% single-copy universality criterion) (`cli/main.cpp:5383-5421`).
 
 5. **`genopack cladesplit build -i genomes.tsv -o panel.csp`** (independent of
    1-4): builds a `.csp` contamination panel from clean reference genomes.
    `--frac-c` (default 30), `--min-aa` (default 8), `--primitive`
    (`aamer`\|`metamer`\|`strobemer`, default `aamer`) (§4;
-   `cli/main.cpp:4519-4536`). `genopack cladesplit score` and
+   `cli/main.cpp:5211-5225`). `genopack cladesplit score` and
    `genopack cladesplit aamers` consume/dump the same primitive and must be
    invoked with matching flags.
