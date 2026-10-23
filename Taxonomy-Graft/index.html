@@ -1,0 +1,1170 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="High-performance single-file genome archive for large-scale microbial collections">
+      
+      
+      
+        <link rel="canonical" href="https://genomewalker.github.io/genopack/Taxonomy-Graft/">
+      
+      
+        <link rel="prev" href="../cli/">
+      
+      
+        <link rel="next" href="../Taxonomy-Export/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../assets/images/favicon.png">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>Unified Taxonomy - genopack</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+      <link rel="stylesheet" href="../stylesheets/extra.css">
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="teal" data-md-color-accent="teal">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#unified-taxonomy" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+    
+      
+
+<header class="md-header" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="genopack" class="md-header__button md-logo" aria-label="genopack" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            genopack
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Unified Taxonomy
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="default" data-md-color-primary="teal" data-md-color-accent="teal"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a4 4 0 0 0-4 4 4 4 0 0 0 4 4 4 4 0 0 0 4-4 4 4 0 0 0-4-4m0 10a6 6 0 0 1-6-6 6 6 0 0 1 6-6 6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="" data-md-color-scheme="slate" data-md-color-primary="teal" data-md-color-accent="teal"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 18c-.89 0-1.74-.2-2.5-.55C11.56 16.5 13 14.42 13 12s-1.44-4.5-3.5-5.45C10.26 6.2 11.11 6 12 6a6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/genomewalker/genopack" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    genomewalker/genopack
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+          
+            
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href=".." class="md-tabs__link">
+        
+  
+  
+    
+  
+  Home
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../getting-started/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Getting Started
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../api/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  API Reference
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../cli/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  CLI Reference
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+    
+  
+  
+    <li class="md-tabs__item md-tabs__item--active">
+      <a href="./" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Unified Taxonomy
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../Taxonomy-Export/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Taxonomy Export
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../quality/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Quality Scoring
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../aamer/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  AAMER Subsystem
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../format/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Format
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../Contig-Index/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Contig Index
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../changelog/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Changelog
+
+      </a>
+    </li>
+  
+
+      
+    </ul>
+  </div>
+</nav>
+          
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+  
+
+<nav class="md-nav md-nav--primary md-nav--lifted md-nav--integrated" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="genopack" class="md-nav__button md-logo" aria-label="genopack" data-md-component="logo">
+      
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3 3 3 0 0 0 3 3m0 3.54C9.64 9.35 6.5 8 3 8v11c3.5 0 6.64 1.35 9 3.54 2.36-2.19 5.5-3.54 9-3.54V8c-3.5 0-6.64 1.35-9 3.54"/></svg>
+
+    </a>
+    genopack
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/genomewalker/genopack" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    genomewalker/genopack
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../getting-started/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting Started
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../api/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    API Reference
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../cli/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    CLI Reference
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Unified Taxonomy
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Unified Taxonomy
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#taxid-scheme" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Taxid scheme
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#how-taxids-are-assigned" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        How taxids are assigned
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#taxonomy-unify" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        taxonomy unify
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="taxonomy unify">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#lineage-overrides" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Lineage overrides
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#reunifying-a-released-taxonomy" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Reunifying a released taxonomy
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#preserving-authoritative-taxids" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Preserving authoritative taxids
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#full-ncbi-backbone" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Full NCBI backbone
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#where-taxids-come-from-per-source" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Where taxids come from, per source
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#guarantees" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Guarantees
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#implementation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Implementation
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../Taxonomy-Export/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Taxonomy Export
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../quality/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Quality Scoring
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../aamer/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    AAMER Subsystem
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../format/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Format
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../Contig-Index/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Contig Index
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../changelog/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Changelog
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="unified-taxonomy">Unified Taxonomy</h1>
+<blockquote>
+<p><strong>Status as of 2026-10-23.</strong> Implemented and tested. Adds <code>taxonomy unify --lineage-overrides</code> (834573a),
+<code>--stable-taxids-from</code> (7887ad4) and the hard failure on duplicate export taxids (365e976). Every reunify of a
+released taxonomy must pass <code>--stable-taxids-from</code>; see <a href="#reunifying-a-released-taxonomy">Reunifying a released taxonomy</a>.</p>
+</blockquote>
+<p>Combine independent reference packs (GTDB prokaryotes, organelles, viruses, and
+optionally full NCBI) into <strong>one taxonomy with NCBI taxids where they apply</strong>, so
+per-pack mapping references and a downstream classifier share a single taxid space.</p>
+<p>Two entry points:</p>
+<ul>
+<li><code>genopack build --ncbi-taxdump &lt;dir&gt;</code>: build a pack whose taxa carry native
+  NCBI taxids where the name resolves, synthetic concept_ids otherwise.</li>
+<li><code>genopack taxonomy unify &lt;packs…&gt; --ncbi-taxdump &lt;dir&gt; -o &lt;out&gt;</code>: reconcile the
+  taxonomies of several <strong>independent</strong> packs into one taxdump <strong>without merging
+  their sequence data</strong>.</li>
+</ul>
+<h2 id="taxid-scheme">Taxid scheme</h2>
+<p>Taxids are <code>uint64_t</code> with bit 63 as a namespace flag:</p>
+<ul>
+<li><strong>bit 63 = 0:</strong> native NCBI taxid (32-bit value).</li>
+<li><strong>bit 63 = 1:</strong> synthetic concept_id, <code>FNV-64(canonical_path) | (1&lt;&lt;63)</code>.</li>
+</ul>
+<p>The two ranges are disjoint, so NCBI-native and source-specific nodes coexist in
+one tree with no renumbering and no collisions. Concept_ids are a deterministic
+hash of the lineage path, so they are stable across NCBI releases. On export, the
+columnar/taxdump writer keeps native NCBI taxids and renumbers only concept_ids
+into a dense block above the maximum NCBI taxid.</p>
+<h2 id="how-taxids-are-assigned">How taxids are assigned</h2>
+<p>For each lineage token, in order of precedence:</p>
+<ol>
+<li><strong>Preserved:</strong> if the accession has an authoritative NCBI taxid
+   (<code>--preserve-taxids</code>), that taxid's real NCBI lineage is imported and the id is
+   kept verbatim, down to a strain/subspecies leaf. Stale ids remap via
+   <code>merged.dmp</code>.</li>
+<li><strong>Name-resolved:</strong> a taxon whose scientific name is <strong>unambiguous</strong> in the
+   NCBI taxdump takes its native NCBI taxid. This gives NCBI precedence at every
+   rank where names agree (e.g. <code>Bacteria</code>→2, <code>Pseudomonadota</code>→1224,
+   <code>Escherichia coli</code>→562, <code>Viruses</code>→10239).</li>
+<li><strong>Concept_id:</strong> otherwise a synthetic hash id (GTDB-renamed clades, viral
+   vOTUs, and other taxa NCBI does not name).</li>
+</ol>
+<p>Ambiguous NCBI names are never used, so name resolution cannot cross homonyms.
+Entries are processed in accession-sorted order, so the output is deterministic:
+identical inputs produce identical taxids.</p>
+<h2 id="taxonomy-unify"><code>taxonomy unify</code></h2>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>genopack<span class="w"> </span>taxonomy<span class="w"> </span>unify<span class="w"> </span>prok.gpk<span class="w"> </span>organelle.gpk<span class="w"> </span>viral.gpk<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w">    </span>--ncbi-taxdump<span class="w"> </span>./taxdump<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="w">    </span>--preserve-taxids<span class="w"> </span>organelle_host_taxids.tsv<span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="w">    </span>-o<span class="w"> </span>./common_taxonomy<span class="w"> </span>-f<span class="w"> </span>columnar
+</code></pre></div>
+<p>Reads each pack's TAXN lineage strings (per-part reads run in parallel), builds
+one tree, and writes the taxonomy. GTDB's propagated <code>l__</code>/<code>k__</code> placeholder ranks
+(the domain name repeated at life/kingdom) are dropped so the prokaryote backbone
+attaches phyla directly under the domain.</p>
+<p>Outputs: <code>taxdump</code> format writes <code>nodes.dmp</code>, <code>names.dmp</code>, <code>acc2taxid.dmp</code>, plus
+empty <code>merged.dmp</code> and <code>delnodes.dmp</code> stubs; <code>columnar</code> writes <code>taxnodes.bin</code>,
+<code>acc2taxid.bin</code>, and <code>taxonomy.tsv</code>/<code>acc2taxid.tsv</code>.</p>
+<h3 id="lineage-overrides">Lineage overrides</h3>
+<p><code>--lineage-overrides</code> takes a two-column <code>accession&lt;TAB&gt;lineage</code> TSV and replaces
+those accessions' pack TAXN lineages at read time, without patching the packs.
+GTDB 7-rank lineages are normalized as in <code>taxonomy patch</code>; 10-rank lineages are
+kept. A malformed row, a duplicate accession, or an accession absent from the input
+packs is an error (<code>cli/main.cpp:2946-2970</code>).</p>
+<h3 id="reunifying-a-released-taxonomy">Reunifying a released taxonomy</h3>
+<p>Export numbering is not stable by itself. Native NCBI taxids are kept, but synthetic
+concept_ids are renumbered into a dense block in concept-hash order. Adding,
+removing or renaming one node therefore shifts the exported id of every later node,
+and an old taxid can come to name a different taxon. A reunify after renaming
+464,051 species reused 1,215,247 prior taxids for other taxa this way (7887ad4).</p>
+<p>Pass <code>--stable-taxids-from &lt;prior&gt;/taxonomy.tsv</code>, the prior release's columnar
+<code>taxonomy.tsv</code>. Every synthetic node whose full (rank, name) path exists there keeps
+that taxid; new nodes are numbered above the prior maximum. Pin common trees to the
+prior common tree and backbone trees to the prior backbone tree.</p>
+<p><code>unify</code> fails rather than silently dropping a node when two taxa would share one
+stable or exported taxid (<code>Stable taxid … assigned to two nodes</code>, <code>Export taxid …
+assigned to two nodes</code>; <code>cli/main.cpp:2660-2690</code>).</p>
+<h3 id="preserving-authoritative-taxids">Preserving authoritative taxids</h3>
+<p><code>--preserve-taxids</code> takes a TSV mapping accessions to NCBI taxids (2-column, or a
+headered file with <code>accession</code> and <code>taxid</code>/<code>host_taxid</code> columns). Use it where a
+pack has an authoritative id. For example, organelle genomes carry their host's
+NCBI taxid. On the RefSeq organelle set this raises the fraction of accessions
+matching their authoritative host taxid from 98.3% (name resolution) to 99.997%,
+recovering strain/subspecies ids that a species name cannot express (e.g.
+<em>S. cerevisiae</em> S288C 559292, <em>Canis lupus familiaris</em> 9615).</p>
+<h3 id="full-ncbi-backbone">Full NCBI backbone</h3>
+<p>By default the tree contains only taxa referenced by the packs. To retain taxa
+with no reference genome for LCA, include the whole NCBI scaffold by adding
+<code>--ncbi-backbone</code>. When both full NCBI and GTDB are present, add
+<code>--gtdb-replaces-prok</code> to excise NCBI's own <code>Bacteria</code>(2)/<code>Archaea</code>(2157)
+descendants (the anchors are kept) so GTDB stays authoritative for prokaryotes and
+nothing is double-counted. NCBI prokaryotes that GTDB also has (name-matched) are
+retained via the GTDB pack; NCBI-only prokaryotes are dropped.</p>
+<h2 id="where-taxids-come-from-per-source">Where taxids come from, per source</h2>
+<table>
+<thead>
+<tr>
+<th>source</th>
+<th>taxonomy in the pack</th>
+<th>id in the unified tree</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>GTDB prokaryotes</td>
+<td>GTDB lineage strings</td>
+<td>native NCBI id where the name matches (domains, and many phyla/genera/species), concept_id where GTDB diverges</td>
+</tr>
+<tr>
+<td>Organelles</td>
+<td>host lineage / <code>--preserve-taxids</code> host taxid</td>
+<td>the host's native NCBI taxid (species or strain)</td>
+</tr>
+<tr>
+<td>Viruses (IMG/VR)</td>
+<td>ICTV lineage strings under <code>d__Viruses</code></td>
+<td>native NCBI id for the ICTV backbone (<code>Viruses</code>→10239, kingdoms/phyla/…/families), concept_id for the vOTU leaves</td>
+</tr>
+<tr>
+<td>Full NCBI (optional)</td>
+<td><code>--ncbi-backbone</code></td>
+<td>native NCBI ids for the whole scaffold</td>
+</tr>
+</tbody>
+</table>
+<h2 id="guarantees">Guarantees</h2>
+<ul>
+<li><strong>Single-rooted, acyclic.</strong> Each node's parent is a strict prefix of its own
+  lineage path, so parent pointers strictly decrease depth. Verified on the
+  produced trees (root 1, no cycles, every node reaches the root).</li>
+<li><strong>Deterministic.</strong> Accession-sorted processing makes concept_id assignment and
+  name-resolution order-independent: identical inputs give byte-identical output.
+  Exported dense taxids are stable across <em>different</em> inputs only with
+  <code>--stable-taxids-from</code>.</li>
+<li><strong>No shared taxids.</strong> Export throws if two nodes would receive one taxid.</li>
+</ul>
+<h2 id="implementation">Implementation</h2>
+<p><code>src/txdb.cpp</code> (tree build + override), <code>src/ncbi_taxdb.cpp</code> (name index,
+<code>canonical_path_taxids</code>, <code>merged.dmp</code>, backbone iteration, binary cache),
+<code>src/builder.cpp</code>, <code>src/merger.cpp</code>, <code>cli/main.cpp</code> (<code>taxonomy unify</code>, taxdump
+export). The NCBI taxdump parse is cached to <code>&lt;dir&gt;/.ncbi_taxdb.cache</code>
+(staleness-checked; any read error falls back to a full parse).</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.tabs", "navigation.sections", "navigation.top", "navigation.indexes", "content.code.copy", "toc.integrate", "search.highlight"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": null}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+        <script src="../javascripts/mathjax.js"></script>
+      
+        <script src="https://polyfill.io/v3/polyfill.min.js?features=es6"></script>
+      
+        <script src="https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js"></script>
+      
+    
+  </body>
+</html>
