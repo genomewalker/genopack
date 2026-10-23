@@ -2657,23 +2657,40 @@ static int write_taxdump_from_tree(TaxdumpTree& tree,
                 (void)v;
                 if (!taxid_is_gtdb(tid)) next_id = std::max(next_id, tid + 1);
             }
+            // Concept ids are hashes of the full path, so two nodes sharing one prior id should be
+            // unreachable from pack input; this names them if it ever happens.
+            std::unordered_map<uint64_t, uint64_t> given;
             for (const auto& [tid, v] : tree.nodes) {
                 (void)v;
                 if (!taxid_is_gtdb(tid)) continue;
                 auto it = stable_ids->find(tid);
                 remap[tid] = it == stable_ids->end() ? next_id++ : it->second;
+                if (it != stable_ids->end()) {
+                    auto [g, fresh] = given.emplace(it->second, tid);
+                    if (!fresh)
+                        throw std::runtime_error("Stable taxid " + std::to_string(it->second) + " assigned to two nodes: " +
+                            rank_name_gtdb(std::get<1>(tree.nodes.at(g->second))) + " " + std::get<2>(tree.nodes.at(g->second)) +
+                            " and " + rank_name_gtdb(std::get<1>(v)) + " " + std::get<2>(v));
+                }
                 if (tree.nodes.count(remap[tid]))
                     throw std::runtime_error("Lineage override introduces a native taxid that conflicts with a reserved export taxid");
             }
         }
         std::map<uint64_t, std::tuple<uint64_t, TaxRank, std::string, bool>> renumbered;
+        std::unordered_map<uint64_t, uint64_t> exported_from;
         for (auto& [tid, v] : tree.nodes) {
             uint64_t par = std::get<0>(v);
             uint64_t new_par = (par == 0) ? remap[tid]
                              : (remap.count(par) ? remap[par] : remap[tid]);
+            auto r = renumbered.find(remap[tid]);
+            if (r != renumbered.end())
+                throw std::runtime_error("Export taxid " + std::to_string(remap[tid]) + " assigned to two nodes: " +
+                    std::to_string(exported_from.at(remap[tid])) + " (" + rank_name_gtdb(std::get<1>(r->second)) + " " +
+                    std::get<2>(r->second) + ") and " + std::to_string(tid) + " (" + rank_name_gtdb(std::get<1>(v)) +
+                    " " + std::get<2>(v) + ")");
             renumbered.emplace(remap[tid],
-                std::make_tuple(new_par, std::get<1>(v),
-                                std::move(std::get<2>(v)), std::get<3>(v)));
+                std::make_tuple(new_par, std::get<1>(v), std::move(std::get<2>(v)), std::get<3>(v)));
+            exported_from.emplace(remap[tid], tid);
         }
         tree.nodes.swap(renumbered);
         for (auto& [a, t] : tree.accs) { (void)a; if (remap.count(t)) t = remap[t]; }
