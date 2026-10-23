@@ -3672,10 +3672,9 @@ int main(int argc, char** argv) {
         "Use a fast local NVMe path to avoid filling /tmp.");
     bool build_thin = false;
     build->add_flag("--thin", build_thin,
-        "Ingest-only preset: write sequences, sketches, TAXN/GIDX/CIDX only. "
-        "Skip all compute sections (GSTX/GCOV/CORE/PCORE/GAMI). "
-        "Produces a thin archive for later enrichment with `genopack enrich`. "
-        "Do NOT pass --taxon-group in thin mode — shards flush by size, not genus.");
+        "Ingest-only preset: skip GSTX and GCOV, deferred to `genopack enrich`; PCORE and GAMI still "
+        "follow --pcore. --taxon-group stays on by default; pass --no-taxon-group so shards flush by size, "
+        "not genus.");
     std::string build_coordinator; // "manifest_dir:output.gpk" or empty
     build->add_option("--coordinator", build_coordinator,
         "NFS manifest coordinator: manifest_dir:/path/to/output.gpk. "
@@ -3776,7 +3775,7 @@ int main(int argc, char** argv) {
     enrich_cmd->add_option("--contam-panel", enrich_contam_panel,
         "Contamination panel (.csp) for duplication scoring");
     enrich_cmd->add_option("--sketch-kmers", enrich_sketch_kmers_str,
-        "Comma-separated k-mer sizes for multi-k SKCH (default: 16,21,31)");
+        "Comma-separated k-mer sizes for multi-k SKCH (default: unset = single-k SKCH with k=16)");
     enrich_cmd->add_option("--sketch-size",  enrich_sketch_size,  "OPH bins (default: 10000)");
     enrich_cmd->add_option("--sketch-syncmer", enrich_sketch_syncmer, "Syncmer s (default: auto)");
     enrich_cmd->add_flag("--pcore", enrich_pcore,
@@ -4887,7 +4886,9 @@ int main(int argc, char** argv) {
         "Comma-separated k-mer sizes for multi-k v2 SKCH section (e.g. 16,21,31). "
         "Takes precedence over --sketch-kmer when more than one value is given.");
     reindex_cmd->add_option("--sketch-size", reindex_skch_size, "OPH sketch size for new SKCH section (default: inherit from existing or 10000)");
-    reindex_cmd->add_option("--sketch-syncmer", reindex_skch_syncmer, "Syncmer s for new SKCH section (0=disabled, default: inherit or 0)");
+    reindex_cmd->add_option("--sketch-syncmer", reindex_skch_syncmer, "Syncmer s for new SKCH section (0=disabled, -1=auto: max(2, k/3) with k the smallest "
+        "--sketch-kmers value, else --sketch-kmer, else 16, even when k itself is inherited; "
+        "default: auto, never inherited from an existing SKCH)");
     reindex_cmd->callback([&]() {
         // Parse --sketch-kmers comma list into a vector<int>.
         std::vector<int> reindex_skch_kmers;
@@ -4927,7 +4928,8 @@ int main(int argc, char** argv) {
 
     auto* repack_cmd = app.add_subcommand("repack",
         "Re-shard an archive by taxonomy (genus by default) for fast per-taxon access on NFS. "
-        "One sequential pass through the source archive; genome IDs are preserved.");
+        "Scans shard directories first, then decompresses the source in one sequential pass; "
+        "genome IDs are preserved.");
     std::string repack_input, repack_output, repack_rank = "g";
     int repack_level = 6, repack_threads = 1, repack_max_mem = 32;
     bool repack_verbose = false;

@@ -4,6 +4,11 @@
 
 ## Unreleased
 
+### Help text
+
+- `--help` now matches the code for `enrich --sketch-kmers` (unset: single-k, k=16), `build --thin` (skips GSTX and GCOV only; taxon grouping stays on), `repack` (directory scan, then one sequential decompression pass) and `reindex --sketch-syncmer` (auto `max(2, k/3)`, never inherited).
+- Still wrong: the `enrich` description, `--pcore` and `--markers` mention CORE/GAMI, which enrich never writes.
+
 ### dedup
 
 - `dedup` confirms fingerprint + length candidates by an XXH3-128 hash of the decoded residues before tombstoning, so genomes that only share a sketch minimum are no longer removed.
