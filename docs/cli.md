@@ -1,6 +1,6 @@
 # CLI Reference
 
-> Status as of 2026-10-23: every subcommand and flag in `genopack --help` is documented here (checked by a per-command flag diff against the installed binary). Known `--help` text bugs, where the code wins: `enrich --sketch-kmers` claims a 16,21,31 default (it has none); `build --thin` says not to pass `--taxon-group`, which is already on by default; `dedup` says "same sequence" (it matches OPH fingerprint + length); `repack` says "one sequential pass" (it is two-pass); `reindex --sketch-syncmer` says "inherit or 0" (it resolves -1 to k/3).
+> Status as of 2026-10-23: `dedup` describes the sequence-hash fix (2026-10-23); binaries built before it, including 2ac05b64, remove on fingerprint + length alone. Every subcommand and flag in `genopack --help` is documented here (checked by a per-command flag diff against the installed binary). Known `--help` text bugs, where the code wins: `enrich --sketch-kmers` claims a 16,21,31 default (it has none); `build --thin` says not to pass `--taxon-group`, which is already on by default; `repack` says "one sequential pass" (it is two-pass); `reindex --sketch-syncmer` says "inherit or 0" (it resolves -1 to k/3).
 
 ## Synopsis
 
@@ -211,13 +211,21 @@ Records the genome ids in a new tombstone (TOMB) section. Physical space is not 
 
 ## `dedup`
 
-Tombstone duplicate genomes (equal OPH fingerprint and length, different accession) in place.
+Tombstone genomes whose sequence equals another genome's, keeping one copy.
 
 ```bash
-genopack dedup mydb.gpk [--dry-run]
+genopack dedup mydb.gpk --dry-run --groups groups.tsv   # review first
+genopack dedup mydb.gpk --groups removed.tsv
 ```
 
-Scans genome metadata only (no FASTA is read) and groups genomes with equal OPH fingerprint and genome length. In each group it keeps the genome with the highest completeness (ties: lowest genome_id) and tombstones the rest in a new TOMB section; physical bytes are reclaimed only by `repack`. With `--dry-run`, prints the duplicate groups without writing. Matching is sketch-based, so "duplicate" means equal fingerprint and length, not byte-identical sequence.
+| Flag | Default | Description |
+|---|---|---|
+| `--dry-run` | off | Write the groups TSV and change nothing |
+| `--groups` | `dedup_groups.tsv` | Group-to-accession TSV, written on every run |
+
+Genomes already tombstoned are skipped. Candidates are genomes with equal OPH fingerprint and genome length. Each candidate's FASTA is decoded and hashed (XXH3-128 over residues only: header lines and line breaks are ignored, contig boundaries are kept). Only candidates with equal hashes are duplicates. In each duplicate set the genome with the highest completeness is kept (ties: lowest genome_id) and the rest are tombstoned in a new TOMB section; physical bytes are reclaimed only by `repack`. Residue case is hashed as stored, so a soft-masked copy is not a duplicate.
+
+The groups TSV has one row per candidate genome: `candidate_group`, `genome_id`, `accession`, `genome_length`, `oph_fingerprint`, `sequence_hash`, `completeness`, `action`. `action` is `keep`, `remove`, or `distinct` (shares fingerprint and length but no other candidate has its sequence).
 
 ---
 

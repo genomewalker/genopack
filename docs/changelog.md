@@ -4,6 +4,13 @@
 
 ## Unreleased
 
+### dedup
+
+- `dedup` confirms fingerprint + length candidates by an XXH3-128 hash of the decoded residues before tombstoning, so genomes that only share a sketch minimum are no longer removed.
+- Candidates are sorted by fingerprint then length; before, equal-fingerprint genomes of different lengths could separate true duplicates so they were never compared.
+- Genomes already in a TOMB section are skipped; before, a second run could keep an already-tombstoned genome and tombstone the live copy.
+- New `--groups` TSV (default `dedup_groups.tsv`) lists every candidate with its hash and action, also under `--dry-run`. Check: `tests/dedup_sequence_confirm.py`.
+
 ### Unified taxonomy: stable taxids
 
 - **`taxonomy unify --stable-taxids-from <prior>/taxonomy.tsv`** (7887ad4): synthetic nodes whose full (rank, name) path exists in a prior unify's columnar `taxonomy.tsv` keep that taxid; new nodes are numbered above its maximum. Without it, export ids follow concept-hash order and a reunify after renaming 464,051 species reused 1,215,247 prior taxids for other taxa. Pass it on every reunify of a released taxonomy.

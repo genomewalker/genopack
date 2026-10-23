@@ -804,7 +804,27 @@ static int cmd_inspect(const std::string& path, bool json) {
 }
 
 // ── genopack dedup ─────────────────────────────────────────────────────────────
-static int cmd_dedup(const std::string& archive_path, bool dry_run) {
+// Residues only: header lines and line breaks are skipped, a '>' marks each contig start.
+static XXH128_hash_t sequence_hash(const std::string& fasta) {
+    XXH3_state_t* st = XXH3_createState();
+    XXH3_128bits_reset(st);
+    size_t pos = 0;
+    while (pos < fasta.size()) {
+        size_t eol = fasta.find('\n', pos);
+        if (eol == std::string::npos) eol = fasta.size();
+        size_t end = eol;
+        if (end > pos && fasta[end - 1] == '\r') --end;
+        if (fasta[pos] == '>') XXH3_128bits_update(st, ">", 1);
+        else XXH3_128bits_update(st, fasta.data() + pos, end - pos);
+        pos = eol + 1;
+    }
+    XXH128_hash_t h = XXH3_128bits_digest(st);
+    XXH3_freeState(st);
+    return h;
+}
+
+// Candidates share (oph_fingerprint, genome_length); only those with equal sequence hashes are removed.
+static int cmd_dedup(const std::string& archive_path, bool dry_run, const std::string& groups_path) {
     ArchiveReader reader;
     reader.open(archive_path);
 
@@ -812,14 +832,19 @@ static int cmd_dedup(const std::string& archive_path, bool dry_run) {
     auto all = reader.filter_meta(q);
 
     all.erase(std::remove_if(all.begin(), all.end(),
-        [](const GenomeMeta& m){ return m.is_deleted(); }), all.end());
+        [&](const GenomeMeta& m){ return m.is_deleted() || reader.is_deleted(m.genome_id); }), all.end());
 
     std::sort(all.begin(), all.end(), [](const GenomeMeta& a, const GenomeMeta& b) {
-        return a.oph_fingerprint < b.oph_fingerprint;
+        return std::tie(a.oph_fingerprint, a.genome_length, a.genome_id)
+             < std::tie(b.oph_fingerprint, b.genome_length, b.genome_id);
     });
 
+    std::ofstream tsv(groups_path);
+    if (!tsv) throw std::runtime_error("dedup: cannot write " + groups_path);
+    tsv << "candidate_group\tgenome_id\taccession\tgenome_length\toph_fingerprint\tsequence_hash\tcompleteness\taction\n";
+
     std::vector<GenomeId> to_tombstone;
-    size_t n_groups = 0;
+    size_t n_candidate_groups = 0, n_dup_groups = 0, n_distinct = 0;
 
     size_t i = 0;
     while (i < all.size()) {
@@ -830,23 +855,48 @@ static int cmd_dedup(const std::string& archive_path, bool dry_run) {
             ++j;
         }
         if (j > i + 1) {
-            ++n_groups;
-            size_t keep = i;
-            for (size_t k = i + 1; k < j; ++k) {
-                if (all[k].completeness_x10 > all[keep].completeness_x10 ||
-                    (all[k].completeness_x10 == all[keep].completeness_x10 &&
-                     all[k].genome_id < all[keep].genome_id))
-                    keep = k;
+            ++n_candidate_groups;
+            struct Member { const GenomeMeta* meta; std::string accession; XXH128_hash_t hash; };
+            std::vector<Member> members;
+            for (size_t k = i; k < j; ++k) {
+                auto eg = reader.fetch_genome(all[k].genome_id);
+                if (!eg) throw std::runtime_error("dedup: cannot fetch genome " + std::to_string(all[k].genome_id));
+                members.push_back({&all[k], eg->accession, sequence_hash(eg->fasta)});
             }
-            for (size_t k = i; k < j; ++k)
-                if (k != keep)
-                    to_tombstone.push_back(all[k].genome_id);
+            std::stable_sort(members.begin(), members.end(), [](const Member& a, const Member& b) {
+                return std::tie(a.hash.high64, a.hash.low64) < std::tie(b.hash.high64, b.hash.low64);
+            });
+            size_t a = 0;
+            while (a < members.size()) {
+                size_t b = a + 1;
+                while (b < members.size() && XXH128_isEqual(members[b].hash, members[a].hash)) ++b;
+                size_t keep = a;
+                for (size_t k = a + 1; k < b; ++k)
+                    if (members[k].meta->completeness_x10 > members[keep].meta->completeness_x10)
+                        keep = k;
+                if (b > a + 1) ++n_dup_groups; else ++n_distinct;
+                for (size_t k = a; k < b; ++k) {
+                    const Member& m = members[k];
+                    const char* action = b == a + 1 ? "distinct" : k == keep ? "keep" : "remove";
+                    if (k != keep) to_tombstone.push_back(m.meta->genome_id);
+                    char fp[17], hx[33];
+                    std::snprintf(fp, sizeof fp, "%016llx", (unsigned long long)m.meta->oph_fingerprint);
+                    std::snprintf(hx, sizeof hx, "%016llx%016llx",
+                                  (unsigned long long)m.hash.high64, (unsigned long long)m.hash.low64);
+                    tsv << n_candidate_groups << '\t' << m.meta->genome_id << '\t' << m.accession << '\t'
+                        << m.meta->genome_length << '\t' << fp << '\t' << hx << '\t'
+                        << m.meta->completeness_x10 / 10.0 << '\t' << action << '\n';
+                }
+                a = b;
+            }
         }
         i = j;
     }
+    tsv.close();
 
-    spdlog::info("dedup: scanned {} genomes, found {} duplicate groups, {} to remove",
-                 all.size(), n_groups, to_tombstone.size());
+    spdlog::info("dedup: scanned {} genomes, {} fingerprint+length candidate groups, "
+                 "{} confirmed by sequence hash, {} candidates distinct, {} to remove; groups written to {}",
+                 all.size(), n_candidate_groups, n_dup_groups, n_distinct, to_tombstone.size(), groups_path);
 
     if (dry_run || to_tombstone.empty()) {
         if (dry_run) spdlog::info("dedup: dry-run, no changes made");
@@ -3894,13 +3944,19 @@ int main(int argc, char** argv) {
     });
 
     // genopack dedup
-    auto* dedup_cmd = app.add_subcommand("dedup", "Remove duplicate genomes (same sequence, different accession)");
+    auto* dedup_cmd = app.add_subcommand("dedup",
+        "Tombstone genomes whose sequence equals another's: candidates share sketch fingerprint and length, "
+        "removal needs equal sequence hashes; the highest-completeness copy is kept");
     std::string dedup_archive;
+    std::string dedup_groups = "dedup_groups.tsv";
     bool dedup_dry_run = false;
     dedup_cmd->add_option("archive", dedup_archive, "Path to .gpk archive")->required();
-    dedup_cmd->add_flag("--dry-run", dedup_dry_run, "Report duplicates without tombstoning");
+    dedup_cmd->add_flag("--dry-run", dedup_dry_run, "Write the groups TSV without tombstoning");
+    dedup_cmd->add_option("--groups", dedup_groups,
+        "Group-to-accession TSV: every candidate genome with its sequence hash and action (keep/remove/distinct)")
+        ->capture_default_str();
     dedup_cmd->callback([&]() {
-        std::exit(cmd_dedup(dedup_archive, dedup_dry_run));
+        std::exit(cmd_dedup(dedup_archive, dedup_dry_run, dedup_groups));
     });
 
     // genopack rm
