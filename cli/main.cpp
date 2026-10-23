@@ -1654,18 +1654,6 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
         //    then to built-in defaults (k=16, size=10000) for a fresh archive.
         uint32_t sk_sketch_size = (skch_size    > 0) ? static_cast<uint32_t>(skch_size)    : 10000;
         uint32_t sk_kmer_size   = (skch_kmer    > 0) ? static_cast<uint32_t>(skch_kmer)    : 16;
-        uint32_t sk_syncmer_s;
-        if (skch_syncmer > 0) {
-            sk_syncmer_s = static_cast<uint32_t>(skch_syncmer);
-        } else if (skch_syncmer == -1) {
-            // auto: s = k/3, targeting ~6-8% syncmer density
-            uint32_t ref_k = multi_k
-                ? static_cast<uint32_t>(*std::min_element(skch_kmers.begin(), skch_kmers.end()))
-                : sk_kmer_size;
-            sk_syncmer_s = std::max(2u, ref_k / 3u);
-        } else {
-            sk_syncmer_s = 0;
-        }
         uint64_t sk_seed1       = 42;
         uint64_t sk_seed2       = 43;
 
@@ -1678,6 +1666,19 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
             // If no explicit override, inherit params from first existing section.
             if (skch_kmer <= 0 && !multi_k) sk_kmer_size  = skch_readers.back().kmer_size();
             if (skch_size <= 0)             sk_sketch_size = skch_readers.back().sketch_size();
+        }
+        // Syncmer s is resolved after k is inherited, so auto uses the k actually sketched.
+        uint32_t sk_syncmer_s;
+        if (skch_syncmer > 0) {
+            sk_syncmer_s = static_cast<uint32_t>(skch_syncmer);
+        } else if (skch_syncmer == -1) {
+            // auto: s = k/3, targeting ~6-8% syncmer density
+            uint32_t ref_k = multi_k
+                ? static_cast<uint32_t>(*std::min_element(skch_kmers.begin(), skch_kmers.end()))
+                : sk_kmer_size;
+            sk_syncmer_s = std::max(2u, ref_k / 3u);
+        } else {
+            sk_syncmer_s = 0;
         }
 
         if (multi_k) {
@@ -3753,9 +3754,10 @@ int main(int argc, char** argv) {
 
     // genopack enrich — compute GSTX/GCOV/CORE/PCORE/GAMI from a thin archive
     auto* enrich_cmd = app.add_subcommand("enrich",
-        "Add compute sections (GSTX/GCOV/CORE/PCORE/GAMI) to a thin archive produced by "
-        "`build --thin`. Reads sequences locally from the thin .gpk (no NFS opens). "
-        "Pass --taxon-group and --markers as for a full build.");
+        "Rebuild a thin archive produced by `build --thin` into a new archive with GSTX/GCOV, reading "
+        "sequences locally from the thin .gpk (no NFS opens). GSTX, and so GCOV, need --taxon-group and a "
+        "multi-k --sketch-kmers (e.g. 16,21,31), both off by default. PCORE needs --pcore. Enrich writes "
+        "no CORE or GAMI; run `genopack gami build` for GAMI.");
     std::string enrich_input, enrich_output, enrich_markers, enrich_contam_panel;
     int enrich_threads = 16;
     bool enrich_taxon_group = false;
@@ -3771,7 +3773,8 @@ int main(int argc, char** argv) {
     enrich_cmd->add_option("--taxon-rank", enrich_taxon_rank,
         "Taxonomy rank for grouping: g=genus (default), f=family");
     enrich_cmd->add_option("--markers", enrich_markers,
-        "Marker panel (.mrk) for CORE/PCORE/GAMI sections");
+        "Path to markers.mrk; marker completeness scoring during the GCOV pass. If omitted, "
+        "auto-resolved from $GENOPACK_DATA/markers.mrk or the install share dir.");
     enrich_cmd->add_option("--contam-panel", enrich_contam_panel,
         "Contamination panel (.csp) for duplication scoring");
     enrich_cmd->add_option("--sketch-kmers", enrich_sketch_kmers_str,
@@ -3779,7 +3782,7 @@ int main(int argc, char** argv) {
     enrich_cmd->add_option("--sketch-size",  enrich_sketch_size,  "OPH bins (default: 10000)");
     enrich_cmd->add_option("--sketch-syncmer", enrich_sketch_syncmer, "Syncmer s (default: auto)");
     enrich_cmd->add_flag("--pcore", enrich_pcore,
-        "Also build PCORE/GAMI (use for thin archives built without --markers)");
+        "Also build PCORE. GAMI is not built; run `genopack gami build` afterwards");
     std::string enrich_tmpdir;
     enrich_cmd->add_option("--tmpdir", enrich_tmpdir,
         "Directory for PCORE/SKCH spill files (default: /scratch if present, else /tmp)");
@@ -4887,8 +4890,8 @@ int main(int argc, char** argv) {
         "Takes precedence over --sketch-kmer when more than one value is given.");
     reindex_cmd->add_option("--sketch-size", reindex_skch_size, "OPH sketch size for new SKCH section (default: inherit from existing or 10000)");
     reindex_cmd->add_option("--sketch-syncmer", reindex_skch_syncmer, "Syncmer s for new SKCH section (0=disabled, -1=auto: max(2, k/3) with k the smallest "
-        "--sketch-kmers value, else --sketch-kmer, else 16, even when k itself is inherited; "
-        "default: auto, never inherited from an existing SKCH)");
+        "--sketch-kmers value, else the resolved single k (--sketch-kmer, else inherited from the "
+        "existing SKCH, else 16); default: auto, s itself is never inherited)");
     reindex_cmd->callback([&]() {
         // Parse --sketch-kmers comma list into a vector<int>.
         std::vector<int> reindex_skch_kmers;

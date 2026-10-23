@@ -1,6 +1,6 @@
 # CLI Reference
 
-> Status as of 2026-10-23: `dedup` describes the sequence-hash fix (2026-10-23); binaries built before it, including 2ac05b64, remove on fingerprint + length alone. Every subcommand and flag in `genopack --help` is documented here (checked by a per-command flag diff against the installed binary). The `--help` strings for `enrich --sketch-kmers`, `build --thin`, `repack` and `reindex --sketch-syncmer` were corrected to match the code on 2026-10-23; binaries built earlier, including 2ac05b64, still print the old text. Open `--help` bugs, where the code wins: the `enrich` description, `enrich --pcore` and `enrich --markers` name CORE/GAMI sections that enrich never writes.
+> Status as of 2026-10-23: `dedup` describes the sequence-hash fix (2026-10-23); binaries built before it, including 2ac05b64, remove on fingerprint + length alone. Every subcommand and flag in `genopack --help` is documented here (checked by a per-command flag diff against the installed binary). The `--help` strings for `enrich --sketch-kmers`, `build --thin`, `repack` and `reindex --sketch-syncmer` were corrected to match the code on 2026-10-23; binaries built earlier, including 2ac05b64, still print the old text. The `enrich` description, `enrich --pcore` and `enrich --markers` were corrected the same day, and `reindex --skch` now resolves auto `s` after k is inherited. Known code problems: `build`/`enrich --sketch-kmers` with a single value is ignored (k stays `--sketch-kmer`, 16 by default) while auto `s` is computed from the given value; `reindex` crashes when every species in the pack is a singleton (GSTX step, `cli/main.cpp` reads element 0 of an empty list).
 
 ## Synopsis
 
@@ -40,7 +40,7 @@ The output `mydb.gpk` is a single file (`-o mydb` also writes `mydb.gpk`). Defau
 | `--taxon-rank` | `g` | Rank for grouping (`g` = genus, `f` = family) |
 | `--sketch` / `--no-sketch` | on | Compute OPH sketches |
 | `--sketch-kmer` | 16 | OPH sketch k-mer size |
-| `--sketch-kmers` | `16,21,31` | Comma list (e.g. `16,21,31`) → multi-k SKCH in a single pass |
+| `--sketch-kmers` | `16,21,31` | Comma list (e.g. `16,21,31`) → multi-k SKCH in a single pass. A single value is ignored: k stays `--sketch-kmer` (16), while auto `--sketch-syncmer` is computed from the given value; pass `--sketch-kmers '' --sketch-kmer K` for single-k |
 | `--sketch-size` | 10000 | Number of OPH bins |
 | `--sketch-syncmer` | `-1` (auto: `s=k/3`) | Open syncmer prefilter `s` (0 disables) |
 | `--gstx` / `--no-gstx` | on | Build GSTX genus-stats index (`--no-gstx` to disable) |
@@ -61,7 +61,7 @@ The output `mydb.gpk` is a single file (`-o mydb` also writes `mydb.gpk`). Defau
 
 ## `enrich`
 
-Rebuild a thin archive produced by `build --thin` into a new archive with GSTX and GCOV, reading sequences from the thin `.gpk` (no NFS opens). PCORE is added only with `--pcore`. Enrich never writes CORE or GAMI: the build path it uses returns before the GAMI step, and no build writes CORE. GSTX, and so GCOV, are accumulated only with taxon grouping and multi-k sketches (`src/builder.cpp:1350`), and both are off by default here, so pass `--taxon-group` and `--sketch-kmers 16,21,31`. The `--help` text still claims CORE/PCORE/GAMI.
+Rebuild a thin archive produced by `build --thin` into a new archive with GSTX and GCOV, reading sequences from the thin `.gpk` (no NFS opens). PCORE is added only with `--pcore`. Enrich never writes CORE or GAMI: the build path it uses returns before the GAMI step, and no build writes CORE. GSTX, and so GCOV, are accumulated only with taxon grouping and multi-k sketches (`src/builder.cpp:1350`), and both are off by default here, so pass `--taxon-group` and `--sketch-kmers 16,21,31`.
 
 ```bash
 genopack enrich -i thin.gpk -o enriched.gpk [options]
@@ -74,12 +74,12 @@ genopack enrich -i thin.gpk -o enriched.gpk [options]
 | `-t / --threads` | 16 | Worker threads |
 | `--taxon-group` | off | Group genomes by genus; required for GSTX and therefore GCOV |
 | `--taxon-rank` | `g` | Taxonomy rank for grouping (`g` = genus, `f` = family) |
-| `--markers` | unset | Marker panel (`.mrk`) for CORE/PCORE/GAMI sections |
+| `--markers` | auto | Marker panel (`.mrk`) for marker completeness scoring during the GCOV pass; if omitted, `$GENOPACK_DATA/markers.mrk` or the install share dir |
 | `--contam-panel` | unset | Contamination panel (`.csp`) for duplication scoring |
 | `--sketch-kmers` | unset (single-k, k=16) | Comma-separated k-mer sizes for multi-k SKCH; pass `16,21,31` explicitly for multi-k. The single-k size is fixed at 16; enrich exposes no option for it. |
 | `--sketch-size` | 10000 | OPH bins |
 | `--sketch-syncmer` | auto | Syncmer `s` (default: auto) |
-| `--pcore` | off | Also build PCORE. GAMI is not built despite the `--help` text; run `genopack gami build` afterwards |
+| `--pcore` | off | Also build PCORE. GAMI is not built; run `genopack gami build` afterwards |
 | `--tmpdir` | `/scratch` or `/tmp` | Directory for PCORE/SKCH spill files |
 
 ---
@@ -830,7 +830,7 @@ genopack reindex mydb.gpk [options]
 | `--sketch-kmer` | inherit / 16 | OPH k-mer size for a single-k SKCH section |
 | `--sketch-kmers` | unset (single-k) | Comma list (e.g. `16,21,31`) → multi-k SKCH v2; takes precedence over `--sketch-kmer` when it has more than one value |
 | `--sketch-size` | inherit / 10000 | OPH sketch size |
-| `--sketch-syncmer` | `-1` (auto) | Open-syncmer prefilter `s` (0 disables). Auto is `max(2, k/3)` with k from `--sketch-kmer` (or 16), or the smallest `--sketch-kmers` value; it is never inherited from existing SKCH sections (only k and size are). When k is inherited, auto `s` still uses `--sketch-kmer` or 16, not the inherited k |
+| `--sketch-syncmer` | `-1` (auto) | Open-syncmer prefilter `s` (0 disables). Auto is `max(2, k/3)` with k the smallest `--sketch-kmers` value, else the resolved single k (`--sketch-kmer`, else the existing SKCH's k, else 16). `s` itself is never inherited from existing SKCH sections (only k and size are) |
 
 Typical uses: an archive built with `build --no-cidx` later wants contig lookup (`--cidx genomes.tsv`); a TAXN-only archive needs the tree (`--txdb`); SKCH layout needs to be upgraded to V4 seekable (`--skch --force`); or a multi-k variant is needed (`--skch --sketch-kmers 16,21,31 --force`).
 
