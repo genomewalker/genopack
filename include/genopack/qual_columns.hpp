@@ -50,6 +50,9 @@ inline const std::vector<QcolField>& qcol_fields() {
         // that lack these columns materialize back to make_empty's NAN default).
         {qual_axis::CONTAMINATION, qual_method::CORE_DUP_MASS,    Unit::Ratio,      ColDType::F32, offsetof(QualRecord, contamination_core_dup_mass)},
         {qual_axis::COMPLETENESS,  qual_method::ACCESSORY_RATIO,  Unit::Ratio,      ColDType::F32, offsetof(QualRecord, accessory_ratio)},
+        // Continuous quality_score (qscore_lo/qscore_hi read as one U16; 0 = not scored -> NaN).
+        // Packs written before this column materialize 0 -> NaN, as before.
+        {qual_axis::SUPPORT,       qual_method::QUALITY_SCORE,    Unit::Fraction01, ColDType::U16, offsetof(QualRecord, qscore_lo)},
     };
     return F;
 }
