@@ -1,6 +1,6 @@
 # Binary Format
 
-> Status as of 2026-10-23: checked against `include/genopack/format.hpp` (GPK3, `FORMAT_MAJOR` 3, `FORMAT_MINOR` 0). TailLocator is 128 bytes; the section table lists every `SEC_*` constant; the MetaBundle fast-open directory is documented below.
+> Status as of 2026-10-23: checked against `include/genopack/format.hpp` (GPK3, `FORMAT_MAJOR` 3, `FORMAT_MINOR` 0). TailLocator is 128 bytes; the section table lists every `SEC_*` constant; the MetaBundle fast-open directory is documented below. The open sequence now includes the metadata prefetch (step 5).
 
 A `.gpk` archive is a **single file**: `FileHeader`, then appended sections, a MetaBundle directory, the TOC and a 128-byte `TailLocator` at end of file. Sections can be appended without rewriting existing data; the TOC is rewritten with each generation and the TailLocator points to the current one. Multipart sets (used for very large or distributed builds) are directories containing one or more `part_*.gpk` files. `ArchiveSetReader` opens them as one archive. `build -o mydb` writes `mydb.gpk`.
 
@@ -364,7 +364,9 @@ Written just before the TOC and pointed to by the TailLocator. One read of `[met
 1. `pread` the final 128 bytes: the `TailLocator`; reject if magic is not `GPKT`.
 2. If `meta_bundle_offset` and `meta_bundle_size` are non-zero, `pread` the MetaBundle and take the directory from it (fast path).
 3. Otherwise (legacy archive), `pread` the raw TOC at `toc_offset`; `genopack reindex` adds a MetaBundle.
-4. Bounds-check every `SectionDesc` against the file size, then open sections lazily from the mmap.
+4. Bounds-check every `SectionDesc` against the file size.
+5. `pread` every CATL, ACCX, GIDX, QCOL and TAXN section in 8 MB chunks, so the page cache holds them before the readers walk them. The mmap is `MADV_RANDOM`, so faulting these in costs one read per page, which took 10-35 s per pack open over NFS.
+6. Open sections from the mmap; other sections stay lazy.
 
 ---
 

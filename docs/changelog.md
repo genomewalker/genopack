@@ -1,8 +1,12 @@
 # Changelog
 
-> Status as of 2026-10-23: Unreleased covers main up to 43238fc. Entries for features merged after 1.1.0 that were missing (2026-07-19 to 2026-08-13) were added under "Commands and flags".
+> Status as of 2026-10-23: Unreleased covers main up to the open-prefetch commit. Entries for features merged after 1.1.0 that were missing (2026-07-19 to 2026-08-13) were added under "Commands and flags".
 
 ## Unreleased
+
+### Open
+
+- `ArchiveReader::open` reads every CATL, ACCX, GIDX, QCOL and TAXN section with large preads before walking them. Before, they were faulted in a page at a time through the `MADV_RANDOM` mmap. On the r232 reps pack (12 parts) at dandycomp01fl, geodesic's pack open went from 20.5 s to 3.0 s cold. A single-genome `genopack extract` went from 12.9-27.4 s to 1.7-2.4 s (3 interleaved rounds each, identical FASTA). Check: `tests/open_prefetch.cpp`.
 
 ### Help text
 

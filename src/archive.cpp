@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <cstring>
 #include <future>
 #include <memory>
@@ -39,6 +40,25 @@
 #include <utility>
 
 namespace genopack {
+
+namespace {
+// The mmap is MADV_RANDOM, so walking a section through it costs one read per
+// page; on NFS that made pack opens take 10-35 s. Large preads fill the page
+// cache first. Best effort: a short read leaves the rest to the mmap faults.
+void prefetch_sections(int fd, const Toc& toc, std::initializer_list<uint32_t> types) {
+    std::vector<uint8_t> buf(8 << 20);
+    for (const auto& sd : toc.sections) {
+        if (std::find(types.begin(), types.end(), sd.type) == types.end()) continue;
+        for (uint64_t done = 0; done < sd.compressed_size;) {
+            const ssize_t n = ::pread(fd, buf.data(), std::min<uint64_t>(buf.size(), sd.compressed_size - done),
+                                      static_cast<off_t>(sd.file_offset + done));
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) break;
+            done += static_cast<uint64_t>(n);
+        }
+    }
+}
+} // namespace
 
 // ── ArchiveReader::Impl ───────────────────────────────────────────────────────
 
@@ -277,6 +297,8 @@ struct ArchiveReader::Impl {
                         " file=" + std::to_string(fsz) + ") — archive truncated/corrupt");
             }
         }
+
+        prefetch_sections(mmap_.fd(), toc_, {SEC_CATL, SEC_ACCX, SEC_GIDX, SEC_QCOL, SEC_TAXN});
 
         // Load catalog fragments (all CATL sections)
         for (auto* sd : toc_.find_by_type(SEC_CATL)) {

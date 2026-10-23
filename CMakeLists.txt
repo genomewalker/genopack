@@ -236,6 +236,11 @@ target_link_libraries(genopack_smoke_test PRIVATE genopack_lib)
 target_compile_definitions(genopack_smoke_test PRIVATE GENOPACK_BIN="$<TARGET_FILE:genopack>")
 add_test(NAME genopack-smoke COMMAND genopack_smoke_test)
 
+add_executable(genopack_open_prefetch_test tests/open_prefetch.cpp)
+target_link_libraries(genopack_open_prefetch_test PRIVATE genopack_lib)
+target_compile_definitions(genopack_open_prefetch_test PRIVATE GENOPACK_BIN="$<TARGET_FILE:genopack>")
+add_test(NAME genopack-open-prefetch COMMAND genopack_open_prefetch_test)
+
 add_executable(genopack_mem_delta_test tests/mem_delta.cpp)
 target_link_libraries(genopack_mem_delta_test PRIVATE genopack_lib)
 target_compile_definitions(genopack_mem_delta_test PRIVATE GENOPACK_BIN="$<TARGET_FILE:genopack>")
