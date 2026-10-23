@@ -350,3 +350,18 @@ add_test(NAME genopack-unify-lineage-override
 add_test(NAME genopack-unify-stable-taxids
   COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/unify_stable_taxids.py
           $<TARGET_FILE:genopack> ${CMAKE_CURRENT_BINARY_DIR})
+add_test(NAME genopack-dedup-sequence-confirm
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/dedup_sequence_confirm.py
+          $<TARGET_FILE:genopack> ${CMAKE_CURRENT_BINARY_DIR})
+add_test(NAME genopack-reindex-singleton-species
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/reindex_singleton_species.py
+          $<TARGET_FILE:genopack> ${CMAKE_CURRENT_BINARY_DIR})
+add_test(NAME genopack-reindex-syncmer-inherit
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/reindex_syncmer_inherit.py
+          $<TARGET_FILE:genopack> ${CMAKE_CURRENT_BINARY_DIR})
+add_test(NAME genopack-sketch-kmers-single
+  COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/sketch_kmers_single.py
+          $<TARGET_FILE:genopack> ${CMAKE_CURRENT_BINARY_DIR})
+set_tests_properties(genopack-dedup-sequence-confirm genopack-reindex-singleton-species
+  genopack-reindex-syncmer-inherit genopack-sketch-kmers-single
+  PROPERTIES ENVIRONMENT PYTHONDONTWRITEBYTECODE=1)
