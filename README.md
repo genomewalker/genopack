@@ -5,7 +5,8 @@ normalized as in `taxonomy patch`) and `--stable-taxids-from PRIOR/taxonomy.tsv`
 exists in a prior unify output keeps that taxid; new nodes are numbered above the prior maximum, so retired ids are never
 reissued). Exported taxids otherwise follow concept-hash order and shift when any node is added or removed, so pass
 `--stable-taxids-from` the previous release's columnar `taxonomy.tsv` on every rebuild. Unify now fails if two nodes would
-share one export taxid. Tests: `tests/unify_lineage_override.py`, `tests/unify_stable_taxids.py`.
+share one export taxid. Tests: `tests/unify_lineage_override.py`, `tests/unify_stable_taxids.py`. QUAL also exposes the
+continuous `quality_score` column (packs written before it read NaN).
 
 A single-file genome archive format for large-scale microbial genome collections. Stores millions of FASTA genomes with compressed shards, fast accession lookup, taxonomy, multi-k OPH sketches, and a full taxonomy tree in one seekable `.gpk` archive (a directory containing `toc.bin` plus section files) or a multipart set of `part_*.gpk` archives read as one.
 
