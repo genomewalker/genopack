@@ -9,7 +9,8 @@
 - `--help` now matches the code for `enrich --sketch-kmers` (unset: single-k, k=16), `build --thin` (skips GSTX and GCOV only; taxon grouping stays on), `repack` (directory scan, then one sequential decompression pass) and `reindex --sketch-syncmer` (auto `max(2, k/3)`, never inherited).
 - `enrich` description, `--pcore` and `--markers` now say what enrich builds: GSTX/GCOV (with `--taxon-group` and multi-k sketches), PCORE with `--pcore`, no CORE or GAMI; the marker panel drives marker completeness scoring.
 - `reindex --skch`: auto `--sketch-syncmer` is resolved after k is inherited from the existing SKCH, so an inherited k=21 gets s=7, not 5. Check: `tests/reindex_syncmer_inherit.py`.
-- Known: `build`/`enrich --sketch-kmers` with one value is ignored (k stays 16) while auto s uses that value; `reindex` crashes on packs where every species is a singleton.
+- `build`, `enrich` and `reindex --sketch-kmers` with one value now set k; before, the value was dropped (k stayed 16) while auto s was computed from it. Check: `tests/sketch_kmers_single.py`.
+- `reindex` no longer crashes on packs where every species has one genome (the GSTX step read element 0 of an empty list). Check: `tests/reindex_singleton_species.py`.
 
 ### dedup
 

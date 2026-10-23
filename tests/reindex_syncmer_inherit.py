@@ -5,32 +5,18 @@ Usage: python3 reindex_syncmer_inherit.py <genopack binary> <tmp parent dir>
 import pathlib
 import random
 import shutil
-import struct
 import subprocess
 import sys
 import tempfile
 
+from skch_header import skch_params
+
 binary = sys.argv[1]
-SKC4 = struct.pack('<I', 0x34434B53)
 
 def run(*args):
     p = subprocess.run([binary, *map(str, args)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
     assert p.returncode == 0, p.stdout + p.stderr
     return p.stdout + p.stderr
-
-def skch_params(pack):
-    """(kmer_sizes, syncmer_s) of every live SKCH section, read from the TailLocator's TOC."""
-    b = pathlib.Path(pack).read_bytes()
-    toc_off = struct.unpack_from('<Q', b, len(b) - 128 + 8)[0]
-    n = struct.unpack_from('<Q', b, toc_off + 24)[0]
-    out = []
-    for i in range(n):
-        off = struct.unpack_from('<Q', b, toc_off + 128 + 112 * i + 16)[0]
-        if b[off:off + 4] == SKC4:
-            nk = struct.unpack_from('<I', b, off + 20)[0]
-            ks = list(struct.unpack_from(f'<{nk}I', b, off + 24))
-            out.append((ks, struct.unpack_from('<I', b, off + 56)[0]))
-    return out
 
 rng = random.Random(20261023)
 with tempfile.TemporaryDirectory(prefix='genopack-syncmer-', dir=sys.argv[2]) as tmp:

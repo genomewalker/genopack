@@ -158,11 +158,11 @@ static int cmd_build(const std::string& input_tsv, const std::string& output_dir
     cfg.sketch_kmer_size                  = sketch_kmer;
     cfg.sketch_size                       = sketch_size;
     cfg.sketch_syncmer_s                  = sketch_syncmer;
-    if (sketch_kmers.size() > 1) {
+    if (!sketch_kmers.empty()) {
         std::sort(sketch_kmers.begin(), sketch_kmers.end());
         sketch_kmers.erase(std::unique(sketch_kmers.begin(), sketch_kmers.end()), sketch_kmers.end());
-        cfg.sketch_kmer_sizes = sketch_kmers;
-        cfg.sketch_kmer_size  = sketch_kmers[0];
+        cfg.sketch_kmer_size = sketch_kmers[0];
+        if (sketch_kmers.size() > 1) cfg.sketch_kmer_sizes = sketch_kmers;
     }
     cfg.markers_path      = resolve_data_file(markers_path, "markers.mrk");
     cfg.contam_panel_path = resolve_data_file(contam_panel, "contamination.csp");
@@ -1646,6 +1646,7 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
     size_t skch_n_missing = 0;
 
     // Normalise k list: --sketch-kmers takes precedence over --sketch-kmer.
+    if (skch_kmers.size() == 1) skch_kmer = skch_kmers[0];
     const bool multi_k = skch_kmers.size() > 1;
 
     if (need_skch) {
@@ -1976,7 +1977,8 @@ static int cmd_reindex(const std::string& archive_path, bool force, bool build_t
                 ar.release_sketches(); // drop pass-1 SKCH pages before pass-2
 
                 // Pass 2: containment vs consensus → p90 per multi-genus per k
-                const bool have_kmrx = ar.kmer_profile(all_sorted_gids[0]) != nullptr;
+                const bool have_kmrx = !all_sorted_gids.empty()
+                    && ar.kmer_profile(all_sorted_gids[0]) != nullptr;
                 std::vector<std::vector<std::vector<float>>> conts(
                     n_multi, std::vector<std::vector<float>>(nk));
                 for (size_t mgi = 0; mgi < n_multi; ++mgi)
@@ -3644,7 +3646,8 @@ int main(int argc, char** argv) {
         "and is the dominant cost; memory is bounded (spilled to $GENOPACK_SPILL_DIR) but on-disk size is large. "
         "Use --no-pcore to disable.");
     build->add_option("--sketch-kmer", build_sketch_kmer, "OPH sketch k-mer size (default: 16)");
-    build->add_option("--sketch-kmers", build_sketch_kmers_str, "Comma-separated k-mer sizes for multi-k SKCH (default: 16,21,31)");
+    build->add_option("--sketch-kmers", build_sketch_kmers_str, "Comma-separated k-mer sizes: several give a multi-k SKCH, one value sets k "
+        "(default: 16,21,31; pass '' to use --sketch-kmer)");
     build->add_option("--sketch-size", build_sketch_size, "Number of OPH bins (default: 10000)");
     build->add_option("--sketch-syncmer", build_sketch_syncmer, "Open syncmer prefilter s (0=disabled, -1=auto: s=k/3; default: auto)");
     build->add_flag("-v,--verbose", build_verbose, "Verbose progress");
@@ -3778,7 +3781,8 @@ int main(int argc, char** argv) {
     enrich_cmd->add_option("--contam-panel", enrich_contam_panel,
         "Contamination panel (.csp) for duplication scoring");
     enrich_cmd->add_option("--sketch-kmers", enrich_sketch_kmers_str,
-        "Comma-separated k-mer sizes for multi-k SKCH (default: unset = single-k SKCH with k=16)");
+        "Comma-separated k-mer sizes: several give a multi-k SKCH, one value sets k "
+        "(default: unset = single-k SKCH with k=16)");
     enrich_cmd->add_option("--sketch-size",  enrich_sketch_size,  "OPH bins (default: 10000)");
     enrich_cmd->add_option("--sketch-syncmer", enrich_sketch_syncmer, "Syncmer s (default: auto)");
     enrich_cmd->add_flag("--pcore", enrich_pcore,
@@ -4886,8 +4890,8 @@ int main(int argc, char** argv) {
     reindex_cmd->add_option("--skch-threads", reindex_skch_threads, "Threads for parallel sketch computation (default: 8)");
     reindex_cmd->add_option("--sketch-kmer", reindex_skch_kmer, "OPH k-mer size for single-k SKCH section (default: inherit from existing or 16)");
     reindex_cmd->add_option("--sketch-kmers", reindex_skch_kmers_str,
-        "Comma-separated k-mer sizes for multi-k v2 SKCH section (e.g. 16,21,31). "
-        "Takes precedence over --sketch-kmer when more than one value is given.");
+        "Comma-separated k-mer sizes: several give a multi-k v2 SKCH section (e.g. 16,21,31), "
+        "one value sets k. Takes precedence over --sketch-kmer.");
     reindex_cmd->add_option("--sketch-size", reindex_skch_size, "OPH sketch size for new SKCH section (default: inherit from existing or 10000)");
     reindex_cmd->add_option("--sketch-syncmer", reindex_skch_syncmer, "Syncmer s for new SKCH section (0=disabled, -1=auto: max(2, k/3) with k the smallest "
         "--sketch-kmers value, else the resolved single k (--sketch-kmer, else inherited from the "

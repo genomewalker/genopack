@@ -1,6 +1,6 @@
 # CLI Reference
 
-> Status as of 2026-10-23: `dedup` describes the sequence-hash fix (2026-10-23); binaries built before it, including 2ac05b64, remove on fingerprint + length alone. Every subcommand and flag in `genopack --help` is documented here (checked by a per-command flag diff against the installed binary). The `--help` strings for `enrich --sketch-kmers`, `build --thin`, `repack` and `reindex --sketch-syncmer` were corrected to match the code on 2026-10-23; binaries built earlier, including 2ac05b64, still print the old text. The `enrich` description, `enrich --pcore` and `enrich --markers` were corrected the same day, and `reindex --skch` now resolves auto `s` after k is inherited. Known code problems: `build`/`enrich --sketch-kmers` with a single value is ignored (k stays `--sketch-kmer`, 16 by default) while auto `s` is computed from the given value; `reindex` crashes when every species in the pack is a singleton (GSTX step, `cli/main.cpp` reads element 0 of an empty list).
+> Status as of 2026-10-23: `dedup` describes the sequence-hash fix (2026-10-23); binaries built before it, including 2ac05b64, remove on fingerprint + length alone. Every subcommand and flag in `genopack --help` is documented here (checked by a per-command flag diff against the installed binary). The `--help` strings for `enrich --sketch-kmers`, `build --thin`, `repack` and `reindex --sketch-syncmer` were corrected to match the code on 2026-10-23; binaries built earlier, including 2ac05b64, still print the old text. The `enrich` description, `enrich --pcore` and `enrich --markers` were corrected the same day, and `reindex --skch` now resolves auto `s` after k is inherited. A single `--sketch-kmers` value now sets k in `build`, `enrich` and `reindex`, and `reindex` no longer crashes on packs where every species is a singleton (both fixed 2026-10-23; earlier binaries, including 2ac05b64, have both bugs).
 
 ## Synopsis
 
@@ -40,7 +40,7 @@ The output `mydb.gpk` is a single file (`-o mydb` also writes `mydb.gpk`). Defau
 | `--taxon-rank` | `g` | Rank for grouping (`g` = genus, `f` = family) |
 | `--sketch` / `--no-sketch` | on | Compute OPH sketches |
 | `--sketch-kmer` | 16 | OPH sketch k-mer size |
-| `--sketch-kmers` | `16,21,31` | Comma list (e.g. `16,21,31`) → multi-k SKCH in a single pass. A single value is ignored: k stays `--sketch-kmer` (16), while auto `--sketch-syncmer` is computed from the given value; pass `--sketch-kmers '' --sketch-kmer K` for single-k |
+| `--sketch-kmers` | `16,21,31` | Comma list (e.g. `16,21,31`) → multi-k SKCH in a single pass; one value (e.g. `21`) gives a single-k SKCH at that k. Pass `''` to use `--sketch-kmer` instead |
 | `--sketch-size` | 10000 | Number of OPH bins |
 | `--sketch-syncmer` | `-1` (auto: `s=k/3`) | Open syncmer prefilter `s` (0 disables) |
 | `--gstx` / `--no-gstx` | on | Build GSTX genus-stats index (`--no-gstx` to disable) |
@@ -76,7 +76,7 @@ genopack enrich -i thin.gpk -o enriched.gpk [options]
 | `--taxon-rank` | `g` | Taxonomy rank for grouping (`g` = genus, `f` = family) |
 | `--markers` | auto | Marker panel (`.mrk`) for marker completeness scoring during the GCOV pass; if omitted, `$GENOPACK_DATA/markers.mrk` or the install share dir |
 | `--contam-panel` | unset | Contamination panel (`.csp`) for duplication scoring |
-| `--sketch-kmers` | unset (single-k, k=16) | Comma-separated k-mer sizes for multi-k SKCH; pass `16,21,31` explicitly for multi-k. The single-k size is fixed at 16; enrich exposes no option for it. |
+| `--sketch-kmers` | unset (single-k, k=16) | Comma-separated k-mer sizes: several give a multi-k SKCH (e.g. `16,21,31`), one value sets k |
 | `--sketch-size` | 10000 | OPH bins |
 | `--sketch-syncmer` | auto | Syncmer `s` (default: auto) |
 | `--pcore` | off | Also build PCORE. GAMI is not built; run `genopack gami build` afterwards |
@@ -828,7 +828,7 @@ genopack reindex mydb.gpk [options]
 | `--skch` | off | Re-sketch **every** genome into one coalesced SKCH section; pre-existing SKCH sections are dropped |
 | `--skch-threads` | 8 | Threads for parallel sketch computation |
 | `--sketch-kmer` | inherit / 16 | OPH k-mer size for a single-k SKCH section |
-| `--sketch-kmers` | unset (single-k) | Comma list (e.g. `16,21,31`) → multi-k SKCH v2; takes precedence over `--sketch-kmer` when it has more than one value |
+| `--sketch-kmers` | unset (single-k) | Comma list (e.g. `16,21,31`) → multi-k SKCH v2; one value sets k. Takes precedence over `--sketch-kmer` |
 | `--sketch-size` | inherit / 10000 | OPH sketch size |
 | `--sketch-syncmer` | `-1` (auto) | Open-syncmer prefilter `s` (0 disables). Auto is `max(2, k/3)` with k the smallest `--sketch-kmers` value, else the resolved single k (`--sketch-kmer`, else the existing SKCH's k, else 16). `s` itself is never inherited from existing SKCH sections (only k and size are) |
 
