@@ -1,7 +1,5 @@
 # Taxonomy Export
 
-> Status as of 2026-10-23: taxid export rule corrected against `cli/main.cpp` (`export_taxid_map`): native NCBI ids are kept, only synthetic ids are renumbered.
-
 `genopack taxdump` exports the taxonomy stored in a `.gpk` archive to two formats: NCBI-compatible taxdump and a columnar binary.
 
 ## Usage

@@ -1,7 +1,5 @@
 # Quality Scoring
 
-> Status as of 2026-10-23: `quality_score` is also a QCOL column (f88d727); field sources checked against `src/check/` and `include/genopack/qual*.hpp`.
-
 `genopack check` computes per-genome completeness and contamination signals from
 sketch geometry, aggregates them into a continuous quality score and an HQ/MQ/LQ
 tier, and writes both a TSV and a 56-byte-per-genome `QUAL` section

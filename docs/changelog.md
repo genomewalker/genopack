@@ -1,7 +1,5 @@
 # Changelog
 
-> Status as of 2026-10-23: Unreleased covers main up to the PCORE spill-dir fix. Entries for features merged after 1.1.0 that were missing (2026-07-19 to 2026-08-13) were added under "Commands and flags".
-
 ## Unreleased
 
 ### ANI

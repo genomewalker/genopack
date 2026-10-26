@@ -1,7 +1,5 @@
 # Getting Started
 
-> Status as of 2026-10-23: examples checked against `genopack --help`; KMRX similarity uses `cosine_similarity` (there is no `find_similar`); `add`/`dedup` descriptions match the code.
-
 ## Input TSV format
 
 `genopack build` and `genopack add` accept a tab-separated file:

@@ -1,7 +1,5 @@
 # CLI Reference
 
-> Status as of 2026-10-23: `dedup` describes the sequence-hash fix (2026-10-23); binaries built before it, including 2ac05b64, remove on fingerprint + length alone. Every subcommand and flag in `genopack --help` is documented here (checked by a per-command flag diff against the installed binary). The `--help` strings for `enrich --sketch-kmers`, `build --thin`, `repack` and `reindex --sketch-syncmer` were corrected to match the code on 2026-10-23; binaries built earlier, including 2ac05b64, still print the old text. The `enrich` description, `enrich --pcore` and `enrich --markers` were corrected the same day, and `reindex --skch` now resolves auto `s` after k is inherited. A single `--sketch-kmers` value now sets k in `build`, `enrich` and `reindex`, and `reindex` no longer crashes on packs where every species is a singleton (both fixed 2026-10-23; earlier binaries, including 2ac05b64, have both bugs).
-
 ## Synopsis
 
 ```

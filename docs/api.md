@@ -1,7 +1,5 @@
 # API Reference
 
-> Status as of 2026-10-23: checked against `include/genopack/*.hpp`. KMRX has no built-in top-k search (`find_similar` does not exist); `ArchiveBuilderConfig` and `BuildRecord` match `archive.hpp` / `types.hpp`; quality, profile, per-contig and taxonomy-tree readers are listed under [Section readers](#section-readers).
-
 All public symbols live in the `genopack` namespace. Include `<genopack/archive.hpp>` for the high-level reader/builder/appender. Low-level types are in `<genopack/types.hpp>`.
 
 ---

@@ -1,7 +1,5 @@
 # AAMER: The Amino-Acid K-mer Subsystem
 
-> Status as of 2026-10-23: CLI citations point at current `cli/main.cpp` lines. `pcore` bootstraps from `--theta` / `--min-seg-aa` / `--frac-max-hash` when an archive has no `SEC_CORE`; it no longer skips such archives.
-
 AAMER is genopack's marker-gene-**free** completeness/contamination substrate. Its
 k=8 amino-acid k-mer engine is shared byte-for-byte between the build side
 (protein) and the check side (DNA). It backs three archive sections

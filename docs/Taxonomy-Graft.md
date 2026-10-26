@@ -1,9 +1,5 @@
 # Unified Taxonomy
 
-> **Status as of 2026-10-23.** Implemented and tested. Adds `taxonomy unify --lineage-overrides` (834573a),
-> `--stable-taxids-from` (7887ad4) and the hard failure on duplicate export taxids (365e976). Every reunify of a
-> released taxonomy must pass `--stable-taxids-from`; see [Reunifying a released taxonomy](#reunifying-a-released-taxonomy).
-
 Combine independent reference packs (GTDB prokaryotes, organelles, viruses, and
 optionally full NCBI) into **one taxonomy with NCBI taxids where they apply**, so
 per-pack mapping references and a downstream classifier share a single taxid space.

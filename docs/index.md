@@ -1,7 +1,5 @@
 # genopack
 
-> Status as of 2026-10-23: a `.gpk` is a single file (multipart sets are directories of `part_*.gpk`); see the [changelog](changelog.md) for unreleased changes.
-
 **Single-file genome archive for large-scale microbial collections.**
 
 genopack stores millions of FASTA genomes with compressed shards, O(1) accession and genome-id lookup, full taxonomy, multi-k OPH sketches, and tetranucleotide profiles. The data is stored in one seekable `.gpk` file or a multipart set of `part_*.gpk` archives read via `ArchiveSetReader`.

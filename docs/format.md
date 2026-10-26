@@ -1,7 +1,5 @@
 # Binary Format
 
-> Status as of 2026-10-23: checked against `include/genopack/format.hpp` (GPK3, `FORMAT_MAJOR` 3, `FORMAT_MINOR` 0). TailLocator is 128 bytes; the section table lists every `SEC_*` constant; the MetaBundle fast-open directory is documented below. The open sequence now includes the metadata prefetch (step 5).
-
 A `.gpk` archive is a **single file**: `FileHeader`, then appended sections, a MetaBundle directory, the TOC and a 128-byte `TailLocator` at end of file. Sections can be appended without rewriting existing data; the TOC is rewritten with each generation and the TailLocator points to the current one. Multipart sets (used for very large or distributed builds) are directories containing one or more `part_*.gpk` files. `ArchiveSetReader` opens them as one archive. `build -o mydb` writes `mydb.gpk`.
 
 > **On-disk form.** Builders write one `.gpk` file (`src/builder.cpp`, since 440fea5) and `ArchiveReader` memory-maps that file. The 1.0.0 changelog described a directory of section files plus `toc.bin`; current code does not produce that layout.
