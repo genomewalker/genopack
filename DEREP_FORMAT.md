@@ -1,8 +1,8 @@
 # `.gpd` — Geodesic Derep Archive Format v1
 
-> Status as of 2026-10-23: checked against `src/derep_view.cpp` and `include/genopack/derep_view.hpp`. The optional CSTAT
-> (cluster stats) section is specified below but **not implemented**: the reader defines no `GPD_SEC_CST`, the HDR byte
-> once named `has_cstats` is padding, and `GpdRepEntry.cstat_offset` is an unused `reserved` field.
+> **Note:** the optional CSTAT (cluster stats) section is specified below but **not implemented**: the
+> reader defines no `GPD_SEC_CST`, the HDR byte once named `has_cstats` is padding, and `GpdRepEntry.cstat_offset` is an
+> unused `reserved` field.
 
 A `.gpd` file is the canonical artifact of a geodesic dereplication run.
 It is a self-contained binary archive that answers, for every genome in
